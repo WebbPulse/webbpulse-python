@@ -34,6 +34,7 @@ __all__ = [
     "create_app",
     "health_router",
     "mount_all",
+    "register_error_handlers",
     "request_id",
 ]
 

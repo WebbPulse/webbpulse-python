@@ -37,6 +37,7 @@ __all__ = [
     "SecretNotJsonObjectError",
     "load_json_secret",
     "reset_secret_cache",
+    "split_csv",
 ]
 
 Environment = Literal["local", "test", "staging", "production"]

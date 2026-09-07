@@ -61,6 +61,7 @@ if TYPE_CHECKING:  # pragma: no cover - typing only
 
 __all__ = [
     "RATE_LIMIT_TABLE",
+    "TTL_ATTRIBUTE",
     "RateLimitDecision",
     "RateLimiter",
     "identity_from_ip",

@@ -33,6 +33,7 @@ __all__ = [
     "Repository",
     "encode_numbers",
     "now_iso",
+    "reset_resource_cache",
     "table_name",
     "ttl_at",
     "ttl_in",
