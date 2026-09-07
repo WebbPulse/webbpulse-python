@@ -1,0 +1,69 @@
+# Lint, type check and test the shared package on every change.
+#
+# The reusable workflow defaults are written for the backend services, which keep their
+# project under `backend/` and install from a requirements file. This repository is a
+# package at the root installed from pyproject.toml, so those inputs are overridden here.
+#
+# No CodeArtifact login is passed. This package's own dependencies all come from PyPI, and
+# supplying `codeartifact-domain` would make the workflow require an OIDC role for no
+# benefit. A service that consumes this package does pass those inputs.
+name: CI
+
+on:
+  push:
+    branches: ["main"]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  ci:
+    uses: WebbPulse/.github/.github/workflows/python-ci.yml@v1
+    with:
+      python-version: "3.13"
+      # The package lives at the repository root, not under backend/.
+      working-directory: "."
+      # Install the package itself with every extra plus the dev tooling, so ruff, mypy
+      # and pytest are present and the optional imports the modules guard are exercised
+      # rather than skipped.
+      install-command: >-
+        python -m pip install --upgrade pip &&
+        pip install -e ".[dynamodb,fastapi,otel,testing]" mypy ruff pytest-cov
+        "boto3-stubs[dynamodb,secretsmanager]" botocore-stubs
+      ruff-target: "src tests"
+      coverage-source: "webbpulse"
+
+  # The reusable workflow runs ruff and pytest but has no type checking step, and this
+  # package ships `py.typed` so its annotations are part of its contract with every
+  # consumer. Running mypy here rather than adding it to the shared workflow keeps that
+  # workflow usable by services that are not yet strict-clean.
+  types:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Check out the repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.13"
+          cache: pip
+
+      - name: Install the package and the type checking tooling
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[dynamodb,fastapi,otel,testing]" mypy \
+            "boto3-stubs[dynamodb,secretsmanager]" botocore-stubs
+
+      - name: Mypy
+        run: mypy
