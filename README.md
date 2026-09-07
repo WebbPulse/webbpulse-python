@@ -64,9 +64,11 @@ and the two CORS fields. Anything domain-specific belongs in the subclass.
 from functools import lru_cache
 from webbpulse.config import BaseServiceSettings
 
+
 class Settings(BaseServiceSettings):
     table_prefix: str = "webbpulse-staging"
     google_client_id: str = ""
+
 
 @lru_cache(maxsize=1)
 def get_settings() -> Settings:
@@ -88,7 +90,7 @@ never a module-level call: an import that reaches Secrets Manager turns every co
 into a synchronous dependency on another service.
 
 ```python
-secrets = get_settings().load_secrets()   # {} locally, where no ARN is set
+secrets = get_settings().load_secrets()  # {} locally, where no ARN is set
 ```
 
 A secret that is not a JSON object raises `SecretNotJsonObjectError`. A missing secret or a
@@ -128,6 +130,7 @@ collector in the request path.
 
 ```python
 from webbpulse.otel import configure_tracing
+
 configure_tracing("webbpulse-staging-posts", environment="staging")
 ```
 
@@ -171,6 +174,7 @@ traverses them: CORS, the request id middleware, the structured error handlers, 
 
 ```python
 from webbpulse.http import create_app
+
 app = create_app([posts_router], service_name="posts", version="1.4.0", settings=settings)
 ```
 
@@ -282,6 +286,7 @@ A thin repository base over one table, plus the helpers every service was reimpl
 ```python
 from webbpulse.dynamodb import Repository
 
+
 class Posts(Repository):
     logical_name = "posts"
 
@@ -320,10 +325,12 @@ from webbpulse.logging import configure_logging
 from webbpulse.otel import configure_tracing
 from app.posts import build_app
 
+
 def main() -> None:
     configure_logging(level="INFO", service="posts", environment="staging")
     configure_tracing("webbpulse-staging-posts", environment="staging")
     run_uvicorn(build_app())
+
 
 if __name__ == "__main__":
     main()
