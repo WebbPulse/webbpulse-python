@@ -119,18 +119,23 @@ def rate_limit_headers(
     Two styles are emitted, on purpose.
 
     The IETF draft `draft-ietf-httpapi-ratelimit-headers` **replaced** the older
-    `RateLimit-Limit` / `RateLimit-Remaining` / `RateLimit-Reset` triple at draft-07 with two
-    structured fields, and the current draft (-11) defines only those::
+    `RateLimit-Limit` / `RateLimit-Remaining` / `RateLimit-Reset` triple. The current
+    revision, draft-11 of 23 May 2026, defines only two structured fields (RFC 9651), each
+    a list of items naming a policy. The triple was dropped in draft-08, which refactored
+    both fields into lists of items carrying parameters::
 
         RateLimit: "default";r=50;t=30
         RateLimit-Policy: "default";q=100;w=60
 
     `r` is the remaining quota, `t` the seconds until the window resets, `q` the quota and
-    `w` the window length. Emitting the abandoned triple as the standards-track answer would
-    be implementing something the draft no longer contains, so this returns the current
-    fields. The `X-RateLimit-*` set is emitted alongside because that is what most existing
-    clients and libraries actually parse; it has never been standardised, but it is the
-    pragmatic compatibility surface and it costs three headers.
+    `w` the window length. The draft also defines an optional `qu` quota unit and a `pk`
+    partition key, neither of which this limiter needs. Emitting the abandoned triple as
+    the standards-track answer would be implementing something the draft no longer
+    contains, so this returns the current fields. The `X-RateLimit-*` set is emitted
+    alongside because that is what most existing clients and libraries actually parse; the
+    draft mentions it only as a survey of existing practice and it has never been
+    standardised, but it is the pragmatic compatibility surface and it costs three
+    headers.
     """
     remaining = max(decision.remaining, 0)
     return {

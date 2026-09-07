@@ -21,8 +21,9 @@ which is traces silently never appearing:
    endpoint is an X-Ray one and warns loudly rather than exporting into a 403 forever.
 2. **Transaction Search has to be enabled on the account** for the endpoint to accept
    spans. It is a one-time per-account setting, not something an application can do.
-3. **The execution role needs `xray:PutTraceSegments`** (the `AWSXrayWriteOnlyAccess`
-   managed policy covers it). Active tracing with no permission records nothing.
+3. **The execution role needs write access to X-Ray.** The CloudWatch documentation
+   prescribes attaching the `AWSXrayWriteOnlyPolicy` managed policy, which grants
+   `xray:PutTraceSegments` among others. Active tracing with no permission records nothing.
 
 ## Sampling
 
@@ -30,7 +31,9 @@ Exporting straight to the endpoint makes the SDK default to `parentbased_always_
 is every trace. Set `OTEL_TRACES_SAMPLER=parentbased_traceidratio` with an
 `OTEL_TRACES_SAMPLER_ARG` below 1.0 in production once volume justifies it. The free tier
 is 100,000 traces per account per month and the estate has four accounts, so 1.0 is fine to
-start with and this module does not override whatever the environment says.
+start with and this module does not override whatever the environment says. AWS documents
+the default as costing up to 20 times the ingestion of their recommended 0.05 ratio, so this
+is a deliberate choice to revisit rather than an oversight.
 
 ## Cold start
 
