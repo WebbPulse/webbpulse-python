@@ -118,9 +118,9 @@ class JsonFormatter(logging.Formatter):
         payload: dict[str, Any] = {
             # RFC 3339 with milliseconds and a Z suffix. Lambda parses this; a bare
             # `asctime` with a comma before the milliseconds does not qualify.
-            "timestamp": datetime.fromtimestamp(record.created, UTC).isoformat(
-                timespec="milliseconds"
-            ).replace("+00:00", "Z"),
+            "timestamp": datetime.fromtimestamp(record.created, UTC)
+            .isoformat(timespec="milliseconds")
+            .replace("+00:00", "Z"),
             "level": record.levelname,
             "message": record.getMessage(),
             "logger": record.name,

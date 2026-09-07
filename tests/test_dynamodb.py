@@ -49,7 +49,7 @@ def test_now_iso_has_second_precision() -> None:
 
 def test_ttl_at_rejects_a_naive_datetime() -> None:
     with pytest.raises(ValueError, match="aware datetime"):
-        ttl_at(datetime(2026, 1, 1, 12, 0, 0))  # noqa: DTZ001 - naive on purpose
+        ttl_at(datetime(2026, 1, 1, 12, 0, 0))
 
 
 def test_ttl_at_returns_epoch_seconds_not_milliseconds() -> None:
@@ -110,7 +110,9 @@ def test_encode_numbers_converts_float_via_str() -> None:
     # Decimal(0.1) is 0.1000000000000000055511151231257827; Decimal("0.1") is exactly 0.1.
     result = encode_numbers(0.1)
     assert result == Decimal("0.1"), f"the conversion must go via str; got {result!r}"
-    assert result != Decimal(0.1), "Decimal(float) would carry the binary float error"
+    assert result != Decimal(0.1), (  # noqa: RUF032 - the float form is the point here
+        "Decimal(float) would carry the binary float error"
+    )
 
 
 def test_encode_numbers_recurses_into_dicts_and_lists() -> None:
@@ -222,12 +224,15 @@ def test_get_with_a_consistent_read(items_repo: Repository) -> None:
 
 def test_update_returning_none_when_no_values_are_requested(items_repo: Repository) -> None:
     items_repo.put({"pk": "counter", "count": 0})
-    assert items_repo.update(
-        {"pk": "counter"},
-        update_expression="ADD #c :one",
-        expression_names={"#c": "count"},
-        expression_values={":one": 1},
-    ) is None, "ReturnValues=NONE must yield None rather than an empty dict"
+    assert (
+        items_repo.update(
+            {"pk": "counter"},
+            update_expression="ADD #c :one",
+            expression_names={"#c": "count"},
+            expression_values={":one": 1},
+        )
+        is None
+    ), "ReturnValues=NONE must yield None rather than an empty dict"
 
 
 def test_delete_of_an_absent_item_is_not_an_error(items_repo: Repository) -> None:
@@ -285,9 +290,7 @@ def test_query_returns_one_page_and_a_cursor(events_repo: Repository) -> None:
 def test_query_descending_and_projection(events_repo: Repository) -> None:
     _seed_events(events_repo)
 
-    page = events_repo.query(
-        Key("pk").eq("session-1"), limit=3, ascending=False, projection="sk"
-    )
+    page = events_repo.query(Key("pk").eq("session-1"), limit=3, ascending=False, projection="sk")
     assert [item["sk"] for item in page.items] == ["0014", "0013", "0012"]
     assert set(page.items[0]) == {"sk"}, "a projection must limit the attributes returned"
 
@@ -327,9 +330,16 @@ def test_iter_query_bounds_the_result_with_max_items(events_repo: Repository) ->
 
 def test_iter_query_max_items_larger_than_the_result_set(events_repo: Repository) -> None:
     _seed_events(events_repo)
-    assert len(list(events_query := events_repo.iter_query(
-        Key("pk").eq("session-1"), max_items=500, page_size=5
-    ))) == 15
+    assert (
+        len(
+            list(
+                events_query := events_repo.iter_query(
+                    Key("pk").eq("session-1"), max_items=500, page_size=5
+                )
+            )
+        )
+        == 15
+    )
     assert events_query is not None
 
 

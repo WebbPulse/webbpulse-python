@@ -53,9 +53,10 @@ def aws_credentials() -> Iterator[None]:
     os.environ.update(
         {
             "AWS_ACCESS_KEY_ID": "testing",
-            "AWS_SECRET_ACCESS_KEY": "testing",  # noqa: S105 - not a real credential
-            "AWS_SECURITY_TOKEN": "testing",  # noqa: S105
-            "AWS_SESSION_TOKEN": "testing",  # noqa: S105
+            # These are moto's conventional placeholders, not real credentials.
+            "AWS_SECRET_ACCESS_KEY": "testing",
+            "AWS_SECURITY_TOKEN": "testing",
+            "AWS_SESSION_TOKEN": "testing",
             "AWS_DEFAULT_REGION": "us-west-2",
             "AWS_REGION": "us-west-2",
         }
@@ -120,7 +121,10 @@ def create_table(
             TableName=name,
             TimeToLiveSpecification={"Enabled": True, "AttributeName": ttl_attribute},
         )
-    return table
+    # `resource` is deliberately Any: it is a moto-backed boto3 resource and the
+    # stubs cannot describe it without forcing every caller to import them.
+    typed_table: Table = table
+    return typed_table
 
 
 @pytest.fixture

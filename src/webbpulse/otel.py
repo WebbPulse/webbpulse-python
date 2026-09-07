@@ -85,9 +85,12 @@ def xray_otlp_endpoint(region: str | None = None) -> str:
     Falls back to `AWS_REGION`, which Lambda always sets, and then to `us-west-2`, which is
     the only region this estate runs in.
     """
-    resolved = region or os.environ.get("AWS_REGION") or os.environ.get(
-        "AWS_DEFAULT_REGION"
-    ) or "us-west-2"
+    resolved = (
+        region
+        or os.environ.get("AWS_REGION")
+        or os.environ.get("AWS_DEFAULT_REGION")
+        or "us-west-2"
+    )
     return f"https://xray.{resolved}.amazonaws.com/v1/traces"
 
 
@@ -140,9 +143,7 @@ def configure_tracing(
         return False
 
     resolved_endpoint = (
-        endpoint
-        or os.environ.get("OTEL_EXPORTER_OTLP_TRACES_ENDPOINT")
-        or xray_otlp_endpoint()
+        endpoint or os.environ.get("OTEL_EXPORTER_OTLP_TRACES_ENDPOINT") or xray_otlp_endpoint()
     )
 
     # The X-Ray endpoint rejects unsigned requests with a 403 and the exporter retries
@@ -190,7 +191,8 @@ def _instrument_botocore() -> None:
         from opentelemetry.instrumentation.botocore import BotocoreInstrumentor
     except ImportError:
         return
-    instrumentor = BotocoreInstrumentor()
+    # The instrumentation packages ship no type information for their constructors.
+    instrumentor = BotocoreInstrumentor()  # type: ignore[no-untyped-call]
     if not instrumentor.is_instrumented_by_opentelemetry:
         instrumentor.instrument()
 

@@ -26,7 +26,9 @@ from webbpulse.http import (
 )
 
 
-def _request(headers: dict[str, str] | None = None, client: tuple[str, int] | None = None) -> Request:
+def _request(
+    headers: dict[str, str] | None = None, client: tuple[str, int] | None = None
+) -> Request:
     raw = [(k.lower().encode(), v.encode()) for k, v in (headers or {}).items()]
     scope: dict[str, Any] = {"type": "http", "method": "GET", "path": "/", "headers": raw}
     if client is not None:

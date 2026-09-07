@@ -111,7 +111,9 @@ class RateLimitDecision:
         )
 
 
-def rate_limit_headers(decision: RateLimitDecision, *, policy_name: str = "default") -> dict[str, str]:
+def rate_limit_headers(
+    decision: RateLimitDecision, *, policy_name: str = "default"
+) -> dict[str, str]:
     """Response headers describing the limit.
 
     Two styles are emitted, on purpose.
@@ -178,7 +180,7 @@ class RateLimiter(Repository):
         current = time.time() if now is None else now
         window_start = int(math.floor(current / window_seconds) * window_seconds)
         window_end = window_start + window_seconds
-        reset_after = max(int(math.ceil(window_end - current)), 0)
+        reset_after = max(math.ceil(window_end - current), 0)
 
         try:
             attributes = self.update(
@@ -186,12 +188,12 @@ class RateLimiter(Repository):
                 # ADD creates the attribute at zero and increments it when it is absent,
                 # which is what makes the first request of a window a single write with no
                 # read and no conditional retry.
-                update_expression=f"ADD #c :one SET #ttl = if_not_exists(#ttl, :ttl)",
+                update_expression="ADD #c :one SET #ttl = if_not_exists(#ttl, :ttl)",
                 expression_names={"#c": "count", "#ttl": TTL_ATTRIBUTE},
                 expression_values={":one": 1, ":ttl": window_end + _TTL_GRACE_SECONDS},
                 return_values="UPDATED_NEW",
             )
-        except Exception as exc:  # noqa: BLE001 - fail open on anything boto3 raises
+        except Exception as exc:  # Fail open on anything boto3 raises. See below.
             # Deliberately broad. botocore raises ClientError, EndpointConnectionError,
             # NoCredentialsError, ReadTimeoutError and more from different base classes, and
             # the correct response to every one of them is the same: allow the request and
@@ -251,7 +253,8 @@ def rate_limit(
     The limiter is constructed once when the dependency is built, not per request, so the
     cached DynamoDB table resource is reused.
     """
-    from fastapi import HTTPException, Request as _Request
+    from fastapi import HTTPException
+    from fastapi import Request as _Request
 
     resolved = limiter if limiter is not None else RateLimiter(namespace=namespace)
 

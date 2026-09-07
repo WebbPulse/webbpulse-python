@@ -128,9 +128,7 @@ class RequestIdMiddleware(BaseHTTPMiddleware):
     a log line, a trace and a support ticket can all be joined on the same string.
     """
 
-    async def dispatch(
-        self, request: Request, call_next: RequestResponseEndpoint
-    ) -> Response:
+    async def dispatch(self, request: Request, call_next: RequestResponseEndpoint) -> Response:
         incoming = request.headers.get(REQUEST_ID_HEADER, "").strip()
         # Bound the length so a hostile header cannot inflate every log line downstream.
         rid = incoming[:128] if incoming else str(uuid.uuid4())
@@ -150,7 +148,9 @@ class RequestIdMiddleware(BaseHTTPMiddleware):
         return response
 
 
-def health_router(*, service: str, version: str, checks: Mapping[str, Any] | None = None) -> APIRouter:
+def health_router(
+    *, service: str, version: str, checks: Mapping[str, Any] | None = None
+) -> APIRouter:
     """A router exposing `GET /health`.
 
     Liveness only, and deliberately so. It always returns 200 and never touches DynamoDB,
@@ -191,7 +191,13 @@ def register_error_handlers(app: FastAPI) -> None:
 
     @app.exception_handler(StarletteHTTPException)
     async def _http_exception(request: Request, exc: StarletteHTTPException) -> JSONResponse:
-        detail = exc.detail if isinstance(exc.detail, str) else "Request failed."
+        # Starlette types `detail` as str, but HTTPException accepts any object and
+        # FastAPI routes commonly raise one with a dict detail, so the check stays.
+        detail = (
+            exc.detail
+            if isinstance(exc.detail, str)  # type: ignore[redundant-expr]
+            else "Request failed."
+        )
         # 5xx raised deliberately is still a server fault worth an ERROR line; 4xx is not.
         if exc.status_code >= 500:
             _log.error(detail, extra={"status": exc.status_code, "path": request.url.path})
@@ -202,13 +208,15 @@ def register_error_handlers(app: FastAPI) -> None:
         )
 
     @app.exception_handler(RequestValidationError)
-    async def _validation_error(
-        request: Request, exc: RequestValidationError
-    ) -> JSONResponse:
+    async def _validation_error(request: Request, exc: RequestValidationError) -> JSONResponse:
         # `exc.errors()` can carry the offending input, which may be a password or token.
         # Only the location and the reason are returned, never the value.
         errors = [
-            {"loc": list(error.get("loc", ())), "msg": error.get("msg", ""), "type": error.get("type", "")}
+            {
+                "loc": list(error.get("loc", ())),
+                "msg": error.get("msg", ""),
+                "type": error.get("type", ""),
+            }
             for error in exc.errors()
         ]
         return JSONResponse(
@@ -258,8 +266,10 @@ def create_app(
     extra is installed and tracing is enabled. Call `configure_tracing` first so the spans
     reach a real provider.
     """
-    origins = list(cors_allow_origins) if cors_allow_origins is not None else (
-        list(settings.cors_allow_origins) if settings is not None else []
+    origins = (
+        list(cors_allow_origins)
+        if cors_allow_origins is not None
+        else (list(settings.cors_allow_origins) if settings is not None else [])
     )
     allow_credentials = (
         cors_allow_credentials

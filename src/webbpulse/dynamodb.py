@@ -341,8 +341,12 @@ class Repository:
             kwargs["ConditionExpression"] = condition
 
         response = self.table.update_item(**kwargs)
+        # The stubs declare Attributes as always present. DynamoDB omits it entirely
+        # when ReturnValues is NONE, so the runtime check stays despite the type.
         attributes = response.get("Attributes")
-        return dict(attributes) if attributes is not None else None
+        if attributes is None:
+            return None
+        return dict(attributes)
 
     def delete(self, key: Key, *, condition: Any | None = None) -> None:
         """Delete one item by primary key. Deleting an absent item is not an error."""

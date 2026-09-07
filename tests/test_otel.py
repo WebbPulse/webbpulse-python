@@ -17,12 +17,29 @@ from webbpulse.otel import (
 )
 
 
+def _clear_global_tracer_provider() -> None:
+    """Undo `trace.set_tracer_provider` so the next call actually installs a provider.
+
+    OpenTelemetry allows the global provider to be set exactly once per process: a second
+    `set_tracer_provider` logs "Overriding of current TracerProvider is not allowed" and
+    keeps the first one. Resetting only `otel._CONFIGURED` is therefore not enough, because
+    the second test would silently assert against the first test's provider. There is no
+    public API for this, so the private globals are reset directly.
+    """
+    from opentelemetry import trace
+
+    trace._TRACER_PROVIDER = None
+    trace._TRACER_PROVIDER_SET_ONCE._done = False
+
+
 @pytest.fixture(autouse=True)
 def _reset_provider() -> Any:
     """The tracer provider is a process global, so each test starts from a clean one."""
     otel._CONFIGURED = False
+    _clear_global_tracer_provider()
     yield
     otel._CONFIGURED = False
+    _clear_global_tracer_provider()
 
 
 def test_the_xray_endpoint_matches_the_documented_shape() -> None:

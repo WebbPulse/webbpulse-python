@@ -227,9 +227,7 @@ def test_missing_table_fails_open(caplog: pytest.LogCaptureFixture, dynamodb_res
 
 def _app(limiter: RateLimiter, *, limit: int = 2, namespace: str = "default") -> FastAPI:
     app = FastAPI()
-    dependency = rate_limit(
-        limit=limit, window_seconds=60, namespace=namespace, limiter=limiter
-    )
+    dependency = rate_limit(limit=limit, window_seconds=60, namespace=namespace, limiter=limiter)
 
     @app.get("/limited")
     async def limited(decision: Any = Depends(dependency)) -> dict[str, Any]:
@@ -301,9 +299,7 @@ def test_the_dependency_exposes_headers_on_a_successful_response(
     client = test_client(app, source_ip="198.51.100.24")
     response = client.get("/state")
     assert response.status_code == 200, response.text
-    assert response.json()["RateLimit"] == '"default";r=4;t=' + response.json()[
-        "X-RateLimit-Reset"
-    ]
+    assert response.json()["RateLimit"] == '"default";r=4;t=' + response.json()["X-RateLimit-Reset"]
     assert Request is not None
 
 

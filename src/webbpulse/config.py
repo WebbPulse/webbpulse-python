@@ -26,7 +26,7 @@ from functools import lru_cache
 from typing import TYPE_CHECKING, Any, Literal
 
 from pydantic import Field, field_validator
-from pydantic_settings import BaseSettings, SettingsConfigDict
+from pydantic_settings import BaseSettings, PydanticBaseSettingsSource, SettingsConfigDict
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
     from mypy_boto3_secretsmanager.client import SecretsManagerClient
@@ -54,6 +54,50 @@ class SecretNotJsonObjectError(ValueError):
     A secret holding a bare string or a JSON array cannot be merged into settings, and
     failing loudly here beats a confusing `AttributeError` three frames later.
     """
+
+
+def split_csv(value: str) -> list[str]:
+    """Split a comma separated environment value into a list, dropping empty entries."""
+    return [part.strip() for part in value.split(",") if part.strip()]
+
+
+class _CsvOrJsonEnvSource(PydanticBaseSettingsSource):
+    """Wrap a settings source so list fields accept CSV as well as JSON.
+
+    Only the decoding of a complex value is overridden. Everything else, including which
+    variables a field matches and how they are cased, is delegated to the wrapped source, so
+    this stays correct as pydantic-settings changes.
+    """
+
+    def __init__(self, wrapped: PydanticBaseSettingsSource) -> None:
+        self._wrapped = wrapped
+        # Bound before any rebinding, so the JSON fallback below always reaches the real
+        # decoder rather than the override that is temporarily installed in __call__.
+        self._decode_json = wrapped.decode_complex_value
+        super().__init__(wrapped.settings_cls)
+
+    def decode_complex_value(self, field_name: str, field: Any, value: Any) -> Any:
+        if isinstance(value, str):
+            stripped = value.strip()
+            if not stripped:
+                return []
+            # Anything that looks like JSON is left to the real decoder, so a genuine
+            # JSON list or object still parses and still reports its own errors.
+            if not stripped.startswith(("[", "{", '"')):
+                return split_csv(stripped)
+        return self._decode_json(field_name, field, value)
+
+    def get_field_value(self, field: Any, field_name: str) -> tuple[Any, str, bool]:
+        return self._wrapped.get_field_value(field, field_name)
+
+    def __call__(self) -> dict[str, Any]:
+        # Re-bind the wrapped source's decoder to this one for the duration of the call,
+        # since the source decodes internally rather than through the caller.
+        self._wrapped.decode_complex_value = self.decode_complex_value  # type: ignore[method-assign]
+        try:
+            return self._wrapped()
+        finally:
+            self._wrapped.decode_complex_value = self._decode_json  # type: ignore[method-assign]
 
 
 class BaseServiceSettings(BaseSettings):
@@ -118,19 +162,33 @@ class BaseServiceSettings(BaseSettings):
             raise ValueError(f"log_level must be one of {sorted(_LOG_LEVELS)}, got {value!r}")
         return upper
 
-    @field_validator("cors_allow_origins", mode="before")
     @classmethod
-    def _split_origins(cls, value: object) -> object:
-        """Allow a comma separated string, which is how a Terraform env var arrives."""
-        if isinstance(value, str):
-            stripped = value.strip()
-            if not stripped:
-                return []
-            # A JSON list is handled by pydantic itself; only split the bare form.
-            if stripped.startswith("["):
-                return value
-            return [part.strip() for part in stripped.split(",") if part.strip()]
-        return value
+    def settings_customise_sources(
+        cls,
+        settings_cls: type[BaseSettings],
+        init_settings: PydanticBaseSettingsSource,
+        env_settings: PydanticBaseSettingsSource,
+        dotenv_settings: PydanticBaseSettingsSource,
+        file_secret_settings: PydanticBaseSettingsSource,
+    ) -> tuple[PydanticBaseSettingsSource, ...]:
+        """Parse list-valued environment variables as CSV as well as JSON.
+
+        pydantic-settings treats any complex-typed field (a `list`, here) as JSON and calls
+        `json.loads` on the raw environment value *inside the source*, before any
+        `mode="before"` field validator runs. So a plain `CORS_ALLOW_ORIGINS=https://a,
+        https://b`, which is exactly what a Terraform-rendered environment variable looks
+        like, raises `SettingsError` from the source and never reaches a validator. Fixing
+        it therefore has to happen at the source layer, not with a validator.
+
+        `_CsvOrJsonEnvSource` below keeps JSON working and adds the bare comma-separated
+        form; the dotenv source is wrapped too, since a `.env` file has the same problem.
+        """
+        return (
+            init_settings,
+            _CsvOrJsonEnvSource(env_settings),
+            _CsvOrJsonEnvSource(dotenv_settings),
+            file_secret_settings,
+        )
 
     @property
     def is_production(self) -> bool:

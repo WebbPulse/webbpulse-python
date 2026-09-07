@@ -121,7 +121,9 @@ def run_uvicorn(
     app: FastAPI | str,
     *,
     port: int | None = None,
-    host: str = "0.0.0.0",  # noqa: S104 - binding all interfaces is required in a container
+    # Binding all interfaces is required inside a container; the adapter reaches the
+    # process over the container network, not over the loopback of the host.
+    host: str = "0.0.0.0",
     log_config: dict[str, Any] | None = None,
     **uvicorn_kwargs: Any,
 ) -> None:
