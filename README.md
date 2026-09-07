@@ -8,9 +8,8 @@ access layer, the Lambda entrypoint, and the test fixtures. They had drifted, an
 drift was where the bugs lived. This package is one implementation of each, typed and
 tested, so a service imports them instead of maintaining them.
 
-Nothing here runs an AWS call at import time. Every module is importable on its own, and
-the optional dependencies sit behind extras, so a service installs only the surface it
-uses.
+Nothing here runs an AWS call at import time, and the optional dependencies sit behind
+extras, so a service installs only the surface it uses.
 
 ## Install
 
@@ -48,9 +47,14 @@ needs. Everything else is opt-in.
 | `testing` | `moto`, `pytest`, `httpx2` | `webbpulse.testing` |
 
 A typical service installs `webbpulse[fastapi,dynamodb,otel]` at runtime and adds
-`testing` in its dev dependencies. `webbpulse.otel` and `webbpulse.http` degrade to no-ops
-rather than failing to import when their extra is absent, so a service can adopt them one
-at a time.
+`testing` in its dev dependencies.
+
+Which modules import without their extra matters when adopting one at a time.
+`webbpulse.otel` imports on the base install and every entry point in it is a no-op until
+the `otel` extra is present, and `config`, `logging`, `dynamodb`, `ratelimit` and
+`lambda_entry` import too, raising only when a call actually needs boto3, uvicorn or
+FastAPI. `webbpulse.http` imports FastAPI at module scope and so needs the `fastapi`
+extra to import at all, and `webbpulse.testing` needs the `testing` extra.
 
 ## Modules
 
@@ -146,8 +150,9 @@ to get wrong, and all three look identical from outside: traces simply never app
    X-Ray one and that distro is missing, rather than exporting into a 403 forever.
 2. **Transaction Search must be enabled on the account.** It is a one-time per-account
    setting that an application cannot make for itself.
-3. **The execution role needs X-Ray write access.** AWS prescribes the
-   `AWSXrayWriteOnlyPolicy` managed policy.
+3. **The execution role needs X-Ray write access.** Attach `AWSXrayWriteOnlyAccess`,
+   `arn:aws:iam::aws:policy/AWSXrayWriteOnlyAccess`. There is no `AWSXrayWriteOnlyPolicy`;
+   an ARN built from that name fails a Terraform apply with NoSuchEntity.
 
 The endpoint takes OTLP over HTTP only, so `OTEL_EXPORTER_OTLP_TRACES_PROTOCOL` must be
 `http/protobuf`; there is no gRPC listener. Note the host is per-signal: logs go to

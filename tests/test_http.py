@@ -280,3 +280,52 @@ def test_a_mounted_app_keeps_its_own_error_handlers() -> None:
 def test_mount_all_rejects_a_relative_mount_path() -> None:
     with pytest.raises(ValueError, match="must start with"):
         mount_all({"api/v1/posts": _domain_app("posts")})
+
+
+def test_a_deliberate_five_hundred_does_not_echo_its_detail() -> None:
+    """A 5xx detail goes to the log, never to the caller.
+
+    `raise HTTPException(500, f"could not read {table}")` is a normal thing to write, and
+    echoing it hands an attacker internals for free. The request id joins the response to
+    the log line that does carry the detail.
+    """
+    router = APIRouter()
+
+    @router.get("/boom")
+    async def boom() -> None:
+        raise HTTPException(status_code=500, detail="connection to webbpulse-prod-posts failed")
+
+    client = TestClient(create_app([router]), raise_server_exceptions=False)
+    response = client.get("/boom")
+
+    assert response.status_code == 500
+    body = response.json()
+    assert body["message"] == "Internal server error."
+    assert "webbpulse-prod-posts" not in response.text, "the internal detail must not leak"
+
+
+def test_a_four_hundred_still_carries_its_detail() -> None:
+    """Only 5xx is scrubbed. A 4xx detail is written for the caller and must survive."""
+    router = APIRouter()
+
+    @router.get("/nope")
+    async def nope() -> None:
+        raise HTTPException(status_code=404, detail="No such post.")
+
+    client = TestClient(create_app([router]), raise_server_exceptions=False)
+    response = client.get("/nope")
+
+    assert response.status_code == 404
+    assert response.json()["message"] == "No such post."
+
+
+def test_cors_exposes_the_rate_limit_headers() -> None:
+    """A header a browser cannot read is one the limiter did not emit, to a fetch() caller."""
+    app = create_app(cors_allow_origins=["https://webbpulse.com"])
+    response = TestClient(app).get("/health", headers={"Origin": "https://webbpulse.com"})
+
+    exposed = {h.strip() for h in response.headers["access-control-expose-headers"].split(",")}
+    for header in ("RateLimit", "RateLimit-Policy", "Retry-After", REQUEST_ID_HEADER):
+        assert header in exposed, f"{header} must be readable by the browser"
+    for header in ("X-RateLimit-Limit", "X-RateLimit-Remaining", "X-RateLimit-Reset"):
+        assert header in exposed, f"{header} is emitted, so it must be exposed too"

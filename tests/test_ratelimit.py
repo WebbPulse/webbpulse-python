@@ -339,3 +339,74 @@ def test_the_dependency_accepts_a_custom_key_function(
     assert client.get("/tenant", headers={"x-tenant": "globex"}).status_code == 200, (
         "a different tenant key must have its own counter"
     )
+
+
+def test_the_dependency_accepts_an_async_key_function(
+    limiter: RateLimiter, test_client: Any
+) -> None:
+    """An async key function is awaited rather than counted as a coroutine object.
+
+    Without the await, every request would key on a distinct `<coroutine object ...>`
+    repr, so each caller would get a fresh counter and the limit would never bite.
+    """
+    app = FastAPI()
+
+    async def key_fn(request: Request) -> str:
+        return request.headers.get("x-tenant", "anonymous")
+
+    dependency = rate_limit(
+        key_fn, limit=1, window_seconds=60, namespace="async-tenant", limiter=limiter
+    )
+
+    @app.get("/tenant")
+    async def tenant(decision: Any = Depends(dependency)) -> dict[str, bool]:
+        return {"ok": True}
+
+    client = test_client(app, source_ip="198.51.100.26")
+
+    assert client.get("/tenant", headers={"x-tenant": "acme"}).status_code == 200
+    assert client.get("/tenant", headers={"x-tenant": "acme"}).status_code == 429, (
+        "the awaited key must be the tenant string, so the second request is limited"
+    )
+    assert client.get("/tenant", headers={"x-tenant": "globex"}).status_code == 200
+
+
+def test_the_dependency_does_not_block_the_event_loop(
+    limiter: RateLimiter, test_client: Any
+) -> None:
+    """The blocking boto3 call must be offloaded, not run on the event loop thread.
+
+    `check` is synchronous socket I/O. Run inline in an `async def` dependency it would
+    stall every other request the worker is serving, which on a Lambda under load is a
+    latency bug that only appears in production.
+    """
+    import threading
+
+    loop_thread = threading.get_ident()
+    seen: dict[str, int] = {}
+    original = limiter.check
+
+    def record(*args: Any, **kwargs: Any) -> Any:
+        seen["thread"] = threading.get_ident()
+        return original(*args, **kwargs)
+
+    app = FastAPI()
+    dependency = rate_limit(limit=5, window_seconds=60, namespace="offload", limiter=limiter)
+
+    @app.get("/offloaded")
+    async def offloaded(decision: Any = Depends(dependency)) -> dict[str, int]:
+        seen["route"] = threading.get_ident()
+        return {"ok": 1}
+
+    limiter.check = record  # type: ignore[method-assign]
+    try:
+        client = test_client(app, source_ip="198.51.100.27")
+        assert client.get("/offloaded").status_code == 200
+    finally:
+        limiter.check = original  # type: ignore[method-assign]
+
+    assert "thread" in seen, "the limiter must have been called"
+    assert seen["thread"] != seen["route"], (
+        "the DynamoDB call must run in a worker thread, not on the thread running the route"
+    )
+    assert loop_thread == threading.get_ident()

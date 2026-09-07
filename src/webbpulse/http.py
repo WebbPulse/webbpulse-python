@@ -200,8 +200,13 @@ def register_error_handlers(app: FastAPI) -> None:
             else "Request failed."
         )
         # 5xx raised deliberately is still a server fault worth an ERROR line; 4xx is not.
+        # The detail goes to CloudWatch but not to the caller: a `raise HTTPException(500,
+        # f"...{table_name}...")` is a normal thing to write, and echoing it would leak
+        # internals to anyone who can provoke the error. The request id joins the two.
         if exc.status_code >= 500:
             _log.error(detail, extra={"status": exc.status_code, "path": request.url.path})
+            detail = "Internal server error."
+
         return JSONResponse(
             status_code=exc.status_code,
             content=_error_body(exc.status_code, detail, request),
@@ -295,7 +300,18 @@ def create_app(
             allow_credentials=allow_credentials,
             allow_methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
             allow_headers=["Accept", "Authorization", "Content-Type", "Origin", REQUEST_ID_HEADER],
-            expose_headers=[REQUEST_ID_HEADER, "RateLimit", "RateLimit-Policy", "Retry-After"],
+            # A header the browser cannot read is a header the limiter did not emit, as
+            # far as a fetch() caller is concerned, so the X-RateLimit-* compatibility
+            # trio is exposed alongside the structured fields it accompanies.
+            expose_headers=[
+                REQUEST_ID_HEADER,
+                "RateLimit",
+                "RateLimit-Policy",
+                "Retry-After",
+                "X-RateLimit-Limit",
+                "X-RateLimit-Remaining",
+                "X-RateLimit-Reset",
+            ],
             max_age=86400,
         )
 

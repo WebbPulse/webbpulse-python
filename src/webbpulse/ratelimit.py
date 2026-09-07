@@ -52,7 +52,8 @@ import logging
 import math
 import time
 from collections.abc import Awaitable, Callable
-from typing import TYPE_CHECKING, Any, Final
+from functools import partial
+from typing import TYPE_CHECKING, Any, Final, TypeAlias
 
 from webbpulse.dynamodb import Repository
 
@@ -148,13 +149,24 @@ def rate_limit_headers(
     }
 
 
-#: Bound to `fastapi.Request` by `_bind_fastapi_request` on first use of `rate_limit`.
-#: `fastapi` is an optional extra, so it cannot be imported at module scope: importing
-#: `webbpulse.ratelimit` must keep working for a service that installed only the
-#: `dynamodb` extra and uses `RateLimiter` directly. The placeholder is never used as an
-#: annotation before it is replaced, because only `rate_limit` refers to it and that
-#: function binds it first.
-_FastAPIRequest: Any = None
+# Bound to `fastapi.Request` by `_bind_fastapi_request` on first use of `rate_limit`.
+# `fastapi` is an optional extra, so it cannot be imported at module scope: importing
+# `webbpulse.ratelimit` must keep working for a service that installed only the
+# `dynamodb` extra and uses `RateLimiter` directly. The placeholder is never used as an
+# annotation before it is replaced, because only `rate_limit` refers to it and that
+# function binds it first.
+#
+# Under TYPE_CHECKING this is the real `fastapi.Request`, so a type checker sees a type
+# rather than a module-level variable. Annotating it `Any` at runtime instead made
+# Pyright report "Variable not allowed in type expression" in every consuming service,
+# since the annotation below resolves to a value, not a type.
+if TYPE_CHECKING:
+    # Deliberately `TypeAlias` and not PEP 695 `type`: a `type` statement creates a lazy
+    # `TypeAliasType`, which FastAPI cannot resolve when it evaluates the annotation
+    # below to discover the request parameter.
+    _FastAPIRequest: TypeAlias = Request  # noqa: UP040
+else:
+    _FastAPIRequest = None
 
 
 def _bind_fastapi_request() -> None:
@@ -278,6 +290,7 @@ def rate_limit(
     cached DynamoDB table resource is reused.
     """
     from fastapi import HTTPException
+    from starlette.concurrency import run_in_threadpool
 
     resolved = limiter if limiter is not None else RateLimiter(namespace=namespace)
 
@@ -291,11 +304,18 @@ def rate_limit(
     _bind_fastapi_request()
 
     async def dependency(request: _FastAPIRequest) -> RateLimitDecision:
-        identity = key_fn(request)
-        if isinstance(identity, Awaitable):
-            identity = await identity
+        produced = key_fn(request)
+        identity = await produced if isinstance(produced, Awaitable) else produced
 
-        decision = resolved.check(identity, limit=limit, window_seconds=window_seconds)
+        # `check` is synchronous boto3, which blocks on socket I/O. This dependency is
+        # `async def`, so calling it directly would block the event loop for the whole
+        # round trip and stall every other request the worker is serving. Starlette's
+        # threadpool is what a `def` dependency would have been given anyway; the
+        # annotation above has to stay resolvable in module globals, which is why this
+        # is an `async def` offloading rather than a plain `def`.
+        decision = await run_in_threadpool(
+            partial(resolved.check, identity, limit=limit, window_seconds=window_seconds)
+        )
         headers = rate_limit_headers(decision, policy_name=namespace)
         request.state.rate_limit_headers = headers
 

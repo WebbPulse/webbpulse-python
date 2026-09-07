@@ -21,9 +21,12 @@ which is traces silently never appearing:
    endpoint is an X-Ray one and warns loudly rather than exporting into a 403 forever.
 2. **Transaction Search has to be enabled on the account** for the endpoint to accept
    spans. It is a one-time per-account setting, not something an application can do.
-3. **The execution role needs write access to X-Ray.** The CloudWatch documentation
-   prescribes attaching the `AWSXrayWriteOnlyPolicy` managed policy, which grants
-   `xray:PutTraceSegments` among others. Active tracing with no permission records nothing.
+3. **The execution role needs write access to X-Ray.** Attach the `AWSXrayWriteOnlyAccess`
+   managed policy, `arn:aws:iam::aws:policy/AWSXrayWriteOnlyAccess`, which grants
+   `xray:PutTraceSegments`, `xray:PutTelemetryRecords` and the three sampling reads. Active
+   tracing with no permission records nothing. Note there is no `AWSXrayWriteOnlyPolicy`:
+   that name does not exist in the managed policy reference, so an ARN built from it fails
+   a Terraform apply with NoSuchEntity.
 
 ## Sampling
 
