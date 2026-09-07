@@ -1,0 +1,124 @@
+[build-system]
+requires = ["hatchling>=1.25"]
+build-backend = "hatchling.build"
+
+[project]
+name = "webbpulse"
+description = "Shared infrastructure code for WebbPulse FastAPI services on AWS Lambda."
+readme = "README.md"
+requires-python = ">=3.13"
+license = "MIT"
+authors = [{ name = "Tyler Webb", email = "tylert2610@gmail.com" }]
+keywords = ["fastapi", "aws", "lambda", "dynamodb", "opentelemetry"]
+classifiers = [
+  "Private :: Do Not Upload",
+  "Programming Language :: Python :: 3.13",
+  "Framework :: FastAPI",
+  "Typing :: Typed",
+]
+dynamic = ["version"]
+
+# The base install carries nothing that is not needed by every consumer.
+# Everything else is an extra, so a service installs only the surface it uses.
+dependencies = [
+  "pydantic>=2.9,<3",
+  "pydantic-settings>=2.6,<3",
+]
+
+[project.optional-dependencies]
+# webbpulse.config secret loading, webbpulse.dynamodb and webbpulse.ratelimit.
+dynamodb = ["boto3>=1.35", "botocore>=1.35"]
+# webbpulse.http, webbpulse.ratelimit dependencies and webbpulse.lambda_entry.
+fastapi = ["fastapi>=0.115", "starlette>=0.40", "uvicorn>=0.32"]
+# webbpulse.otel.
+otel = [
+  "opentelemetry-api>=1.30",
+  "opentelemetry-sdk>=1.30",
+  "opentelemetry-exporter-otlp-proto-http>=1.30",
+  "opentelemetry-instrumentation-fastapi>=0.51b0",
+  "opentelemetry-instrumentation-botocore>=0.51b0",
+]
+# webbpulse.testing. Starlette 1.x TestClient is built on httpx2 and warns (and under
+# `-W error` fails) when only the 0.x httpx is importable, so httpx2 is what is pinned.
+testing = ["moto[dynamodb,secretsmanager]>=5", "pytest>=8", "httpx2>=2"]
+
+[project.urls]
+Homepage = "https://github.com/WebbPulse/webbpulse-python"
+Source = "https://github.com/WebbPulse/webbpulse-python"
+
+[dependency-groups]
+dev = [
+  "webbpulse[dynamodb,fastapi,otel,testing]",
+  "boto3-stubs[dynamodb,secretsmanager]",
+  "botocore-stubs",
+  "mypy>=1.13",
+  "pytest-cov>=6",
+  "ruff>=0.8",
+]
+
+[tool.hatch.version]
+path = "src/webbpulse/_version.py"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/webbpulse"]
+
+[tool.hatch.build.targets.sdist]
+include = ["src/webbpulse", "README.md", "LICENSE"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py313"
+src = ["src", "tests"]
+
+[tool.ruff.lint]
+select = [
+  "E",   # pycodestyle
+  "F",   # pyflakes
+  "I",   # isort
+  "B",   # bugbear
+  "UP",  # pyupgrade
+  "SIM", # flake8-simplify
+  "TID", # flake8-tidy-imports
+  "RUF",
+]
+ignore = [
+  # A boolean positional argument is fine on the small helpers here.
+  "B008",
+]
+
+[tool.ruff.lint.per-file-ignores]
+# Tests reach into private helpers and shadow builtins freely.
+"tests/*" = ["E501"]
+# The module docstring carries a copy-pasteable Dockerfile. Wrapping the CodeArtifact
+# index URL or the COPY --from line would break the snippet for anyone who pastes it.
+"src/webbpulse/lambda_entry.py" = ["E501"]
+
+[tool.ruff.lint.isort]
+known-first-party = ["webbpulse"]
+
+[tool.mypy]
+python_version = "3.13"
+strict = true
+files = ["src/webbpulse", "tests"]
+# Optional extras are absent in a minimal install, and mypy should not fail on that.
+ignore_missing_imports = false
+warn_unused_ignores = true
+enable_error_code = ["ignore-without-code", "redundant-expr", "truthy-bool"]
+
+[[tool.mypy.overrides]]
+# moto ships no stubs.
+module = ["moto.*"]
+ignore_missing_imports = true
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q --strict-markers --strict-config"
+# Warnings are errors, so a deprecation in this package's own code fails the suite
+# rather than scrolling past. The exemptions below are third-party and narrowly
+# targeted: each names the emitting module, so the same warning raised from
+# webbpulse code would still fail.
+filterwarnings = [
+  "error",
+  # Starlette's own testclient module touches the deprecated anyio.abc alias at import.
+  "ignore:The anyio.abc.BlockingPortal alias is deprecated:DeprecationWarning:starlette.testclient",
+]
