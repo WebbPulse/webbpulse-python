@@ -142,6 +142,24 @@ def rate_limit_headers(
     }
 
 
+#: Bound to `fastapi.Request` by `_bind_fastapi_request` on first use of `rate_limit`.
+#: `fastapi` is an optional extra, so it cannot be imported at module scope: importing
+#: `webbpulse.ratelimit` must keep working for a service that installed only the
+#: `dynamodb` extra and uses `RateLimiter` directly. The placeholder is never used as an
+#: annotation before it is replaced, because only `rate_limit` refers to it and that
+#: function binds it first.
+_FastAPIRequest: Any = None
+
+
+def _bind_fastapi_request() -> None:
+    """Put `fastapi.Request` in this module's globals for FastAPI's annotation lookup."""
+    global _FastAPIRequest
+    if _FastAPIRequest is None:
+        from fastapi import Request as ImportedRequest
+
+        _FastAPIRequest = ImportedRequest
+
+
 def identity_from_ip(request: Request) -> str:
     """Default identity: the API Gateway source IP. See `webbpulse.http.client_ip`."""
     from webbpulse.http import client_ip
@@ -254,11 +272,19 @@ def rate_limit(
     cached DynamoDB table resource is reused.
     """
     from fastapi import HTTPException
-    from fastapi import Request as _Request
 
     resolved = limiter if limiter is not None else RateLimiter(namespace=namespace)
 
-    async def dependency(request: _Request) -> RateLimitDecision:
+    # The annotation below must be resolvable in this module's globals. `from __future__
+    # import annotations` makes every annotation a string, and FastAPI resolves a
+    # dependency's annotations against the defining module's namespace. A `Request`
+    # imported inside this function is not in that namespace, so FastAPI could not tell
+    # the parameter was the request object and treated it as a required query parameter,
+    # which made every guarded route answer 422 instead of running. `_FastAPIRequest` is
+    # bound at module level for exactly that lookup.
+    _bind_fastapi_request()
+
+    async def dependency(request: _FastAPIRequest) -> RateLimitDecision:
         identity = key_fn(request)
         if isinstance(identity, Awaitable):
             identity = await identity

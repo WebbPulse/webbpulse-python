@@ -7,7 +7,7 @@ from typing import Any
 
 import pytest
 from botocore.exceptions import ClientError
-from fastapi import Depends, FastAPI
+from fastapi import Depends, FastAPI, Request
 
 from webbpulse.ratelimit import (
     RateLimitDecision,
@@ -130,22 +130,36 @@ def test_two_namespaces_are_independent_counters(rate_limit_table: Any) -> None:
 
 
 def test_the_fixed_window_rolls_over(limiter: RateLimiter) -> None:
-    # moto does not expire TTL items and neither does DynamoDB promptly, so the reset is
-    # asserted through the window key changing rather than the old item disappearing.
+    """A new window is a new key, so the counter starts again rather than being reset.
+
+    moto does not expire TTL items and neither does DynamoDB promptly, so the rollover is
+    asserted through the window key changing and the old item surviving, never through an
+    expired item having disappeared.
+
+    The window containing t=1000 with a 60 second window is floor(1000/60)*60 = 960, so it
+    spans 960..1020. t=1010 is inside it and t=1100 (window 1080..1140) is not.
+    """
     for _ in range(3):
         limiter.check("198.51.100.7", limit=3, window_seconds=60, now=1_000.0)
 
-    exhausted = limiter.check("198.51.100.7", limit=3, window_seconds=60, now=1_050.0)
-    assert exhausted.allowed is False, "still inside the 960..1020 window at t=1050? no"
+    exhausted = limiter.check("198.51.100.7", limit=3, window_seconds=60, now=1_010.0)
+    assert exhausted.allowed is False, "the 4th request inside the 960..1020 window is over"
+    assert exhausted.remaining == 0
 
     rolled = limiter.check("198.51.100.7", limit=3, window_seconds=60, now=1_100.0)
     assert rolled.allowed is True, "a new window must start a fresh counter"
     assert rolled.remaining == 2, "the count must reset to 1 in the new window"
 
-    # The old window's item is untouched, which is what makes the rollover a new key.
+    # The old window's item is untouched, which is what makes the rollover a new key, and
+    # it holds 4 because a rejected request still counts against its window.
     old = limiter.get({"pk": "default#198.51.100.7#960"})
     assert old is not None
     assert int(old["count"]) == 4
+
+    # The new window is a genuinely separate item rather than the old one mutated.
+    fresh = limiter.get({"pk": "default#198.51.100.7#1080"})
+    assert fresh is not None
+    assert int(fresh["count"]) == 1
 
 
 def test_reset_after_counts_down_within_the_window(limiter: RateLimiter) -> None:
@@ -289,13 +303,12 @@ def test_the_dependency_exposes_headers_on_a_successful_response(
     dependency = rate_limit(limit=5, window_seconds=60, limiter=limiter)
 
     @app.get("/state")
-    async def state(request: Any, decision: Any = Depends(dependency)) -> dict[str, Any]:
+    async def state(request: Request, decision: Any = Depends(dependency)) -> dict[str, Any]:
         # The dependency stashes the headers on request.state for a middleware to attach.
+        # `request` must be annotated as Request, not Any: FastAPI decides a parameter is
+        # the request object from its annotation, and Any makes it a query parameter.
         return dict(request.state.rate_limit_headers)
 
-    from fastapi import Request
-
-    app.dependency_overrides = {}
     client = test_client(app, source_ip="198.51.100.24")
     response = client.get("/state")
     assert response.status_code == 200, response.text
