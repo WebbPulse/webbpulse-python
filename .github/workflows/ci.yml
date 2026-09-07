@@ -25,6 +25,12 @@ concurrency:
 jobs:
   ci:
     uses: WebbPulse/.github/.github/workflows/python-ci.yml@v1
+    # A called workflow cannot hold more permission than its caller grants, and the
+    # shared workflow requests id-token: write for its optional CodeArtifact login.
+    # Without this grant the run fails at startup before any job is created.
+    permissions:
+      contents: read
+      id-token: write
     with:
       python-version: "3.13"
       # The package lives at the repository root, not under backend/.
