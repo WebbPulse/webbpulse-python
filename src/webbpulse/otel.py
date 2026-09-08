@@ -1,24 +1,41 @@
 """OpenTelemetry tracing, exported to AWS X-Ray over the OTLP endpoint.
 
 OpenTelemetry is the only instrumentation in this package. There is no Sentry, no vendor
-SDK, and no ADOT collector in the request path.
+SDK, no ADOT collector, no sidecar and no Lambda extension. Everything below runs in
+process, in the application, built by `configure_tracing`.
+
+That last point is a deliberate design choice rather than an omission. The obvious
+alternative is to launch under `opentelemetry-instrument` and let the ADOT distribution's
+configurator build the pipeline from environment variables. It is rejected here because
+that configurator calls `set_tracer_provider` itself, and the global provider is set-once
+per process: whichever of the configurator and `configure_tracing` ran first would win and
+the other would be silently ignored, giving either a provider with no tail sampling or one
+with no signed exporter, with nothing in the logs to say which. Owning the whole pipeline in
+one place removes that race. It also means a service starts with a plain
+`python -m app.entrypoints.<domain>` rather than an instrumentation wrapper, which is what
+the container images actually do.
+
+Only the distribution's *exporter class* is borrowed, and only for the signing it provides.
 
 ## The X-Ray OTLP endpoint
 
 CloudWatch exposes an OTLP trace endpoint at `https://xray.<region>.amazonaws.com/v1/traces`
-which accepts OTLP over HTTP with a protobuf or JSON body. There is no gRPC listener, so
-`OTEL_EXPORTER_OTLP_TRACES_PROTOCOL` must be `http/protobuf`.
+which accepts OTLP over HTTP with a protobuf or JSON body. There is no gRPC listener. The
+protocol is not configured by environment variable here: `_build_span_exporter` constructs
+an HTTP protobuf exporter class directly, so `http/protobuf` is implicit in the code rather
+than something a deployment can get wrong.
 
 Three things about it are easy to get wrong and each looks identical from the outside,
 which is traces silently never appearing:
 
 1. **The endpoint authenticates with SigV4.** A plain OTLP exporter posts unsigned and gets
-   a 403. Signing is not something this module implements: it is supplied by the ADOT
-   Python distribution, `aws-opentelemetry-distro` (0.10.0 or later, with `botocore`
-   present), selected through `OTEL_PYTHON_DISTRO=aws_distro` and
-   `OTEL_PYTHON_CONFIGURATOR=aws_configurator` and activated by launching under
-   `opentelemetry-instrument`. `configure_tracing` below checks for that distro when the
-   endpoint is an X-Ray one and warns loudly rather than exporting into a 403 forever.
+   a 403, which the exporter then retries quietly, so it looks exactly like having no
+   traffic. Signing is not something this module implements: `OTLPAwsSpanExporter` from
+   `aws-opentelemetry-distro` subclasses the plain HTTP exporter and swaps in a `requests`
+   session that signs each request for the `xray` service. Install it with the `aws-otel`
+   extra, `pip install "webbpulse[otel,aws-otel]"`. `_build_span_exporter` selects it
+   automatically for an X-Ray endpoint, and warns and falls back to the unsigned exporter
+   when the extra is missing rather than crashing a cold start.
 2. **Transaction Search has to be enabled on the account** for the endpoint to accept
    spans. It is a one-time per-account setting, not something an application can do.
 3. **The execution role needs write access to X-Ray.** Attach the `AWSXrayWriteOnlyAccess`
@@ -78,13 +95,24 @@ Web Adapter on Lambda is normally one.
 
 ## Lambda and force_flush
 
-A Lambda invocation ends when the response is written, and the process is then frozen. The
-tail decision is made at flush time, so the flush is not optional: without it the buffered
-spans sit in a frozen process until the next invoke, and are lost entirely when the
-environment is reclaimed. `flush_tracing()` is the call to make at the end of an invocation.
-Under the Web Adapter the process stays alive between invokes, so the practical pattern is
-to call it from a FastAPI `after_response` hook or middleware. `shutdown_tracing()` flushes
-too, which covers the container shutdown path.
+A Lambda invocation ends when the response is written, and the execution environment is
+frozen immediately afterwards. The tail decision is made at flush time, so the flush is not
+optional: without it the buffered spans sit in a frozen process until the next invoke, and
+are lost entirely when the environment is reclaimed.
+
+Under the Lambda Web Adapter there is no handler to hook, and "after the invocation" is not
+a place code can run: a `BackgroundTask`, an `asyncio` task or an `atexit` hook all schedule
+work that the freeze catches mid-flight. The flush therefore has to happen *inside* the
+request, after the handler has produced the response and before that response is handed
+back to the adapter. `instrument_fastapi` installs a Starlette middleware that does exactly
+that. It is on by default when `AWS_LAMBDA_FUNCTION_NAME` is set and off otherwise, since a
+long-lived server can flush on its own schedule; `flush_per_request` overrides the
+detection either way. The flush is bounded by `flush_timeout_millis` and never raises into
+the request, because a telemetry failure that turned a healthy 200 into a 500 would be
+worse than the trace it was reporting on.
+
+`flush_tracing()` is the same call for anything that is not a FastAPI app, and
+`shutdown_tracing()` flushes too, which covers the container shutdown path.
 
 ## Cold start
 
@@ -446,14 +474,79 @@ class TailSamplingSpanProcessor:
         self._exporter.shutdown()
 
 
-def _has_adot_distro() -> bool:
-    """Whether the ADOT Python distribution that performs SigV4 signing is installed."""
-    from importlib.util import find_spec
+def _is_xray_endpoint(endpoint: str) -> bool:
+    """Whether an endpoint is the CloudWatch X-Ray OTLP one, which requires SigV4."""
+    return ".amazonaws.com/v1/traces" in endpoint
+
+
+def _region_for_endpoint(endpoint: str) -> str:
+    """The region to sign for, taken from the endpoint host rather than guessed.
+
+    `https://xray.us-west-2.amazonaws.com/v1/traces` signs for `us-west-2`. Deriving it from
+    the endpoint rather than from `AWS_REGION` keeps the signature correct when a caller
+    passes an explicit cross-region endpoint, where the two would disagree and the request
+    would be rejected as a signature mismatch.
+    """
+    from urllib.parse import urlparse
+
+    host = (urlparse(endpoint).hostname or "").split(".")
+    if len(host) >= 3 and host[0] == "xray":
+        return host[1]
+    return os.environ.get("AWS_REGION") or os.environ.get("AWS_DEFAULT_REGION") or "us-west-2"
+
+
+def _build_span_exporter(endpoint: str) -> SpanExporter:
+    """The exporter for an endpoint: SigV4 signing for X-Ray, plain OTLP for anything else.
+
+    The X-Ray OTLP endpoint authenticates with SigV4 and rejects an unsigned request with a
+    403, which the exporter retries quietly, so an unsigned export is indistinguishable from
+    having no traffic. The signing is not implemented here; it comes from
+    `aws-opentelemetry-distro`, whose `OTLPAwsSpanExporter` subclasses the plain HTTP
+    exporter and swaps in a `requests` session that signs each request for the `xray`
+    service. Install it with the `aws-otel` extra.
+
+    This is constructed directly rather than being left to the ADOT configurator. The
+    configurator only runs under `opentelemetry-instrument`, and it calls
+    `set_tracer_provider` itself, which is set-once per process: whichever of it and
+    `configure_tracing` ran first would win and the other would be silently ignored. Owning
+    the exporter here removes that race, and it is what lets a service start with a plain
+    `python -m` rather than an instrumentation wrapper.
+
+    Falls back to the unsigned exporter when the distro is absent, after warning, because a
+    warned-about 403 is a better failure than a cold start crash.
+    """
+    from opentelemetry.exporter.otlp.proto.http.trace_exporter import OTLPSpanExporter
+
+    if not _is_xray_endpoint(endpoint):
+        return OTLPSpanExporter(endpoint=endpoint)
 
     try:
-        return find_spec("amazon.opentelemetry.distro") is not None
-    except (ImportError, ValueError):
-        return False
+        import botocore.session
+        from amazon.opentelemetry.distro.exporter.otlp.aws.traces.otlp_aws_span_exporter import (
+            OTLPAwsSpanExporter,
+        )
+    except ImportError:
+        _log.warning(
+            "Exporting to the X-Ray OTLP endpoint without aws-opentelemetry-distro installed. "
+            "That endpoint requires SigV4 signing, so spans will be rejected with 403 and the "
+            "exporter will retry silently, which looks exactly like having no traffic. "
+            "Install it with the 'aws-otel' extra: pip install 'webbpulse[otel,aws-otel]'.",
+            extra={"otlp_endpoint": endpoint},
+        )
+        return OTLPSpanExporter(endpoint=endpoint)
+
+    # botocore resolves credentials lazily, on the first signed request rather than here, so
+    # building this at cold start does not add an IMDS or STS round trip to the critical path.
+    # `OTLPAwsSpanExporter` subclasses `OTLPSpanExporter`, but the distro ships no stubs so
+    # mypy sees it as Any; the cast restores the contract this function promises.
+    return cast(
+        "SpanExporter",
+        OTLPAwsSpanExporter(
+            aws_region=_region_for_endpoint(endpoint),
+            session=botocore.session.Session(),
+            endpoint=endpoint,
+        ),
+    )
 
 
 def configure_tracing(
@@ -508,7 +601,6 @@ def configure_tracing(
 
     try:
         from opentelemetry import trace
-        from opentelemetry.exporter.otlp.proto.http.trace_exporter import OTLPSpanExporter
         from opentelemetry.sdk.resources import Resource
         from opentelemetry.sdk.trace import TracerProvider
         from opentelemetry.sdk.trace.sampling import ALWAYS_ON, ParentBased
@@ -519,16 +611,6 @@ def configure_tracing(
     resolved_endpoint = (
         endpoint or os.environ.get("OTEL_EXPORTER_OTLP_TRACES_ENDPOINT") or xray_otlp_endpoint()
     )
-
-    # The X-Ray endpoint rejects unsigned requests with a 403 and the exporter retries
-    # quietly, so without this warning a missing distro looks exactly like "no traffic".
-    if ".amazonaws.com/v1/traces" in resolved_endpoint and not _has_adot_distro():
-        _log.warning(
-            "Exporting to the X-Ray OTLP endpoint without aws-opentelemetry-distro installed. "
-            "That endpoint requires SigV4 signing, so spans will be rejected with 403. "
-            "Install aws-opentelemetry-distro and run under opentelemetry-instrument.",
-            extra={"otlp_endpoint": resolved_endpoint},
-        )
 
     attributes: dict[str, Any] = {"service.name": service_name, "service.namespace": "webbpulse"}
     if environment:
@@ -557,7 +639,7 @@ def configure_tracing(
         sampler=ParentBased(root=ALWAYS_ON), resource=Resource.create(attributes)
     )
     processor = TailSamplingSpanProcessor(
-        OTLPSpanExporter(endpoint=resolved_endpoint),
+        _build_span_exporter(resolved_endpoint),
         sample_ratio=ratio,
         always_sample_errors=always_sample_errors,
         max_spans_per_trace=max_spans_per_trace,
@@ -597,13 +679,80 @@ def _instrument_botocore() -> None:
         instrumentor.instrument()
 
 
-def instrument_fastapi(app: FastAPI, *, excluded_urls: str | None = None) -> None:
+#: Default ceiling on the in-request flush. Short on purpose: it is latency a user is
+#: waiting on, and a flush that cannot finish in a second is one whose spans are better
+#: dropped than paid for. The exporter keeps its own longer timeout for the HTTP call.
+_DEFAULT_FLUSH_TIMEOUT_MILLIS: Final = 1000
+
+
+def _running_on_lambda() -> bool:
+    """Whether this process is a Lambda execution environment.
+
+    `AWS_LAMBDA_FUNCTION_NAME` is set by the runtime itself, so it is true under the Web
+    Adapter as well, where there is no handler to hook and the ASGI app is all there is.
+    """
+    return bool(os.environ.get("AWS_LAMBDA_FUNCTION_NAME"))
+
+
+def _flush_middleware_factory(timeout_millis: int) -> Any:
+    """Build the flush middleware. Imported lazily so Starlette stays an optional extra."""
+    from starlette.middleware.base import BaseHTTPMiddleware
+
+    class _FlushTracingMiddleware(BaseHTTPMiddleware):
+        """Flush buffered spans after the handler and before the response is returned.
+
+        The placement is the whole point. Under the Lambda Web Adapter an invocation ends
+        when the HTTP response completes, and the execution environment is frozen
+        immediately afterwards: a background task, a `BackgroundTask` on the response, or an
+        `atexit` hook all run too late and are frozen mid-flush, losing the trace. So the
+        flush happens inline, after `call_next` has produced the response and before that
+        response is handed back to the adapter.
+
+        It never raises into the request. A telemetry failure that turned a healthy 200 into
+        a 500 would be far worse than the missing trace it is reporting.
+        """
+
+        async def dispatch(self, request: Any, call_next: Any) -> Any:
+            response = await call_next(request)
+            try:
+                flush_tracing(timeout_millis)
+            except Exception:
+                # Bounded and swallowed: the response is already built and correct.
+                _log.warning(
+                    "Flushing spans before returning the response failed; "
+                    "this request's trace may be lost.",
+                    exc_info=True,
+                )
+            return response
+
+    return _FlushTracingMiddleware
+
+
+def instrument_fastapi(
+    app: FastAPI,
+    *,
+    excluded_urls: str | None = None,
+    flush_per_request: bool | None = None,
+    flush_timeout_millis: int = _DEFAULT_FLUSH_TIMEOUT_MILLIS,
+) -> None:
     """Instrument one FastAPI app so each request becomes a server span.
 
     A no-op when the `otel` extra is absent or tracing is disabled. `excluded_urls` is a
     comma separated list of path patterns; the health route is excluded by default because
     the Web Adapter polls it on every cold start and API Gateway health checks would
     otherwise dominate the trace volume for no diagnostic value.
+
+    Because sampling here is tail based, nothing is exported until a flush, and on Lambda the
+    only safe place for that flush is inside the request. This adds a middleware that flushes
+    after the handler and before the response is returned. It is on by default when
+    `AWS_LAMBDA_FUNCTION_NAME` is set and off otherwise, since a long-lived server can flush
+    on its own schedule; pass `flush_per_request` to decide explicitly.
+
+    Args:
+        app: the FastAPI application to instrument.
+        excluded_urls: comma separated path patterns to leave untraced.
+        flush_per_request: force the flush middleware on or off. `None` means auto-detect.
+        flush_timeout_millis: ceiling on that flush, in milliseconds.
     """
     if not is_tracing_enabled():
         return
@@ -614,6 +763,16 @@ def instrument_fastapi(app: FastAPI, *, excluded_urls: str | None = None) -> Non
     FastAPIInstrumentor.instrument_app(
         app, excluded_urls=excluded_urls if excluded_urls is not None else "health,ready"
     )
+
+    should_flush = _running_on_lambda() if flush_per_request is None else flush_per_request
+    if not should_flush:
+        return
+    try:
+        middleware = _flush_middleware_factory(flush_timeout_millis)
+    except ImportError:  # pragma: no cover - starlette ships with fastapi
+        _log.warning("Starlette is not installed, so spans will not be flushed per request.")
+        return
+    app.add_middleware(middleware)
 
 
 def flush_tracing(timeout_millis: int = 30000) -> bool:

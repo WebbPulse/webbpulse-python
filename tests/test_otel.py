@@ -161,49 +161,97 @@ def test_custom_resource_attributes_win(monkeypatch: MonkeyPatch) -> None:
     shutdown_tracing()
 
 
+def _without_adot_distro(monkeypatch: MonkeyPatch) -> None:
+    """Make the distro import fail the way a minimal install does.
+
+    The exporter is chosen by a guarded `import`, not by a feature flag, so the only honest
+    way to test the fallback is to make that import raise. The dev environment installs the
+    `aws-otel` extra, so the module really is importable here.
+    """
+    import builtins
+
+    real_import = builtins.__import__
+
+    def fake_import(name: str, *args: object, **kwargs: object) -> object:
+        if name.startswith("amazon.opentelemetry"):
+            raise ImportError(f"No module named {name!r}")
+        return real_import(name, *args, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(builtins, "__import__", fake_import)
+
+
 def test_an_unsigned_xray_export_warns(
     monkeypatch: MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:
     """Without SigV4 the endpoint returns 403 and the exporter retries silently.
 
     That failure is indistinguishable from having no traffic, so the warning is the only
-    signal a software engineer gets that the ADOT distro is missing.
+    signal a software engineer gets that the `aws-otel` extra is missing.
     """
-    monkeypatch.delenv(OTEL_DISABLED_ENV, raising=False)
-    monkeypatch.setattr(otel, "_has_adot_distro", lambda: False)
+    from opentelemetry.exporter.otlp.proto.http.trace_exporter import OTLPSpanExporter
+
+    _without_adot_distro(monkeypatch)
 
     with caplog.at_level("WARNING", logger="webbpulse.otel"):
-        configure_tracing("posts", endpoint="https://xray.us-west-2.amazonaws.com/v1/traces")
+        exporter = otel._build_span_exporter("https://xray.us-west-2.amazonaws.com/v1/traces")
 
     assert any("SigV4" in record.message for record in caplog.records)
-    shutdown_tracing()
+    assert any("aws-otel" in record.message for record in caplog.records)
+    # Warned, but still usable: a 403 that says so beats crashing the cold start.
+    assert type(exporter) is OTLPSpanExporter
 
 
-def test_no_warning_when_the_distro_is_present(
-    monkeypatch: MonkeyPatch, caplog: pytest.LogCaptureFixture
-) -> None:
-    monkeypatch.delenv(OTEL_DISABLED_ENV, raising=False)
-    monkeypatch.setattr(otel, "_has_adot_distro", lambda: True)
+def test_an_xray_endpoint_gets_the_signing_exporter() -> None:
+    """The whole point of the extra: X-Ray must get the SigV4 subclass, not the plain one."""
+    from amazon.opentelemetry.distro.exporter.otlp.aws.traces.otlp_aws_span_exporter import (
+        OTLPAwsSpanExporter,
+    )
 
+    exporter = otel._build_span_exporter("https://xray.eu-west-1.amazonaws.com/v1/traces")
+
+    assert isinstance(exporter, OTLPAwsSpanExporter)
+
+
+def test_no_warning_when_the_distro_is_present(caplog: pytest.LogCaptureFixture) -> None:
     with caplog.at_level("WARNING", logger="webbpulse.otel"):
-        configure_tracing("posts", endpoint="https://xray.us-west-2.amazonaws.com/v1/traces")
+        otel._build_span_exporter("https://xray.us-west-2.amazonaws.com/v1/traces")
 
     assert not [r for r in caplog.records if "SigV4" in r.message]
-    shutdown_tracing()
 
 
-def test_no_signing_warning_for_a_non_aws_endpoint(
+def test_a_non_aws_endpoint_gets_the_plain_exporter(
     monkeypatch: MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:
-    """A local collector needs no SigV4, so the warning must not fire for it."""
-    monkeypatch.delenv(OTEL_DISABLED_ENV, raising=False)
-    monkeypatch.setattr(otel, "_has_adot_distro", lambda: False)
+    """A local collector needs no SigV4, so it must not be signed and must not warn."""
+    from opentelemetry.exporter.otlp.proto.http.trace_exporter import OTLPSpanExporter
+
+    _without_adot_distro(monkeypatch)
 
     with caplog.at_level("WARNING", logger="webbpulse.otel"):
-        configure_tracing("posts", endpoint="http://localhost:4318/v1/traces")
+        exporter = otel._build_span_exporter("http://localhost:4318/v1/traces")
 
+    assert type(exporter) is OTLPSpanExporter
     assert not [r for r in caplog.records if "SigV4" in r.message]
-    shutdown_tracing()
+
+
+def test_the_signing_region_comes_from_the_endpoint(monkeypatch: MonkeyPatch) -> None:
+    """An explicit cross-region endpoint must be signed for its own region, not AWS_REGION.
+
+    Signing `xray.eu-west-1` for `us-west-2` produces a credential scope mismatch and a 403,
+    so the host wins over the environment.
+    """
+    monkeypatch.setenv("AWS_REGION", "us-west-2")
+
+    assert (
+        otel._region_for_endpoint("https://xray.eu-west-1.amazonaws.com/v1/traces") == "eu-west-1"
+    )
+
+
+def test_the_signing_region_falls_back_to_the_environment(monkeypatch: MonkeyPatch) -> None:
+    monkeypatch.setenv("AWS_REGION", "ap-southeast-2")
+    monkeypatch.delenv("AWS_DEFAULT_REGION", raising=False)
+
+    assert otel._region_for_endpoint("https://otlp.example.com/v1/traces") == "ap-southeast-2"
 
 
 def test_instrumenting_an_app_does_not_break_it(monkeypatch: MonkeyPatch) -> None:
@@ -769,3 +817,108 @@ def test_a_record_only_span_is_still_tail_sampled() -> None:
     processor.force_flush()
 
     assert [s.name for s in exporter.get_finished_spans()] == ["failing"]
+
+
+def _recording_flush(calls: list[int]) -> Any:
+    """A `flush_tracing` stand-in that records that it was called."""
+
+    def fake_flush(timeout_millis: int = 30000) -> bool:
+        calls.append(timeout_millis)
+        return True
+
+    return fake_flush
+
+
+def _app_with_flush_middleware(*, flush_per_request: bool | None = True) -> Any:
+    """A minimal FastAPI app carrying the flush middleware, with tracing configured."""
+    from fastapi import FastAPI
+
+    from webbpulse.otel import instrument_fastapi
+
+    configure_tracing("posts", endpoint="http://localhost:4318/v1/traces")
+    app = FastAPI()
+
+    @app.get("/thing")
+    def thing() -> dict[str, str]:
+        return {"ok": "yes"}
+
+    instrument_fastapi(app, flush_per_request=flush_per_request)
+    return app
+
+
+def test_the_middleware_flushes_before_returning_the_response(monkeypatch: MonkeyPatch) -> None:
+    """Under the Web Adapter the sandbox freezes once the response completes.
+
+    So the flush has to happen while the request is still in flight. Recording the order
+    proves it ran before the response was handed back, not after.
+    """
+    from fastapi.testclient import TestClient
+
+    monkeypatch.delenv(OTEL_DISABLED_ENV, raising=False)
+    calls: list[int] = []
+    monkeypatch.setattr(otel, "flush_tracing", _recording_flush(calls))
+
+    app = _app_with_flush_middleware()
+    with TestClient(app) as client:
+        response = client.get("/thing")
+
+    assert response.status_code == 200
+    assert calls == [1000]
+    shutdown_tracing()
+
+
+def test_a_flush_failure_does_not_change_the_response(monkeypatch: MonkeyPatch) -> None:
+    """Telemetry must never turn a healthy 200 into a 500.
+
+    The response is already built by the time the flush runs, so a raising exporter is
+    logged and swallowed rather than allowed to propagate out of the middleware.
+    """
+    from fastapi.testclient import TestClient
+
+    monkeypatch.delenv(OTEL_DISABLED_ENV, raising=False)
+
+    def boom(timeout_millis: int = 30000) -> bool:
+        raise RuntimeError("exporter is down")
+
+    monkeypatch.setattr(otel, "flush_tracing", boom)
+
+    app = _app_with_flush_middleware()
+    with TestClient(app) as client:
+        response = client.get("/thing")
+
+    assert response.status_code == 200
+    assert response.json() == {"ok": "yes"}
+    shutdown_tracing()
+
+
+def test_the_flush_middleware_is_off_outside_lambda(monkeypatch: MonkeyPatch) -> None:
+    """A long-lived server flushes on its own schedule and should not pay per request."""
+    from fastapi.testclient import TestClient
+
+    monkeypatch.delenv(OTEL_DISABLED_ENV, raising=False)
+    monkeypatch.delenv("AWS_LAMBDA_FUNCTION_NAME", raising=False)
+    calls: list[int] = []
+    monkeypatch.setattr(otel, "flush_tracing", _recording_flush(calls))
+
+    app = _app_with_flush_middleware(flush_per_request=None)
+    with TestClient(app) as client:
+        assert client.get("/thing").status_code == 200
+
+    assert calls == []
+    shutdown_tracing()
+
+
+def test_the_flush_middleware_is_on_under_lambda(monkeypatch: MonkeyPatch) -> None:
+    from fastapi.testclient import TestClient
+
+    monkeypatch.delenv(OTEL_DISABLED_ENV, raising=False)
+    monkeypatch.setenv("AWS_LAMBDA_FUNCTION_NAME", "webbpulse-staging-posts")
+    calls: list[int] = []
+    monkeypatch.setattr(otel, "flush_tracing", _recording_flush(calls))
+
+    app = _app_with_flush_middleware(flush_per_request=None)
+    with TestClient(app) as client:
+        assert client.get("/thing").status_code == 200
+
+    assert calls == [1000]
+    shutdown_tracing()

@@ -27,7 +27,7 @@ For local work on the package itself:
 
 ```bash
 python3.13 -m venv .venv
-.venv/bin/pip install -e ".[dynamodb,fastapi,otel,testing]" mypy ruff pytest-cov \
+.venv/bin/pip install -e ".[aws-otel,dynamodb,fastapi,otel,testing]" mypy ruff pytest-cov \
   "boto3-stubs[dynamodb,secretsmanager]" botocore-stubs
 .venv/bin/ruff check . && .venv/bin/ruff format --check .
 .venv/bin/mypy
@@ -130,7 +130,12 @@ uvicorn's loggers so access lines are JSON too.
 ### `webbpulse.otel`
 
 OpenTelemetry is the only instrumentation in this package. Sentry is gone, and there is no
-collector in the request path.
+collector, sidecar or Lambda extension in the request path. The whole pipeline is built in
+process by `configure_tracing`, and a service starts with a plain `python -m`, not under
+`opentelemetry-instrument`. That is deliberate: an auto-instrumentation configurator calls
+`set_tracer_provider` itself, and the global provider is set-once per process, so whichever
+of the configurator and `configure_tracing` ran first would win and the other would be
+silently ignored. Owning the pipeline in one place removes that race.
 
 ```python
 from webbpulse.otel import configure_tracing
@@ -142,20 +147,32 @@ Traces go straight to the CloudWatch X-Ray OTLP endpoint,
 `https://xray.<region>.amazonaws.com/v1/traces`. Three things about that endpoint are easy
 to get wrong, and all three look identical from outside: traces simply never appear.
 
-1. **It authenticates with SigV4.** A plain OTLP exporter posts unsigned and gets a 403.
-   The signing comes from the ADOT Python distribution, `aws-opentelemetry-distro` 0.10.0
-   or later with `botocore` present, selected by `OTEL_PYTHON_DISTRO=aws_distro` and
-   `OTEL_PYTHON_CONFIGURATOR=aws_configurator` and activated by launching under
-   `opentelemetry-instrument`. `configure_tracing` warns loudly when the endpoint is an
-   X-Ray one and that distro is missing, rather than exporting into a 403 forever.
+1. **It authenticates with SigV4.** A plain OTLP exporter posts unsigned, gets a 403, and
+   retries it quietly, which looks exactly like having no traffic. The signing comes from
+   `OTLPAwsSpanExporter` in `aws-opentelemetry-distro`, which subclasses the plain HTTP
+   exporter and swaps in a `requests` session that signs for the `xray` service. Install it
+   with the **`aws-otel`** extra:
+
+   ```
+   pip install "webbpulse[otel,aws-otel]"
+   ```
+
+   `configure_tracing` picks that exporter automatically whenever the resolved endpoint is
+   an X-Ray one, and a plain `OTLPSpanExporter` for anything else, such as a local
+   collector. Only the exporter class is used; the distribution's configurator and its
+   `opentelemetry-instrument` entry point deliberately are not. When the extra is missing it
+   warns, naming the extra, and falls back to the unsigned exporter, because a warned-about
+   403 is a better failure than a crashed cold start.
 2. **Transaction Search must be enabled on the account.** It is a one-time per-account
    setting that an application cannot make for itself.
 3. **The execution role needs X-Ray write access.** Attach `AWSXrayWriteOnlyAccess`,
    `arn:aws:iam::aws:policy/AWSXrayWriteOnlyAccess`. There is no `AWSXrayWriteOnlyPolicy`;
    an ARN built from that name fails a Terraform apply with NoSuchEntity.
 
-The endpoint takes OTLP over HTTP only, so `OTEL_EXPORTER_OTLP_TRACES_PROTOCOL` must be
-`http/protobuf`; there is no gRPC listener. Note the host is per-signal: logs go to
+The endpoint takes OTLP over HTTP only; there is no gRPC listener. The protocol is not an
+environment variable here, because the exporter class is constructed directly, so
+`http/protobuf` is implicit in the code rather than something a deployment can get wrong.
+Note the host is per-signal: logs go to
 `logs.<region>.amazonaws.com/v1/logs` and metrics to `monitoring.<region>.amazonaws.com/v1/metrics`.
 This package sends traces only, and CloudWatch handles logs.
 
@@ -198,20 +215,41 @@ configure_tracing(
 )
 ```
 
-##### The flush is not optional
+##### The flush is not optional, and it is wired for you
 
 The tail decision is made at flush time, so a Lambda invocation must reach a flush before
 the execution environment is frozen. Nothing is exported before it.
 
-```python
-from webbpulse.otel import flush_tracing
+Under the Lambda Web Adapter there is no handler to hook, and "after the invocation" is not
+a place code can run: the invocation ends when the HTTP response completes and the sandbox
+freezes immediately, so a `BackgroundTask`, an `asyncio` task or an `atexit` hook is caught
+mid-flight. The flush therefore has to happen inside the request, after the handler has
+produced the response and before it is handed back to the adapter.
 
-flush_tracing()  # at the end of an invocation
+`instrument_fastapi(app)` installs a Starlette middleware that does exactly that. It is on
+by default when `AWS_LAMBDA_FUNCTION_NAME` is set and off otherwise, since a long-lived
+server can flush on its own schedule.
+
+```python
+instrument_fastapi(
+    app,
+    flush_per_request=None,     # None auto-detects Lambda; True or False decides explicitly
+    flush_timeout_millis=1000,  # ceiling on the in-request flush
+)
 ```
 
-Under the Web Adapter the process outlives an invoke, so the practical place is a FastAPI
-middleware or an `after_response` hook rather than a handler epilogue. `shutdown_tracing()`
-flushes too, which covers the container shutdown path.
+The flush is bounded by that timeout and never raises into the request: a failure is logged
+at WARNING and the response is returned unchanged, because telemetry turning a healthy 200
+into a 500 would be worse than the trace it was reporting on.
+
+On the latency cost: the flush only does work when the trace is actually being exported. At
+a production ratio of 0.1, roughly nine requests in ten resolve to "drop", the buffered
+spans are discarded and no HTTP call is made, so the cost lands almost entirely on the
+sampled traces and the errors, which are the requests worth paying for. Staging at 1.0 pays
+an export on every request, which is the intended trade for complete traces there.
+
+`flush_tracing()` is the same call for anything that is not a FastAPI app, and
+`shutdown_tracing()` flushes too, which covers the container shutdown path.
 
 ##### The memory bound
 
@@ -228,16 +266,19 @@ times the number of concurrently open traces, which under the Web Adapter is nor
 
 ##### Environment variables
 
-Terraform sets these on each function. The first three are what make the export work at all;
-the last two are what make the sampling work.
+There is exactly one, and it is optional:
 
 | Variable | Value | Why |
 | --- | --- | --- |
-| `OTEL_EXPORTER_OTLP_TRACES_PROTOCOL` | `http/protobuf` | there is no gRPC listener on the X-Ray endpoint |
-| `OTEL_PYTHON_DISTRO` | `aws_distro` | selects the ADOT distro, which is what signs with SigV4 |
-| `OTEL_PYTHON_CONFIGURATOR` | `aws_configurator` | the matching configurator |
-| `OTEL_TRACES_SAMPLER` | `always_on` | see below |
-| `WEBBPULSE_OTEL_SAMPLE_RATIO` | `1.0` on staging, `0.1` on production | the tail ratio |
+| `WEBBPULSE_OTEL_SAMPLE_RATIO` | `1.0` on staging, `0.1` on production | the tail sampling ratio |
+
+Everything else that used to be needed here is gone. There is no
+`OTEL_EXPORTER_OTLP_TRACES_PROTOCOL`, because the exporter class is chosen in code. There is
+no `OTEL_PYTHON_DISTRO` or `OTEL_PYTHON_CONFIGURATOR`, because nothing runs under
+`opentelemetry-instrument`. There is no `OTEL_TRACES_SAMPLER`, because `configure_tracing`
+passes an explicit `ParentBased(root=ALWAYS_ON)` sampler to the `TracerProvider`, which
+overrides the environment for the provider this package builds. Terraform sets one variable
+per environment and the rest is the package's problem.
 
 `WEBBPULSE_OTEL_SAMPLE_RATIO` falls back to `OTEL_TRACES_SAMPLER_ARG`, but only when
 `OTEL_TRACES_SAMPLER` is `traceidratio` or `parentbased_traceidratio`; under any other
@@ -245,61 +286,46 @@ sampler name the arg is meaningless and reading it would invent a ratio. An unpa
 out-of-range value warns and is skipped, so a typo in a Terraform variable costs money
 rather than availability. With nothing set the ratio is 1.0.
 
-##### Setting `OTEL_TRACES_SAMPLER=always_on`, and the ADOT caveat
+`WEBBPULSE_OTEL_DISABLED` and the standard `OTEL_SDK_DISABLED` still turn everything off,
+and `OTEL_EXPORTER_OTLP_TRACES_ENDPOINT` still overrides the endpoint if you want to point a
+local run at a collector.
 
-`configure_tracing` passes an explicit `ParentBased(root=ALWAYS_ON)` sampler to the
-`TracerProvider`, so for a provider this package builds, `OTEL_TRACES_SAMPLER` is already
-overridden and setting it changes nothing. Set it anyway, for two reasons.
+##### Why the sampler is explicit
 
-The first is the ADOT distro. `OTEL_PYTHON_DISTRO=aws_distro` makes
-`opentelemetry-instrument` run the AWS configurator during start-up, and a configurator
-builds its own `TracerProvider` from the environment. Any provider built without an explicit
-sampler falls back to `sampling._get_from_env_or_default()`, which reads `OTEL_TRACES_SAMPLER`
-and `OTEL_TRACES_SAMPLER_ARG`. A ratio sampler there would head-drop 90 percent of spans
-before any processor saw them, and no amount of tail logic can recover a span that was never
-recorded. `always_on` makes that fallback harmless whichever provider wins the race.
+`ParentBased(root=ALWAYS_ON)` is passed to the provider rather than left to the SDK default.
+Without it the SDK falls back to `sampling._get_from_env_or_default()`, which reads
+`OTEL_TRACES_SAMPLER` and `OTEL_TRACES_SAMPLER_ARG` from whatever the environment happens to
+hold. A ratio sampler there would head-drop 90 percent of spans before any processor saw
+them, and no amount of tail logic can recover a span that was never recorded. Being explicit
+means a stray `OTEL_TRACES_SAMPLER` in a task definition cannot quietly defeat the design.
+`tests/test_otel.py` asserts this directly, by setting `OTEL_TRACES_SAMPLER` to
+`parentbased_traceidratio` with an arg of `0.0` and checking spans are still recorded.
 
-The second is that it documents the intent at the function's env block: the ratio lives in
-`WEBBPULSE_OTEL_SAMPLE_RATIO`, and `OTEL_TRACES_SAMPLER_ARG` is not the knob.
+The `ParentBased` half matters as much as the `ALWAYS_ON` half: a span whose parent arrived
+sampled-out from API Gateway or an X-Ray propagated header still follows that decision, so
+an upstream choice is honoured rather than overridden here.
 
-**Caveat: which provider wins.** `configure_tracing` calls `trace.set_tracer_provider`, and
-OpenTelemetry allows that exactly once per process. Whichever of the ADOT configurator and
-`configure_tracing` runs first wins; the second logs "Overriding of current TracerProvider is
-not allowed" and is ignored. The configurator runs during `opentelemetry-instrument`
-start-up, before the application's `main()`, so under the distro it normally wins, and the
-provider in use is the distro's with the distro's own `BatchSpanProcessor`. The tail
-sampling here is then not in the export path, `webbpulse.otel._PROCESSOR` is still set but
-unused, and `flush_tracing()` falls through to the provider's own `force_flush`. There is no
-error; the symptom is that every trace is exported and the bill is the signal.
+##### A note on `AlwaysRecordSampler`
 
-How this was checked, since `aws-opentelemetry-distro` is a runtime-only dependency and is
-not installed in CI: the 0.19.0 wheel was unpacked and
-`amazon/opentelemetry/distro/aws_opentelemetry_configurator.py` read directly. `_init_tracing`
-builds its own `TracerProvider` and calls `set_tracer_provider` on it, and its sampler comes
-from `_get_sampler()`, which reads `OTEL_TRACES_SAMPLER` and defaults to
-`parentbased_always_on` when unset.
+Worth knowing if this package is ever run alongside the ADOT distribution's configurator
+after all. `_customize_sampler` there wraps the configured sampler in `AlwaysRecordSampler`,
+which turns a `Decision.DROP` into `Decision.RECORD_ONLY`. A RECORD_ONLY span is still
+created and still handed to every registered processor; only its `trace_flags.sampled` bit
+is clear. The SDK's own `BatchSpanProcessor` and `SimpleSpanProcessor` open `on_end` with
+`if not span.context.trace_flags.sampled: return`, which is why a ratio sampler drops spans
+under them.
 
-**The distro does not pre-drop spans, though.** `_customize_sampler` wraps that sampler in
-`AlwaysRecordSampler`, which turns a `Decision.DROP` into `Decision.RECORD_ONLY`. A
-RECORD_ONLY span is still created and still handed to every registered processor; only its
-`trace_flags.sampled` bit is clear. The SDK's own `BatchSpanProcessor` and
-`SimpleSpanProcessor` open `on_end` with `if not span.context.trace_flags.sampled: return`,
-which is why a ratio sampler drops spans under them.
 `TailSamplingSpanProcessor` deliberately does **not** filter on that flag, because the flag
-is a head decision and this processor exists to make a later one. So even in the case where
-the distro's provider wins and a ratio sampler is configured, an error span still reaches
-this processor and is still kept. `tests/test_otel.py` reproduces the wrapper over a ratio-0
-sampler and asserts exactly that, which is the part of the interplay that is testable without
-the distro installed.
+records a head decision and this processor exists to make a later one. `tests/test_otel.py`
+reproduces the wrapper over a ratio-0 sampler and asserts an error span still survives.
 
-Setting `OTEL_TRACES_SAMPLER=always_on` removes the question entirely rather than relying on
-that safety net. The other half, which the tests do cover directly, is that a
-`TracerProvider` this package builds carries `ParentBased(root=ALWAYS_ON)` even when
-`OTEL_TRACES_SAMPLER` says `parentbased_traceidratio` with an arg of 0.0.
-
-To confirm on a deployed function, log `type(trace.get_tracer_provider())` and whether
-`webbpulse.otel._PROCESSOR` is the provider's processor, or check that a non-error trace at
-ratio 0.1 is genuinely absent from X-Ray.
+How the distribution's internals were checked, since it is an optional extra: the 0.19.0
+wheel was unpacked and `amazon/opentelemetry/distro/` read directly. The exporter used here
+is
+`amazon.opentelemetry.distro.exporter.otlp.aws.traces.otlp_aws_span_exporter.OTLPAwsSpanExporter`,
+taking `aws_region`, a `botocore` `Session`, and `endpoint`. Credentials are resolved lazily
+by `AwsAuthSession` on the first signed request, not at construction, so building it at cold
+start adds no IMDS or STS round trip to the critical path.
 
 ### `webbpulse.http`
 

@@ -28,6 +28,20 @@ This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - `flush_tracing()`, which resolves the buffered traces and exports the kept ones. This is
   where the tail decision is made, so a Lambda invocation has to reach it before the
   execution environment is frozen. `shutdown_tracing()` flushes too.
+- `instrument_fastapi` now installs a Starlette middleware that calls that flush after the
+  handler and before the response is returned, which is the only point that works under the
+  Lambda Web Adapter: the invocation ends when the HTTP response completes and the sandbox
+  freezes immediately, so a background task or `atexit` hook is caught mid-flight. On by
+  default when `AWS_LAMBDA_FUNCTION_NAME` is set, off otherwise, and `flush_per_request`
+  decides explicitly. Bounded by `flush_timeout_millis` (default 1000) and never raises into
+  the request; a failure is logged at WARNING and the response is returned unchanged.
+- An `aws-otel` extra, `pip install "webbpulse[otel,aws-otel]"`, bringing
+  `aws-opentelemetry-distro` and `botocore`. `configure_tracing` now builds the exporter
+  itself: `OTLPAwsSpanExporter` when the resolved endpoint is the X-Ray OTLP one, so requests
+  are signed with SigV4, and a plain `OTLPSpanExporter` for anything else. Only the exporter
+  class is taken from the distribution; its configurator and `opentelemetry-instrument` entry
+  point are not used. Without the extra it warns, naming the extra, and falls back to the
+  unsigned exporter.
 - `resolve_sample_ratio()` and the `SAMPLE_RATIO_ENV` constant are public, for a service that
   wants to log or assert on the ratio it resolved.
 
@@ -43,12 +57,24 @@ This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - `configure_tracing` registers `TailSamplingSpanProcessor` where it previously registered a
   `BatchSpanProcessor`. Nothing is exported until a flush, which is a behaviour change for
   any caller that relied on the batch processor's own timer.
+- The tracing pipeline is now built entirely in process. There is no collector, no sidecar,
+  no Lambda extension, and nothing runs under `opentelemetry-instrument`. That last one is
+  the point: an auto-instrumentation configurator calls `set_tracer_provider` itself, and the
+  global provider is set-once per process, so whichever of it and `configure_tracing` ran
+  first would win and the other would be silently ignored, leaving either no tail sampling or
+  no signed exporter with nothing in the logs to say which.
 
 ### Notes for consumers
 
-Set `OTEL_TRACES_SAMPLER=always_on` alongside the ADOT distro variables, and use
-`WEBBPULSE_OTEL_SAMPLE_RATIO` for the ratio. See the README's `webbpulse.otel` section for
-the full environment variable set.
+The environment variable contract shrank to one optional variable,
+`WEBBPULSE_OTEL_SAMPLE_RATIO`. `OTEL_EXPORTER_OTLP_TRACES_PROTOCOL`, `OTEL_PYTHON_DISTRO`,
+`OTEL_PYTHON_CONFIGURATOR` and `OTEL_TRACES_SAMPLER` are no longer needed and can be removed
+from function environments: the protocol is implicit in the exporter class, the distribution
+is used as a library rather than a launcher, and the sampler is passed explicitly.
+
+Install with the `aws-otel` extra wherever the X-Ray endpoint is the target, and call
+`instrument_fastapi(app)` so the per-request flush is wired. See the README's
+`webbpulse.otel` section.
 
 ## 0.1.0
 
