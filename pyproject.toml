@@ -38,6 +38,11 @@ otel = [
   "opentelemetry-instrumentation-fastapi>=0.51b0",
   "opentelemetry-instrumentation-botocore>=0.51b0",
 ]
+# SigV4 signing for the CloudWatch X-Ray OTLP endpoint, which rejects unsigned requests
+# with a 403. Only the exporter class is used; the distro's configurator and its
+# `opentelemetry-instrument` entry point are deliberately not, so this is additive to
+# `otel` rather than a replacement for it. Needs botocore, which `dynamodb` also brings.
+aws-otel = ["aws-opentelemetry-distro>=0.10", "botocore>=1.35"]
 # webbpulse.testing. Starlette 1.x TestClient is built on httpx2 and warns (and under
 # `-W error` fails) when only the 0.x httpx is importable, so httpx2 is what is pinned.
 testing = ["moto[dynamodb,secretsmanager]>=5", "pytest>=8", "httpx2>=2"]
@@ -48,7 +53,7 @@ Source = "https://github.com/WebbPulse/webbpulse-python"
 
 [dependency-groups]
 dev = [
-  "webbpulse[dynamodb,fastapi,otel,testing]",
+  "webbpulse[aws-otel,dynamodb,fastapi,otel,testing]",
   "boto3-stubs[dynamodb,secretsmanager]",
   "botocore-stubs",
   "mypy>=1.13",
@@ -108,6 +113,12 @@ enable_error_code = ["ignore-without-code", "redundant-expr", "truthy-bool"]
 [[tool.mypy.overrides]]
 # moto ships no stubs.
 module = ["moto.*"]
+ignore_missing_imports = true
+
+[[tool.mypy.overrides]]
+# aws-opentelemetry-distro ships no stubs, and it is an optional extra that is absent from a
+# minimal install anyway, so its import is guarded at runtime.
+module = ["amazon.*"]
 ignore_missing_imports = true
 
 [tool.pytest.ini_options]

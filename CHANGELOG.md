@@ -1,0 +1,133 @@
+# Changelog
+
+Notable changes to the `webbpulse` package. The version here is the one in
+`src/webbpulse/_version.py`, and a release is that edit plus the matching `v<version>` tag.
+
+This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
+
+## 0.2.0
+
+### Added
+
+- `webbpulse.otel` now tail samples, so **errors are always kept** whatever the ratio says.
+  A head sampler decides when the root span starts, before the request has been handled, so
+  it cannot know that a request is about to fail; a ratio of 0.1 therefore discards 90
+  percent of the failures too. Every span is now recorded, buffered per trace, and judged
+  once at flush time: a trace is exported if any span in it carries `StatusCode.ERROR` or an
+  `exception` event, or if its trace id falls below the configured probability.
+- `TailSamplingSpanProcessor`, the processor that does it. It wraps the exporter rather than
+  sitting beside one, so it is the export path; do not register a `BatchSpanProcessor` for
+  the same exporter alongside it.
+- `configure_tracing` takes `sample_ratio`, `always_sample_errors`, `max_spans_per_trace`,
+  `on_overflow`, `max_buffered_traces`, `max_trace_age_seconds` and `export_timeout_millis`
+  keyword arguments. All have defaults, so existing call sites are unaffected.
+- `WEBBPULSE_OTEL_SAMPLE_RATIO` sets the ratio from the environment, which is how Terraform
+  sets 1.0 on staging and 0.1 on production without a code change. It falls back to
+  `OTEL_TRACES_SAMPLER_ARG`, but only when `OTEL_TRACES_SAMPLER` is `traceidratio` or
+  `parentbased_traceidratio`, and then to 1.0. An unparseable or out-of-range value warns and
+  is skipped rather than raising, so a typo costs money instead of availability.
+- `flush_tracing()`, which resolves the buffered traces and exports the kept ones. This is
+  where the tail decision is made, so a Lambda invocation has to reach it before the
+  execution environment is frozen. `shutdown_tracing()` flushes too.
+- `instrument_fastapi` now wraps the instrumented app in an ASGI middleware that flushes once
+  the request is complete, which is the only point that works under the Lambda Web Adapter:
+  the invocation ends when the HTTP response completes and the sandbox freezes immediately,
+  so a background task or `atexit` hook is caught mid-flight. It wraps from the outside
+  rather than being added with `add_middleware`, because `FastAPIInstrumentor.instrument_app`
+  makes `OpenTelemetryMiddleware` outermost and an inner flush would run before the server
+  span had ended, exporting the previous request's trace and leaving the current one
+  buffered. On by default when `AWS_LAMBDA_FUNCTION_NAME` is set, off otherwise, and
+  `flush_per_request` decides explicitly. The flush runs on a worker thread rather than the
+  event loop, since it exports synchronously over HTTP and awaiting it inline stalls every
+  other connection the process is serving. It never raises into the request; a failure is
+  logged at WARNING and the response is returned unchanged.
+- `TailSamplingSpanProcessor` counts open spans per trace and `force_flush` resolves only the
+  traces with none left, so a concurrent request's flush can no longer judge a half-built
+  trace and split it across two decisions. `shutdown` still resolves everything, since there
+  is no later flush to defer to.
+- `max_buffered_traces` (default 1024) and `max_trace_age_seconds` (default 300) bound the
+  buffer in count and in age. Eviction judges the trace rather than discarding it, so an
+  error trace still exports, and `evicted_traces` counts it. The count bound only evicts
+  traces with no spans still open, since judging an in-flight trace early is the bug the
+  open-span tracking exists to prevent; the age bound will evict an in-flight trace, which is
+  the deliberate exception. It has to be: a leaked span or an abandoned request never
+  completes, so the count bound alone can be pinned indefinitely by traces it refuses to
+  touch, and under Lambda nothing else ever reclaims them. A trace open for five minutes is
+  not a request in progress.
+- An `aws-otel` extra, `pip install "webbpulse[otel,aws-otel]"`, bringing
+  `aws-opentelemetry-distro` and `botocore`. `configure_tracing` now builds the exporter
+  itself: `OTLPAwsSpanExporter` when the resolved endpoint is the X-Ray OTLP one, so requests
+  are signed with SigV4, and a plain `OTLPSpanExporter` for anything else. Only the exporter
+  class is taken from the distribution; its configurator and `opentelemetry-instrument` entry
+  point are not used. Without the extra it warns, naming the extra, and falls back to the
+  unsigned exporter.
+- `resolve_sample_ratio()` and the `SAMPLE_RATIO_ENV` constant are public, for a service that
+  wants to log or assert on the ratio it resolved.
+
+### Changed
+
+- `configure_tracing` now passes an explicit `ParentBased(root=ALWAYS_ON)` sampler to the
+  `TracerProvider` instead of letting the SDK pick one. `TracerProvider.__init__` falls back
+  to `sampling._get_from_env_or_default()`, which reads `OTEL_TRACES_SAMPLER`; leaving that
+  fallback in place would let a ratio sampler in the environment, or one installed by the
+  ADOT configurator, pre-drop spans before the tail step ever saw them and silently defeat
+  "errors are always sampled". Spans arriving with a sampled-out decision from an upstream
+  service are still honoured, because the root sampler only applies to locally started traces.
+- `configure_tracing` registers `TailSamplingSpanProcessor` where it previously registered a
+  `BatchSpanProcessor`. Nothing is exported until a flush, which is a behaviour change for
+  any caller that relied on the batch processor's own timer.
+- The tracing pipeline is now built entirely in process. There is no collector, no sidecar,
+  no Lambda extension, and nothing runs under `opentelemetry-instrument`. That last one is
+  the point: an auto-instrumentation configurator calls `set_tracer_provider` itself, and the
+  global provider is set-once per process, so whichever of it and `configure_tracing` ran
+  first would win and the other would be silently ignored, leaving either no tail sampling or
+  no signed exporter with nothing in the logs to say which.
+
+### Fixed
+
+- Overflow markers are cleared only for traces that have fully completed. Clearing them for a
+  still-open trace let its remaining spans start buffering again and be judged a second time,
+  so a "keep" could become a "drop" and, under `on_overflow="drop"`, fragments of an already
+  dropped trace could still be exported.
+- Spans are handed to the exporter outside the processor lock. Exporting under it made every
+  `on_end` in the process block on the X-Ray HTTP round trip.
+- X-Ray endpoint detection matches `xray.<region>.amazonaws.com`, the FIPS form
+  `xray-fips.<region>.amazonaws.com` and the interface VPC endpoint form
+  `<vpce-id>.xray.<region>.vpce.amazonaws.com` explicitly, and derives the signing region
+  from each. The previous substring test on `.amazonaws.com/v1/traces` matched any AWS-hosted
+  OTLP endpoint, and the VPC endpoint form was signed for `AWS_REGION` instead of its own
+  region, which fails as a credential scope mismatch. The FIPS endpoint is the one a caller
+  under a FIPS mandate cannot simply switch away from, and it was silently getting an
+  unsigned exporter and a 403.
+- `flush_timeout_millis` now bounds the export. It is passed to the exporter as its `timeout`
+  (in seconds, floored at 1), which is a deadline across the whole export including its
+  retries. Previously it was only forwarded to `force_flush`, which is a no-op on the OTLP
+  exporter, so the exporter kept its own 10 second default and the value bounded nothing: a
+  slow or unreachable endpoint could hold a request open far past the configured timeout.
+- An overflowed trace's marker is discarded once its last span ends. `force_flush` only walks
+  the buffers, and an overflowed trace has no buffer entry, so its marker was never reachable
+  and the marker sets grew without bound, uncapped by `max_buffered_traces`. Under
+  `on_overflow="drop"` a later trace reusing the id would also have been dropped in silence.
+- `instrument_fastapi` is idempotent with respect to the flush wrapper, so calling it twice
+  no longer nests two flush layers and flushes twice per request.
+- `instrument_fastapi` logs a WARNING when called on an application whose middleware stack is
+  already built. `FastAPIInstrumentor` cannot inject the server span middleware into a built
+  stack, so the app looks instrumented and emits no spans at all, which is harder to diagnose
+  than not instrumenting it.
+
+### Notes for consumers
+
+The environment variable contract shrank to one optional variable,
+`WEBBPULSE_OTEL_SAMPLE_RATIO`. `OTEL_EXPORTER_OTLP_TRACES_PROTOCOL`, `OTEL_PYTHON_DISTRO`,
+`OTEL_PYTHON_CONFIGURATOR` and `OTEL_TRACES_SAMPLER` are no longer needed and can be removed
+from function environments: the protocol is implicit in the exporter class, the distribution
+is used as a library rather than a launcher, and the sampler is passed explicitly.
+
+Install with the `aws-otel` extra wherever the X-Ray endpoint is the target, and call
+`instrument_fastapi(app)` so the per-request flush is wired. See the README's
+`webbpulse.otel` section.
+
+## 0.1.0
+
+- First release: `config`, `logging`, `otel`, `http`, `dynamodb`, `ratelimit`,
+  `lambda_entry` and `testing`.
