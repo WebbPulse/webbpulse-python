@@ -5,6 +5,59 @@ Notable changes to the `webbpulse` package. The version here is the one in
 
 This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## 0.3.0
+
+The org standardises on the `{success, status, message, request_id}` envelope for every
+backend. This release makes that envelope carry what the other services needed, so they can
+adopt it without forking the handlers. **Every addition is opt in and the default body is
+byte identical to 0.2.0**, so an existing caller upgrades with no change.
+
+### Added
+
+- `error_body(status_code, message, request, *, error_code=None, details=None, **extra)`, the
+  envelope builder, now public. The four base fields are always present and in the same
+  order; `error_code` and `details` are omitted entirely when unset. Exported as
+  `webbpulse.http.error_body`.
+- `register_error_handlers` takes `error_codes`, `validation_details`,
+  `validation_error_code` and `dynamodb` keyword arguments, all defaulting to off.
+  `error_codes=True` adds a stable `error_code` per status (`NOT_FOUND`, `CONFLICT`,
+  `INTERNAL_ERROR` and so on); `validation_details=True` adds `details` to the 422 body as a
+  list of `{"field", "message", "type"}` entries, with the field path flattened to a dotted
+  string and the `query`/`body` prefix dropped. The 0.2.0 `errors` key stays exactly as it
+  was alongside it, because dropping it would break a reader.
+- `create_app` takes the matching `error_codes`, `validation_details` and
+  `dynamodb_handlers` keyword arguments and passes them through.
+- A route can set a per-response code without turning any option on, by raising an
+  `HTTPException` whose `detail` is a mapping carrying `message` and optionally `error_code`
+  and `details`. A mapping detail that has no usable `message` renders the generic
+  "Request failed." rather than being echoed, so an internal dict cannot leak.
+- `install_dynamodb_handlers(app, *, error_codes=False)` maps botocore `ClientError` raised
+  by DynamoDB onto the envelope. `ConditionalCheckFailedException` is a **409**, not a 500,
+  because a failed condition means someone else got there first and that is a caller visible
+  conflict. `ProvisionedThroughputExceededException`, `ThrottlingException` and
+  `RequestLimitExceeded` are a **503** with `Retry-After`, because they are transient and a
+  500 tells a client not to bother retrying. `ResourceNotFoundException` is a **500** logged
+  at error, never a 404: a missing table is a deployment fault, and a 404 would send an
+  operator hunting for a missing record instead. `TransactionCanceledException` is inspected
+  rather than assumed, and is a 409 when any entry in `CancellationReasons` is
+  `ConditionalCheckFailed` and a 500 otherwise. Every branch logs with the request id and
+  the AWS error code, and no branch puts AWS text in the response body.
+- `DYNAMODB_RETRY_AFTER_SECONDS`, the value sent on a throttling 503. Deliberately short,
+  since on-demand capacity recovers in seconds and a long value turns a brief spike into a
+  long outage.
+- Starlette's raw routing errors now render the envelope. An unmatched route and a wrong
+  method previously fell through as `{"detail": "Not Found"}`, a different shape from every
+  handled error in the same API, which is what CarModPicker was leaking to its frontend.
+
+### Notes
+
+- The DynamoDB handlers are opt in and import botocore lazily, inside the function, so the
+  base install still needs no boto3. Install the existing `dynamodb` extra to use them. This
+  is verified against a genuinely boto3-free install, not just a mocked one.
+- No `dynamodb` extra was added, because the package already had one covering
+  `webbpulse.config` secret loading, `webbpulse.dynamodb` and `webbpulse.ratelimit`. The new
+  handlers ride on it rather than duplicating it.
+
 ## 0.2.0
 
 ### Added

@@ -393,15 +393,81 @@ origin list must be exact and never `"*"`: the CORS specification forbids that p
 is the browser that rejects the response, which makes a server misconfiguration look like a
 client bug.
 
-Errors all render in one envelope, so a validation failure and an unhandled exception have
-the same shape and neither leaks a stack trace to the caller:
+Errors all render in one envelope, so a validation failure, an unhandled exception and a
+request to a path that does not exist have the same shape, and none of them leaks a stack
+trace to the caller:
 
 ```json
 {"success": false, "status": 422, "message": "...", "request_id": "..."}
 ```
 
+Those four fields are always present. Starlette's raw 404 and 405 go through the same
+handler, so an unmatched route returns the envelope rather than the `{"detail": "Not Found"}`
+that the framework would otherwise emit.
+
 Validation errors return only the location and the reason, never the offending input, which
 can be a password or a token.
+
+#### Carrying more than the four fields
+
+Some services need a machine readable code, or per-field validation detail for a form. Both
+are options rather than defaults, so a service that wants neither gets a body byte identical
+to 0.2.0:
+
+```python
+app = create_app([posts_router], error_codes=True, validation_details=True)
+```
+
+`error_codes=True` adds `error_code`, a stable string per status (`NOT_FOUND`, `CONFLICT`,
+`INTERNAL_ERROR`). `validation_details=True` adds `details` to a 422, one entry per offending
+field, alongside the `errors` key that 0.2.0 callers already read:
+
+```json
+{
+  "success": false, "status": 422, "message": "Request validation failed.",
+  "request_id": "...", "error_code": "VALIDATION_ERROR",
+  "details": [{"field": "email", "message": "value is not a valid email address", "type": "value_error"}]
+}
+```
+
+The field path is flattened to a dotted string with the `query`/`body` prefix dropped, since
+the caller knows where it sent the value. As with `errors`, `details` never carries the
+rejected input.
+
+A single route can set its own code without turning any option on, by raising with a mapping
+detail:
+
+```python
+raise HTTPException(404, {"message": "No such post.", "error_code": "POST_NOT_FOUND"})
+```
+
+A mapping detail with no usable `message` renders the generic "Request failed." rather than
+being echoed, so an internal dict cannot leak into a response.
+
+#### DynamoDB errors
+
+Opt in, because it imports botocore and the base install has no boto3. Needs the `dynamodb`
+extra:
+
+```python
+app = create_app([posts_router], dynamodb_handlers=True)
+# or, for an app not built by create_app:
+from webbpulse.http import install_dynamodb_handlers
+install_dynamodb_handlers(app)
+```
+
+A botocore `ClientError` from DynamoDB then renders the envelope instead of becoming an
+opaque 500. The mapping is the part that is easy to get wrong per service:
+
+| AWS error code | Status | Why |
+| --- | --- | --- |
+| `ConditionalCheckFailedException` | 409 | Someone else got there first. A caller visible conflict, and the normal outcome of an optimistic create, not a server fault. |
+| `ProvisionedThroughputExceededException`, `ThrottlingException`, `RequestLimitExceeded` | 503 + `Retry-After` | Transient and retryable. A 500 tells a client not to bother retrying. |
+| `ResourceNotFoundException` | 500, logged at error | A missing table is a deployment fault, never the caller's. A 404 would send an operator hunting for a missing record instead of a missing table. |
+| `TransactionCanceledException` | 409 or 500 | Inspected, not assumed: 409 when any `CancellationReasons` entry is `ConditionalCheckFailed`, 500 otherwise. Treating the whole class as 409 hides real faults; treating it as 500 pages someone for an ordinary lost race. |
+
+Every branch logs with the request id and the AWS error code, and no branch puts AWS error
+text in the response body, so the caller's report joins to the CloudWatch line by request id.
 
 `RequestIdMiddleware` honours an inbound `X-Request-ID`, mints a UUID4 otherwise, bounds the
 length so a hostile header cannot inflate every downstream log line, echoes it on the

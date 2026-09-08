@@ -9,18 +9,23 @@ supported shapes and the refusal to trust `X-Forwarded-For`.
 from __future__ import annotations
 
 import json
+import logging
 from typing import Any
 
 import pytest
+from botocore.exceptions import ClientError
 from fastapi import APIRouter, FastAPI, HTTPException
 from fastapi.testclient import TestClient
 from starlette.requests import Request
 
 from webbpulse.http import (
+    DYNAMODB_RETRY_AFTER_SECONDS,
     REQUEST_CONTEXT_HEADER,
     REQUEST_ID_HEADER,
     client_ip,
     create_app,
+    error_body,
+    install_dynamodb_handlers,
     mount_all,
     request_id,
 )
@@ -329,3 +334,317 @@ def test_cors_exposes_the_rate_limit_headers() -> None:
         assert header in exposed, f"{header} must be readable by the browser"
     for header in ("X-RateLimit-Limit", "X-RateLimit-Remaining", "X-RateLimit-Reset"):
         assert header in exposed, f"{header} is emitted, so it must be exposed too"
+
+
+# ---- the 0.3.0 envelope options ------------------------------------------------------
+#
+# The whole point of these being options is that a 0.2.0 caller is unaffected, so the
+# first test here pins the default body exactly rather than field by field.
+
+
+def test_the_default_envelope_is_byte_identical_to_0_2_0() -> None:
+    """Portfolio reads this body. Adding a key by default would be a breaking change."""
+    router = APIRouter()
+
+    @router.get("/missing")
+    async def missing() -> None:
+        raise HTTPException(status_code=404, detail="No such post.")
+
+    response = TestClient(create_app([router])).get("/missing")
+    body = response.json()
+    assert set(body) == {"success", "status", "message", "request_id"}, (
+        "no error_code and no details unless the service opts in"
+    )
+
+
+def test_error_codes_add_a_stable_code_per_status() -> None:
+    router = APIRouter()
+
+    @router.get("/missing")
+    async def missing() -> None:
+        raise HTTPException(status_code=404, detail="No such post.")
+
+    @router.get("/conflict")
+    async def conflict() -> None:
+        raise HTTPException(status_code=409, detail="Already exists.")
+
+    client = TestClient(create_app([router], error_codes=True))
+    assert client.get("/missing").json()["error_code"] == "NOT_FOUND"
+    assert client.get("/conflict").json()["error_code"] == "CONFLICT"
+
+
+def test_the_four_base_fields_survive_every_option() -> None:
+    router = APIRouter()
+
+    @router.get("/missing")
+    async def missing() -> None:
+        raise HTTPException(status_code=404, detail="No such post.")
+
+    app = create_app([router], error_codes=True, validation_details=True)
+    body = TestClient(app).get("/missing").json()
+    for field in ("success", "status", "message", "request_id"):
+        assert field in body, f"{field} is always present, whatever the options say"
+
+
+def test_a_route_can_override_the_error_code_at_the_raise_site() -> None:
+    """A dict detail carries a per-response code without a global option."""
+    router = APIRouter()
+
+    @router.get("/missing")
+    async def missing() -> None:
+        raise HTTPException(
+            status_code=404,
+            detail={"message": "No such post.", "error_code": "POST_NOT_FOUND"},
+        )
+
+    body = TestClient(create_app([router])).get("/missing").json()
+    assert body["message"] == "No such post."
+    assert body["error_code"] == "POST_NOT_FOUND", "explicit at the raise site beats the default"
+
+
+def test_a_dict_detail_without_a_message_does_not_leak_the_dict() -> None:
+    router = APIRouter()
+
+    @router.get("/weird")
+    async def weird() -> None:
+        raise HTTPException(status_code=400, detail={"internal": "table=webbpulse-prod"})
+
+    body = TestClient(create_app([router])).get("/weird").json()
+    assert body["message"] == "Request failed."
+    assert "webbpulse-prod" not in json.dumps(body), "an unrecognised detail must not be echoed"
+
+
+def test_validation_details_add_the_flat_field_shape() -> None:
+    router = APIRouter()
+
+    @router.get("/items")
+    async def items(count: int) -> dict[str, int]:
+        return {"count": count}
+
+    app = create_app([router], validation_details=True)
+    response = TestClient(app).get("/items", params={"count": "nope"})
+
+    assert response.status_code == 422
+    body = response.json()
+    assert body["details"][0]["field"] == "count", "the query/body prefix is dropped"
+    assert body["details"][0]["message"]
+    assert body["details"][0]["type"]
+    assert body["errors"], "the 0.2.0 key stays alongside it"
+
+
+def test_validation_details_never_echo_the_offending_value() -> None:
+    """The same guarantee the `errors` key has always had, now for `details` too."""
+    router = APIRouter()
+
+    @router.get("/items")
+    async def items(count: int) -> dict[str, int]:
+        return {"count": count}
+
+    app = create_app([router], validation_details=True, error_codes=True)
+    response = TestClient(app).get("/items", params={"count": "sup3r-s3cret"})
+
+    body = response.json()
+    assert "sup3r-s3cret" not in json.dumps(body)
+    assert body["error_code"] == "VALIDATION_ERROR"
+
+
+def test_error_body_omits_the_optional_fields_when_unset() -> None:
+    request = _request()
+    assert set(error_body(500, "Boom.", request)) == {
+        "success",
+        "status",
+        "message",
+        "request_id",
+    }
+
+
+def test_error_body_includes_the_optional_fields_when_set() -> None:
+    request = _request()
+    body = error_body(409, "Conflict.", request, error_code="CONFLICT", details={"a": 1})
+    assert body["error_code"] == "CONFLICT"
+    assert body["details"] == {"a": 1}
+    assert body["success"] is False and body["status"] == 409
+
+
+# ---- raw routing errors --------------------------------------------------------------
+#
+# CarModPicker leaked Starlette's own {"detail": "Not Found"} for an unmatched route,
+# which is a different shape from every handled error in the same API.
+
+
+def test_an_unmatched_route_renders_the_envelope() -> None:
+    response = TestClient(create_app()).get("/no-such-path")
+
+    assert response.status_code == 404
+    body = response.json()
+    assert "detail" not in body, "the raw Starlette shape must not survive"
+    assert body["success"] is False
+    assert body["status"] == 404
+    assert body["message"] == "The requested resource was not found."
+    assert body["request_id"]
+
+
+def test_a_wrong_method_renders_the_envelope() -> None:
+    router = APIRouter()
+
+    @router.get("/thing")
+    async def thing() -> dict[str, bool]:
+        return {"ok": True}
+
+    response = TestClient(create_app([router])).post("/thing")
+
+    assert response.status_code == 405
+    body = response.json()
+    assert "detail" not in body
+    assert body["message"] == "That method is not allowed on this resource."
+
+
+def test_routing_errors_carry_an_error_code_when_enabled() -> None:
+    client = TestClient(create_app(error_codes=True))
+    assert client.get("/no-such-path").json()["error_code"] == "NOT_FOUND"
+
+
+# ---- DynamoDB handlers ---------------------------------------------------------------
+#
+# Opt in, because installing them imports botocore and the base install has no boto3.
+# The mapping is the part worth pinning: a failed condition is a 409 and not a 500, and
+# throttling is a retryable 503 and not a 500, or a client is told not to bother retrying.
+
+
+def _client_error(code: str, **extra: Any) -> ClientError:
+    """A botocore ClientError shaped the way DynamoDB actually returns one."""
+    response: dict[str, Any] = {"Error": {"Code": code, "Message": f"{code} occurred."}, **extra}
+    return ClientError(response, "PutItem")  # type: ignore[arg-type]
+
+
+def _dynamodb_app(raises: ClientError, **kwargs: Any) -> TestClient:
+    router = APIRouter()
+
+    @router.get("/write")
+    async def write() -> None:
+        raise raises
+
+    app = create_app([router], dynamodb_handlers=True, **kwargs)
+    return TestClient(app, raise_server_exceptions=False)
+
+
+def test_a_failed_condition_is_a_conflict_not_a_server_error() -> None:
+    """Someone else got there first, which is a caller visible conflict."""
+    response = _dynamodb_app(_client_error("ConditionalCheckFailedException")).get("/write")
+
+    assert response.status_code == 409
+    body = response.json()
+    assert body["success"] is False
+    assert body["status"] == 409
+    assert body["request_id"]
+
+
+@pytest.mark.parametrize(
+    "code",
+    [
+        "ProvisionedThroughputExceededException",
+        "ThrottlingException",
+        "RequestLimitExceeded",
+    ],
+)
+def test_throttling_is_a_retryable_503_with_retry_after(code: str) -> None:
+    response = _dynamodb_app(_client_error(code)).get("/write")
+
+    assert response.status_code == 503
+    assert response.headers["Retry-After"] == str(DYNAMODB_RETRY_AFTER_SECONDS)
+    assert response.json()["status"] == 503
+
+
+def test_a_missing_table_is_a_five_hundred_and_tells_the_caller_nothing() -> None:
+    """A missing table is a deployment fault, never the caller's, and never a 404."""
+    error = _client_error("ResourceNotFoundException")
+    response = _dynamodb_app(error).get("/write")
+
+    assert response.status_code == 500
+    assert response.json()["message"] == "Internal server error."
+    assert "ResourceNotFound" not in response.text, "the AWS error text must not leak"
+
+
+def test_a_missing_table_logs_at_error(caplog: pytest.LogCaptureFixture) -> None:
+    with caplog.at_level(logging.ERROR, logger="webbpulse.http"):
+        _dynamodb_app(_client_error("ResourceNotFoundException")).get("/write")
+
+    assert any(r.levelno == logging.ERROR for r in caplog.records), "a missing table is loud"
+
+
+def test_a_cancelled_transaction_with_a_failed_condition_is_a_conflict() -> None:
+    error = _client_error(
+        "TransactionCanceledException",
+        CancellationReasons=[{"Code": "None"}, {"Code": "ConditionalCheckFailed"}],
+    )
+    response = _dynamodb_app(error).get("/write")
+
+    assert response.status_code == 409, "any failed condition in the transaction makes it a 409"
+
+
+def test_a_cancelled_transaction_without_a_failed_condition_is_a_five_hundred() -> None:
+    """Treating the whole class as a 409 would hide a real fault, so the reasons decide."""
+    error = _client_error(
+        "TransactionCanceledException",
+        CancellationReasons=[{"Code": "TransactionConflict"}],
+    )
+    response = _dynamodb_app(error).get("/write")
+
+    assert response.status_code == 500
+
+
+def test_a_cancelled_transaction_with_no_reasons_is_a_five_hundred() -> None:
+    response = _dynamodb_app(_client_error("TransactionCanceledException")).get("/write")
+
+    assert response.status_code == 500
+
+
+def test_an_unrecognised_client_error_is_a_generic_five_hundred() -> None:
+    error = _client_error("ValidationException")
+    response = _dynamodb_app(error).get("/write")
+
+    assert response.status_code == 500
+    assert response.json()["message"] == "Internal server error."
+
+
+def test_dynamodb_errors_carry_an_error_code_when_enabled() -> None:
+    client = _dynamodb_app(_client_error("ConditionalCheckFailedException"), error_codes=True)
+    assert client.get("/write").json()["error_code"] == "CONFLICT"
+
+
+def test_dynamodb_handlers_log_with_the_request_id(caplog: pytest.LogCaptureFixture) -> None:
+    """The response body carries no AWS detail, so the log line is how the two join up."""
+    with caplog.at_level(logging.WARNING, logger="webbpulse.http"):
+        response = _dynamodb_app(_client_error("ThrottlingException")).get(
+            "/write", headers={REQUEST_ID_HEADER: "trace-me"}
+        )
+
+    assert response.json()["request_id"] == "trace-me"
+    assert any(getattr(r, "request_id", None) == "trace-me" for r in caplog.records)
+
+
+def test_install_dynamodb_handlers_can_be_called_on_its_own() -> None:
+    """The separate entry point, for an app not built by `create_app`."""
+    router = APIRouter()
+
+    @router.get("/write")
+    async def write() -> None:
+        raise _client_error("ConditionalCheckFailedException")
+
+    app = create_app([router])
+    install_dynamodb_handlers(app)
+
+    response = TestClient(app, raise_server_exceptions=False).get("/write")
+    assert response.status_code == 409
+
+
+def test_the_dynamodb_handlers_are_absent_unless_requested() -> None:
+    """Without the opt in, a ClientError is just an unhandled exception: a plain 500."""
+    router = APIRouter()
+
+    @router.get("/write")
+    async def write() -> None:
+        raise _client_error("ConditionalCheckFailedException")
+
+    response = TestClient(create_app([router]), raise_server_exceptions=False).get("/write")
+    assert response.status_code == 500, "no 409 mapping without dynamodb_handlers=True"
