@@ -89,9 +89,27 @@ overflow is resolved by `on_overflow`:
 * `"drop"` discards the trace and increments `dropped_traces`. Choose it when a hard ceiling
   on egress matters more than seeing the outlier.
 
-Either way the buffer for a single trace never exceeds the cap, and the total buffer never
-exceeds `max_spans_per_trace` times the number of concurrently open traces, which under the
-Web Adapter on Lambda is normally one.
+That bounds one trace. The *number* of traces is bounded separately by
+`max_buffered_traces` (default 1024), because a buffer is only drained when its trace
+completes and a flush comes round: a trace that never completes, because the request was
+abandoned or a span was leaked, would otherwise sit there for the life of the process. Past
+the ceiling the oldest completed trace is evicted, and evicting means judging it now rather
+than discarding it, so an error trace that was about to be kept is still exported. A trace
+with spans still open is never evicted, for the same reason a flush never judges one.
+
+The total is therefore bounded by `max_spans_per_trace * max_buffered_traces`, and in
+practice sits far below it, because under the Web Adapter a flush runs on every request.
+
+## Flushing and in-flight traces
+
+A trace is only judged once every span in it has ended. `on_start` and `on_end` keep a
+per-trace count of open spans, and `force_flush` resolves only the traces at zero, leaving
+the rest buffered. Without that, one request's flush would judge another request's
+half-built trace on whichever spans happened to have ended, usually dropping it, and then
+judge the remainder separately when it arrived, so a single logical trace could end up half
+exported and half discarded. Deferring costs nothing, because the request that owns the
+trace flushes when it finishes. `shutdown` is the exception: there is no later, so it
+resolves everything, in flight or not.
 
 ## Lambda and force_flush
 
@@ -168,6 +186,11 @@ _EXCEPTION_EVENT_NAME: Final = "exception"
 #: Per-trace buffer ceiling. 2048 spans is far above a normal request against this estate and
 #: still small enough that a handful of concurrent traces cannot exhaust a 512MB Lambda.
 _DEFAULT_MAX_SPANS_PER_TRACE: Final = 2048
+
+#: Ceiling on the number of traces buffered at once. Under the Web Adapter a flush runs every
+#: request, so a single-digit number of traces is buffered in practice; 1024 is far above
+#: that and still bounds a leak.
+_DEFAULT_MAX_BUFFERED_TRACES: Final = 1024
 
 OverflowPolicy = Literal["export", "drop"]
 
@@ -318,6 +341,8 @@ class TailSamplingSpanProcessor:
         max_spans_per_trace: per-trace buffer ceiling.
         on_overflow: what to do with a trace that exceeds the ceiling. `"export"` keeps it
             and streams the rest of it straight through; `"drop"` discards it.
+        max_buffered_traces: ceiling on the *number* of traces buffered at once, which is the
+            other half of the memory bound. See `_evict_oldest`.
     """
 
     def __init__(
@@ -328,6 +353,7 @@ class TailSamplingSpanProcessor:
         always_sample_errors: bool = True,
         max_spans_per_trace: int = _DEFAULT_MAX_SPANS_PER_TRACE,
         on_overflow: OverflowPolicy = "export",
+        max_buffered_traces: int = _DEFAULT_MAX_BUFFERED_TRACES,
     ) -> None:
         if not 0.0 <= sample_ratio <= 1.0:
             raise ValueError(f"sample_ratio must be between 0.0 and 1.0, got {sample_ratio!r}")
@@ -335,6 +361,8 @@ class TailSamplingSpanProcessor:
             raise ValueError(f"max_spans_per_trace must be at least 1, got {max_spans_per_trace!r}")
         if on_overflow not in ("export", "drop"):
             raise ValueError(f"on_overflow must be 'export' or 'drop', got {on_overflow!r}")
+        if max_buffered_traces < 1:
+            raise ValueError(f"max_buffered_traces must be at least 1, got {max_buffered_traces!r}")
 
         self._exporter = exporter
         self._sample_ratio = sample_ratio
@@ -342,11 +370,17 @@ class TailSamplingSpanProcessor:
         self._always_sample_errors = always_sample_errors
         self._max_spans_per_trace = max_spans_per_trace
         self._on_overflow: OverflowPolicy = on_overflow
+        self._max_buffered_traces = max_buffered_traces
 
         # on_end runs on whichever thread ended the span, and uvicorn serves on a thread
         # pool, so the buffers need a lock even though a Lambda invocation is one request.
         self._lock = threading.Lock()
+        # Insertion-ordered, which `_evict_oldest` relies on to find the oldest trace.
         self._buffers: dict[int, list[ReadableSpan]] = {}
+        # Spans started but not yet ended, per trace. A trace is only safe to judge at zero:
+        # judging it earlier judges a partial trace, and the spans that arrive afterwards are
+        # then judged again as if they were a second, separate trace.
+        self._open_spans: dict[int, int] = {}
         # Traces already resolved to "keep" by an overflow, whose later spans stream through.
         self._overflowed_keep: set[int] = set()
         # Traces already resolved to "drop" by an overflow, whose later spans are discarded.
@@ -360,13 +394,29 @@ class TailSamplingSpanProcessor:
         self.sampled_out_traces = 0
         #: Traces handed to the exporter.
         self.exported_traces = 0
+        #: Traces evicted because too many were buffered at once. Distinct from
+        #: `dropped_traces`, which counts the per-trace span cap.
+        self.evicted_traces = 0
 
     @property
     def sample_ratio(self) -> float:
         return self._sample_ratio
 
     def on_start(self, span: Span, parent_context: Context | None = None) -> None:
-        """Required by the `SpanProcessor` interface. The tail decision needs no start hook."""
+        """Count the span as in flight, so a flush knows the trace is not complete yet.
+
+        Without this a `force_flush` from one request judges a trace that another request is
+        still building. The partial trace is judged on the spans that happen to have ended,
+        typically dropped, and the spans that arrive afterwards are judged all over again as
+        if they were a separate trace, so one logical trace can be half exported and half
+        discarded. Counting starts and ends and only resolving traces at zero is what makes
+        the decision per trace rather than per flush.
+        """
+        context = span.get_span_context()
+        if context is None:
+            return
+        with self._lock:
+            self._open_spans[context.trace_id] = self._open_spans.get(context.trace_id, 0) + 1
 
     def _on_ending(self, span: Span) -> None:
         """Called by `Span.end` before `on_end`. Nothing to mutate before the buffer."""
@@ -389,47 +439,106 @@ class TailSamplingSpanProcessor:
             return
         trace_id = context.trace_id
 
+        stream: list[ReadableSpan] = []
         with self._lock:
+            if trace_id in self._open_spans:
+                remaining = self._open_spans[trace_id] - 1
+                if remaining <= 0:
+                    del self._open_spans[trace_id]
+                else:
+                    self._open_spans[trace_id] = remaining
+
             if trace_id in self._overflowed_drop:
                 return
             if trace_id in self._overflowed_keep:
                 # Already resolved to keep, so nothing accumulates for this trace.
-                self._export([span])
-                return
+                stream = [span]
+            else:
+                buffer = self._buffers.setdefault(trace_id, [])
+                if len(buffer) < self._max_spans_per_trace:
+                    buffer.append(span)
+                    self._evict_oldest_locked()
+                else:
+                    stream = self._resolve_overflow_locked(trace_id, buffer, span)
 
-            buffer = self._buffers.setdefault(trace_id, [])
-            if len(buffer) < self._max_spans_per_trace:
-                buffer.append(span)
-                return
+        # Deliberately outside the lock. `export` is an HTTP round trip to the X-Ray
+        # endpoint, and holding the lock across it would make every `on_end` in the process
+        # block on the network, serialising span completion behind telemetry egress.
+        self._export(stream)
 
-            # The cap is reached. Resolve the trace now, one way or the other, so the buffer
-            # for it stops growing.
-            del self._buffers[trace_id]
-            if self._on_overflow == "drop":
-                self._overflowed_drop.add(trace_id)
-                self.dropped_traces += 1
-                _log.warning(
-                    "Dropped a trace that exceeded the tail sampling buffer cap.",
-                    extra={
-                        "otel_trace_id": f"{trace_id:032x}",
-                        "max_spans_per_trace": self._max_spans_per_trace,
-                    },
-                )
-                return
-
-            self._overflowed_keep.add(trace_id)
+    def _resolve_overflow_locked(
+        self, trace_id: int, buffer: list[ReadableSpan], span: ReadableSpan
+    ) -> list[ReadableSpan]:
+        """Resolve a trace that hit the per-trace cap. Returns the spans to export."""
+        del self._buffers[trace_id]
+        if self._on_overflow == "drop":
+            self._overflowed_drop.add(trace_id)
+            self.dropped_traces += 1
             _log.warning(
-                "Exporting a trace that exceeded the tail sampling buffer cap without a "
-                "sampling decision.",
+                "Dropped a trace that exceeded the tail sampling buffer cap.",
                 extra={
                     "otel_trace_id": f"{trace_id:032x}",
                     "max_spans_per_trace": self._max_spans_per_trace,
                 },
             )
-            self._export([*buffer, span])
+            return []
+
+        self._overflowed_keep.add(trace_id)
+        _log.warning(
+            "Exporting a trace that exceeded the tail sampling buffer cap without a "
+            "sampling decision.",
+            extra={
+                "otel_trace_id": f"{trace_id:032x}",
+                "max_spans_per_trace": self._max_spans_per_trace,
+            },
+        )
+        return [*buffer, span]
+
+    def _evict_oldest_locked(self) -> None:
+        """Keep the number of buffered traces bounded, not just the size of each one.
+
+        The per-trace cap bounds one trace; without this the *count* of traces is unbounded,
+        because a buffer is only drained when the trace completes and a flush comes round.
+        A trace that never completes, because the request was abandoned or the span was
+        leaked, would sit there for the life of the process. Under the Web Adapter a flush
+        runs every request so this should never fire, but "should never fire" is not a memory
+        bound.
+
+        The oldest trace is evicted first, and evicting means judging it now rather than
+        discarding it, so an error trace that was about to be kept is still exported. Only a
+        trace with no spans still open is eligible; an in-flight one is left alone, since
+        judging it early is the very bug this class otherwise avoids.
+        """
+        if len(self._buffers) <= self._max_buffered_traces:
+            return
+        for trace_id in self._buffers:
+            if self._open_spans.get(trace_id):
+                continue
+            spans = self._buffers.pop(trace_id)
+            self.evicted_traces += 1
+            _log.warning(
+                "Evicting the oldest buffered trace: too many traces are buffered at once.",
+                extra={
+                    "otel_trace_id": f"{trace_id:032x}",
+                    "max_buffered_traces": self._max_buffered_traces,
+                    "buffered_traces": len(self._buffers) + 1,
+                },
+            )
+            if self._should_keep(trace_id, spans):
+                self.exported_traces += 1
+                # Under the lock by necessity here: the caller holds it. An eviction is a
+                # pathological path, so paying a blocking export on it is the right trade
+                # against the bookkeeping to defer it.
+                self._export(spans)
+            else:
+                self.sampled_out_traces += 1
+            return
+        # Every buffered trace is still in flight, so there is nothing safe to evict. The
+        # per-trace cap still bounds each one, and the next completion will make one eligible.
 
     def _export(self, spans: list[ReadableSpan]) -> None:
-        """Hand spans to the exporter. Called with the lock held."""
+        """Hand spans to the exporter. Must not be called with the lock held, except from
+        `_evict_oldest_locked`, which documents why it is the exception."""
         if not spans:
             return
         try:
@@ -444,22 +553,39 @@ class TailSamplingSpanProcessor:
         return _trace_id_is_sampled(trace_id, self._bound)
 
     def force_flush(self, timeout_millis: int = 30000) -> bool:
-        """Resolve every buffered trace and export the ones that are kept.
+        """Resolve every *completed* buffered trace and export the ones that are kept.
 
         This is where the tail decision happens, so a Lambda invocation must reach it before
         the process is frozen. Returns the wrapped exporter's own flush result.
-        """
-        with self._lock:
-            buffers, self._buffers = self._buffers, {}
-            self._overflowed_keep.clear()
-            self._overflowed_drop.clear()
 
-            for trace_id, spans in buffers.items():
+        A trace with spans still open is left buffered rather than judged. Under a
+        concurrent server one request's flush would otherwise resolve another request's
+        half-built trace, drop it on the strength of the spans that happened to have ended,
+        and then judge the rest of it separately when it arrives. Leaving it alone costs
+        nothing: the request that owns it flushes when it finishes.
+        """
+        to_export: list[list[ReadableSpan]] = []
+        with self._lock:
+            complete = [
+                trace_id for trace_id in self._buffers if not self._open_spans.get(trace_id)
+            ]
+            for trace_id in complete:
+                spans = self._buffers.pop(trace_id)
+                # Only now is this trace's overflow marker meaningless. Clearing markers for
+                # a trace that is still open would let its tail start buffering again and be
+                # judged a second time, so a "keep" could become a "drop", and under
+                # `on_overflow="drop"` fragments of a dropped trace could be exported.
+                self._overflowed_keep.discard(trace_id)
+                self._overflowed_drop.discard(trace_id)
                 if self._should_keep(trace_id, spans):
                     self.exported_traces += 1
-                    self._export(spans)
+                    to_export.append(spans)
                 else:
                     self.sampled_out_traces += 1
+
+        # Outside the lock, for the same reason as `on_end`.
+        for spans in to_export:
+            self._export(spans)
 
         flush = getattr(self._exporter, "force_flush", None)
         if callable(flush):
@@ -468,30 +594,68 @@ class TailSamplingSpanProcessor:
         return True
 
     def shutdown(self) -> None:
-        """Flush what is buffered, then shut the exporter down."""
+        """Resolve everything still buffered, in flight or not, then shut the exporter down.
+
+        `force_flush` deliberately leaves in-flight traces alone because their owning request
+        will flush them later. At shutdown there is no later, so an incomplete trace is
+        judged on what it has rather than discarded silently: a half-recorded error trace is
+        still the most useful thing in the buffer.
+        """
+        with self._lock:
+            self._open_spans.clear()
         self.force_flush()
         self._shutdown = True
         self._exporter.shutdown()
 
 
+def _xray_region(endpoint: str) -> str | None:
+    """The region an X-Ray OTLP endpoint signs for, or `None` if it is not one.
+
+    Two host shapes are X-Ray, and both must be recognised precisely, because getting either
+    half wrong is a silent 403:
+
+    * `xray.<region>.amazonaws.com`, the public endpoint.
+    * `<vpce-id>.xray.<region>.vpce.amazonaws.com`, the interface VPC endpoint, which a
+      function in a private subnet with no NAT gateway has to use.
+
+    A substring test for `.amazonaws.com` would match any AWS-hosted OTLP endpoint and sign
+    requests that should not be signed, and reading the region from `AWS_REGION` instead of
+    the host would sign a VPC endpoint or an explicit cross-region endpoint for the wrong
+    region, which fails as a credential scope mismatch rather than as anything legible.
+    """
+    from urllib.parse import urlparse
+
+    parsed = urlparse(endpoint)
+    if not parsed.path.startswith("/v1/traces"):
+        return None
+    labels = (parsed.hostname or "").lower().split(".")
+
+    # xray.<region>.amazonaws.com
+    if len(labels) == 4 and labels[0] == "xray" and labels[2:] == ["amazonaws", "com"]:
+        return labels[1]
+    # <vpce-id>.xray.<region>.vpce.amazonaws.com
+    if len(labels) == 6 and labels[1] == "xray" and labels[3:] == ["vpce", "amazonaws", "com"]:
+        return labels[2]
+    return None
+
+
 def _is_xray_endpoint(endpoint: str) -> bool:
-    """Whether an endpoint is the CloudWatch X-Ray OTLP one, which requires SigV4."""
-    return ".amazonaws.com/v1/traces" in endpoint
+    """Whether an endpoint is a CloudWatch X-Ray OTLP one, which requires SigV4."""
+    return _xray_region(endpoint) is not None
 
 
 def _region_for_endpoint(endpoint: str) -> str:
     """The region to sign for, taken from the endpoint host rather than guessed.
 
-    `https://xray.us-west-2.amazonaws.com/v1/traces` signs for `us-west-2`. Deriving it from
-    the endpoint rather than from `AWS_REGION` keeps the signature correct when a caller
-    passes an explicit cross-region endpoint, where the two would disagree and the request
-    would be rejected as a signature mismatch.
+    `https://xray.us-west-2.amazonaws.com/v1/traces` signs for `us-west-2`, and so does its
+    VPC endpoint form. Deriving it from the endpoint rather than from `AWS_REGION` keeps the
+    signature correct when a caller passes an explicit cross-region endpoint, where the two
+    would disagree and the request would be rejected as a signature mismatch. The environment
+    is only the fallback for a host that carries no region at all.
     """
-    from urllib.parse import urlparse
-
-    host = (urlparse(endpoint).hostname or "").split(".")
-    if len(host) >= 3 and host[0] == "xray":
-        return host[1]
+    region = _xray_region(endpoint)
+    if region is not None:
+        return region
     return os.environ.get("AWS_REGION") or os.environ.get("AWS_DEFAULT_REGION") or "us-west-2"
 
 
@@ -559,6 +723,7 @@ def configure_tracing(
     always_sample_errors: bool = True,
     max_spans_per_trace: int = _DEFAULT_MAX_SPANS_PER_TRACE,
     on_overflow: OverflowPolicy = "export",
+    max_buffered_traces: int = _DEFAULT_MAX_BUFFERED_TRACES,
     force: bool = False,
 ) -> bool:
     """Set up the tracer provider and the tail sampling span exporter. Returns whether it did.
@@ -590,6 +755,7 @@ def configure_tracing(
             `exception` event, regardless of the ratio.
         max_spans_per_trace: per-trace buffer ceiling.
         on_overflow: `"export"` keeps a trace that exceeds the ceiling, `"drop"` discards it.
+        max_buffered_traces: ceiling on how many traces are buffered at once.
         force: reconfigure even if a provider was already installed by an earlier call.
     """
     global _CONFIGURED, _PROCESSOR
@@ -644,6 +810,7 @@ def configure_tracing(
         always_sample_errors=always_sample_errors,
         max_spans_per_trace=max_spans_per_trace,
         on_overflow=on_overflow,
+        max_buffered_traces=max_buffered_traces,
     )
     # This processor is the export path. Adding a BatchSpanProcessor for the same exporter
     # alongside it would export every kept trace twice and every dropped one once.
@@ -694,38 +861,65 @@ def _running_on_lambda() -> bool:
     return bool(os.environ.get("AWS_LAMBDA_FUNCTION_NAME"))
 
 
-def _flush_middleware_factory(timeout_millis: int) -> Any:
-    """Build the flush middleware. Imported lazily so Starlette stays an optional extra."""
-    from starlette.middleware.base import BaseHTTPMiddleware
+class _FlushTracingASGIMiddleware:
+    """A pure ASGI wrapper that flushes buffered spans once the response is complete.
 
-    class _FlushTracingMiddleware(BaseHTTPMiddleware):
-        """Flush buffered spans after the handler and before the response is returned.
+    Why ASGI and not `BaseHTTPMiddleware`. `FastAPIInstrumentor.instrument_app` does not add
+    a middleware to the app's list; it replaces `build_middleware_stack` so that
+    `OpenTelemetryMiddleware` wraps the entire finished stack, outermost. Anything registered
+    with `add_middleware` therefore runs *inside* it, and inside it the server span has not
+    ended yet: the span ends when `OpenTelemetryMiddleware` sees the response go by, which is
+    after every inner middleware has returned.
 
-        The placement is the whole point. Under the Lambda Web Adapter an invocation ends
-        when the HTTP response completes, and the execution environment is frozen
-        immediately afterwards: a background task, a `BackgroundTask` on the response, or an
-        `atexit` hook all run too late and are frozen mid-flush, losing the trace. So the
-        flush happens inline, after `call_next` has produced the response and before that
-        response is handed back to the adapter.
+    A flush from inside that boundary is a full request out of step. It exports whatever the
+    previous request left buffered and leaves the current request's own trace behind, which
+    under the Web Adapter means the sandbox freezes on it and it is lost. The failure is
+    worst exactly where it matters most: at a 0.1 ratio a 500's error trace is judged
+    keep-worthy, buffered, and then frozen and discarded, so the traces this whole design
+    exists to keep are the ones that go missing.
 
-        It never raises into the request. A telemetry failure that turned a healthy 200 into
-        a 500 would be far worse than the missing trace it is reporting.
-        """
+    So this wraps the instrumented application from the outside instead, and flushes after
+    the inner application has fully returned. That last detail matters as much as being
+    outermost: `OpenTelemetryMiddleware` ends the server span *after* the terminal
+    `http.response.body` message has been sent, so flushing on that message is still one span
+    too early, and the tail step correctly refuses to judge a trace that has a span open.
+    Returning from `await self.app(...)` is the first moment the trace is complete.
 
-        async def dispatch(self, request: Any, call_next: Any) -> Any:
-            response = await call_next(request)
-            try:
-                flush_tracing(timeout_millis)
-            except Exception:
-                # Bounded and swallowed: the response is already built and correct.
-                _log.warning(
-                    "Flushing spans before returning the response failed; "
-                    "this request's trace may be lost.",
-                    exc_info=True,
-                )
-            return response
+    Under the Web Adapter the invocation ends when the HTTP response completes, and the
+    sandbox freezes immediately afterwards. The response body has already gone out by the
+    time this flush runs, so the client is not waiting on the export, but the process is
+    still thawed, which is the window this needs.
+    """
 
-    return _FlushTracingMiddleware
+    def __init__(self, app: Any, timeout_millis: int) -> None:
+        self.app = app
+        self._timeout_millis = timeout_millis
+
+    def _flush(self) -> None:
+        try:
+            flush_tracing(self._timeout_millis)
+        except Exception:
+            # Bounded and swallowed. The response has already been sent, and a telemetry
+            # failure that propagated from here would surface as a broken connection.
+            _log.warning(
+                "Flushing spans at the end of the request failed; this request's trace may "
+                "be lost.",
+                exc_info=True,
+            )
+
+    async def __call__(self, scope: Any, receive: Any, send: Any) -> None:
+        if scope.get("type") != "http":
+            await self.app(scope, receive, send)
+            return
+        try:
+            await self.app(scope, receive, send)
+        except Exception:
+            # The trace of a request that blew up is the one most worth having, and an
+            # unhandled exception here means the server span was ended by the instrumentation
+            # on its way out, so the trace is complete and ready to judge.
+            self._flush()
+            raise
+        self._flush()
 
 
 def instrument_fastapi(
@@ -743,8 +937,8 @@ def instrument_fastapi(
     otherwise dominate the trace volume for no diagnostic value.
 
     Because sampling here is tail based, nothing is exported until a flush, and on Lambda the
-    only safe place for that flush is inside the request. This adds a middleware that flushes
-    after the handler and before the response is returned. It is on by default when
+    only safe place for that flush is inside the request. This wraps the instrumented app in
+    an ASGI middleware that flushes once the response is complete. It is on by default when
     `AWS_LAMBDA_FUNCTION_NAME` is set and off otherwise, since a long-lived server can flush
     on its own schedule; pass `flush_per_request` to decide explicitly.
 
@@ -765,14 +959,34 @@ def instrument_fastapi(
     )
 
     should_flush = _running_on_lambda() if flush_per_request is None else flush_per_request
-    if not should_flush:
-        return
-    try:
-        middleware = _flush_middleware_factory(flush_timeout_millis)
-    except ImportError:  # pragma: no cover - starlette ships with fastapi
-        _log.warning("Starlette is not installed, so spans will not be flushed per request.")
-        return
-    app.add_middleware(middleware)
+    if should_flush:
+        _wrap_with_flush(app, flush_timeout_millis)
+
+
+def _wrap_with_flush(app: FastAPI, timeout_millis: int) -> None:
+    """Put the flush wrapper outside everything, including the OTel server span middleware.
+
+    `app.add_middleware` is not usable for this. `instrument_app` replaces
+    `build_middleware_stack` so `OpenTelemetryMiddleware` ends up outermost, so an added
+    middleware would run inside it, before the server span has ended. `add_middleware` also
+    raises on an app that has already started, which a call from a lifespan hook would hit.
+
+    Wrapping `build_middleware_stack` instead puts this outside the OTel middleware and
+    composes with it, since each wrapper decorates whatever the previous one produced. The
+    stack is rebuilt lazily on startup, so this takes effect for a stack that has not been
+    built yet and is re-applied if the app rebuilds it.
+    """
+    built = app.build_middleware_stack
+
+    def build_middleware_stack() -> Any:
+        return _FlushTracingASGIMiddleware(built(), timeout_millis)
+
+    app.build_middleware_stack = build_middleware_stack  # type: ignore[method-assign]
+    # An app that is already running has a built stack that the rebuild above will not reach,
+    # so patch the live one too. Both paths are needed: a plain `create_app()` has not built
+    # its stack yet, while an app instrumented from a lifespan hook has.
+    if getattr(app, "middleware_stack", None) is not None:
+        app.middleware_stack = _FlushTracingASGIMiddleware(app.middleware_stack, timeout_millis)
 
 
 def flush_tracing(timeout_millis: int = 30000) -> bool:

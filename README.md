@@ -210,8 +210,8 @@ top.
 configure_tracing(
     "webbpulse-portfolio-content",
     environment="production",
-    sample_ratio=0.1,          # or leave it to WEBBPULSE_OTEL_SAMPLE_RATIO
-    always_sample_errors=True, # the default
+    sample_ratio=0.1,  # or leave it to WEBBPULSE_OTEL_SAMPLE_RATIO
+    always_sample_errors=True,  # the default
 )
 ```
 
@@ -226,14 +226,23 @@ freezes immediately, so a `BackgroundTask`, an `asyncio` task or an `atexit` hoo
 mid-flight. The flush therefore has to happen inside the request, after the handler has
 produced the response and before it is handed back to the adapter.
 
-`instrument_fastapi(app)` installs a Starlette middleware that does exactly that. It is on
-by default when `AWS_LAMBDA_FUNCTION_NAME` is set and off otherwise, since a long-lived
-server can flush on its own schedule.
+`instrument_fastapi(app)` installs an ASGI middleware that does exactly that. It is on by
+default when `AWS_LAMBDA_FUNCTION_NAME` is set and off otherwise, since a long-lived server
+can flush on its own schedule.
+
+The placement is load-bearing and is the reason this is a raw ASGI wrapper rather than a
+`BaseHTTPMiddleware` added with `add_middleware`. `FastAPIInstrumentor.instrument_app`
+replaces `build_middleware_stack` so that `OpenTelemetryMiddleware` wraps the entire finished
+stack, outermost. Anything added the ordinary way runs *inside* it, where the server span has
+not ended yet, so the flush would export the previous request's trace and leave the current
+one buffered for the sandbox to freeze on. The wrapper therefore goes outside the
+instrumented app, and it flushes after that app has fully returned, since the server span is
+ended on the way out and not when the last response body chunk is sent.
 
 ```python
 instrument_fastapi(
     app,
-    flush_per_request=None,     # None auto-detects Lambda; True or False decides explicitly
+    flush_per_request=None,  # None auto-detects Lambda; True or False decides explicitly
     flush_timeout_millis=1000,  # ceiling on the in-request flush
 )
 ```
@@ -261,8 +270,23 @@ the cap is resolved immediately rather than being allowed to grow:
 | `"export"` (default) | the trace is marked sampled and the rest of it streams straight through to the exporter. A trace big enough to overflow is unusual, so keeping it is the useful bias. |
 | `"drop"` | the trace is discarded and `dropped_traces` is incremented. Choose it when a hard ceiling on egress matters more than seeing the outlier. |
 
-Either way one trace never buffers more than the cap, so the total is bounded by the cap
-times the number of concurrently open traces, which under the Web Adapter is normally one.
+That bounds one trace. The number of traces is bounded separately by `max_buffered_traces`
+(default 1024), because a buffer is only drained when its trace completes and a flush comes
+round, so a trace that never completes would otherwise sit there for the life of the process.
+Past the ceiling the oldest completed trace is evicted, and evicting means judging it rather
+than discarding it, so an error trace that was about to be kept is still exported. A trace
+with spans still open is never evicted. The total is bounded by
+`max_spans_per_trace * max_buffered_traces` and in practice sits far below it.
+
+##### In-flight traces
+
+A trace is judged only once every span in it has ended. `force_flush` resolves the traces
+with no open spans and leaves the rest buffered. Without that, one request's flush would
+judge another request's half-built trace on whichever spans happened to have ended, usually
+dropping it, and then judge the remainder separately when it arrived, so one logical trace
+could end up half exported and half discarded. Deferring costs nothing, because the request
+that owns the trace flushes when it finishes. `shutdown_tracing()` is the exception: there is
+no later, so it resolves everything.
 
 ##### Environment variables
 

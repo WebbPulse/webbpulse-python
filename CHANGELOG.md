@@ -28,13 +28,24 @@ This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - `flush_tracing()`, which resolves the buffered traces and exports the kept ones. This is
   where the tail decision is made, so a Lambda invocation has to reach it before the
   execution environment is frozen. `shutdown_tracing()` flushes too.
-- `instrument_fastapi` now installs a Starlette middleware that calls that flush after the
-  handler and before the response is returned, which is the only point that works under the
-  Lambda Web Adapter: the invocation ends when the HTTP response completes and the sandbox
-  freezes immediately, so a background task or `atexit` hook is caught mid-flight. On by
-  default when `AWS_LAMBDA_FUNCTION_NAME` is set, off otherwise, and `flush_per_request`
-  decides explicitly. Bounded by `flush_timeout_millis` (default 1000) and never raises into
-  the request; a failure is logged at WARNING and the response is returned unchanged.
+- `instrument_fastapi` now wraps the instrumented app in an ASGI middleware that flushes once
+  the request is complete, which is the only point that works under the Lambda Web Adapter:
+  the invocation ends when the HTTP response completes and the sandbox freezes immediately,
+  so a background task or `atexit` hook is caught mid-flight. It wraps from the outside
+  rather than being added with `add_middleware`, because `FastAPIInstrumentor.instrument_app`
+  makes `OpenTelemetryMiddleware` outermost and an inner flush would run before the server
+  span had ended, exporting the previous request's trace and leaving the current one
+  buffered. On by default when `AWS_LAMBDA_FUNCTION_NAME` is set, off otherwise, and
+  `flush_per_request` decides explicitly. Bounded by `flush_timeout_millis` (default 1000)
+  and never raises into the request; a failure is logged at WARNING and the response is
+  returned unchanged.
+- `TailSamplingSpanProcessor` counts open spans per trace and `force_flush` resolves only the
+  traces with none left, so a concurrent request's flush can no longer judge a half-built
+  trace and split it across two decisions. `shutdown` still resolves everything, since there
+  is no later flush to defer to.
+- `max_buffered_traces` (default 1024) bounds the number of buffered traces, not just the
+  size of each. Past the ceiling the oldest completed trace is evicted by being judged, so an
+  error trace still exports; an in-flight trace is never evicted. `evicted_traces` counts it.
 - An `aws-otel` extra, `pip install "webbpulse[otel,aws-otel]"`, bringing
   `aws-opentelemetry-distro` and `botocore`. `configure_tracing` now builds the exporter
   itself: `OTLPAwsSpanExporter` when the resolved endpoint is the X-Ray OTLP one, so requests
@@ -63,6 +74,20 @@ This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   global provider is set-once per process, so whichever of it and `configure_tracing` ran
   first would win and the other would be silently ignored, leaving either no tail sampling or
   no signed exporter with nothing in the logs to say which.
+
+### Fixed
+
+- Overflow markers are cleared only for traces that have fully completed. Clearing them for a
+  still-open trace let its remaining spans start buffering again and be judged a second time,
+  so a "keep" could become a "drop" and, under `on_overflow="drop"`, fragments of an already
+  dropped trace could still be exported.
+- Spans are handed to the exporter outside the processor lock. Exporting under it made every
+  `on_end` in the process block on the X-Ray HTTP round trip.
+- X-Ray endpoint detection matches `xray.<region>.amazonaws.com` and the interface VPC
+  endpoint form `<vpce-id>.xray.<region>.vpce.amazonaws.com` explicitly, and derives the
+  signing region from either. The previous substring test on `.amazonaws.com/v1/traces`
+  matched any AWS-hosted OTLP endpoint, and the VPC endpoint form was signed for `AWS_REGION`
+  instead of its own region, which fails as a credential scope mismatch.
 
 ### Notes for consumers
 

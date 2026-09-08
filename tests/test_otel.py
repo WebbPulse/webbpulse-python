@@ -5,6 +5,7 @@ from __future__ import annotations
 from typing import Any, cast
 
 import pytest
+from opentelemetry import trace as trace_api
 from pytest import MonkeyPatch
 
 from webbpulse import otel
@@ -922,3 +923,294 @@ def test_the_flush_middleware_is_on_under_lambda(monkeypatch: MonkeyPatch) -> No
 
     assert calls == [1000]
     shutdown_tracing()
+
+
+def _real_pipeline_app(ratio: float) -> tuple[Any, Any]:
+    """A real FastAPI app whose tail processor exports into memory, wired end to end.
+
+    Deliberately not a monkeypatched `flush_tracing`: the defect this guards against is one
+    of *ordering* relative to the OTel server span middleware, and a stubbed flush records
+    that it was called without recording whether the server span had ended by then.
+    """
+    from fastapi import FastAPI
+    from opentelemetry import trace
+    from opentelemetry.sdk.trace import SpanProcessor, TracerProvider
+    from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
+    from opentelemetry.sdk.trace.sampling import ALWAYS_ON, ParentBased
+
+    from webbpulse.otel import instrument_fastapi
+
+    exporter = InMemorySpanExporter()
+    processor = TailSamplingSpanProcessor(exporter, sample_ratio=ratio)
+    provider = TracerProvider(sampler=ParentBased(root=ALWAYS_ON))
+    provider.add_span_processor(cast("SpanProcessor", processor))
+    trace.set_tracer_provider(provider)
+    otel._PROCESSOR = processor
+
+    app = FastAPI()
+
+    @app.get("/thing")
+    def thing() -> dict[str, str]:
+        return {"ok": "yes"}
+
+    @app.get("/boom")
+    def boom() -> dict[str, str]:
+        raise RuntimeError("kaboom")
+
+    instrument_fastapi(app, excluded_urls="", flush_per_request=True)
+    return app, exporter
+
+
+def test_the_request_own_server_span_is_exported_before_the_response_returns() -> None:
+    """The flush must run OUTSIDE the OTel middleware, not inside it.
+
+    `instrument_app` replaces `build_middleware_stack` so `OpenTelemetryMiddleware` wraps the
+    whole stack. A flush registered with `add_middleware` runs inside that, before the server
+    span has ended, so it exports the *previous* request's trace and leaves this one
+    buffered. Under the Web Adapter the sandbox then freezes on the buffered trace and it is
+    lost. Asserting on the span names, rather than on a flush having been called, is what
+    makes this test able to see the difference.
+    """
+    from fastapi.testclient import TestClient
+
+    app, exporter = _real_pipeline_app(1.0)
+    with TestClient(app) as client:
+        assert client.get("/thing").status_code == 200
+
+    names = [s.name for s in exporter.get_finished_spans()]
+    assert names, "the request's own trace was still buffered when the response returned"
+    assert any("/thing" in name for name in names), names
+    shutdown_tracing()
+
+
+def test_an_error_trace_is_exported_at_ratio_zero_through_the_real_stack() -> None:
+    """The whole point of the design, asserted end to end rather than on the processor alone.
+
+    At ratio 0.0 nothing is kept except errors. If the flush ran a request out of step, the
+    500's trace would be judged keep-worthy and then left buffered, which is the exact case
+    the tail sampling exists for.
+    """
+    from fastapi.testclient import TestClient
+
+    app, exporter = _real_pipeline_app(0.0)
+    with TestClient(app, raise_server_exceptions=False) as client:
+        assert client.get("/boom").status_code == 500
+
+    names = [s.name for s in exporter.get_finished_spans()]
+    assert names, "the error trace was judged keep-worthy and then left buffered"
+    shutdown_tracing()
+
+
+def test_a_non_error_request_exports_nothing_at_ratio_zero() -> None:
+    """The other half: the flush firing must not mean the trace is kept regardless."""
+    from fastapi.testclient import TestClient
+
+    app, exporter = _real_pipeline_app(0.0)
+    with TestClient(app) as client:
+        assert client.get("/thing").status_code == 200
+
+    assert exporter.get_finished_spans() == ()
+    shutdown_tracing()
+
+
+def test_a_flush_leaves_a_concurrent_in_flight_trace_alone() -> None:
+    """One request's flush must not judge another request's half-built trace.
+
+    Reproduces the concurrent case directly: trace A is still open when trace B finishes and
+    flushes. Judging A on the spans that happen to have ended so far would drop it, and the
+    rest of A would then be judged all over again as if it were a separate trace, so one
+    logical trace ends up half exported and half discarded. At ratio 0.0 with an ERROR on A's
+    root, A must survive intact once it actually completes.
+    """
+    from opentelemetry.trace import Status, StatusCode
+
+    exporter, processor, tracer = _tail_harness(0.0)
+
+    a_root = tracer.start_span("a-root")
+    with trace_api.use_span(a_root, end_on_exit=False):
+        child = tracer.start_span("a-child")
+        child.end()
+
+    # Trace B completes and flushes while A is still open.
+    with tracer.start_as_current_span("b-root"):
+        pass
+    processor.force_flush()
+
+    assert exporter.get_finished_spans() == (), "an in-flight trace was judged early"
+
+    a_root.set_status(Status(StatusCode.ERROR))
+    a_root.end()
+    processor.force_flush()
+
+    assert sorted(s.name for s in exporter.get_finished_spans()) == ["a-child", "a-root"]
+
+
+def test_a_flush_still_exports_traces_that_are_complete() -> None:
+    """The in-flight guard must not stall traces that are genuinely finished."""
+    exporter, processor, tracer = _tail_harness(1.0)
+
+    open_root = tracer.start_span("open-root")
+    with tracer.start_as_current_span("done-root"):
+        pass
+    processor.force_flush()
+
+    assert [s.name for s in exporter.get_finished_spans()] == ["done-root"]
+    open_root.end()
+
+
+def test_shutdown_resolves_a_trace_that_is_still_in_flight() -> None:
+    """`force_flush` defers an open trace because its request will flush later.
+
+    At shutdown there is no later, so a half-recorded error trace is judged on what it has
+    rather than discarded silently.
+    """
+    from opentelemetry.trace import Status, StatusCode
+
+    exporter, processor, tracer = _tail_harness(0.0)
+
+    root = tracer.start_span("dangling")
+    with trace_api.use_span(root, end_on_exit=False):
+        child = tracer.start_span("dangling-child")
+        child.set_status(Status(StatusCode.ERROR))
+        child.end()
+
+    processor.force_flush()
+    assert exporter.get_finished_spans() == ()
+
+    processor.shutdown()
+    assert [s.name for s in exporter.get_finished_spans()] == ["dangling-child"]
+
+
+def test_too_many_buffered_traces_evicts_the_oldest() -> None:
+    """The per-trace cap bounds one trace; this bounds the number of them.
+
+    A trace is only drained when it completes and a flush comes round, so without a ceiling
+    on the count a leaked or abandoned trace sits in the buffer for the life of the process.
+    """
+    exporter, processor, tracer = _tail_harness(1.0, max_buffered_traces=2)
+
+    for i in range(4):
+        with tracer.start_as_current_span(f"root-{i}"):
+            pass
+
+    # Evicting resolves the trace rather than discarding it, so at ratio 1.0 the evicted
+    # ones are exported rather than lost.
+    assert processor.evicted_traces == 2
+    assert sorted(s.name for s in exporter.get_finished_spans()) == ["root-0", "root-1"]
+    assert len(processor._buffers) == 2
+
+
+def test_eviction_still_honours_the_error_rule() -> None:
+    """An evicted trace is judged, not dumped, so an error survives eviction at ratio 0."""
+    from opentelemetry.trace import Status, StatusCode
+
+    exporter, processor, tracer = _tail_harness(0.0, max_buffered_traces=1)
+
+    with tracer.start_as_current_span("failing") as span:
+        span.set_status(Status(StatusCode.ERROR))
+    for i in range(2):
+        with tracer.start_as_current_span(f"fine-{i}"):
+            pass
+
+    assert [s.name for s in exporter.get_finished_spans()] == ["failing"]
+    assert processor.sampled_out_traces >= 1
+
+
+def test_eviction_skips_traces_that_are_still_open() -> None:
+    """Evicting an in-flight trace would reintroduce the partial-judgement bug."""
+    exporter, _processor, tracer = _tail_harness(1.0, max_buffered_traces=1)
+
+    open_root = tracer.start_span("still-open")
+    with trace_api.use_span(open_root, end_on_exit=False):
+        child = tracer.start_span("open-child")
+        child.end()
+    for i in range(2):
+        with tracer.start_as_current_span(f"complete-{i}"):
+            pass
+
+    names = [s.name for s in exporter.get_finished_spans()]
+    assert "open-child" not in names, "an in-flight trace was evicted and judged early"
+    open_root.end()
+
+
+def test_a_flush_does_not_reset_an_open_traces_overflow_decision() -> None:
+    """Clearing overflow markers for a still-open trace would re-judge its tail.
+
+    Under `on_overflow="drop"` that means fragments of an already-dropped trace get exported
+    later, which is worse than either honest outcome.
+    """
+    exporter, processor, tracer = _tail_harness(1.0, max_spans_per_trace=2, on_overflow="drop")
+
+    root = tracer.start_span("over-root")
+    with trace_api.use_span(root, end_on_exit=False):
+        for i in range(3):
+            child = tracer.start_span(f"over-child-{i}")
+            child.end()
+        assert processor.dropped_traces == 1
+
+        processor.force_flush()
+
+        # Still open, so the drop decision must still stand for the rest of the trace.
+        late = tracer.start_span("over-child-late")
+        late.end()
+    root.end()
+    processor.force_flush()
+
+    assert exporter.get_finished_spans() == (), "a dropped trace leaked a fragment"
+
+
+def test_an_export_does_not_hold_the_lock() -> None:
+    """`export` is an HTTP round trip; holding the lock across it serialises every on_end.
+
+    The exporter here reaches back into the processor's lock, which deadlocks if the export
+    happens while it is held.
+    """
+    from opentelemetry.sdk.trace import SpanProcessor, TracerProvider
+    from opentelemetry.sdk.trace.export import SpanExportResult
+    from opentelemetry.sdk.trace.sampling import ALWAYS_ON, ParentBased
+
+    seen: list[int] = []
+
+    class ReentrantExporter:
+        def export(self, spans: Any) -> Any:
+            # Would block forever if `_export` were called under a held non-reentrant lock.
+            acquired = processor._lock.acquire(timeout=2)
+            assert acquired, "export ran while the processor lock was held"
+            processor._lock.release()
+            seen.extend(range(len(spans)))
+            return SpanExportResult.SUCCESS
+
+        def shutdown(self) -> None: ...
+
+    processor = TailSamplingSpanProcessor(cast("Any", ReentrantExporter()), sample_ratio=1.0)
+    provider = TracerProvider(sampler=ParentBased(root=ALWAYS_ON))
+    provider.add_span_processor(cast("SpanProcessor", processor))
+
+    with provider.get_tracer("test").start_as_current_span("work"):
+        pass
+    processor.force_flush()
+
+    assert seen == [0]
+
+
+def test_the_vpc_endpoint_form_is_detected_and_signed_for_its_own_region(
+    monkeypatch: MonkeyPatch,
+) -> None:
+    """A function in a private subnet with no NAT gateway uses the interface VPC endpoint.
+
+    It is still X-Ray and still needs signing, and signing it for `AWS_REGION` rather than
+    the region in the host is a credential scope mismatch, which surfaces only as a 403.
+    """
+    monkeypatch.setenv("AWS_REGION", "us-east-1")
+    endpoint = "https://vpce-123-abc.xray.us-west-2.vpce.amazonaws.com/v1/traces"
+
+    assert otel._is_xray_endpoint(endpoint) is True
+    assert otel._region_for_endpoint(endpoint) == "us-west-2"
+
+
+def test_another_aws_hosted_otlp_endpoint_is_not_treated_as_xray() -> None:
+    """A substring match on `.amazonaws.com` would sign endpoints that must not be signed."""
+    assert otel._is_xray_endpoint("https://otlp.example.amazonaws.com/v1/traces") is False
+    assert otel._is_xray_endpoint("https://logs.us-west-2.amazonaws.com/v1/logs") is False
+    assert otel._is_xray_endpoint("http://localhost:4318/v1/traces") is False
+    assert otel._is_xray_endpoint("https://xray.us-west-2.amazonaws.com/v1/traces") is True
