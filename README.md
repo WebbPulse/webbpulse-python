@@ -469,6 +469,62 @@ opaque 500. The mapping is the part that is easy to get wrong per service:
 Every branch logs with the request id and the AWS error code, and no branch puts AWS error
 text in the response body, so the caller's report joins to the CloudWatch line by request id.
 
+#### The service's own exception types
+
+Those branches only fire for a botocore `ClientError` that actually reaches a handler. Most
+repository layers translate one first, so `ConditionalCheckFailedException` becomes the
+service's own `ConditionFailed` and the handler above never sees it. Hand the types over
+instead of keeping thin handlers of your own:
+
+```python
+from webbpulse.http import ErrorSpec, create_app
+
+app = create_app(
+    [posts_router],
+    dynamodb_handlers=True,
+    exception_map={ItemNotFound: 404, ConditionFailed: 409, TransactionCanceled: 409},
+)
+```
+
+A value is either a status or an `ErrorSpec` when the message, the code or a `Retry-After`
+needs saying explicitly:
+
+```python
+exception_map = {
+    ItemNotFound: ErrorSpec(404, message="No such post.", error_code="POST_NOT_FOUND"),
+    Throttled: ErrorSpec(503, retry_after=1),
+}
+```
+
+The response is the envelope `error_body` builds for everything else, so dropping your own
+handlers changes nothing a caller can see. The details worth knowing:
+
+- `error_code` appears only under `error_codes=True`, including one an `ErrorSpec` names. The
+  spec chooses which code, not whether there is one.
+- A message the spec does not give defaults to the wording already used for that status. The
+  409 and 503 wordings are the ones the botocore branches send, so a mapped `ConditionFailed`
+  reads exactly like a `ConditionalCheckFailedException`.
+- A mapped status of 500 or above never echoes its message. It logs at error with a stack
+  trace and returns the generic "Internal server error.", because a message written for an
+  internal exception is not written for a stranger. A mapped 4xx logs at warning, since a
+  lost race is the ordinary outcome rather than a page.
+- The exception's own text never reaches the body, so a `raise ItemNotFound(f"pk={pk}")` is
+  safe to write.
+- The mapping is validated when the app is built. A key that is not an exception class or a
+  value that is neither an int nor an `ErrorSpec` raises `TypeError`, and a status outside
+  100 to 599 raises `ValueError`. A wiring mistake belongs at import, not in a 500 under load.
+- `exception_map` needs no extra of its own. Passing it without `dynamodb_handlers=True`
+  installs only these handlers and imports no botocore, so a service with no DynamoDB can use
+  it on the base install:
+
+  ```python
+  from webbpulse.http import register_error_handlers
+  register_error_handlers(app, exception_map={ItemNotFound: 404})
+  ```
+
+Starlette walks an exception's MRO, so a subclass without its own entry uses the nearest base
+class that has one, and a subclass with its own entry wins.
+
 `RequestIdMiddleware` honours an inbound `X-Request-ID`, mints a UUID4 otherwise, bounds the
 length so a hostile header cannot inflate every downstream log line, echoes it on the
 response, and sets it on the active span. Read it in a route with `Depends(request_id)`.

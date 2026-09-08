@@ -12,6 +12,7 @@ import json
 import logging
 import uuid
 from collections.abc import Iterable, Mapping, Sequence
+from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Final
 
 from fastapi import APIRouter, FastAPI, Request
@@ -30,6 +31,8 @@ __all__ = [
     "LAMBDA_CONTEXT_HEADER",
     "REQUEST_CONTEXT_HEADER",
     "REQUEST_ID_HEADER",
+    "ErrorSpec",
+    "ExceptionMap",
     "RequestIdMiddleware",
     "client_ip",
     "create_app",
@@ -245,6 +248,7 @@ def register_error_handlers(
     validation_details: bool = False,
     validation_error_code: str = "VALIDATION_ERROR",
     dynamodb: bool = False,
+    exception_map: ExceptionMap | None = None,
 ) -> None:
     """Install handlers that render every error in one JSON envelope.
 
@@ -265,6 +269,11 @@ def register_error_handlers(
     - `dynamodb=True` also installs the botocore handlers, equivalent to calling
       `install_dynamodb_handlers(app)`. It imports botocore, so it needs the `dynamodb`
       extra; leave it off and the package keeps working without boto3.
+    - `exception_map` maps the service's own exception types onto statuses, for the errors a
+      repository layer translates before any botocore handler could see them:
+      `{ItemNotFound: 404, ConditionFailed: 409}`. Each value is a status or an `ErrorSpec`.
+      It needs no extra of its own and works with `dynamodb` either way: passing it without
+      `dynamodb=True` installs only these handlers and imports no botocore.
 
     A route may set a per-response code by raising an `HTTPException` whose `detail` is a
     mapping carrying `message` and optionally `error_code` and `details`::
@@ -390,7 +399,14 @@ def register_error_handlers(
         )
 
     if dynamodb:
-        install_dynamodb_handlers(app, error_codes=error_codes)
+        # One call, so the botocore branches and the caller's own types are installed
+        # together and the mapping is validated the same way either way.
+        install_dynamodb_handlers(app, error_codes=error_codes, exception_map=exception_map)
+    elif exception_map:
+        # No botocore import on this path: the mapping alone needs no AWS SDK.
+        _install_exception_map(
+            app, _normalise_exception_map(exception_map), error_codes=error_codes
+        )
 
 
 #: How long a throttled caller is told to wait. Short, because DynamoDB on-demand capacity
@@ -407,7 +423,152 @@ _DYNAMODB_THROTTLE_CODES: Final = frozenset(
 )
 
 
-def install_dynamodb_handlers(app: FastAPI, *, error_codes: bool = False) -> None:
+@dataclass(frozen=True, slots=True)
+class ErrorSpec:
+    """How one caller-supplied exception type renders in the envelope.
+
+    A repository layer usually translates a botocore `ClientError` into its own class long
+    before any handler sees it, so `ItemNotFound` never reaches the `ClientError` handler.
+    Passing `{ItemNotFound: 404}` maps the type directly, and this spec is the longer form
+    for when the default message or code is not the right one::
+
+        ErrorSpec(404, message="No such post.", error_code="POST_NOT_FOUND")
+
+    `message` defaults to the wording already used for that status, so a bare status is
+    usually enough. `error_code` is honoured only when `error_codes=True`, exactly like the
+    per-status codes, so turning the option off still yields the 0.3.0 body. `retry_after`
+    adds the `Retry-After` header in seconds, which is what a 503 or a 429 wants.
+
+    A status of 500 or above never echoes `message` to the caller. It logs at error and
+    returns the generic "Internal server error." instead, because a message written for an
+    internal exception is not written for a stranger.
+    """
+
+    status: int
+    message: str | None = None
+    error_code: str | None = None
+    retry_after: int | None = None
+
+
+#: What `exception_map` accepts: an exception type mapped to a status, or to an `ErrorSpec`
+#: when the message, the code or a `Retry-After` needs saying explicitly.
+type ExceptionMap = Mapping[type[BaseException], int | ErrorSpec]
+
+#: The default `message` per status, used when an `ErrorSpec` names none. The 409 and 503
+#: wordings are the ones the botocore handlers already send, so a caller-supplied
+#: `ConditionFailed` reads identically to a `ConditionalCheckFailedException`.
+_STATUS_MESSAGES: Final[Mapping[int, str]] = {
+    400: "The request could not be understood.",
+    401: "Authentication is required.",
+    403: "You do not have access to this resource.",
+    404: "The requested resource was not found.",
+    405: "That method is not allowed on this resource.",
+    409: "The resource was modified by another request. Try again.",
+    422: "Request validation failed.",
+    429: "Too many requests. Try again shortly.",
+    503: "The service is busy. Try again shortly.",
+}
+
+
+def _normalise_exception_map(
+    exception_map: ExceptionMap | None,
+) -> list[tuple[type[BaseException], ErrorSpec]]:
+    """Validate the caller's mapping and turn every value into an `ErrorSpec`.
+
+    Ordering matters: Starlette walks an exception's MRO and picks the handler registered
+    for the most derived class it finds, but a caller can pass both a base class and its
+    subclass, and each becomes its own registration. Sorting subclasses first is therefore
+    belt and braces rather than the mechanism, and it costs nothing.
+
+    Raising here rather than at request time is deliberate. A typo in the mapping is a wiring
+    mistake, and finding it when the app is built beats finding it in a 500 under load.
+    """
+    if not exception_map:
+        return []
+
+    entries: list[tuple[type[BaseException], ErrorSpec]] = []
+    # Widened deliberately. The annotation promises exception classes and statuses, but a
+    # consumer's mapping is often assembled dynamically and untyped, and a wiring mistake
+    # should fail loudly here rather than as a 500 at request time.
+    raw_items: Iterable[tuple[Any, Any]] = exception_map.items()
+    for exc_type, value in raw_items:
+        if not isinstance(exc_type, type) or not issubclass(exc_type, BaseException):
+            raise TypeError(f"exception_map keys must be exception classes, got {exc_type!r}.")
+        spec = ErrorSpec(value) if isinstance(value, int) else value
+        if not isinstance(spec, ErrorSpec):
+            raise TypeError(
+                f"exception_map values must be an int status or an ErrorSpec, "
+                f"got {value!r} for {exc_type.__name__}."
+            )
+        if not 100 <= spec.status <= 599:
+            raise ValueError(
+                f"exception_map status for {exc_type.__name__} must be a valid HTTP "
+                f"status, got {spec.status}."
+            )
+        entries.append((exc_type, spec))
+
+    # Most derived first, so a subclass entry is registered after nothing that shadows it.
+    entries.sort(key=lambda item: len(item[0].__mro__), reverse=True)
+    return entries
+
+
+def _install_exception_map(
+    app: FastAPI,
+    entries: Sequence[tuple[type[BaseException], ErrorSpec]],
+    *,
+    error_codes: bool,
+) -> None:
+    """Register one handler per caller-supplied exception type.
+
+    Each handler builds the same envelope `error_body` builds for every other error, so a
+    consumer that drops its own thin handlers gets byte identical responses.
+    """
+
+    def _register(exc_type: type[BaseException], spec: ErrorSpec) -> None:
+        status = spec.status
+        is_server_fault = status >= 500
+        message = (
+            "Internal server error."
+            if is_server_fault
+            else (spec.message or _STATUS_MESSAGES.get(status) or "Request failed.")
+        )
+        code: str | None = None
+        if error_codes:
+            fallback = "HTTP_ERROR" if status < 500 else "INTERNAL_ERROR"
+            code = spec.error_code or _STATUS_ERROR_CODES.get(status, fallback)
+        headers = {"Retry-After": str(spec.retry_after)} if spec.retry_after is not None else None
+
+        async def _handler(request: Request, exc: BaseException) -> JSONResponse:
+            log_extra = {
+                "path": request.url.path,
+                "method": request.method,
+                "request_id": request_id(request),
+                "exception_type": type(exc).__name__,
+            }
+            # A mapped 5xx is still a server fault worth a stack trace; a mapped 4xx is the
+            # ordinary outcome of a lost race or a missing row and only warrants a warning.
+            if is_server_fault:
+                _log.exception("Mapped exception raised a server fault.", extra=log_extra)
+            else:
+                _log.warning("Mapped exception handled.", extra=log_extra)
+            return JSONResponse(
+                status_code=status,
+                content=error_body(status, message, request, error_code=code),
+                headers=headers,
+            )
+
+        app.add_exception_handler(exc_type, _handler)  # type: ignore[arg-type]
+
+    for exc_type, spec in entries:
+        _register(exc_type, spec)
+
+
+def install_dynamodb_handlers(
+    app: FastAPI,
+    *,
+    error_codes: bool = False,
+    exception_map: ExceptionMap | None = None,
+) -> None:
     """Install exception handlers for botocore `ClientError` raised by DynamoDB.
 
     Opt in, and separate from `register_error_handlers`, because it imports botocore: the
@@ -434,7 +595,27 @@ def install_dynamodb_handlers(app: FastAPI, *, error_codes: bool = False) -> Non
 
     Every response carries the request id, and every one logs with it, so a caller's report
     joins to the CloudWatch line without the body having to carry the AWS error text.
+
+    **`exception_map`** covers the case those botocore branches cannot reach. A repository
+    layer that translates a conditional check failure into its own `ConditionFailed` before
+    returning leaves nothing for the `ClientError` handler to see, so each such service grew
+    its own thin handlers around `error_body`. Pass the types instead::
+
+        install_dynamodb_handlers(
+            app,
+            exception_map={ItemNotFound: 404, ConditionFailed: 409, TransactionCanceled: 409},
+        )
+
+    A value is either a status or an `ErrorSpec` when the message, the `error_code` or a
+    `Retry-After` needs saying. The rendered envelope is the one `error_body` builds, so a
+    consumer dropping its own handlers sees no change in the response. A bad key or status
+    raises at install time rather than at request time.
+
+    The mapping is validated before botocore is imported, so a wiring mistake surfaces as a
+    `TypeError` and not as an `ImportError` from a missing extra.
     """
+    entries = _normalise_exception_map(exception_map)
+
     from botocore.exceptions import ClientError
 
     def _code(status_code: int, override: str | None = None) -> str | None:
@@ -524,6 +705,8 @@ def install_dynamodb_handlers(app: FastAPI, *, error_codes: bool = False) -> Non
             content=error_body(500, "Internal server error.", request, error_code=_code(500)),
         )
 
+    _install_exception_map(app, entries, error_codes=error_codes)
+
 
 def create_app(
     domain_routers: Iterable[APIRouter] = (),
@@ -540,6 +723,7 @@ def create_app(
     error_codes: bool = False,
     validation_details: bool = False,
     dynamodb_handlers: bool = False,
+    exception_map: ExceptionMap | None = None,
     **fastapi_kwargs: Any,
 ) -> FastAPI:
     """Build one domain's FastAPI application.
@@ -555,6 +739,12 @@ def create_app(
     `instrument=True` attaches the OpenTelemetry FastAPI instrumentation when the `otel`
     extra is installed and tracing is enabled. Call `configure_tracing` first so the spans
     reach a real provider.
+
+    `exception_map` renders the service's own exception types in the same envelope, so a
+    repository layer that raises `ItemNotFound` rather than letting a botocore `ClientError`
+    escape does not need thin handlers of its own::
+
+        app = create_app([posts_router], exception_map={ItemNotFound: 404, ConditionFailed: 409})
     """
     origins = (
         list(cors_allow_origins)
@@ -604,6 +794,7 @@ def create_app(
         error_codes=error_codes,
         validation_details=validation_details,
         dynamodb=dynamodb_handlers,
+        exception_map=exception_map,
     )
 
     if include_health:
