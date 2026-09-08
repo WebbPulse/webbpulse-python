@@ -10,7 +10,9 @@ from __future__ import annotations
 
 import json
 import logging
+import sys
 from typing import Any
+from unittest import mock
 
 import pytest
 from botocore.exceptions import ClientError
@@ -22,11 +24,13 @@ from webbpulse.http import (
     DYNAMODB_RETRY_AFTER_SECONDS,
     REQUEST_CONTEXT_HEADER,
     REQUEST_ID_HEADER,
+    ErrorSpec,
     client_ip,
     create_app,
     error_body,
     install_dynamodb_handlers,
     mount_all,
+    register_error_handlers,
     request_id,
 )
 
@@ -648,3 +652,263 @@ def test_the_dynamodb_handlers_are_absent_unless_requested() -> None:
 
     response = TestClient(create_app([router]), raise_server_exceptions=False).get("/write")
     assert response.status_code == 500, "no 409 mapping without dynamodb_handlers=True"
+
+
+# ---- Caller-supplied exception map ------------------------------------------------------
+#
+# The case the botocore branches cannot reach. A repository layer that translates a
+# conditional check failure into its own class means no `ClientError` ever reaches the
+# handler, so before this the consumer kept thin handlers of its own around `error_body`.
+
+
+class ItemNotFound(Exception):
+    """Stand-in for a consumer's own repository exception."""
+
+
+class ConditionFailed(Exception):
+    pass
+
+
+class TransactionCanceled(Exception):
+    pass
+
+
+_ADOPTION_MAP: dict[type[BaseException], int | ErrorSpec] = {
+    ItemNotFound: 404,
+    ConditionFailed: 409,
+    TransactionCanceled: 409,
+}
+
+
+def _mapped_app(raises: BaseException, **kwargs: Any) -> TestClient:
+    router = APIRouter()
+
+    @router.get("/work")
+    async def work() -> None:
+        raise raises
+
+    app = create_app([router], **kwargs)
+    return TestClient(app, raise_server_exceptions=False)
+
+
+def test_a_mapped_exception_renders_the_envelope_at_its_status() -> None:
+    """The whole point: the consumer's own class, no botocore involved."""
+    response = _mapped_app(ItemNotFound("post 7"), exception_map=_ADOPTION_MAP).get("/work")
+
+    assert response.status_code == 404
+    body = response.json()
+    assert body["success"] is False
+    assert body["status"] == 404
+    assert body["request_id"]
+    assert "error_code" not in body, "off unless error_codes=True"
+
+
+@pytest.mark.parametrize("exc", [ConditionFailed(), TransactionCanceled()])
+def test_the_conflict_entries_are_four_oh_nines(exc: BaseException) -> None:
+    response = _mapped_app(exc, exception_map=_ADOPTION_MAP).get("/work")
+    assert response.status_code == 409
+
+
+def test_a_mapped_conflict_reads_exactly_like_the_botocore_one() -> None:
+    """A consumer dropping its own handlers must not change what callers receive."""
+    mapped = _mapped_app(ConditionFailed(), exception_map={ConditionFailed: 409}).get("/work")
+    botocore_side = _dynamodb_app(_client_error("ConditionalCheckFailedException")).get("/write")
+
+    assert mapped.json()["message"] == botocore_side.json()["message"]
+    assert set(mapped.json()) == set(botocore_side.json())
+
+
+def test_the_internal_exception_message_never_reaches_the_caller() -> None:
+    response = _mapped_app(ItemNotFound("pk=USER#42 sk=SECRET"), exception_map=_ADOPTION_MAP).get(
+        "/work"
+    )
+    assert "SECRET" not in response.text, "the exception's own text must not leak"
+
+
+def test_a_mapped_status_carries_its_default_message() -> None:
+    response = _mapped_app(ItemNotFound(), exception_map={ItemNotFound: 404}).get("/work")
+    assert response.json()["message"] == "The requested resource was not found."
+
+
+def test_an_error_spec_sets_the_message_and_the_code() -> None:
+    spec = ErrorSpec(404, message="No such post.", error_code="POST_NOT_FOUND")
+    response = _mapped_app(
+        ItemNotFound(), exception_map={ItemNotFound: spec}, error_codes=True
+    ).get("/work")
+
+    body = response.json()
+    assert body["message"] == "No such post."
+    assert body["error_code"] == "POST_NOT_FOUND"
+
+
+def test_an_error_spec_code_is_still_suppressed_without_error_codes() -> None:
+    """`error_codes=False` must yield the 0.3.0 body, whatever the spec asks for."""
+    spec = ErrorSpec(404, error_code="POST_NOT_FOUND")
+    response = _mapped_app(ItemNotFound(), exception_map={ItemNotFound: spec}).get("/work")
+
+    assert "error_code" not in response.json()
+
+
+def test_a_mapped_status_gets_the_per_status_code_when_enabled() -> None:
+    response = _mapped_app(
+        ConditionFailed(), exception_map={ConditionFailed: 409}, error_codes=True
+    ).get("/work")
+    assert response.json()["error_code"] == "CONFLICT"
+
+
+def test_an_unlisted_status_falls_back_to_a_generic_code() -> None:
+    response = _mapped_app(ItemNotFound(), exception_map={ItemNotFound: 418}, error_codes=True).get(
+        "/work"
+    )
+
+    assert response.status_code == 418
+    assert response.json()["error_code"] == "HTTP_ERROR"
+    assert response.json()["message"] == "Request failed.", "no wording for an unlisted status"
+
+
+def test_a_spec_can_ask_for_retry_after() -> None:
+    spec = ErrorSpec(503, retry_after=5)
+    response = _mapped_app(ConditionFailed(), exception_map={ConditionFailed: spec}).get("/work")
+
+    assert response.status_code == 503
+    assert response.headers["Retry-After"] == "5"
+
+
+def test_the_throttling_retry_after_still_comes_from_the_botocore_path() -> None:
+    """The 0.3.0 header on the throttling branch is unchanged by the new parameter."""
+    client = _dynamodb_app(_client_error("ThrottlingException"), exception_map=_ADOPTION_MAP)
+    response = client.get("/write")
+
+    assert response.status_code == 503
+    assert response.headers["Retry-After"] == str(DYNAMODB_RETRY_AFTER_SECONDS)
+
+
+def test_a_mapped_five_hundred_is_generic_and_logs_at_error(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A message written for an internal exception is not written for a stranger."""
+    spec = ErrorSpec(500, message="the shard is wedged")
+    with caplog.at_level(logging.ERROR, logger="webbpulse.http"):
+        response = _mapped_app(ConditionFailed(), exception_map={ConditionFailed: spec}).get(
+            "/work"
+        )
+
+    assert response.status_code == 500
+    assert response.json()["message"] == "Internal server error."
+    assert "wedged" not in response.text
+    assert any(r.levelno == logging.ERROR for r in caplog.records)
+
+
+def test_a_mapped_four_xx_logs_at_warning_with_the_request_id(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    with caplog.at_level(logging.WARNING, logger="webbpulse.http"):
+        response = _mapped_app(ItemNotFound(), exception_map=_ADOPTION_MAP).get(
+            "/work", headers={REQUEST_ID_HEADER: "map-me"}
+        )
+
+    assert response.json()["request_id"] == "map-me"
+    assert any(getattr(r, "request_id", None) == "map-me" for r in caplog.records)
+    assert any(getattr(r, "exception_type", None) == "ItemNotFound" for r in caplog.records)
+    assert not any(r.levelno >= logging.ERROR for r in caplog.records), "a lost race is not a page"
+
+
+def test_a_subclass_uses_its_own_entry_rather_than_the_base_one() -> None:
+    class Missing(ItemNotFound):
+        pass
+
+    response = _mapped_app(Missing(), exception_map={ItemNotFound: 404, Missing: 410}).get("/work")
+    assert response.status_code == 410
+
+
+def test_a_subclass_without_its_own_entry_falls_back_to_the_base() -> None:
+    class Missing(ItemNotFound):
+        pass
+
+    response = _mapped_app(Missing(), exception_map={ItemNotFound: 404}).get("/work")
+    assert response.status_code == 404, "Starlette walks the MRO"
+
+
+def test_the_map_works_alongside_the_botocore_handlers() -> None:
+    """`dynamodb_handlers=True` and `exception_map` are not an either/or."""
+    router = APIRouter()
+
+    @router.get("/aws")
+    async def aws() -> None:
+        raise _client_error("ConditionalCheckFailedException")
+
+    @router.get("/own")
+    async def own() -> None:
+        raise ItemNotFound()
+
+    app = create_app([router], dynamodb_handlers=True, exception_map=_ADOPTION_MAP)
+    client = TestClient(app, raise_server_exceptions=False)
+
+    assert client.get("/aws").status_code == 409
+    assert client.get("/own").status_code == 404
+
+
+def test_the_map_needs_no_botocore_import() -> None:
+    """Passing it without `dynamodb_handlers=True` must not reach for the AWS SDK."""
+    router = APIRouter()
+
+    @router.get("/own")
+    async def own() -> None:
+        raise ItemNotFound()
+
+    app = FastAPI()
+    app.include_router(router)
+    with mock.patch.dict(sys.modules, {"botocore.exceptions": None}):
+        register_error_handlers(app, exception_map={ItemNotFound: 404})
+
+    assert TestClient(app, raise_server_exceptions=False).get("/own").status_code == 404
+
+
+def test_install_dynamodb_handlers_takes_the_map_directly() -> None:
+    """The separate entry point, for an app not built by `create_app`."""
+    router = APIRouter()
+
+    @router.get("/own")
+    async def own() -> None:
+        raise ConditionFailed()
+
+    app = create_app([router])
+    install_dynamodb_handlers(app, exception_map={ConditionFailed: 409})
+
+    assert TestClient(app, raise_server_exceptions=False).get("/own").status_code == 409
+
+
+def test_an_unmapped_exception_is_still_a_plain_five_hundred() -> None:
+    """Omitting the parameter must leave 0.3.0 behaviour exactly as it was."""
+    response = _mapped_app(ItemNotFound()).get("/work")
+
+    assert response.status_code == 500
+    assert response.json()["message"] == "Internal server error."
+
+
+def test_an_exception_outside_the_map_is_unaffected_by_it() -> None:
+    response = _mapped_app(RuntimeError("boom"), exception_map=_ADOPTION_MAP).get("/work")
+
+    assert response.status_code == 500
+    assert "boom" not in response.text
+
+
+def test_a_non_exception_key_is_rejected_when_the_app_is_built() -> None:
+    """A wiring mistake should fail at import, not as a 500 under load."""
+    with pytest.raises(TypeError, match="exception classes"):
+        create_app([], exception_map={"ItemNotFound": 404})  # type: ignore[dict-item]
+
+
+def test_a_nonsense_value_is_rejected_when_the_app_is_built() -> None:
+    with pytest.raises(TypeError, match="int status or an ErrorSpec"):
+        create_app([], exception_map={ItemNotFound: "404"})  # type: ignore[dict-item]
+
+
+def test_an_impossible_status_is_rejected_when_the_app_is_built() -> None:
+    with pytest.raises(ValueError, match="valid HTTP status"):
+        create_app([], exception_map={ItemNotFound: 42})
+
+
+def test_an_empty_map_installs_nothing_and_raises_nothing() -> None:
+    response = _mapped_app(ItemNotFound(), exception_map={}).get("/work")
+    assert response.status_code == 500, "an empty map is the same as no map"

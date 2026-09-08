@@ -5,6 +5,62 @@ Notable changes to the `webbpulse` package. The version here is the one in
 
 This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## 0.4.0
+
+CarModPicker's repository layer translates a conditional check failure into its own
+exception class before anything else sees it, so the 0.3.0 botocore handlers never fired for
+it and the service kept three thin handlers of its own built on `error_body`. This release
+lets the caller hand those types to the package instead. **The new parameter defaults to
+`None` and every 0.3.0 body is unchanged when it is omitted.**
+
+### Added
+
+- `exception_map` on `install_dynamodb_handlers`, on the `dynamodb` path of
+  `register_error_handlers`, and on `create_app`. It maps the service's own exception types
+  onto statuses, so a repository layer that raises `ItemNotFound` rather than letting a
+  botocore `ClientError` escape needs no handlers of its own:
+
+  ```python
+  app = create_app(
+      [posts_router],
+      dynamodb_handlers=True,
+      exception_map={ItemNotFound: 404, ConditionFailed: 409, TransactionCanceled: 409},
+  )
+  ```
+
+- `ErrorSpec(status, message=None, error_code=None, retry_after=None)`, the longer form of a
+  mapping value for when the default message, the code or a `Retry-After` needs saying
+  explicitly. A bare int status is shorthand for `ErrorSpec(status)`. Exported as
+  `webbpulse.http.ErrorSpec`.
+- `ExceptionMap`, the type alias for what `exception_map` accepts, so a consumer can annotate
+  its own mapping constant.
+
+### Behaviour
+
+- The rendered envelope is the one `error_body` already builds, so a consumer dropping its
+  own handlers sees byte identical responses. `error_code` appears only when
+  `error_codes=True`, including a code an `ErrorSpec` names: the spec chooses which code, not
+  whether there is one.
+- A `message` the spec does not give defaults to the wording already used for that status.
+  The 409 and 503 wordings are the ones the botocore branches send, so a caller-supplied
+  `ConditionFailed` reads exactly like a `ConditionalCheckFailedException`.
+- A mapped status of 500 or above never echoes its `message`. It logs at error with a stack
+  trace and returns the generic "Internal server error.", because a message written for an
+  internal exception is not written for a stranger. A mapped 4xx logs at warning instead,
+  since a lost race is the ordinary outcome and not a page.
+- Every mapped handler logs with the request id and the exception type name, matching the
+  botocore branches, and no branch puts the exception's own text in the response body.
+- The mapping is validated when the app is built, not when a request arrives. A key that is
+  not an exception class raises `TypeError`, a value that is neither an int nor an
+  `ErrorSpec` raises `TypeError`, and a status outside 100 to 599 raises `ValueError`. A
+  wiring mistake should surface at import rather than as a 500 under load.
+- Passing `exception_map` without `dynamodb=True` installs only these handlers and imports no
+  botocore, so a service with no DynamoDB at all can use it on the base install. The mapping
+  is also validated before the botocore import on the `dynamodb=True` path, so a bad mapping
+  is a `TypeError` and not a confusing `ImportError` from a missing extra.
+- `Retry-After` on the DynamoDB throttling branch is unchanged, and `ErrorSpec.retry_after`
+  is how a mapped type asks for the same header.
+
 ## 0.3.0
 
 The org standardises on the `{success, status, message, request_id}` envelope for every
