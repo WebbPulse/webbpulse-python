@@ -165,11 +165,141 @@ too, so DynamoDB and Secrets Manager calls become spans. All of it is a no-op wh
 `otel` extra is absent or when `WEBBPULSE_OTEL_DISABLED` or `OTEL_SDK_DISABLED` is set, so
 tests and local runs cost nothing.
 
-On sampling: exporting straight to the endpoint leaves the SDK at `parentbased_always_on`,
-which AWS documents as up to twenty times the ingestion of their recommended 0.05 ratio.
-This module does not override whatever the environment says, so set
-`OTEL_TRACES_SAMPLER=parentbased_traceidratio` with a ratio below 1.0 once volume justifies
-it.
+#### Sampling: errors are always kept
+
+The decision is 100 percent of traces on staging, 10 percent on production, and errors are
+always kept. Head sampling cannot deliver the last clause: `should_sample` runs when the
+root span starts, before the request has been handled, so it cannot know the request is
+about to fail. `OTEL_TRACES_SAMPLER=parentbased_traceidratio` with an arg of 0.1 therefore
+throws away 90 percent of the failures, which is the 90 percent worth keeping.
+
+So the package records every span and decides at export time instead. `configure_tracing`
+installs a `TailSamplingSpanProcessor` that buffers ended spans per trace and judges each
+trace once at flush time. A trace is exported when **either**:
+
+- any span in it has `StatusCode.ERROR` or an `exception` event (both, because
+  `FastAPIInstrumentor` sets the status on a 5xx while `record_exception`, which botocore's
+  instrumentation uses, adds the event and does not always set the status), **or**
+- its trace id falls below the configured probability.
+
+The probability test is the SDK's own `TraceIdRatioBased` arithmetic, keep when
+`trace_id & ((1 << 64) - 1) < round(ratio * (1 << 64))`. Using the identical bound is what
+makes the decision a pure function of the trace id, so this service and an upstream one at
+the same ratio agree on the same traces without coordinating. A trace API Gateway or X-Ray
+already sampled in is sampled in here too, and the tail step only ever adds error traces on
+top.
+
+```python
+configure_tracing(
+    "webbpulse-portfolio-content",
+    environment="production",
+    sample_ratio=0.1,          # or leave it to WEBBPULSE_OTEL_SAMPLE_RATIO
+    always_sample_errors=True, # the default
+)
+```
+
+##### The flush is not optional
+
+The tail decision is made at flush time, so a Lambda invocation must reach a flush before
+the execution environment is frozen. Nothing is exported before it.
+
+```python
+from webbpulse.otel import flush_tracing
+
+flush_tracing()  # at the end of an invocation
+```
+
+Under the Web Adapter the process outlives an invoke, so the practical place is a FastAPI
+middleware or an `after_response` hook rather than a handler epilogue. `shutdown_tracing()`
+flushes too, which covers the container shutdown path.
+
+##### The memory bound
+
+Buffering per trace is capped by `max_spans_per_trace`, default 2048. A trace that exceeds
+the cap is resolved immediately rather than being allowed to grow:
+
+| `on_overflow` | behaviour |
+| --- | --- |
+| `"export"` (default) | the trace is marked sampled and the rest of it streams straight through to the exporter. A trace big enough to overflow is unusual, so keeping it is the useful bias. |
+| `"drop"` | the trace is discarded and `dropped_traces` is incremented. Choose it when a hard ceiling on egress matters more than seeing the outlier. |
+
+Either way one trace never buffers more than the cap, so the total is bounded by the cap
+times the number of concurrently open traces, which under the Web Adapter is normally one.
+
+##### Environment variables
+
+Terraform sets these on each function. The first three are what make the export work at all;
+the last two are what make the sampling work.
+
+| Variable | Value | Why |
+| --- | --- | --- |
+| `OTEL_EXPORTER_OTLP_TRACES_PROTOCOL` | `http/protobuf` | there is no gRPC listener on the X-Ray endpoint |
+| `OTEL_PYTHON_DISTRO` | `aws_distro` | selects the ADOT distro, which is what signs with SigV4 |
+| `OTEL_PYTHON_CONFIGURATOR` | `aws_configurator` | the matching configurator |
+| `OTEL_TRACES_SAMPLER` | `always_on` | see below |
+| `WEBBPULSE_OTEL_SAMPLE_RATIO` | `1.0` on staging, `0.1` on production | the tail ratio |
+
+`WEBBPULSE_OTEL_SAMPLE_RATIO` falls back to `OTEL_TRACES_SAMPLER_ARG`, but only when
+`OTEL_TRACES_SAMPLER` is `traceidratio` or `parentbased_traceidratio`; under any other
+sampler name the arg is meaningless and reading it would invent a ratio. An unparseable or
+out-of-range value warns and is skipped, so a typo in a Terraform variable costs money
+rather than availability. With nothing set the ratio is 1.0.
+
+##### Setting `OTEL_TRACES_SAMPLER=always_on`, and the ADOT caveat
+
+`configure_tracing` passes an explicit `ParentBased(root=ALWAYS_ON)` sampler to the
+`TracerProvider`, so for a provider this package builds, `OTEL_TRACES_SAMPLER` is already
+overridden and setting it changes nothing. Set it anyway, for two reasons.
+
+The first is the ADOT distro. `OTEL_PYTHON_DISTRO=aws_distro` makes
+`opentelemetry-instrument` run the AWS configurator during start-up, and a configurator
+builds its own `TracerProvider` from the environment. Any provider built without an explicit
+sampler falls back to `sampling._get_from_env_or_default()`, which reads `OTEL_TRACES_SAMPLER`
+and `OTEL_TRACES_SAMPLER_ARG`. A ratio sampler there would head-drop 90 percent of spans
+before any processor saw them, and no amount of tail logic can recover a span that was never
+recorded. `always_on` makes that fallback harmless whichever provider wins the race.
+
+The second is that it documents the intent at the function's env block: the ratio lives in
+`WEBBPULSE_OTEL_SAMPLE_RATIO`, and `OTEL_TRACES_SAMPLER_ARG` is not the knob.
+
+**Caveat: which provider wins.** `configure_tracing` calls `trace.set_tracer_provider`, and
+OpenTelemetry allows that exactly once per process. Whichever of the ADOT configurator and
+`configure_tracing` runs first wins; the second logs "Overriding of current TracerProvider is
+not allowed" and is ignored. The configurator runs during `opentelemetry-instrument`
+start-up, before the application's `main()`, so under the distro it normally wins, and the
+provider in use is the distro's with the distro's own `BatchSpanProcessor`. The tail
+sampling here is then not in the export path, `webbpulse.otel._PROCESSOR` is still set but
+unused, and `flush_tracing()` falls through to the provider's own `force_flush`. There is no
+error; the symptom is that every trace is exported and the bill is the signal.
+
+How this was checked, since `aws-opentelemetry-distro` is a runtime-only dependency and is
+not installed in CI: the 0.19.0 wheel was unpacked and
+`amazon/opentelemetry/distro/aws_opentelemetry_configurator.py` read directly. `_init_tracing`
+builds its own `TracerProvider` and calls `set_tracer_provider` on it, and its sampler comes
+from `_get_sampler()`, which reads `OTEL_TRACES_SAMPLER` and defaults to
+`parentbased_always_on` when unset.
+
+**The distro does not pre-drop spans, though.** `_customize_sampler` wraps that sampler in
+`AlwaysRecordSampler`, which turns a `Decision.DROP` into `Decision.RECORD_ONLY`. A
+RECORD_ONLY span is still created and still handed to every registered processor; only its
+`trace_flags.sampled` bit is clear. The SDK's own `BatchSpanProcessor` and
+`SimpleSpanProcessor` open `on_end` with `if not span.context.trace_flags.sampled: return`,
+which is why a ratio sampler drops spans under them.
+`TailSamplingSpanProcessor` deliberately does **not** filter on that flag, because the flag
+is a head decision and this processor exists to make a later one. So even in the case where
+the distro's provider wins and a ratio sampler is configured, an error span still reaches
+this processor and is still kept. `tests/test_otel.py` reproduces the wrapper over a ratio-0
+sampler and asserts exactly that, which is the part of the interplay that is testable without
+the distro installed.
+
+Setting `OTEL_TRACES_SAMPLER=always_on` removes the question entirely rather than relying on
+that safety net. The other half, which the tests do cover directly, is that a
+`TracerProvider` this package builds carries `ParentBased(root=ALWAYS_ON)` even when
+`OTEL_TRACES_SAMPLER` says `parentbased_traceidratio` with an arg of 0.0.
+
+To confirm on a deployed function, log `type(trace.get_tracer_provider())` and whether
+`webbpulse.otel._PROCESSOR` is the provider's processor, or check that a non-error trace at
+ratio 0.1 is genuinely absent from X-Ray.
 
 ### `webbpulse.http`
 

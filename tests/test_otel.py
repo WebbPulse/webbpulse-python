@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import Any
+from typing import Any, cast
 
 import pytest
 from pytest import MonkeyPatch
@@ -10,8 +10,12 @@ from pytest import MonkeyPatch
 from webbpulse import otel
 from webbpulse.otel import (
     OTEL_DISABLED_ENV,
+    SAMPLE_RATIO_ENV,
+    TailSamplingSpanProcessor,
     configure_tracing,
+    flush_tracing,
     is_tracing_enabled,
+    resolve_sample_ratio,
     shutdown_tracing,
     xray_otlp_endpoint,
 )
@@ -36,10 +40,23 @@ def _clear_global_tracer_provider() -> None:
 def _reset_provider() -> Any:
     """The tracer provider is a process global, so each test starts from a clean one."""
     otel._CONFIGURED = False
+    otel._PROCESSOR = None
     _clear_global_tracer_provider()
     yield
     otel._CONFIGURED = False
+    otel._PROCESSOR = None
     _clear_global_tracer_provider()
+
+
+@pytest.fixture(autouse=True)
+def _clear_sampling_env(monkeypatch: MonkeyPatch) -> None:
+    """Each test starts from an environment with no sampling configuration in it.
+
+    Otherwise a stray `OTEL_TRACES_SAMPLER_ARG` in the developer's shell, or one left by an
+    earlier test, would change the ratio a later test resolves.
+    """
+    for name in (SAMPLE_RATIO_ENV, "OTEL_TRACES_SAMPLER", "OTEL_TRACES_SAMPLER_ARG"):
+        monkeypatch.delenv(name, raising=False)
 
 
 def test_the_xray_endpoint_matches_the_documented_shape() -> None:
@@ -210,3 +227,545 @@ def test_instrumenting_is_skipped_when_disabled(monkeypatch: MonkeyPatch) -> Non
     monkeypatch.setenv(OTEL_DISABLED_ENV, "1")
     # The assertion is simply that this does not raise and does not install anything.
     instrument_fastapi(FastAPI())
+
+
+# --------------------------------------------------------------------------------------
+# Tail sampling
+#
+# The unit under test is `TailSamplingSpanProcessor` driven through a real `TracerProvider`
+# with an `InMemorySpanExporter`, so the assertions are about what an exporter would
+# actually receive rather than about the processor's internal bookkeeping.
+# --------------------------------------------------------------------------------------
+
+
+def _tail_harness(ratio: float, **kwargs: Any) -> tuple[Any, TailSamplingSpanProcessor, Any]:
+    """An exporter, the processor under test, and a tracer feeding it.
+
+    A local `TracerProvider` rather than the global one, so these tests never contend with
+    the set-once global and can run in any order.
+    """
+    from opentelemetry.sdk.trace import SpanProcessor, TracerProvider
+    from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
+    from opentelemetry.sdk.trace.sampling import ALWAYS_ON, ParentBased
+
+    exporter = InMemorySpanExporter()
+    processor = TailSamplingSpanProcessor(exporter, sample_ratio=ratio, **kwargs)
+    # The same sampler `configure_tracing` installs: everything is recorded so the tail step
+    # is the only thing making a decision.
+    provider = TracerProvider(sampler=ParentBased(root=ALWAYS_ON))
+    # The processor is structurally a SpanProcessor but deliberately not a subclass of one;
+    # see its docstring for why. The cast is the same one `configure_tracing` makes.
+    provider.add_span_processor(cast("SpanProcessor", processor))
+    return exporter, processor, provider.get_tracer("test")
+
+
+def test_an_error_trace_is_kept_even_at_ratio_zero() -> None:
+    """The whole point of the tail step. At 0.0 a ratio decision keeps nothing."""
+    from opentelemetry.trace import Status, StatusCode
+
+    exporter, processor, tracer = _tail_harness(0.0)
+
+    with tracer.start_as_current_span("failing") as span:
+        span.set_status(Status(StatusCode.ERROR))
+    processor.force_flush()
+
+    assert [s.name for s in exporter.get_finished_spans()] == ["failing"]
+    assert processor.exported_traces == 1
+    assert processor.sampled_out_traces == 0
+
+
+def test_an_exception_event_keeps_a_trace_without_an_error_status() -> None:
+    """`record_exception` adds an `exception` event and does not always set the status.
+
+    Botocore's instrumentation is the case that matters: a failed AWS call records the
+    exception on the span, so keying only on `StatusCode.ERROR` would miss it.
+    """
+    exporter, processor, tracer = _tail_harness(0.0)
+
+    with pytest.raises(ValueError, match="boom"), tracer.start_as_current_span("calling"):
+        raise ValueError("boom")
+    processor.force_flush()
+
+    exported = exporter.get_finished_spans()
+    assert [s.name for s in exported] == ["calling"]
+    assert any(event.name == "exception" for event in exported[0].events)
+
+
+def test_an_exception_event_alone_is_enough(monkeypatch: MonkeyPatch) -> None:
+    """A span carrying only the event, with an unset status, still keeps its trace."""
+    from opentelemetry.trace import StatusCode
+
+    exporter, processor, tracer = _tail_harness(0.0)
+
+    span = tracer.start_span("recorded")
+    span.record_exception(RuntimeError("noted"))
+    span.end()
+    processor.force_flush()
+
+    exported = exporter.get_finished_spans()
+    assert len(exported) == 1
+    # The status was never set, so this trace was kept purely on the event.
+    assert exported[0].status.status_code is not StatusCode.ERROR
+
+
+def test_a_non_error_trace_is_dropped_at_ratio_zero() -> None:
+    exporter, processor, tracer = _tail_harness(0.0)
+
+    with tracer.start_as_current_span("healthy"):
+        pass
+    processor.force_flush()
+
+    assert exporter.get_finished_spans() == ()
+    assert processor.sampled_out_traces == 1
+    assert processor.exported_traces == 0
+
+
+def test_a_non_error_trace_is_kept_at_ratio_one() -> None:
+    exporter, processor, tracer = _tail_harness(1.0)
+
+    with tracer.start_as_current_span("healthy"):
+        pass
+    processor.force_flush()
+
+    assert [s.name for s in exporter.get_finished_spans()] == ["healthy"]
+    assert processor.exported_traces == 1
+
+
+def test_an_error_keeps_every_span_in_its_trace() -> None:
+    """A trace is kept or dropped whole. A root plus its children arrive together."""
+    from opentelemetry.trace import Status, StatusCode
+
+    exporter, processor, tracer = _tail_harness(0.0)
+
+    with tracer.start_as_current_span("root"):
+        with tracer.start_as_current_span("child-ok"):
+            pass
+        with tracer.start_as_current_span("child-bad") as bad:
+            bad.set_status(Status(StatusCode.ERROR))
+    processor.force_flush()
+
+    assert {s.name for s in exporter.get_finished_spans()} == {"root", "child-ok", "child-bad"}
+
+
+def test_errors_can_be_opted_out_of() -> None:
+    """`always_sample_errors=False` reduces the processor to pure ratio sampling."""
+    from opentelemetry.trace import Status, StatusCode
+
+    exporter, processor, tracer = _tail_harness(0.0, always_sample_errors=False)
+
+    with tracer.start_as_current_span("failing") as span:
+        span.set_status(Status(StatusCode.ERROR))
+    processor.force_flush()
+
+    assert exporter.get_finished_spans() == ()
+    assert processor.sampled_out_traces == 1
+
+
+def test_nothing_is_exported_before_a_flush() -> None:
+    """The decision needs the whole trace, so a span that has ended is still only buffered.
+
+    This is what makes the flush at the end of a Lambda invocation mandatory rather than an
+    optimisation.
+    """
+    exporter, processor, tracer = _tail_harness(1.0)
+
+    with tracer.start_as_current_span("healthy"):
+        pass
+
+    assert exporter.get_finished_spans() == ()
+    processor.force_flush()
+    assert len(exporter.get_finished_spans()) == 1
+
+
+# --------------------------------------------------------------------------------------
+# The ratio decision itself
+# --------------------------------------------------------------------------------------
+
+
+def test_the_bound_matches_the_sdk_sampler() -> None:
+    """The tail decision has to agree with `TraceIdRatioBased` or it stops composing.
+
+    An upstream service running the stock head sampler at the same ratio must reach the same
+    verdict on the same trace id, otherwise a trace is kept in fragments.
+    """
+    from opentelemetry.sdk.trace.sampling import TraceIdRatioBased
+
+    for ratio in (0.0, 0.05, 0.1, 0.5, 1.0):
+        assert otel._ratio_bound(ratio) == TraceIdRatioBased.get_bound_for_rate(ratio)
+
+
+def test_the_keep_decision_matches_the_sdk_sampler() -> None:
+    """Same arithmetic, span by span, across a spread of trace ids."""
+    from opentelemetry.sdk.trace.sampling import Decision, TraceIdRatioBased
+
+    sampler = TraceIdRatioBased(0.5)
+    bound = otel._ratio_bound(0.5)
+
+    for trace_id in (1, 2**63 - 1, 2**63, 2**64 - 1, 2**127, 0xDEADBEEF):
+        sdk_decision = sampler.should_sample(None, trace_id, "span").decision
+        expected = sdk_decision is Decision.RECORD_AND_SAMPLE
+        assert otel._trace_id_is_sampled(trace_id, bound) is expected
+
+
+def test_the_decision_at_half_is_deterministic_by_trace_id() -> None:
+    """The same trace id always lands the same way, and the split is by the low 64 bits.
+
+    Explicit ids rather than a statistical check, so this test cannot flake.
+    """
+    bound = otel._ratio_bound(0.5)
+
+    # The low 64 bits below the midpoint are kept.
+    assert otel._trace_id_is_sampled(0x0000_0000_0000_0001, bound) is True
+    assert otel._trace_id_is_sampled((1 << 63) - 1, bound) is True
+    # At or above the midpoint they are dropped.
+    assert otel._trace_id_is_sampled(1 << 63, bound) is False
+    assert otel._trace_id_is_sampled((1 << 64) - 1, bound) is False
+    # Only the low 64 bits count, so the high half cannot change the verdict.
+    assert otel._trace_id_is_sampled((0xFFFF_FFFF_FFFF_FFFF << 64) | 1, bound) is True
+
+
+def test_a_trace_kept_at_a_low_ratio_is_kept_at_a_higher_one() -> None:
+    """The bound is monotonic, so raising the ratio only ever adds traces."""
+    low, high = otel._ratio_bound(0.1), otel._ratio_bound(0.5)
+    kept_at_low = [i for i in range(0, 1 << 64, 1 << 55) if otel._trace_id_is_sampled(i, low)]
+
+    assert kept_at_low
+    assert all(otel._trace_id_is_sampled(i, high) for i in kept_at_low)
+
+
+# --------------------------------------------------------------------------------------
+# The buffer cap
+# --------------------------------------------------------------------------------------
+
+
+def test_a_trace_over_the_cap_is_exported_by_default() -> None:
+    """`on_overflow="export"` keeps the outlier, which is the useful bias for a big trace."""
+    exporter, processor, tracer = _tail_harness(0.0, max_spans_per_trace=3)
+
+    with tracer.start_as_current_span("root"):
+        for i in range(6):
+            with tracer.start_as_current_span(f"child-{i}"):
+                pass
+    processor.force_flush()
+
+    # Every span in the trace arrives: the buffered ones and the ones streamed through after.
+    assert len(exporter.get_finished_spans()) == 7
+    assert processor.dropped_traces == 0
+
+
+def test_a_trace_over_the_cap_can_be_dropped_with_a_counter() -> None:
+    exporter, processor, tracer = _tail_harness(1.0, max_spans_per_trace=3, on_overflow="drop")
+
+    with tracer.start_as_current_span("root"):
+        for i in range(6):
+            with tracer.start_as_current_span(f"child-{i}"):
+                pass
+    processor.force_flush()
+
+    # Dropped despite ratio 1.0: the cap is a memory bound, not a sampling decision.
+    assert exporter.get_finished_spans() == ()
+    assert processor.dropped_traces == 1
+
+
+def test_the_buffer_never_grows_past_the_cap() -> None:
+    """The memory bound is the claim being tested, so assert on the buffer itself."""
+    _, processor, tracer = _tail_harness(1.0, max_spans_per_trace=4, on_overflow="drop")
+
+    with tracer.start_as_current_span("root"):
+        for i in range(20):
+            with tracer.start_as_current_span(f"child-{i}"):
+                pass
+
+    assert all(len(buffer) <= 4 for buffer in processor._buffers.values())
+
+
+def test_a_trace_under_the_cap_is_unaffected() -> None:
+    exporter, processor, tracer = _tail_harness(1.0, max_spans_per_trace=100)
+
+    with tracer.start_as_current_span("root"), tracer.start_as_current_span("child"):
+        pass
+    processor.force_flush()
+
+    assert len(exporter.get_finished_spans()) == 2
+    assert processor.dropped_traces == 0
+
+
+def test_traces_are_decided_independently() -> None:
+    """One trace overflowing must not resolve another one."""
+    exporter, processor, tracer = _tail_harness(1.0, max_spans_per_trace=2, on_overflow="drop")
+
+    with tracer.start_as_current_span("big"):
+        for i in range(5):
+            with tracer.start_as_current_span(f"child-{i}"):
+                pass
+    with tracer.start_as_current_span("small"):
+        pass
+    processor.force_flush()
+
+    assert [s.name for s in exporter.get_finished_spans()] == ["small"]
+    assert processor.dropped_traces == 1
+
+
+def test_the_constructor_rejects_nonsense() -> None:
+    from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
+
+    exporter = InMemorySpanExporter()
+    with pytest.raises(ValueError, match="sample_ratio"):
+        TailSamplingSpanProcessor(exporter, sample_ratio=1.5)
+    with pytest.raises(ValueError, match="max_spans_per_trace"):
+        TailSamplingSpanProcessor(exporter, max_spans_per_trace=0)
+    with pytest.raises(ValueError, match="on_overflow"):
+        TailSamplingSpanProcessor(exporter, on_overflow="explode")  # type: ignore[arg-type]
+
+
+def test_shutdown_flushes_what_is_buffered() -> None:
+    """The container shutdown path must not lose a trace that was already decided keep."""
+    exporter, processor, tracer = _tail_harness(1.0)
+
+    with tracer.start_as_current_span("healthy"):
+        pass
+    processor.shutdown()
+
+    assert len(exporter.get_finished_spans()) == 1
+
+
+def test_an_exporter_that_raises_does_not_break_the_request() -> None:
+    """A failing exporter must never surface as a 500 on the request that produced the span."""
+    from opentelemetry.sdk.trace import SpanProcessor, TracerProvider
+    from opentelemetry.sdk.trace.export import SpanExporter
+    from opentelemetry.sdk.trace.sampling import ALWAYS_ON, ParentBased
+
+    class Exploding(SpanExporter):
+        def export(self, spans: Any) -> Any:
+            raise RuntimeError("network gone")
+
+    processor = TailSamplingSpanProcessor(Exploding(), sample_ratio=1.0)
+    provider = TracerProvider(sampler=ParentBased(root=ALWAYS_ON))
+    provider.add_span_processor(cast("SpanProcessor", processor))
+
+    with provider.get_tracer("test").start_as_current_span("healthy"):
+        pass
+    assert processor.force_flush() is True
+
+
+# --------------------------------------------------------------------------------------
+# Resolving the ratio from the environment
+# --------------------------------------------------------------------------------------
+
+
+def test_the_ratio_defaults_to_keeping_everything() -> None:
+    """A service with nothing configured should not silently lose traces."""
+    assert resolve_sample_ratio() == 1.0
+
+
+def test_an_explicit_ratio_wins_over_the_environment(monkeypatch: MonkeyPatch) -> None:
+    monkeypatch.setenv(SAMPLE_RATIO_ENV, "0.5")
+    assert resolve_sample_ratio(0.1) == 0.1
+
+
+def test_an_explicit_ratio_out_of_range_is_a_programming_error() -> None:
+    """An argument is code, so it raises. An environment variable is config, so it warns."""
+    with pytest.raises(ValueError, match="sample_ratio"):
+        resolve_sample_ratio(1.5)
+
+
+def test_the_package_env_var_sets_the_ratio(monkeypatch: MonkeyPatch) -> None:
+    """This is the variable Terraform sets: 1.0 on staging, 0.1 on production."""
+    monkeypatch.setenv(SAMPLE_RATIO_ENV, "0.1")
+    assert resolve_sample_ratio() == 0.1
+
+
+def test_the_sampler_arg_is_the_fallback_under_a_ratio_sampler(monkeypatch: MonkeyPatch) -> None:
+    """A service already configured the OpenTelemetry way keeps its ratio."""
+    monkeypatch.setenv("OTEL_TRACES_SAMPLER", "parentbased_traceidratio")
+    monkeypatch.setenv("OTEL_TRACES_SAMPLER_ARG", "0.25")
+    assert resolve_sample_ratio() == 0.25
+
+
+def test_the_bare_ratio_sampler_name_is_honoured_too(monkeypatch: MonkeyPatch) -> None:
+    monkeypatch.setenv("OTEL_TRACES_SAMPLER", "traceidratio")
+    monkeypatch.setenv("OTEL_TRACES_SAMPLER_ARG", "0.4")
+    assert resolve_sample_ratio() == 0.4
+
+
+def test_the_sampler_arg_is_ignored_under_a_non_ratio_sampler(monkeypatch: MonkeyPatch) -> None:
+    """Under `always_on` the arg is meaningless, and reading it would invent a ratio.
+
+    This is the case that matters in production: `OTEL_TRACES_SAMPLER=always_on` is what has
+    to be set so the ADOT configurator does not install a head sampler that pre-drops spans,
+    and a stale `OTEL_TRACES_SAMPLER_ARG` left beside it must not become the tail ratio.
+    """
+    monkeypatch.setenv("OTEL_TRACES_SAMPLER", "always_on")
+    monkeypatch.setenv("OTEL_TRACES_SAMPLER_ARG", "0.01")
+    assert resolve_sample_ratio() == 1.0
+
+
+def test_the_package_env_var_beats_the_sampler_arg(monkeypatch: MonkeyPatch) -> None:
+    monkeypatch.setenv(SAMPLE_RATIO_ENV, "0.9")
+    monkeypatch.setenv("OTEL_TRACES_SAMPLER", "traceidratio")
+    monkeypatch.setenv("OTEL_TRACES_SAMPLER_ARG", "0.01")
+    assert resolve_sample_ratio() == 0.9
+
+
+@pytest.mark.parametrize("value", ["not-a-number", "-0.5", "2.0", ""])
+def test_an_unusable_ratio_degrades_to_keeping_everything(
+    monkeypatch: MonkeyPatch, value: str
+) -> None:
+    """A typo in a Terraform variable should cost money, not availability."""
+    monkeypatch.setenv(SAMPLE_RATIO_ENV, value)
+    assert resolve_sample_ratio() == 1.0
+
+
+def test_a_bad_package_var_still_falls_through_to_the_sampler_arg(
+    monkeypatch: MonkeyPatch,
+) -> None:
+    monkeypatch.setenv(SAMPLE_RATIO_ENV, "banana")
+    monkeypatch.setenv("OTEL_TRACES_SAMPLER", "traceidratio")
+    monkeypatch.setenv("OTEL_TRACES_SAMPLER_ARG", "0.3")
+    assert resolve_sample_ratio() == 0.3
+
+
+# --------------------------------------------------------------------------------------
+# configure_tracing wiring
+# --------------------------------------------------------------------------------------
+
+
+def test_configure_tracing_installs_an_always_on_sampler(monkeypatch: MonkeyPatch) -> None:
+    """The head sampler must not pre-drop, or "errors are always sampled" is a lie.
+
+    `TracerProvider.__init__` falls back to `sampling._get_from_env_or_default()` when no
+    sampler is passed, and that reads `OTEL_TRACES_SAMPLER`. This asserts the explicit
+    sampler wins, so an operator setting a ratio sampler in the environment, or the ADOT
+    configurator doing it, cannot silently defeat the tail step.
+    """
+    monkeypatch.delenv(OTEL_DISABLED_ENV, raising=False)
+    monkeypatch.setenv("OTEL_TRACES_SAMPLER", "parentbased_traceidratio")
+    monkeypatch.setenv("OTEL_TRACES_SAMPLER_ARG", "0.0")
+
+    assert configure_tracing("posts") is True
+
+    from opentelemetry import trace
+    from opentelemetry.sdk.trace import TracerProvider
+    from opentelemetry.sdk.trace.sampling import ALWAYS_ON, ParentBased
+
+    provider = trace.get_tracer_provider()
+    assert isinstance(provider, TracerProvider)
+    assert isinstance(provider.sampler, ParentBased)
+    assert provider.sampler._root is ALWAYS_ON
+
+    # And the ratio still came from the environment, so an operator setting 0.0 gets 0.0.
+    assert otel._PROCESSOR is not None
+    assert otel._PROCESSOR.sample_ratio == 0.0
+    shutdown_tracing()
+
+
+def test_configure_tracing_takes_the_ratio_as_a_keyword(monkeypatch: MonkeyPatch) -> None:
+    monkeypatch.delenv(OTEL_DISABLED_ENV, raising=False)
+
+    configure_tracing("posts", sample_ratio=0.1, always_sample_errors=False)
+
+    assert otel._PROCESSOR is not None
+    assert otel._PROCESSOR.sample_ratio == 0.1
+    assert otel._PROCESSOR._always_sample_errors is False
+    shutdown_tracing()
+
+
+def test_configure_tracing_registers_exactly_one_processor(monkeypatch: MonkeyPatch) -> None:
+    """A BatchSpanProcessor alongside the tail one would double-export every kept trace."""
+    monkeypatch.delenv(OTEL_DISABLED_ENV, raising=False)
+
+    configure_tracing("posts")
+
+    from opentelemetry import trace
+    from opentelemetry.sdk.trace import TracerProvider
+
+    provider = trace.get_tracer_provider()
+    assert isinstance(provider, TracerProvider)
+    processors = provider._active_span_processor._span_processors
+    assert len(processors) == 1
+    assert isinstance(processors[0], TailSamplingSpanProcessor)
+    shutdown_tracing()
+
+
+def test_flush_tracing_is_safe_with_no_provider(monkeypatch: MonkeyPatch) -> None:
+    """A service that never configured tracing can still call the flush hook."""
+    monkeypatch.setenv(OTEL_DISABLED_ENV, "1")
+    otel._PROCESSOR = None
+    # The API's default provider has no force_flush, so this reports that it did nothing.
+    assert flush_tracing() is False
+
+
+def test_flush_tracing_drives_the_installed_processor(monkeypatch: MonkeyPatch) -> None:
+    monkeypatch.delenv(OTEL_DISABLED_ENV, raising=False)
+    configure_tracing("posts", sample_ratio=1.0)
+
+    assert otel._PROCESSOR is not None
+    assert flush_tracing() is True
+    shutdown_tracing()
+
+
+def test_a_record_only_span_is_still_tail_sampled() -> None:
+    """The ADOT distro's `AlwaysRecordSampler` behaviour, reproduced without the distro.
+
+    `aws-opentelemetry-distro` wraps whatever `OTEL_TRACES_SAMPLER` names in an
+    `AlwaysRecordSampler`, which turns a `Decision.DROP` into `Decision.RECORD_ONLY`. A
+    RECORD_ONLY span is created and passed to every processor, but its context has the
+    sampled flag clear, and the SDK's own `BatchSpanProcessor` and `SimpleSpanProcessor` both
+    open `on_end` with `if not span.context.trace_flags.sampled: return`.
+
+    `TailSamplingSpanProcessor` deliberately does not filter on that flag: the flag is a head
+    decision and this processor exists to make a later one. The stub below is the distro's
+    wrapper reimplemented over a ratio-0 sampler, and the assertion is that an error trace
+    survives it. That is the safety net behind the `OTEL_TRACES_SAMPLER=always_on` guidance:
+    even if the distro's provider wins the `set_tracer_provider` race with a ratio sampler
+    configured, the error trace is still recorded and still kept.
+    """
+    from opentelemetry.sdk.trace import SpanProcessor, TracerProvider
+    from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
+    from opentelemetry.sdk.trace.sampling import (
+        Decision,
+        Sampler,
+        SamplingResult,
+        TraceIdRatioBased,
+    )
+    from opentelemetry.trace import Status, StatusCode
+
+    class AlwaysRecord(Sampler):
+        """The distro's wrapper: DROP becomes RECORD_ONLY, everything else passes through."""
+
+        def __init__(self, root: Sampler) -> None:
+            self._root = root
+
+        def should_sample(
+            self,
+            parent_context: Any = None,
+            trace_id: int = 0,
+            name: str = "",
+            kind: Any = None,
+            attributes: Any = None,
+            links: Any = None,
+            trace_state: Any = None,
+        ) -> SamplingResult:
+            result = self._root.should_sample(
+                parent_context, trace_id, name, kind, attributes, links, trace_state
+            )
+            if result.decision is Decision.DROP:
+                return SamplingResult(Decision.RECORD_ONLY, attributes or {}, result.trace_state)
+            return result
+
+        def get_description(self) -> str:
+            return "AlwaysRecord"
+
+    exporter = InMemorySpanExporter()
+    processor = TailSamplingSpanProcessor(exporter, sample_ratio=0.0)
+    provider = TracerProvider(sampler=AlwaysRecord(TraceIdRatioBased(0.0)))
+    provider.add_span_processor(cast("SpanProcessor", processor))
+
+    with provider.get_tracer("test").start_as_current_span("failing") as span:
+        # The head sampler dropped it, so the wire flag is clear, but it is still recording.
+        assert span.get_span_context().trace_flags.sampled is False
+        assert span.is_recording() is True
+        span.set_status(Status(StatusCode.ERROR))
+    processor.force_flush()
+
+    assert [s.name for s in exporter.get_finished_spans()] == ["failing"]
