@@ -276,7 +276,6 @@ class TailSamplingSpanProcessor:
     `Span.end` calls it unconditionally through the multi-processor, so omitting it raises an
     `AttributeError` on the first span that ends.
 
-
     This is the processor that performs the actual export, so it wraps the real exporter
     rather than sitting alongside one. Register exactly one of these and no
     `BatchSpanProcessor` for the same exporter, or every kept trace is exported twice.
