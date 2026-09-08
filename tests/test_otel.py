@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import threading
+import time
 from typing import Any, cast
 
 import pytest
@@ -194,7 +196,7 @@ def test_an_unsigned_xray_export_warns(
     _without_adot_distro(monkeypatch)
 
     with caplog.at_level("WARNING", logger="webbpulse.otel"):
-        exporter = otel._build_span_exporter("https://xray.us-west-2.amazonaws.com/v1/traces")
+        exporter = otel._build_span_exporter("https://xray.us-west-2.amazonaws.com/v1/traces", 1000)
 
     assert any("SigV4" in record.message for record in caplog.records)
     assert any("aws-otel" in record.message for record in caplog.records)
@@ -208,14 +210,14 @@ def test_an_xray_endpoint_gets_the_signing_exporter() -> None:
         OTLPAwsSpanExporter,
     )
 
-    exporter = otel._build_span_exporter("https://xray.eu-west-1.amazonaws.com/v1/traces")
+    exporter = otel._build_span_exporter("https://xray.eu-west-1.amazonaws.com/v1/traces", 1000)
 
     assert isinstance(exporter, OTLPAwsSpanExporter)
 
 
 def test_no_warning_when_the_distro_is_present(caplog: pytest.LogCaptureFixture) -> None:
     with caplog.at_level("WARNING", logger="webbpulse.otel"):
-        otel._build_span_exporter("https://xray.us-west-2.amazonaws.com/v1/traces")
+        otel._build_span_exporter("https://xray.us-west-2.amazonaws.com/v1/traces", 1000)
 
     assert not [r for r in caplog.records if "SigV4" in r.message]
 
@@ -229,7 +231,7 @@ def test_a_non_aws_endpoint_gets_the_plain_exporter(
     _without_adot_distro(monkeypatch)
 
     with caplog.at_level("WARNING", logger="webbpulse.otel"):
-        exporter = otel._build_span_exporter("http://localhost:4318/v1/traces")
+        exporter = otel._build_span_exporter("http://localhost:4318/v1/traces", 1000)
 
     assert type(exporter) is OTLPSpanExporter
     assert not [r for r in caplog.records if "SigV4" in r.message]
@@ -1214,3 +1216,284 @@ def test_another_aws_hosted_otlp_endpoint_is_not_treated_as_xray() -> None:
     assert otel._is_xray_endpoint("https://logs.us-west-2.amazonaws.com/v1/logs") is False
     assert otel._is_xray_endpoint("http://localhost:4318/v1/traces") is False
     assert otel._is_xray_endpoint("https://xray.us-west-2.amazonaws.com/v1/traces") is True
+
+
+def test_an_overflowed_trace_leaves_no_marker_behind() -> None:
+    """The overflow markers are the one structure nothing else reclaims.
+
+    `force_flush` only walks `_buffers`, and `_resolve_overflow_locked` deletes the buffer
+    entry before adding the marker, so an overflowed trace is never in the set the flush
+    discards from. Left unfixed the markers grow without bound, uncapped by
+    `max_buffered_traces`, and under `on_overflow="drop"` a later trace that reused the id
+    would be discarded in silence.
+    """
+    _exporter, processor, tracer = _tail_harness(1.0, max_spans_per_trace=2, on_overflow="drop")
+
+    for i in range(50):
+        root = tracer.start_span(f"root-{i}")
+        with trace_api.use_span(root, end_on_exit=False):
+            for j in range(3):
+                child = tracer.start_span(f"child-{j}")
+                child.end()
+        root.end()
+        processor.force_flush()
+
+    assert processor.dropped_traces == 50
+    assert processor._overflowed_drop == set(), "overflow markers leaked"
+    assert processor._overflowed_keep == set()
+    assert processor._open_spans == {}
+    assert processor._started_at == {}
+
+
+def test_an_overflowed_keep_trace_also_clears_its_marker() -> None:
+    exporter, processor, tracer = _tail_harness(1.0, max_spans_per_trace=2, on_overflow="export")
+
+    root = tracer.start_span("over-root")
+    with trace_api.use_span(root, end_on_exit=False):
+        for j in range(3):
+            child = tracer.start_span(f"c{j}")
+            child.end()
+    root.end()
+
+    assert processor._overflowed_keep == set()
+    assert [s.name for s in exporter.get_finished_spans()][-1] == "over-root"
+
+
+def test_traces_that_never_complete_are_reclaimed_by_age() -> None:
+    """The count bound alone cannot reclaim a leak.
+
+    It refuses to evict an in-flight trace, correctly, so a supply of traces whose spans
+    never end pins every buffer and the count bound never fires. Under Lambda nothing else
+    ever reclaims them. The age bound is the only thing that does.
+    """
+    _exporter, processor, tracer = _tail_harness(
+        1.0, max_buffered_traces=10, max_trace_age_seconds=0.05
+    )
+
+    leaked = []
+    for i in range(50):
+        root = tracer.start_span(f"leak-{i}")
+        with trace_api.use_span(root, end_on_exit=False):
+            child = tracer.start_span(f"leak-child-{i}")
+            child.end()
+        leaked.append(root)
+
+    time.sleep(0.06)
+    # Any subsequent span drives the sweep.
+    with tracer.start_as_current_span("trigger"):
+        pass
+
+    assert processor.evicted_traces > 0, "leaked traces were never reclaimed"
+    assert len(processor._buffers) <= 11
+    for root in leaked:
+        root.end()
+
+
+def test_age_eviction_still_honours_the_error_rule() -> None:
+    """Evicting by age judges the trace, so a stale error trace is exported, not binned."""
+    from opentelemetry.trace import Status, StatusCode
+
+    exporter, _processor, tracer = _tail_harness(0.0, max_trace_age_seconds=0.05)
+
+    root = tracer.start_span("stale-failing")
+    with trace_api.use_span(root, end_on_exit=False):
+        child = tracer.start_span("stale-child")
+        child.set_status(Status(StatusCode.ERROR))
+        child.end()
+
+    time.sleep(0.06)
+    with tracer.start_as_current_span("trigger"):
+        pass
+
+    assert [s.name for s in exporter.get_finished_spans()] == ["stale-child"]
+    root.end()
+
+
+def test_a_young_in_flight_trace_is_not_evicted_by_age() -> None:
+    """The age bound must not turn into the partial-judgement bug for ordinary requests."""
+    exporter, processor, tracer = _tail_harness(1.0, max_trace_age_seconds=300.0)
+
+    root = tracer.start_span("in-progress")
+    with trace_api.use_span(root, end_on_exit=False):
+        child = tracer.start_span("in-progress-child")
+        child.end()
+    with tracer.start_as_current_span("other"):
+        pass
+
+    assert "in-progress-child" not in [s.name for s in exporter.get_finished_spans()]
+    assert processor.evicted_traces == 0
+    root.end()
+
+
+def test_the_exporter_is_given_the_export_deadline() -> None:
+    """`flush_timeout_millis` only bounds anything if the exporter is told about it.
+
+    The flush exports synchronously and `OTLPSpanExporter.force_flush` is a no-op, so the
+    exporter's own `timeout`, a deadline across the whole export including retries, is the
+    only thing that decides how long a request can be held waiting on telemetry.
+    """
+    exporter = otel._build_span_exporter("http://localhost:4318/v1/traces", 2000)
+    assert exporter._timeout == 2  # type: ignore[attr-defined]
+
+    signed = otel._build_span_exporter("https://xray.us-west-2.amazonaws.com/v1/traces", 3000)
+    assert signed._timeout == 3  # type: ignore[attr-defined]
+
+    # A sub-second deadline would fail even a healthy export on a cold TLS handshake.
+    floored = otel._build_span_exporter("http://localhost:4318/v1/traces", 100)
+    assert floored._timeout == 1  # type: ignore[attr-defined]
+
+
+async def _noop_asgi_app(scope: Any, receive: Any, send: Any) -> None:
+    """A minimal downstream app, standing in for the instrumented stack."""
+    return None
+
+
+async def _noop_receive() -> dict[str, Any]:
+    return {"type": "http.request"}
+
+
+async def _noop_send(message: dict[str, Any]) -> None:
+    return None
+
+
+def test_a_slow_export_does_not_stall_the_whole_event_loop() -> None:
+    """The flush is synchronous HTTP, so it must not run on the event loop.
+
+    Awaiting it inline stalls every other connection the process is serving for the length of
+    the export, not just the request being flushed, and an export is exactly the operation
+    slow enough for that to matter. A ticker coroutine stands in for those other connections:
+    while the export is in flight it keeps running if the flush is on a worker thread, and
+    cannot advance at all if the flush is holding the loop.
+    """
+    import asyncio
+
+    from opentelemetry.sdk.trace import SpanProcessor, TracerProvider
+    from opentelemetry.sdk.trace.export import SpanExportResult
+    from opentelemetry.sdk.trace.sampling import ALWAYS_ON, ParentBased
+
+    release_export = threading.Event()
+
+    class BlockingExporter:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def export(self, spans: Any) -> Any:
+            self.calls += 1
+            # Stands in for an export against a slow or unreachable endpoint.
+            release_export.wait(timeout=5)
+            return SpanExportResult.SUCCESS
+
+        def shutdown(self) -> None: ...
+
+    blocking = BlockingExporter()
+    processor = TailSamplingSpanProcessor(cast("Any", blocking), sample_ratio=1.0)
+    provider = TracerProvider(sampler=ParentBased(root=ALWAYS_ON))
+    provider.add_span_processor(cast("SpanProcessor", processor))
+    tracer = provider.get_tracer("test")
+    otel._PROCESSOR = processor
+    middleware = otel._FlushTracingASGIMiddleware(_noop_asgi_app, 1000)
+
+    # A completed trace sitting in the buffer, so the flush has something real to export.
+    with tracer.start_as_current_span("request"):
+        pass
+
+    ticks = 0
+
+    async def ticker() -> None:
+        nonlocal ticks
+        while not release_export.is_set():
+            await asyncio.sleep(0.01)
+            ticks += 1
+
+    async def drive() -> None:
+        nonlocal ticks
+        tick_task = asyncio.ensure_future(ticker())
+        await asyncio.sleep(0.05)
+        before = ticks
+
+        # Release the export from outside the loop, so how long it blocks is fixed by the
+        # clock rather than by anything the loop does or fails to do.
+        def release_after_delay() -> None:
+            time.sleep(0.3)
+            release_export.set()
+
+        threading.Thread(target=release_after_delay, daemon=True).start()
+
+        await middleware({"type": "http"}, _noop_receive, _noop_send)
+
+        gained = ticks - before
+        await tick_task
+        assert blocking.calls == 1, "the flush never exported"
+        assert gained > 0, (
+            f"the event loop made no progress ({gained} ticks) while the export was in "
+            "flight, so the flush is blocking it"
+        )
+
+    asyncio.run(asyncio.wait_for(drive(), timeout=10))
+    shutdown_tracing()
+
+
+def test_the_flush_wrapper_is_installed_only_once() -> None:
+    """Two instrument_fastapi calls must not nest two flush layers and flush twice."""
+    from fastapi import FastAPI
+
+    from webbpulse.otel import instrument_fastapi
+
+    configure_tracing("posts", endpoint="http://localhost:4318/v1/traces")
+    app = FastAPI()
+
+    @app.get("/thing")
+    def thing() -> dict[str, str]:
+        return {"ok": "yes"}
+
+    instrument_fastapi(app, flush_per_request=True)
+    instrument_fastapi(app, flush_per_request=True)
+
+    stack = app.build_middleware_stack()
+    layers = 0
+    node: Any = stack
+    while isinstance(node, otel._FlushTracingASGIMiddleware):
+        layers += 1
+        node = node.app
+    assert layers == 1, f"the flush wrapper nested {layers} deep"
+    shutdown_tracing()
+
+
+def test_instrumenting_a_started_app_warns_that_there_will_be_no_spans(
+    monkeypatch: MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """An app whose stack is built cannot take the server span middleware.
+
+    Instrumenting it produces something that looks instrumented and emits nothing, which is
+    more confusing than not instrumenting at all, so it has to say so.
+    """
+    from fastapi import FastAPI
+
+    from webbpulse.otel import instrument_fastapi
+
+    monkeypatch.delenv(OTEL_DISABLED_ENV, raising=False)
+    configure_tracing("posts", endpoint="http://localhost:4318/v1/traces")
+    app = FastAPI()
+    app.build_middleware_stack()
+    app.middleware_stack = app.build_middleware_stack()
+
+    with caplog.at_level("WARNING", logger="webbpulse.otel"):
+        instrument_fastapi(app, flush_per_request=True)
+
+    assert any("already started" in r.message for r in caplog.records)
+    shutdown_tracing()
+
+
+def test_the_fips_endpoint_is_detected_and_signed_for_its_own_region(
+    monkeypatch: MonkeyPatch,
+) -> None:
+    """`xray-fips.<region>.amazonaws.com` is a real endpoint and needs signing like any other.
+
+    Missing it means the one caller who is required to use FIPS, and cannot simply switch,
+    silently gets an unsigned exporter and a 403.
+    """
+    monkeypatch.setenv("AWS_REGION", "eu-west-1")
+    endpoint = "https://xray-fips.us-gov-west-1.amazonaws.com/v1/traces"
+
+    assert otel._is_xray_endpoint(endpoint) is True
+    assert otel._region_for_endpoint(endpoint) == "us-gov-west-1"

@@ -159,7 +159,10 @@ to get wrong, and all three look identical from outside: traces simply never app
 
    `configure_tracing` picks that exporter automatically whenever the resolved endpoint is
    an X-Ray one, and a plain `OTLPSpanExporter` for anything else, such as a local
-   collector. Only the exporter class is used; the distribution's configurator and its
+   collector. An X-Ray endpoint means `xray.<region>.amazonaws.com`, the FIPS form
+   `xray-fips.<region>.amazonaws.com`, or an interface VPC endpoint
+   `<vpce-id>.xray.<region>.vpce.amazonaws.com`; the signing region is taken from the host
+   itself rather than from `AWS_REGION`, which would be the wrong scope for a VPC endpoint. Only the exporter class is used; the distribution's configurator and its
    `opentelemetry-instrument` entry point deliberately are not. When the extra is missing it
    warns, naming the extra, and falls back to the unsigned exporter, because a warned-about
    403 is a better failure than a crashed cold start.
@@ -247,9 +250,18 @@ instrument_fastapi(
 )
 ```
 
-The flush is bounded by that timeout and never raises into the request: a failure is logged
-at WARNING and the response is returned unchanged, because telemetry turning a healthy 200
-into a 500 would be worse than the trace it was reporting on.
+That timeout is passed to the exporter as its own deadline, covering the whole export
+including its retries, which is what actually bounds how long a request can be held waiting
+on telemetry. The flush also runs on a worker thread rather than the event loop: it exports
+synchronously over HTTP, and awaiting it inline would stall every other connection the
+process is serving, not just the request being flushed. It never raises into the request:
+a failure is logged at WARNING and the response is returned unchanged, because telemetry
+turning a healthy 200 into a 500 would be worse than the trace it was reporting on.
+
+Call `instrument_fastapi(app)` before the application starts serving. Once the middleware
+stack is built, `FastAPIInstrumentor` can no longer inject the server span middleware into
+it, so the app would look instrumented and produce no spans at all; that case logs a WARNING
+rather than failing quietly.
 
 On the latency cost: the flush only does work when the trace is actually being exported. At
 a production ratio of 0.1, roughly nine requests in ten resolve to "drop", the buffered
@@ -271,11 +283,24 @@ the cap is resolved immediately rather than being allowed to grow:
 | `"drop"` | the trace is discarded and `dropped_traces` is incremented. Choose it when a hard ceiling on egress matters more than seeing the outlier. |
 
 That bounds one trace. The number of traces is bounded separately by `max_buffered_traces`
-(default 1024), because a buffer is only drained when its trace completes and a flush comes
-round, so a trace that never completes would otherwise sit there for the life of the process.
-Past the ceiling the oldest completed trace is evicted, and evicting means judging it rather
-than discarding it, so an error trace that was about to be kept is still exported. A trace
-with spans still open is never evicted. The total is bounded by
+(default 1024) and their lifetime by `max_trace_age_seconds` (default 300), because a buffer
+is only drained when its trace completes and a flush comes round, so a trace that never
+completes would otherwise sit there for the life of the process. Eviction means judging the
+trace rather than discarding it, so an error trace that was about to be kept is still
+exported, and `evicted_traces` counts it.
+
+The two ceilings catch different failures, and the difference matters:
+
+| bound | evicts | why |
+| --- | --- | --- |
+| `max_buffered_traces` | the oldest trace with **no spans still open** | judging an in-flight trace early is the partial-trace bug the open-span tracking exists to prevent, so the count bound refuses to do it |
+| `max_trace_age_seconds` | the oldest trace, **in flight or not** | the deliberate exception, and the load-bearing one |
+
+The age bound has to be willing to evict an in-flight trace, because otherwise nothing
+reclaims a leak. A leaked span or an abandoned request never completes, so a supply of them
+pins every buffer while the count bound declines to touch any of it, and under Lambda no
+later flush ever comes round. A trace that has been open for five minutes is not a request in
+progress, and half of it is worth more than none of it. The total is bounded by
 `max_spans_per_trace * max_buffered_traces` and in practice sits far below it.
 
 ##### In-flight traces

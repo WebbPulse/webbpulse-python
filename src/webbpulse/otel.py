@@ -143,6 +143,7 @@ from __future__ import annotations
 import logging
 import os
 import threading
+import time
 from typing import TYPE_CHECKING, Any, Final, Literal, cast
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
@@ -192,6 +193,20 @@ _DEFAULT_MAX_SPANS_PER_TRACE: Final = 2048
 #: that and still bounds a leak.
 _DEFAULT_MAX_BUFFERED_TRACES: Final = 1024
 
+#: How long a trace may sit buffered before it is judged early. This is what reclaims a trace
+#: whose spans never end, which the count bound alone cannot, since it refuses to evict an
+#: in-flight trace. Comfortably longer than any request that has not already hit the Lambda
+#: timeout, so a real request is never judged early.
+_DEFAULT_MAX_TRACE_AGE_SECONDS: Final = 300.0
+
+#: Default ceiling on an export, and so on the in-request flush. Short on purpose: it is
+#: latency a user is waiting on, and a flush that cannot finish in a second is one whose
+#: spans are better dropped than paid for. This is passed to the exporter as its `timeout`,
+#: which it applies as a deadline across the whole export including retries. That is the only
+#: thing that actually bounds the flush, because the flush itself exports synchronously: left
+#: at the exporter's own default the worst case is 10 seconds with six retries behind it.
+_DEFAULT_FLUSH_TIMEOUT_MILLIS: Final = 1000
+
 OverflowPolicy = Literal["export", "drop"]
 
 # Set once configure_tracing has installed a provider, so a second call is a no-op rather
@@ -201,6 +216,14 @@ _CONFIGURED = False
 # The processor configure_tracing installed, kept so flush_tracing can reach it without
 # depending on the provider exposing its processors.
 _PROCESSOR: TailSamplingSpanProcessor | None = None
+
+#: The export deadline `configure_tracing` gave the exporter, so `instrument_fastapi` can
+#: default the in-request flush to the same value. Two different numbers here would be
+#: misleading, since the exporter's is the one that binds.
+_EXPORT_TIMEOUT_MILLIS: int = _DEFAULT_FLUSH_TIMEOUT_MILLIS
+
+#: Marks an app whose middleware stack already carries the flush wrapper.
+_FLUSH_WRAPPED_ATTR: Final = "_webbpulse_flush_wrapped"
 
 
 def is_tracing_enabled() -> bool:
@@ -354,6 +377,7 @@ class TailSamplingSpanProcessor:
         max_spans_per_trace: int = _DEFAULT_MAX_SPANS_PER_TRACE,
         on_overflow: OverflowPolicy = "export",
         max_buffered_traces: int = _DEFAULT_MAX_BUFFERED_TRACES,
+        max_trace_age_seconds: float = _DEFAULT_MAX_TRACE_AGE_SECONDS,
     ) -> None:
         if not 0.0 <= sample_ratio <= 1.0:
             raise ValueError(f"sample_ratio must be between 0.0 and 1.0, got {sample_ratio!r}")
@@ -363,6 +387,10 @@ class TailSamplingSpanProcessor:
             raise ValueError(f"on_overflow must be 'export' or 'drop', got {on_overflow!r}")
         if max_buffered_traces < 1:
             raise ValueError(f"max_buffered_traces must be at least 1, got {max_buffered_traces!r}")
+        if max_trace_age_seconds <= 0:
+            raise ValueError(
+                f"max_trace_age_seconds must be positive, got {max_trace_age_seconds!r}"
+            )
 
         self._exporter = exporter
         self._sample_ratio = sample_ratio
@@ -371,6 +399,7 @@ class TailSamplingSpanProcessor:
         self._max_spans_per_trace = max_spans_per_trace
         self._on_overflow: OverflowPolicy = on_overflow
         self._max_buffered_traces = max_buffered_traces
+        self._max_trace_age_seconds = max_trace_age_seconds
 
         # on_end runs on whichever thread ended the span, and uvicorn serves on a thread
         # pool, so the buffers need a lock even though a Lambda invocation is one request.
@@ -381,6 +410,9 @@ class TailSamplingSpanProcessor:
         # judging it earlier judges a partial trace, and the spans that arrive afterwards are
         # then judged again as if they were a second, separate trace.
         self._open_spans: dict[int, int] = {}
+        # When each buffered trace was first seen, for the age bound. Insertion-ordered, so
+        # the oldest is first and `_evict_locked` can stop scanning at the first young one.
+        self._started_at: dict[int, float] = {}
         # Traces already resolved to "keep" by an overflow, whose later spans stream through.
         self._overflowed_keep: set[int] = set()
         # Traces already resolved to "drop" by an overflow, whose later spans are discarded.
@@ -441,23 +473,23 @@ class TailSamplingSpanProcessor:
 
         stream: list[ReadableSpan] = []
         with self._lock:
-            if trace_id in self._open_spans:
-                remaining = self._open_spans[trace_id] - 1
-                if remaining <= 0:
-                    del self._open_spans[trace_id]
-                else:
-                    self._open_spans[trace_id] = remaining
+            complete = self._close_span_locked(trace_id)
 
             if trace_id in self._overflowed_drop:
+                if complete:
+                    self._overflowed_drop.discard(trace_id)
                 return
             if trace_id in self._overflowed_keep:
                 # Already resolved to keep, so nothing accumulates for this trace.
                 stream = [span]
+                if complete:
+                    self._overflowed_keep.discard(trace_id)
             else:
                 buffer = self._buffers.setdefault(trace_id, [])
+                self._started_at.setdefault(trace_id, time.monotonic())
                 if len(buffer) < self._max_spans_per_trace:
                     buffer.append(span)
-                    self._evict_oldest_locked()
+                    self._evict_locked()
                 else:
                     stream = self._resolve_overflow_locked(trace_id, buffer, span)
 
@@ -466,11 +498,31 @@ class TailSamplingSpanProcessor:
         # block on the network, serialising span completion behind telemetry egress.
         self._export(stream)
 
+    def _close_span_locked(self, trace_id: int) -> bool:
+        """Decrement a trace's open-span count. Returns whether it just reached zero.
+
+        An overflowed trace stays counted here even though its buffer is gone, because the
+        count is what tells the marker when it is safe to drop. Without that the markers are
+        the one structure nothing ever reclaims: `force_flush` only walks `_buffers`, and an
+        overflowed trace has no buffer, so its marker would live for the process. Under
+        `on_overflow="drop"` a retained marker also means a later trace that happened to
+        reuse the id would be discarded in silence.
+        """
+        remaining = self._open_spans.get(trace_id)
+        if remaining is None:
+            return False
+        if remaining <= 1:
+            del self._open_spans[trace_id]
+            return True
+        self._open_spans[trace_id] = remaining - 1
+        return False
+
     def _resolve_overflow_locked(
         self, trace_id: int, buffer: list[ReadableSpan], span: ReadableSpan
     ) -> list[ReadableSpan]:
         """Resolve a trace that hit the per-trace cap. Returns the spans to export."""
         del self._buffers[trace_id]
+        self._started_at.pop(trace_id, None)
         if self._on_overflow == "drop":
             self._overflowed_drop.add(trace_id)
             self.dropped_traces += 1
@@ -494,51 +546,73 @@ class TailSamplingSpanProcessor:
         )
         return [*buffer, span]
 
-    def _evict_oldest_locked(self) -> None:
-        """Keep the number of buffered traces bounded, not just the size of each one.
+    def _evict_locked(self) -> None:
+        """Keep the buffer bounded in both count and age.
 
-        The per-trace cap bounds one trace; without this the *count* of traces is unbounded,
-        because a buffer is only drained when the trace completes and a flush comes round.
-        A trace that never completes, because the request was abandoned or the span was
-        leaked, would sit there for the life of the process. Under the Web Adapter a flush
-        runs every request so this should never fire, but "should never fire" is not a memory
-        bound.
+        Two ceilings, because they catch different failures. `max_buffered_traces` bounds how
+        many traces are held at once, and `max_trace_age_seconds` bounds how long any one of
+        them is held. The age bound is the load-bearing one: the count bound can only evict a
+        trace with no spans still open, since evicting an in-flight trace early is the
+        partial-judgement bug this class exists to avoid, so a supply of traces that never
+        complete, a leaked span or an abandoned request, would otherwise pin every buffer and
+        the count bound would never fire. Under Lambda nothing else ever reclaims those.
 
-        The oldest trace is evicted first, and evicting means judging it now rather than
-        discarding it, so an error trace that was about to be kept is still exported. Only a
-        trace with no spans still open is eligible; an in-flight one is left alone, since
-        judging it early is the very bug this class otherwise avoids.
+        Eviction means judging the trace now, not discarding it, so an error trace that was
+        about to be kept is still exported. Age eviction is the one place a trace can be
+        judged while still in flight, which is a deliberate trade: a trace that has been open
+        for five minutes is not a request in progress, it is a leak, and half of it is worth
+        more than none of it.
         """
-        if len(self._buffers) <= self._max_buffered_traces:
-            return
-        for trace_id in self._buffers:
-            if self._open_spans.get(trace_id):
-                continue
-            spans = self._buffers.pop(trace_id)
-            self.evicted_traces += 1
-            _log.warning(
-                "Evicting the oldest buffered trace: too many traces are buffered at once.",
-                extra={
-                    "otel_trace_id": f"{trace_id:032x}",
-                    "max_buffered_traces": self._max_buffered_traces,
-                    "buffered_traces": len(self._buffers) + 1,
-                },
+        now = time.monotonic()
+        deadline = now - self._max_trace_age_seconds
+        # Insertion-ordered, so the oldest is first and the scan stops at the first trace
+        # young enough to keep. Ages only need checking while something is actually old.
+        for trace_id, started in list(self._started_at.items()):
+            if started > deadline:
+                break
+            self._evict_one_locked(trace_id, reason="age")
+
+        while len(self._buffers) > self._max_buffered_traces:
+            evictable = next(
+                (t for t in self._buffers if not self._open_spans.get(t)),
+                None,
             )
-            if self._should_keep(trace_id, spans):
-                self.exported_traces += 1
-                # Under the lock by necessity here: the caller holds it. An eviction is a
-                # pathological path, so paying a blocking export on it is the right trade
-                # against the bookkeeping to defer it.
-                self._export(spans)
-            else:
-                self.sampled_out_traces += 1
+            if evictable is None:
+                # Everything buffered is still in flight, so there is nothing safe to evict
+                # on count alone. The per-trace cap still bounds each one and the age bound
+                # will reclaim them once they are genuinely stale.
+                return
+            self._evict_one_locked(evictable, reason="count")
+
+    def _evict_one_locked(self, trace_id: int, *, reason: str) -> None:
+        """Resolve one trace early and account for it. Called with the lock held."""
+        spans = self._buffers.pop(trace_id, None)
+        self._started_at.pop(trace_id, None)
+        if spans is None:
             return
-        # Every buffered trace is still in flight, so there is nothing safe to evict. The
-        # per-trace cap still bounds each one, and the next completion will make one eligible.
+        self.evicted_traces += 1
+        _log.warning(
+            "Evicting a buffered trace before its request flushed.",
+            extra={
+                "otel_trace_id": f"{trace_id:032x}",
+                "eviction_reason": reason,
+                "open_spans": self._open_spans.get(trace_id, 0),
+                "max_buffered_traces": self._max_buffered_traces,
+                "max_trace_age_seconds": self._max_trace_age_seconds,
+            },
+        )
+        if self._should_keep(trace_id, spans):
+            self.exported_traces += 1
+            # Under the lock by necessity: the caller holds it. Eviction is a pathological
+            # path, so a blocking export there is the right trade against the bookkeeping
+            # needed to defer it.
+            self._export(spans)
+        else:
+            self.sampled_out_traces += 1
 
     def _export(self, spans: list[ReadableSpan]) -> None:
         """Hand spans to the exporter. Must not be called with the lock held, except from
-        `_evict_oldest_locked`, which documents why it is the exception."""
+        `_evict_one_locked`, which documents why it is the exception."""
         if not spans:
             return
         try:
@@ -571,6 +645,7 @@ class TailSamplingSpanProcessor:
             ]
             for trace_id in complete:
                 spans = self._buffers.pop(trace_id)
+                self._started_at.pop(trace_id, None)
                 # Only now is this trace's overflow marker meaningless. Clearing markers for
                 # a trace that is still open would let its tail start buffering again and be
                 # judged a second time, so a "keep" could become a "drop", and under
@@ -615,6 +690,10 @@ def _xray_region(endpoint: str) -> str | None:
     half wrong is a silent 403:
 
     * `xray.<region>.amazonaws.com`, the public endpoint.
+    * `xray-fips.<region>.amazonaws.com`, the FIPS 140-3 endpoint, which is a real endpoint
+      in botocore's endpoint data and signs for `xray` exactly like the public one. Missing
+      it means a caller who is required to use FIPS gets an unsigned exporter and a silent
+      403, which is the worst possible failure for the one caller who cannot simply switch.
     * `<vpce-id>.xray.<region>.vpce.amazonaws.com`, the interface VPC endpoint, which a
       function in a private subnet with no NAT gateway has to use.
 
@@ -630,8 +709,12 @@ def _xray_region(endpoint: str) -> str | None:
         return None
     labels = (parsed.hostname or "").lower().split(".")
 
-    # xray.<region>.amazonaws.com
-    if len(labels) == 4 and labels[0] == "xray" and labels[2:] == ["amazonaws", "com"]:
+    # xray.<region>.amazonaws.com and xray-fips.<region>.amazonaws.com
+    if (
+        len(labels) == 4
+        and labels[0] in ("xray", "xray-fips")
+        and labels[2:] == ["amazonaws", "com"]
+    ):
         return labels[1]
     # <vpce-id>.xray.<region>.vpce.amazonaws.com
     if len(labels) == 6 and labels[1] == "xray" and labels[3:] == ["vpce", "amazonaws", "com"]:
@@ -659,7 +742,7 @@ def _region_for_endpoint(endpoint: str) -> str:
     return os.environ.get("AWS_REGION") or os.environ.get("AWS_DEFAULT_REGION") or "us-west-2"
 
 
-def _build_span_exporter(endpoint: str) -> SpanExporter:
+def _build_span_exporter(endpoint: str, timeout_millis: int) -> SpanExporter:
     """The exporter for an endpoint: SigV4 signing for X-Ray, plain OTLP for anything else.
 
     The X-Ray OTLP endpoint authenticates with SigV4 and rejects an unsigned request with a
@@ -678,11 +761,22 @@ def _build_span_exporter(endpoint: str) -> SpanExporter:
 
     Falls back to the unsigned exporter when the distro is absent, after warning, because a
     warned-about 403 is a better failure than a cold start crash.
+
+    `timeout_millis` is what actually bounds the in-request flush. The exporter treats its
+    `timeout`, in seconds, as a deadline across the whole export including its retries, and
+    the flush is synchronous, so this constructor argument and nothing else decides how long
+    a request can be held waiting on telemetry. Left at the exporter's default it is 10
+    seconds with six retries behind it, which is longer than most of the API Gateway
+    timeouts it would be sitting inside.
     """
     from opentelemetry.exporter.otlp.proto.http.trace_exporter import OTLPSpanExporter
 
+    # The exporter takes seconds. At least one second, because a sub-second deadline makes
+    # even a healthy export fail on a cold TLS handshake.
+    timeout_seconds = max(1, round(timeout_millis / 1000))
+
     if not _is_xray_endpoint(endpoint):
-        return OTLPSpanExporter(endpoint=endpoint)
+        return OTLPSpanExporter(endpoint=endpoint, timeout=timeout_seconds)
 
     try:
         import botocore.session
@@ -697,7 +791,7 @@ def _build_span_exporter(endpoint: str) -> SpanExporter:
             "Install it with the 'aws-otel' extra: pip install 'webbpulse[otel,aws-otel]'.",
             extra={"otlp_endpoint": endpoint},
         )
-        return OTLPSpanExporter(endpoint=endpoint)
+        return OTLPSpanExporter(endpoint=endpoint, timeout=timeout_seconds)
 
     # botocore resolves credentials lazily, on the first signed request rather than here, so
     # building this at cold start does not add an IMDS or STS round trip to the critical path.
@@ -709,6 +803,7 @@ def _build_span_exporter(endpoint: str) -> SpanExporter:
             aws_region=_region_for_endpoint(endpoint),
             session=botocore.session.Session(),
             endpoint=endpoint,
+            timeout=timeout_seconds,
         ),
     )
 
@@ -724,6 +819,8 @@ def configure_tracing(
     max_spans_per_trace: int = _DEFAULT_MAX_SPANS_PER_TRACE,
     on_overflow: OverflowPolicy = "export",
     max_buffered_traces: int = _DEFAULT_MAX_BUFFERED_TRACES,
+    max_trace_age_seconds: float = _DEFAULT_MAX_TRACE_AGE_SECONDS,
+    export_timeout_millis: int = _DEFAULT_FLUSH_TIMEOUT_MILLIS,
     force: bool = False,
 ) -> bool:
     """Set up the tracer provider and the tail sampling span exporter. Returns whether it did.
@@ -756,6 +853,11 @@ def configure_tracing(
         max_spans_per_trace: per-trace buffer ceiling.
         on_overflow: `"export"` keeps a trace that exceeds the ceiling, `"drop"` discards it.
         max_buffered_traces: ceiling on how many traces are buffered at once.
+        max_trace_age_seconds: how long a trace may sit buffered before it is judged early,
+            which is what reclaims a trace whose spans never end.
+        export_timeout_millis: deadline on one export, retries included. This is the real
+            bound on how long an in-request flush can hold a response, because the exporter
+            enforces it and the flush is synchronous.
         force: reconfigure even if a provider was already installed by an earlier call.
     """
     global _CONFIGURED, _PROCESSOR
@@ -805,13 +907,16 @@ def configure_tracing(
         sampler=ParentBased(root=ALWAYS_ON), resource=Resource.create(attributes)
     )
     processor = TailSamplingSpanProcessor(
-        _build_span_exporter(resolved_endpoint),
+        _build_span_exporter(resolved_endpoint, export_timeout_millis),
         sample_ratio=ratio,
         always_sample_errors=always_sample_errors,
         max_spans_per_trace=max_spans_per_trace,
         on_overflow=on_overflow,
         max_buffered_traces=max_buffered_traces,
+        max_trace_age_seconds=max_trace_age_seconds,
     )
+    global _EXPORT_TIMEOUT_MILLIS
+    _EXPORT_TIMEOUT_MILLIS = export_timeout_millis
     # This processor is the export path. Adding a BatchSpanProcessor for the same exporter
     # alongside it would export every kept trace twice and every dropped one once.
     # The cast is the price of not subclassing the SDK's SpanProcessor, which would make this
@@ -844,12 +949,6 @@ def _instrument_botocore() -> None:
     instrumentor = BotocoreInstrumentor()  # type: ignore[no-untyped-call]
     if not instrumentor.is_instrumented_by_opentelemetry:
         instrumentor.instrument()
-
-
-#: Default ceiling on the in-request flush. Short on purpose: it is latency a user is
-#: waiting on, and a flush that cannot finish in a second is one whose spans are better
-#: dropped than paid for. The exporter keeps its own longer timeout for the HTTP call.
-_DEFAULT_FLUSH_TIMEOUT_MILLIS: Final = 1000
 
 
 def _running_on_lambda() -> bool:
@@ -907,6 +1006,18 @@ class _FlushTracingASGIMiddleware:
                 exc_info=True,
             )
 
+    async def _flush_async(self) -> None:
+        """Run the flush off the event loop.
+
+        `flush_tracing` exports synchronously, over HTTP. Calling it directly from this
+        coroutine would block the event loop for the duration, which on a server handling
+        more than one request at a time stalls every other connection, not just this one.
+        A worker thread keeps the stall to this request.
+        """
+        import asyncio
+
+        await asyncio.get_running_loop().run_in_executor(None, self._flush)
+
     async def __call__(self, scope: Any, receive: Any, send: Any) -> None:
         if scope.get("type") != "http":
             await self.app(scope, receive, send)
@@ -917,9 +1028,9 @@ class _FlushTracingASGIMiddleware:
             # The trace of a request that blew up is the one most worth having, and an
             # unhandled exception here means the server span was ended by the instrumentation
             # on its way out, so the trace is complete and ready to judge.
-            self._flush()
+            await self._flush_async()
             raise
-        self._flush()
+        await self._flush_async()
 
 
 def instrument_fastapi(
@@ -927,7 +1038,7 @@ def instrument_fastapi(
     *,
     excluded_urls: str | None = None,
     flush_per_request: bool | None = None,
-    flush_timeout_millis: int = _DEFAULT_FLUSH_TIMEOUT_MILLIS,
+    flush_timeout_millis: int | None = None,
 ) -> None:
     """Instrument one FastAPI app so each request becomes a server span.
 
@@ -946,7 +1057,9 @@ def instrument_fastapi(
         app: the FastAPI application to instrument.
         excluded_urls: comma separated path patterns to leave untraced.
         flush_per_request: force the flush middleware on or off. `None` means auto-detect.
-        flush_timeout_millis: ceiling on that flush, in milliseconds.
+        flush_timeout_millis: ceiling on that flush, in milliseconds. `None` uses the export
+            deadline `configure_tracing` already gave the exporter, which is the value that
+            actually binds; passing a larger number here does not extend it.
     """
     if not is_tracing_enabled():
         return
@@ -954,13 +1067,27 @@ def instrument_fastapi(
         from opentelemetry.instrumentation.fastapi import FastAPIInstrumentor
     except ImportError:
         return
+
+    if getattr(app, "middleware_stack", None) is not None:
+        # The stack is built on startup and `instrument_app` can only inject the server span
+        # middleware while it is still being built. Past that point instrumenting produces an
+        # app that looks instrumented and emits no spans at all, which is a far more
+        # confusing failure than not instrumenting, so say so.
+        _log.warning(
+            "instrument_fastapi was called on an application that has already started, so "
+            "its middleware stack is built and the server span middleware cannot be "
+            "installed. No request spans will be recorded. Call instrument_fastapi during "
+            "application construction, before the app starts.",
+        )
+
     FastAPIInstrumentor.instrument_app(
         app, excluded_urls=excluded_urls if excluded_urls is not None else "health,ready"
     )
 
     should_flush = _running_on_lambda() if flush_per_request is None else flush_per_request
     if should_flush:
-        _wrap_with_flush(app, flush_timeout_millis)
+        timeout = _EXPORT_TIMEOUT_MILLIS if flush_timeout_millis is None else flush_timeout_millis
+        _wrap_with_flush(app, timeout)
 
 
 def _wrap_with_flush(app: FastAPI, timeout_millis: int) -> None:
@@ -969,13 +1096,21 @@ def _wrap_with_flush(app: FastAPI, timeout_millis: int) -> None:
     `app.add_middleware` is not usable for this. `instrument_app` replaces
     `build_middleware_stack` so `OpenTelemetryMiddleware` ends up outermost, so an added
     middleware would run inside it, before the server span has ended. `add_middleware` also
-    raises on an app that has already started, which a call from a lifespan hook would hit.
+    raises on an app that has already started.
 
     Wrapping `build_middleware_stack` instead puts this outside the OTel middleware and
     composes with it, since each wrapper decorates whatever the previous one produced. The
     stack is rebuilt lazily on startup, so this takes effect for a stack that has not been
-    built yet and is re-applied if the app rebuilds it.
+    built yet.
+
+    Guarded by a sentinel, because wrapping is not idempotent: two `instrument_fastapi` calls
+    on the same app would otherwise nest two flush layers and flush twice per request, and
+    each layer would pay its own thread hop.
     """
+    if getattr(app, _FLUSH_WRAPPED_ATTR, False):
+        return
+    setattr(app, _FLUSH_WRAPPED_ATTR, True)
+
     built = app.build_middleware_stack
 
     def build_middleware_stack() -> Any:
@@ -983,8 +1118,8 @@ def _wrap_with_flush(app: FastAPI, timeout_millis: int) -> None:
 
     app.build_middleware_stack = build_middleware_stack  # type: ignore[method-assign]
     # An app that is already running has a built stack that the rebuild above will not reach,
-    # so patch the live one too. Both paths are needed: a plain `create_app()` has not built
-    # its stack yet, while an app instrumented from a lifespan hook has.
+    # so patch the live one too. It will not carry server spans, for the reason warned about
+    # in `instrument_fastapi`, but it still flushes whatever else is buffered.
     if getattr(app, "middleware_stack", None) is not None:
         app.middleware_stack = _FlushTracingASGIMiddleware(app.middleware_stack, timeout_millis)
 
