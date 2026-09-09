@@ -626,15 +626,36 @@ The configured issuer was `https://api.staging.webbpulse.com`, with no path. API
 constructed the discovery URL from it, and named that URL in the error. That is the
 resolution path settled.
 
-**What this does and does not establish.** It establishes that the discovery document is
-fetched and that its location is derived from the issuer. It does **not** establish that the
-JWKS is then fetched from the document's `jwks_uri`: what was observed is the discovery
-retrieval, through the error above, and no JWKS request has been seen yet. Reading
-`jwks_uri` out of the discovery document is the standard OIDC behaviour and is what API
-Gateway's own wording ("fetched from the issuer's `jwks_uri`") describes, so it is the
-reasonable expectation rather than a measurement. The access log on the spike's identity
-function settles it the moment a request reaches the protected route, and until then this
-document should not claim more than the error proves.
+**The JWKS fetch, also confirmed by M0, and also at `CreateAuthorizer` time.** API Gateway
+does read `jwks_uri` out of the discovery document and fetch the JWKS from it, and it does
+so during the same create call rather than waiting for a request to verify. The API access
+log for the successful apply (`run-84hxuWZUsZ76nhme`, `CreateAuthorizer` at
+2026-09-09T05:51:41Z) has both fetches, from AWS-owned source addresses, in the seconds
+either side of it:
+
+```
+05:51:35Z  /.well-known/openid-configuration  200  44.220.161.215  (AWS us-east-1)
+05:51:40Z  /.well-known/openid-configuration  200  184.32.188.63   (AWS us-west-2)
+05:51:40Z  /.well-known/jwks.json             200  184.32.188.63   (AWS us-west-2)
+```
+
+Two things in that trace are worth keeping. The **discovery document is fetched twice, from
+two different AWS regions**, once about six seconds before the create call and once one
+second before it. The earlier us-east-1 fetch has a 4402 ms integration latency, which is a
+cold start, so it is the validator warming the path; the us-west-2 pair is the fetch that
+the authorizer is actually built from. And the **JWKS request comes from the same address as
+the second discovery request, in the same second**, which is what following `jwks_uri` out of
+a just-retrieved document looks like. Nothing fetched the JWKS at a guessed path, and
+nothing fetched it before the discovery document.
+
+The operational consequence is one notch stronger than 10.1 stated. It is not only the
+discovery route that has to answer anonymously before the authorizer can be created: **the
+`jwks_uri` the discovery document advertises has to answer anonymously at create time too.**
+A discovery document that points at a JWKS behind the staging access gate would fail the
+create call as surely as a missing discovery route does, and the error would name only the
+discovery URL. Both `.well-known` routes carry `authorization_type = "NONE"` in
+`terraform/identity_spike.tf` for exactly this reason, and 9.2's `identity` module must keep
+both exempt rather than only the discovery one.
 
 Serving discovery at the API root as well as at `<issuer>/.well-known/openid-configuration`
 is therefore no longer load-bearing. It is harmless and can stay, but the path is known and
@@ -1508,7 +1529,7 @@ Effort is rough, in days of focused work, and assumes one person.
 
 | M | Scope | Package version | Effort |
 |---|---|---|---|
-| **M0** | Spike: deploy a throwaway HTTP API with a JWT authorizer against a hand-rolled JWKS from a KMS RSA_2048 key. Answer the 3.4 discovery-path question and confirm RS256 end to end. **Nothing else starts until this passes.** *In progress. The discovery-path half is answered (3.4); RS256 end to end is not yet.* | none | 1 to 2 |
+| **M0** | Spike: deploy a throwaway HTTP API with a JWT authorizer against a hand-rolled JWKS from a KMS RSA_2048 key. Answer the 3.4 discovery-path question and confirm RS256 end to end. **Nothing else starts until this passes.** *Verified 2026-09-09 for the resolution half: both `.well-known` documents are fetched by API Gateway at `CreateAuthorizer` time, the JWKS from the discovery document's `jwks_uri` (3.4, 10.6), and the served JWKS modulus matches `kms:GetPublicKey` byte for byte. RS256 end to end is still unverified: the mint route is not reachable, see 9.1's note below.* | none | 1 to 2 |
 | **M1** | `webbpulse.identity` skeleton: `IdentitySettings`, `IdentityHooks`, `build_identity_router`, storage classes, `authorizer_claims()`. Token service: KMS signing, JWKS, discovery, rotation by `kid`. No flows yet | 0.6.0 | 4 to 6 |
 | **M2** | Password flows: register, login, change, policy, dummy-hash equalisation, lockout, `credentials` table. Sessions: families, rotation, reuse detection, grace window, logout, logout-all | 0.7.0 | 5 to 7 |
 | **M3** | Email: SES sender, templates, verification, reset. Contract tests for JWKS and discovery against a real deployed authorizer | 0.7.0 | 3 to 4 |
@@ -1523,6 +1544,18 @@ Effort is rough, in days of focused work, and assumes one person.
 Roughly 8 to 10 weeks of focused work. M0 is deliberately first and deliberately throwaway:
 every later milestone assumes the authorizer verifies a KMS-signed RS256 token from our own
 JWKS, and that assumption is cheap to test now and expensive to discover is wrong at M9.
+
+**M0 is not finished, and the gap is a missing route rather than a wrong design.**
+`backend/app/domains/identity/spike.py` declares `POST /api/identity/spike/token`, but
+`terraform/identity_spike.tf` never creates an API Gateway route for it. The route table on
+the staging API has the two `.well-known` keys and `GET /api/identity/spike/whoami` and
+nothing else, so the mint endpoint returns the gateway's own `{"message":"Not Found"}` with
+a 404 and no token can be obtained through the public API. Everything that does not need a
+token is confirmed; the two measurements that do need one, a 200 from `whoami` carrying the
+authorizer's claims and a rejection of a tampered signature, are still outstanding. Adding
+the route key `POST /api/identity/spike/token` to the gated routes map, where the access
+gate rather than the JWT authorizer protects it, is the whole fix and is what the module
+docstring already assumes exists.
 
 Three prerequisites sit outside the milestones and should land on their own schedule:
 
@@ -1634,7 +1667,15 @@ Stated plainly, since each is a place the design could be wrong.
    3.4 has the error, the exact wording and the ordering that follows from it. What remains
    open is narrower and is now item 6 below: the JWKS fetch itself has not been observed.
 2. **moto's fidelity for `kms:Sign` with `RSASSA_PKCS1_V1_5_SHA_256`** against a real JWT
-   verifier. Mitigated by making the signer a seam and testing against real KMS in M0.
+   verifier. Mitigated by making the signer a seam and testing against real KMS in M0. Still
+   open as of 2026-09-09: no signature has been produced by the real key yet, because the
+   spike's mint route is not reachable through the gateway (9.1). What the same run did
+   confirm is the key half of the pair. `kms:GetPublicKey` on
+   `alias/webbpulse-staging-identity-signing` returns an `RSA_2048` `SIGN_VERIFY` key whose
+   modulus is byte-identical to the `n` the live JWKS serves, under kid
+   `ZMAdbmKxC7lsl8jc9-McfmfpjHi1cc5e-6-waagXTSw`, and `RSASSA_PKCS1_V1_5_SHA_256` is among
+   its advertised signing algorithms. So the DER parsing and the `kid` derivation in 3.4 and
+   3.5 are verified against real KMS; only the signing call is not.
 3. **Whether CarModPicker usernames may contain `@`.** This decides whether the token
    confusion path in 8.1 is a live vulnerability or only a latent one, since
    `verify_email` and `reset_password` tokens put an email in `sub` while session tokens put
@@ -1646,13 +1687,13 @@ Stated plainly, since each is a place the design could be wrong.
 5. **KMS request quotas per region for the two AWS accounts.** Not checked. At current
    volumes it is not close to a limit, but a load test should confirm before a launch that
    expects a login spike.
-6. **Whether API Gateway reads `jwks_uri` out of the discovery document, and fetches the
-   JWKS from there.** What item 1 settled is that the discovery document is fetched and
-   where from; the JWKS request has not been seen. Following `jwks_uri` is what OIDC
-   Discovery specifies and what API Gateway's own wording describes, so the design assumes
-   it, but the assumption is untested. The identity function's access log resolves it as
-   soon as a token is verified against the M0 authorizer, which is the remaining half of
-   M0's own measurement.
+6. ~~**Whether API Gateway reads `jwks_uri` out of the discovery document, and fetches the
+   JWKS from there.**~~ **Closed by M0, 2026-09-09.** It does, and it does so at
+   `CreateAuthorizer` time rather than at first verification. The access log has the
+   discovery document and `jwks.json` fetched from the same AWS us-west-2 address one second
+   apart, immediately before the create call that succeeded; 3.4 has the trace and the
+   consequence, which is that the advertised `jwks_uri` must answer anonymously at create
+   time as well.
 
 ---
 
