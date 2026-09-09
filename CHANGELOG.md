@@ -5,6 +5,93 @@ Notable changes to the `webbpulse` package. The version here is the one in
 
 This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## 0.6.0
+
+The M0 slice of the identity standard (`docs/identity-standard.md`): enough of
+`webbpulse.identity` to prove that an API Gateway HTTP API JWT authorizer verifies a token
+this package signed with a real KMS key, against a JWKS this package served.
+
+Deliberately not the whole standard. There is no user model, no password flow, no session,
+no refresh rotation and no storage of any kind. Those land in 0.7.0 and later per section
+9.1. What is here is the part every later milestone rests on, which is why it is proven
+first.
+
+**Additive. Nothing existing changes, and no module gains a dependency.**
+
+### Added
+
+- `webbpulse.identity`, behind a new `identity` extra (`PyJWT[crypto]`, `fastapi`):
+
+  ```python
+  from webbpulse.identity import KmsSigner, identity_router, public_jwk_from_kms
+
+  signer = KmsSigner(kms_client, key_id)
+  jwk = public_jwk_from_kms(kms_client, key_id)   # cache per execution environment
+  app.include_router(identity_router(issuer=issuer, jwks=lambda: [jwk]))
+  ```
+
+- `KmsSigner(client, key_id)`, with `.kid`, `.sign(signing_input)` and
+  `.encode(claims)`. Signs through `kms:Sign` with `MessageType="DIGEST"` and
+  `SigningAlgorithm="RSASSA_PKCS1_V1_5_SHA_256"`, so no key material is ever held.
+- `public_jwk_from_kms(client, key_id)`, an RSA JWK with `kid` = base64url SHA-256 of the
+  DER SubjectPublicKeyInfo. Refuses a key whose `KeySpec` is not `RSA_2048`.
+- `kid_for_der(der_spki)`, the same derivation without a KMS client, for a verifier holding
+  only the public key.
+- `build_jwks(jwks)` and `build_discovery_document(issuer)`, the two document bodies. The
+  issuer's trailing slash is normalised away in one place rather than at three call sites.
+- `identity_router(issuer=..., jwks=...)`, serving `GET /.well-known/jwks.json` and
+  `GET /.well-known/openid-configuration` at the origin. `jwks` is a callable so the caller
+  owns the caching and a rotation changes the document without rebuilding the router.
+- `mint_test_token(...)`, gated behind an explicit `enabled` argument **and** a refusal on
+  `environment` of `production`. Raises `TokenMintingDisabled`.
+- `JWS_ALGORITHM`, `KMS_SIGNING_ALGORITHM`, `DIGEST_MESSAGE_TYPE`, `KMS_KEY_SPEC`.
+
+### The AWS behaviour this is built on, with the documentation it came from
+
+- **Only RSA algorithms.** The HTTP API JWT authorizer's token validation workflow says
+  "Check the token's algorithm and signature by using the public key that is fetched from
+  the issuer's `jwks_uri`. Currently, only RSA-based algorithms are supported." That is what
+  forces RS256 over the standard's preferred ES256, and it is not a preference this package
+  can revisit while the built-in authorizer does the verifying.
+- **PKCS1 v1.5, not PSS.** The KMS `Sign` documentation prefers PSS for RSA in general, but
+  JWA binds `RS256` to PKCS1 v1.5 and `PS256` to PSS. Signing with PSS under an `RS256`
+  header produces a token nothing verifies, and the failure is a 401 with no explanation.
+- **`DIGEST` skips only the hashing.** "When the value is `DIGEST`, AWS KMS skips the
+  hashing step in the signing algorithm." The padding still applies, so the algorithm name
+  is unchanged.
+- **The RSA signature needs no reshaping.** "When used with the supported RSA signing
+  algorithms, the encoding of this value is defined by PKCS #1 in RFC 8017", which is the
+  octet string JWS wants. ECDSA would have needed the DER-to-r||s conversion.
+- **The key is cached for two hours.** "API Gateway can cache the public key for two hours.
+  As a best practice, when you rotate keys, allow a grace period during which both the old
+  and new keys are valid." The standard's three hour overlap is that grace period.
+
+### What is still unproven, and where it gets settled
+
+The standard's section 3.4 records that AWS does not document whether the authorizer
+resolves `<issuer>/.well-known/openid-configuration` and follows its `jwks_uri`, or fetches
+a JWKS from the issuer directly. Re-reading both the developer guide and the `JWTConfiguration`
+API reference for 0.6.0 did not settle it: the guide says only "the issuer's `jwks_uri`",
+and the API reference describes `issuer` as "The base domain of the identity provider that
+issues JSON Web Tokens" with no mention of `.well-known` at all. This release is written so
+either behaviour works, serving both documents at the origin, and the Portfolio staging
+spike is what answers it empirically.
+
+`moto`'s fidelity for `kms:Sign` with `RSASSA_PKCS1_V1_5_SHA_256` is also still unconfirmed
+(section 9.4), so the unit suite does not use it for signing. `tests/test_identity.py` fakes
+the client with a real `cryptography` PKCS1 v1.5 signature over the digest, which is the
+documented KMS contract, and then verifies the resulting token with PyJWT using **only** the
+JWK this module emitted. That is what proves the JWK encoding: a wrong `n`, a wrong `e`, a
+`kid` mismatch or a differently assembled signing input all fail it. The signing seam stays
+fakeable exactly so the moto question never has to be answered.
+
+### Naming
+
+`TokenMintingDisabled`, not `TestTokenDisabled`. pytest collects any class whose name starts
+with `Test`, so the more natural name makes a consumer's suite fail at collection with
+`PytestCollectionWarning: cannot collect test class`. Renaming the exception once here is
+cheaper than every consumer adding a `python_classes` override.
+
 ## 0.5.0
 
 Both backends carried a near-identical `security.py`: bcrypt password hashing plus JWT

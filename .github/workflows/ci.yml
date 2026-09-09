@@ -40,8 +40,8 @@ jobs:
       # rather than skipped.
       install-command: >-
         python -m pip install --upgrade pip &&
-        pip install -e ".[aws-otel,dynamodb,fastapi,otel,security,testing]" mypy ruff pytest-cov
-        "boto3-stubs[dynamodb,secretsmanager]" botocore-stubs
+        pip install -e ".[aws-otel,dynamodb,fastapi,identity,otel,security,testing]" mypy ruff pytest-cov
+        "boto3-stubs[dynamodb,kms,secretsmanager]" botocore-stubs
       ruff-target: "src tests"
       coverage-source: "webbpulse"
 
@@ -68,8 +68,8 @@ jobs:
       - name: Install the package and the type checking tooling
         run: |
           python -m pip install --upgrade pip
-          pip install -e ".[aws-otel,dynamodb,fastapi,otel,security,testing]" mypy \
-            "boto3-stubs[dynamodb,secretsmanager]" botocore-stubs
+          pip install -e ".[aws-otel,dynamodb,fastapi,identity,otel,security,testing]" mypy \
+            "boto3-stubs[dynamodb,kms,secretsmanager]" botocore-stubs
 
       - name: Mypy
         run: mypy
