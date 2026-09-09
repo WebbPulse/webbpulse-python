@@ -27,8 +27,8 @@ For local work on the package itself:
 
 ```bash
 python3.13 -m venv .venv
-.venv/bin/pip install -e ".[aws-otel,dynamodb,fastapi,otel,security,testing]" mypy ruff pytest-cov \
-  "boto3-stubs[dynamodb,secretsmanager]" botocore-stubs
+.venv/bin/pip install -e ".[aws-otel,dynamodb,fastapi,identity,otel,security,testing]" mypy ruff pytest-cov \
+  "boto3-stubs[dynamodb,kms,secretsmanager]" botocore-stubs
 .venv/bin/ruff check . && .venv/bin/ruff format --check .
 .venv/bin/mypy
 .venv/bin/pytest
@@ -45,6 +45,7 @@ needs. Everything else is opt-in.
 | `fastapi` | `fastapi`, `starlette`, `uvicorn` | `webbpulse.http`, `webbpulse.lambda_entry`, the `webbpulse.ratelimit` dependency |
 | `otel` | the OpenTelemetry SDK, the OTLP HTTP exporter, the FastAPI and botocore instrumentations | `webbpulse.otel` |
 | `security` | `PyJWT`, `bcrypt` | `webbpulse.security` |
+| `identity` | `PyJWT[crypto]`, `fastapi` | `webbpulse.identity` |
 | `testing` | `moto`, `pytest`, `httpx2` | `webbpulse.testing` |
 
 A typical service installs `webbpulse[fastapi,dynamodb,otel]` at runtime and adds
@@ -56,6 +57,10 @@ the `otel` extra is present, and `config`, `logging`, `dynamodb`, `ratelimit` an
 `lambda_entry` import too, raising only when a call actually needs boto3, uvicorn or
 FastAPI. `webbpulse.http` imports FastAPI at module scope and so needs the `fastapi`
 extra to import at all, and `webbpulse.testing` needs the `testing` extra.
+`webbpulse.identity` imports on the base install: it takes a KMS client rather than
+building one, and it defers both the `cryptography` and the FastAPI import to the call
+that needs it, so serving a JWKS needs the `identity` extra but importing the module
+does not.
 
 ## Modules
 
@@ -781,6 +786,58 @@ it in the package's existing envelope rather than a new shape, with `error_code`
 `TOKEN_EXPIRED` or `INVALID_TOKEN` and a `WWW-Authenticate: Bearer` challenge. With
 `auto_error=False` it returns `None` instead of raising, for a route serving both anonymous
 and authenticated callers.
+
+### `webbpulse.identity`
+
+KMS-backed RS256 token signing, and the JWKS and OIDC discovery documents that let an API
+Gateway HTTP API JWT authorizer verify what it signed. Needs the `identity` extra.
+
+This is the M0 slice of `docs/identity-standard.md` and deliberately not the whole
+standard: there is no user model, no password flow, no session and no storage. Those land
+in 0.7.0 and later.
+
+```python
+import boto3
+from webbpulse.identity import KmsSigner, identity_router, public_jwk_from_kms
+
+kms = boto3.client("kms")
+signer = KmsSigner(kms, settings.identity_signing_key_id)
+
+# Resolved once per execution environment: it is a read of a public key.
+jwk = public_jwk_from_kms(kms, settings.identity_signing_key_id)
+app.include_router(identity_router(issuer=settings.identity_issuer, jwks=lambda: [jwk]))
+```
+
+**RS256, and there was no choice.** The API Gateway documentation for HTTP API JWT
+authorizers says, in the token validation workflow, "Check the token's algorithm and
+signature by using the public key that is fetched from the issuer's `jwks_uri`. Currently,
+only RSA-based algorithms are supported." ES256 is ECDSA and so is excluded. The KMS key is
+`RSA_2048` with `RSASSA_PKCS1_V1_5_SHA_256`, not a PSS variant: JWA binds `RS256` to
+PKCS1 v1.5, and a PSS signature under an `RS256` header verifies nowhere.
+
+**The private key never leaves KMS.** `KmsSigner` hashes the JWS signing input itself and
+calls `kms:Sign` with `MessageType="DIGEST"`, which the KMS documentation describes as
+skipping "the hashing step in the signing algorithm". That keeps the request 32 bytes and
+puts the 4096 byte `Message` limit permanently out of scope. The returned RSA signature is
+"defined by PKCS #1 in RFC 8017", which is exactly what JWS wants, so it is base64url
+encoded as-is.
+
+**`kid` is the base64url SHA-256 of the DER SubjectPublicKeyInfo**, so it is a pure function
+of the key material: stable across redeploys, identical in every process, and never an AWS
+account identifier in a public document. Rotation is by adding a second key rather than
+mutating one, and the JWKS serves both through the overlap.
+
+**Both `.well-known` routes must be reachable with no authorizer at all**, including no
+staging access gate. API Gateway fetches them itself, holding no cookies. A gate in front of
+either one means the JWT authorizer cannot retrieve the key and every authorized route fails
+closed.
+
+`mint_test_token` signs an access token without authenticating anybody, for exercising an
+authorizer end to end. It has two independent gates: an `enabled` argument with no default,
+so no call site is accidental, and a refusal on `environment` of `production` on top of
+that, so one flag left true in the wrong place is still refused. It raises
+`TokenMintingDisabled`, which is named for the condition rather than the helper because
+pytest collects any class named `Test*`.
 
 ### `webbpulse.testing`
 
