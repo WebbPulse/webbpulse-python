@@ -278,6 +278,21 @@ answers:
 This needs a decision and is question Q3 in section 11. It does not block the identity
 application itself, only the gateway wiring, and the two can be delivered in either order.
 
+**One constraint M0 added, which none of the three answers removes.** The discovery route
+must be exempt from the gate, and not merely for the convenience of a verification fetch at
+request time. 3.4 records that API Gateway fetches
+`<issuer>/.well-known/openid-configuration` when the authorizer is **created**, from its own
+infrastructure, carrying no gate cookie and no origin-verify header. A discovery route
+behind the gate returns the gate's 401 to that fetch, and `CreateAuthorizer` then fails
+outright with the same `BadRequestException` as a route that does not exist. So on a gated
+staging environment the two `.well-known` routes carry `authorization_type = "NONE"` under
+every option above. That is a hole in the gate in the literal sense and an empty one: what
+sits behind those paths is a public key and a document saying where the public key is, which
+is what every OIDC provider on the internet serves anonymously by definition. The private
+half never leaves KMS. Option 3 in particular is not an escape from this, since the point of
+the option is to enable the JWT authorizer somewhere, and wherever it is enabled the create
+call fetches.
+
 ### 2.6 Request flows
 
 Notation: **SPA** is the browser app, **IDP** is the identity function, **KMS** is
@@ -589,15 +604,75 @@ execution environment. This is a read of a public key, so caching it is safe.
 and to the authorizer's configured issuer. A trailing-slash mismatch here is the classic
 failure and presents as every request being denied with no useful message.
 
-**What could not be confirmed.** The API Gateway documentation says the public key is
-"fetched from the issuer's `jwks_uri`", which implies it reads the discovery document to
-find that URI, and the `IssuerUrl` in its own CLI example is a bare Cognito issuer with no
-path suffix. I could not find documentation stating explicitly whether API Gateway appends
-`/.well-known/openid-configuration` to the configured issuer, or requires the issuer itself
-to serve that document at its root. The design serves discovery at **both**
-`<issuer>/.well-known/openid-configuration` and the API root, which satisfies either
-behaviour, and milestone M3 (9.1) includes a contract test that resolves this empirically
-against a real deployed authorizer before anything depends on it.
+**Confirmed by M0.** API Gateway appends `/.well-known/openid-configuration` to the
+configured issuer. It does not require the issuer to serve the document at its root, and it
+does not go straight to a JWKS.
+
+It is stricter than that, in a way nothing in the documentation prepares you for: **the
+fetch happens at `CreateAuthorizer` time, not only when a request is verified.** The
+authorizer cannot be created at all unless the URL already answers with a valid discovery
+document. The M0 spike's first apply is where this surfaced, as a create-time failure with
+the URL quoted back:
+
+```
+BadRequestException: Caught exception when connecting to
+https://api.staging.webbpulse.com/.well-known/openid-configuration for issuer
+https://api.staging.webbpulse.com. Please try again later.
+Error: Invalid issuer: https://api.staging.webbpulse.com. Issuer must have a valid
+discovery endpoint ended with '/.well-known/openid-configuration'
+```
+
+The configured issuer was `https://api.staging.webbpulse.com`, with no path. API Gateway
+constructed the discovery URL from it, and named that URL in the error. That is the
+resolution path settled.
+
+**What this does and does not establish.** It establishes that the discovery document is
+fetched and that its location is derived from the issuer. It does **not** establish that the
+JWKS is then fetched from the document's `jwks_uri`: what was observed is the discovery
+retrieval, through the error above, and no JWKS request has been seen yet. Reading
+`jwks_uri` out of the discovery document is the standard OIDC behaviour and is what API
+Gateway's own wording ("fetched from the issuer's `jwks_uri`") describes, so it is the
+reasonable expectation rather than a measurement. The access log on the spike's identity
+function settles it the moment a request reaches the protected route, and until then this
+document should not claim more than the error proves.
+
+Serving discovery at the API root as well as at `<issuer>/.well-known/openid-configuration`
+is therefore no longer load-bearing. It is harmless and can stay, but the path is known and
+the design need not hedge on it.
+
+**The operational consequence, which is the part that changes deployments.** Because the
+fetch is synchronous with `CreateAuthorizer`, the discovery route and the service serving it
+are prerequisites of the authorizer rather than peers of it. Concretely:
+
+- The `.well-known` routes must be created, deployed and reachable **anonymously** before
+  the authorizer is created. Anonymously matters twice over: API Gateway's validator carries
+  no cookie and no origin-verify header, so a discovery route behind a staging access gate
+  fails the create call exactly as a missing one does.
+- The service serving them must already be running with the configuration that makes it
+  serve them. An environment variable that switches discovery on takes effect only after the
+  function's update completes and a new execution environment starts.
+- **A fresh environment cannot create the authorizer in the same apply that first deploys
+  the identity function, unless the ordering is enforced explicitly.** Nothing in the
+  authorizer's own arguments implies either dependency: its `api_id` is the API, which
+  exists long before any route on it, and it references the serving function not at all. A
+  Terraform graph left to its own devices is free to create the authorizer first, and will.
+
+So the Terraform for this needs explicit ordering, in two directions at once. The discovery
+routes and the function come **before** the authorizer, by `depends_on`. Any route that
+names the authorizer comes **after** it, which happens naturally by reference. The trap is
+putting both kinds of route in one `for_each` over a routes map: a single protected route
+referencing the authorizer makes the whole map wait on it, including the discovery routes
+the authorizer is waiting for, and the apply fails with every route skipped. The protected
+route has to be declared separately from the discovery routes for the ordering to be
+expressible at all. `terraform/identity_spike.tf` in WebbPulse-Portfolio carries the working
+shape, and 9.2's `identity` module should adopt it rather than rediscover it.
+
+One further wrinkle worth writing down: `depends_on` orders the API calls, not their
+effects. An auto-deploy stage deploys a new route asynchronously, and
+`UpdateFunctionConfiguration` returns while the update is still in progress, so the
+authorizer can be created after a successful `CreateRoute` and still fetch a 404. A poll of
+the live discovery URL between the two is the reliable form, and the identity module should
+provide it rather than leave each consumer to find out.
 
 ### 3.5 How `kid` is chosen, and rotation
 
@@ -1433,7 +1508,7 @@ Effort is rough, in days of focused work, and assumes one person.
 
 | M | Scope | Package version | Effort |
 |---|---|---|---|
-| **M0** | Spike: deploy a throwaway HTTP API with a JWT authorizer against a hand-rolled JWKS from a KMS RSA_2048 key. Answer the 3.4 discovery-path question and confirm RS256 end to end. **Nothing else starts until this passes.** | none | 1 to 2 |
+| **M0** | Spike: deploy a throwaway HTTP API with a JWT authorizer against a hand-rolled JWKS from a KMS RSA_2048 key. Answer the 3.4 discovery-path question and confirm RS256 end to end. **Nothing else starts until this passes.** *In progress. The discovery-path half is answered (3.4); RS256 end to end is not yet.* | none | 1 to 2 |
 | **M1** | `webbpulse.identity` skeleton: `IdentitySettings`, `IdentityHooks`, `build_identity_router`, storage classes, `authorizer_claims()`. Token service: KMS signing, JWKS, discovery, rotation by `kid`. No flows yet | 0.6.0 | 4 to 6 |
 | **M2** | Password flows: register, login, change, policy, dummy-hash equalisation, lockout, `credentials` table. Sessions: families, rotation, reuse detection, grace window, logout, logout-all | 0.7.0 | 5 to 7 |
 | **M3** | Email: SES sender, templates, verification, reset. Contract tests for JWKS and discovery against a real deployed authorizer | 0.7.0 | 3 to 4 |
@@ -1474,7 +1549,16 @@ It creates:
 - The nine DynamoDB tables of 4.2, with TTL where 4.3 says and point-in-time recovery on the
   ones holding user state.
 - `aws_apigatewayv2_authorizer` of type `JWT`, with `issuer` and `audience`, plus the route
-  attachments for the domains that use it.
+  attachments for the domains that use it. **The module owns the create-time ordering that
+  3.4 documents**, and this is the reason it is a module rather than four resources a
+  consumer wires up: the authorizer cannot be created until the issuer's
+  `/.well-known/openid-configuration` already answers anonymously, so the module takes the
+  discovery routes and the identity function as explicit dependencies, polls the live URL
+  before creating the authorizer, and declares protected routes separately from discovery
+  routes so the two
+  orderings do not collapse into one `for_each`. A consumer that assembles this by hand gets
+  a first apply that fails and a half-created stack, which is what happened to Portfolio's
+  M0 spike.
 - SES wiring only where a product lacks it. CarModPicker already has an
   `aws_sesv2_configuration_set.transactional` and a domain identity with DKIM, MAIL FROM and
   feedback attributes (`terraform/ses.tf`), so the module must **accept an existing
@@ -1543,10 +1627,12 @@ reason it is the pilot.
 
 Stated plainly, since each is a place the design could be wrong.
 
-1. **Whether API Gateway appends `/.well-known/openid-configuration` to the configured
-   issuer, or expects the issuer itself to serve it.** The documentation describes fetching
-   the key from "the issuer's `jwks_uri`" but does not state the resolution path. Mitigated by
-   serving discovery at both locations and by M0.
+1. ~~**Whether API Gateway appends `/.well-known/openid-configuration` to the configured
+   issuer, or expects the issuer itself to serve it.**~~ **Closed by M0.** It appends. It
+   also fetches at `CreateAuthorizer` time rather than only at request time, so the
+   discovery route and the service behind it are deployment prerequisites of the authorizer;
+   3.4 has the error, the exact wording and the ordering that follows from it. What remains
+   open is narrower and is now item 6 below: the JWKS fetch itself has not been observed.
 2. **moto's fidelity for `kms:Sign` with `RSASSA_PKCS1_V1_5_SHA_256`** against a real JWT
    verifier. Mitigated by making the signer a seam and testing against real KMS in M0.
 3. **Whether CarModPicker usernames may contain `@`.** This decides whether the token
@@ -1560,6 +1646,13 @@ Stated plainly, since each is a place the design could be wrong.
 5. **KMS request quotas per region for the two AWS accounts.** Not checked. At current
    volumes it is not close to a limit, but a load test should confirm before a launch that
    expects a login spike.
+6. **Whether API Gateway reads `jwks_uri` out of the discovery document, and fetches the
+   JWKS from there.** What item 1 settled is that the discovery document is fetched and
+   where from; the JWKS request has not been seen. Following `jwks_uri` is what OIDC
+   Discovery specifies and what API Gateway's own wording describes, so the design assumes
+   it, but the assumption is untested. The identity function's access log resolves it as
+   soon as a token is verified against the M0 authorizer, which is the remaining half of
+   M0's own measurement.
 
 ---
 
