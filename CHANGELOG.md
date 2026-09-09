@@ -5,6 +5,94 @@ Notable changes to the `webbpulse` package. The version here is the one in
 
 This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## 0.8.0
+
+Adoption ergonomics. Two services took 0.7.0 (WebbPulse-Portfolio #153, CarModPicker #380)
+and between them found one silent failure and two places where the package was strict
+enough that a consumer kept a local wrapper rather than delete one. All three are addressed
+here.
+
+**Additive. No behaviour changes to anything that does not pass a new argument.** A service
+that upgrades and changes nothing gets byte-identical log lines, the same handler on the
+same stream, and the same `MetricsEmitter` defaults.
+
+### Added
+
+- `webbpulse.http.user_id_dependency(get_user, *, attribute="id", extract=None)` and
+  `webbpulse.http.bind_user_id(user_id)`, for the sync dependency trap.
+
+  `set_user_id` called inside a **sync** (`def`) FastAPI dependency binds nothing the
+  handler or any later log line can see. Starlette runs a sync dependency through
+  `anyio.to_thread.run_sync`, which copies the context into a worker thread; the dependency
+  mutates the copy and the copy is discarded on return. Nothing raises, the request
+  succeeds, and `user_id` reads `"-"` for the rest of it. Portfolio shipped that to
+  production, and it is the reason the fix is a helper rather than a paragraph.
+
+  ```python
+  from webbpulse.http import user_id_dependency
+
+  CurrentUser = user_id_dependency(get_current_user)   # get_current_user may stay `def`
+
+  @router.get("/me")
+  async def me(user: User = Depends(CurrentUser)) -> UserRead:
+      ...
+  ```
+
+  - `user_id_dependency` returns an `async def` dependency that resolves the service's own
+    resolver as a sub-dependency, binds the id in the request's own context, and returns
+    the resolved object unchanged. It is a drop-in swap at the call site: the handler
+    receives the identical object. The wrapped resolver keeps its own dependencies and may
+    be `def` or `async def`.
+  - `attribute=` names the id attribute when it is not `.id`; `extract=` takes a callable
+    for the case where the id is not a plain attribute at all, such as a claims dict.
+  - A resolver returning `None`, the optional-authentication shape, binds nothing and
+    leaves the `"-"` placeholder rather than binding the string `"None"`. An object with no
+    usable id binds nothing too, rather than failing a request that would have succeeded.
+  - `bind_user_id` is the same binding as an awaitable, for a service writing its own async
+    wrapper. Being a coroutine is deliberate: the wrong shape leaves an un-awaited
+    coroutine, which Python warns about and a suite under `-W error` fails on, so it stops
+    being silent. `set_user_id` is unchanged and remains correct in a middleware, a
+    `task_context` block or a CLI entry point, where the caller owns the context.
+
+- `webbpulse.logging.configure_logging(stream=..., formatter=...)`, the two escape hatches
+  CarModPicker kept a local wrapper module for.
+
+  - `stream=` (default `sys.stdout`) routes **every handler the function installs**. Two
+    CarModPicker commands write data on stdout and are compared byte for byte, so a log
+    line landing there breaks the comparison; `stream=sys.stderr` gives that stdout back.
+    The default is read at call time rather than bound at import, so a runtime that
+    replaced `sys.stdout` is honoured.
+  - `formatter=` takes `"json"` (the default, byte identical to 0.7.0), `"text"` for a
+    human readable line on a TTY, or a `logging.Formatter` instance. An unknown selector
+    raises `ValueError` **before** the existing handlers are removed, so a typo cannot
+    leave the root logger with nothing attached.
+  - `TextFormatter` and `TEXT_LOG_FORMAT` are exported for a service that wants the same
+    line under its own wiring. `"text"` drops `service` and `environment` rather than
+    rendering them, since locally there is one of each.
+
+- `webbpulse.metrics.metrics_enabled_from_env(environment=None, *, testing_var="TESTING",
+  environment_var="ENVIRONMENT", allowed=DEFAULT_METRIC_ENVIRONMENTS)`, returning a bool
+  for `enabled=`.
+
+  This is the gate CarModPicker's deleted `core/cloudwatch_emf.py` carried, hoisted so the
+  next adopter does not write it again slightly differently: silent while the testing
+  variable is truthy, live only in the environments named, which default to staging and
+  production. Comparison is case-insensitive after a strip on both sides, since these
+  values arrive from Terraform and a task definition. An unset or blank environment returns
+  `False`, so a missing variable fails closed to silence rather than to production-
+  namespaced noise from an unidentified source.
+
+  `DEFAULT_METRIC_ENVIRONMENTS` is exported as `("staging", "production")`.
+
+  `MetricsEmitter` is untouched: `enabled` is still a constructor argument and still
+  defaults to `True`. The helper reads environment variables and returns a bool, so it
+  composes with `enabled=` rather than replacing it.
+
+### Changed
+
+- Nothing observable. `configure_logging` still installs one handler, on stdout, with
+  `JsonFormatter`, when called the way 0.7.0 callers call it.
+
 ## 0.7.0
 
 The two observability primitives CarModPicker grew on its own, hoisted so Portfolio can

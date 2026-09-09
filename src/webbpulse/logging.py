@@ -17,6 +17,23 @@ So a service can set `log_format = "JSON"` on the function and use this formatte
 same time, and the log event in CloudWatch is the object below rather than that object
 nested inside Lambda's. The one thing to avoid is `print()`, which Lambda captures as plain
 text regardless of the format setting.
+
+**The two escape hatches, and why they exist.** The defaults above are the deployed shape
+and nothing about them changed in 0.8.0. What was missing was a way out of them, which cost
+CarModPicker a local wrapper module it could not delete:
+
+* `stream=` moves every handler this function installs. A CLI whose commands write data on
+  stdout and are compared byte for byte cannot also have log lines land there, so it passes
+  `stream=sys.stderr` and gets its stdout back. Note "every handler": routing only some of
+  them would leave the interleaving that the argument exists to remove.
+* `formatter=` chooses the rendering. `"json"` is the default and is byte identical to
+  0.7.0; `"text"` is a human readable line for a TTY, and a `logging.Formatter` instance is
+  accepted for a service that wants its own. A one-line JSON object is the right thing in
+  CloudWatch and the wrong thing in a terminal, and reading it in a terminal was previously
+  the thing a local wrapper was written to fix.
+
+Neither hatch is reached by the deployed path. A service that passes neither argument gets
+the 0.7.0 handler, on the 0.7.0 stream, with the 0.7.0 formatter.
 """
 
 from __future__ import annotations
@@ -25,9 +42,16 @@ import json
 import logging
 import sys
 from datetime import UTC, datetime
-from typing import Any, Final
+from typing import Any, Final, Literal, TextIO
 
-__all__ = ["JsonFormatter", "configure_logging", "get_logger"]
+__all__ = [
+    "TEXT_LOG_FORMAT",
+    "FormatterSpec",
+    "JsonFormatter",
+    "TextFormatter",
+    "configure_logging",
+    "get_logger",
+]
 
 # Attributes `logging.LogRecord` sets itself. Anything outside this set arrived through
 # `extra={...}` and belongs in the emitted object.
@@ -172,14 +196,68 @@ class JsonFormatter(logging.Formatter):
         return json.dumps(payload, default=str, separators=(",", ":"))
 
 
+#: The format string `formatter="text"` renders. Deliberately not the stdlib default, which
+#: is the bare message: a line with no time, level or logger name is unreadable the moment
+#: two components log at once, which is the normal state of a service running locally.
+TEXT_LOG_FORMAT: Final = "%(asctime)s %(levelname)-8s %(name)s %(message)s"
+
+
+class TextFormatter(logging.Formatter):
+    """One human readable line per record, for a TTY.
+
+    The `service` and `environment` a `JsonFormatter` writes as keys are dropped rather
+    than rendered: locally there is one service and one environment, so repeating both on
+    every line is noise. The bound request context is not appended either, for the same
+    reason plus one more, that `LogContextFilter` already exists for a service that wants
+    `%(request_id)s` in its own format string and stacking a second mechanism on top of it
+    would give two ways to get the same field.
+
+    This is a thin subclass rather than a bare `logging.Formatter` so a caller can name the
+    class in an `isinstance` check, and so the format string lives with the class that uses
+    it rather than at whichever call site constructed it.
+    """
+
+    def __init__(self, fmt: str | None = None, datefmt: str | None = None) -> None:
+        super().__init__(fmt or TEXT_LOG_FORMAT, datefmt)
+
+
+#: What `configure_logging(formatter=...)` accepts. The two string selectors cover the two
+#: cases that exist, and the instance escape hatch means a service with a third does not
+#: have to wait for this package to grow a selector for it.
+FormatterSpec = Literal["json", "text"] | logging.Formatter
+
+
+def _resolve_formatter(
+    spec: FormatterSpec,
+    *,
+    service: str | None,
+    environment: str | None,
+) -> logging.Formatter:
+    """Turn a `formatter=` argument into the formatter instance to install.
+
+    A `logging.Formatter` instance is returned as given. `service` and `environment` are not
+    pushed into it: the caller built it and owns what it renders, and silently mutating a
+    caller's formatter is worse than ignoring two arguments it did not ask for.
+    """
+    if isinstance(spec, logging.Formatter):
+        return spec
+    if spec == "json":
+        return JsonFormatter(service=service, environment=environment)
+    if spec == "text":
+        return TextFormatter()
+    raise ValueError(f"formatter must be 'json', 'text' or a logging.Formatter, got {spec!r}")
+
+
 def configure_logging(
     *,
     level: str = "INFO",
     service: str | None = None,
     environment: str | None = None,
     force: bool = False,
+    stream: TextIO | None = None,
+    formatter: FormatterSpec = "json",
 ) -> None:
-    """Install `JsonFormatter` on the root logger, writing to stdout.
+    """Install a formatter on the root logger, writing to stdout by default.
 
     Idempotent: calling it twice does not double every log line. Pass `force=True` to
     reconfigure anyway, which tests need.
@@ -188,17 +266,41 @@ def configure_logging(
     logger, and leaving it in place means every record is emitted twice, once as this JSON
     and once in Lambda's format. Uvicorn's loggers are also reattached to the root here so
     access and error lines arrive as JSON like everything else.
+
+    Args:
+        level: Root log level, case insensitive.
+        service: Written as a `service` key by `JsonFormatter`. Ignored by `"text"` and by
+            a caller-supplied formatter instance.
+        environment: As `service`, written as an `environment` key.
+        force: Reconfigure even though a previous call already did.
+        stream: Where every handler this function installs writes. Defaults to
+            `sys.stdout`, which is what Lambda and a container both read. Pass
+            `sys.stderr` when stdout carries data rather than logs, as it does for a CLI
+            command whose output is compared byte for byte.
+        formatter: `"json"` (the default, and byte identical to 0.7.0), `"text"` for a
+            human readable line on a TTY, or a `logging.Formatter` instance for a service
+            that wants its own.
+
+    Raises:
+        ValueError: `formatter` is a string outside `"json"` and `"text"`.
     """
     global _CONFIGURED
     if _CONFIGURED and not force:
         return
 
+    # Resolved before anything is torn down, so a bad `formatter` argument raises with the
+    # previous configuration still in place rather than leaving the root logger with no
+    # handler at all.
+    resolved = _resolve_formatter(formatter, service=service, environment=environment)
+
     root = logging.getLogger()
     for existing in root.handlers[:]:
         root.removeHandler(existing)
 
-    handler = logging.StreamHandler(sys.stdout)
-    handler.setFormatter(JsonFormatter(service=service, environment=environment))
+    # `sys.stdout` is read here rather than defaulted in the signature, so a test or a
+    # Lambda runtime that replaced the stream after import gets the replacement.
+    handler = logging.StreamHandler(stream if stream is not None else sys.stdout)
+    handler.setFormatter(resolved)
     root.addHandler(handler)
     root.setLevel(level.upper())
 

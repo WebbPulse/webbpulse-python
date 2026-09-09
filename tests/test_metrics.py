@@ -17,10 +17,12 @@ from typing import Any
 import pytest
 
 from webbpulse.metrics import (
+    DEFAULT_METRIC_ENVIRONMENTS,
     EMF_MAX_DIMENSIONS,
     UNITS,
     MetricsEmitter,
     emit,
+    metrics_enabled_from_env,
     timed,
 )
 
@@ -503,3 +505,121 @@ def test_timed_records_the_duration_even_when_the_block_raises() -> None:
     emitter.flush()
     (payload,) = _lines(stream)
     assert payload["Elapsed"] >= 0.0
+
+
+# --------------------------------------------------------------------------------------
+# `metrics_enabled_from_env`. CarModPicker's deleted module carried exactly this gate, so
+# these tests pin the behaviour it had rather than inventing a new policy.
+# --------------------------------------------------------------------------------------
+
+
+@pytest.fixture
+def clean_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Neither variable set, so a workstation's own environment cannot decide a test."""
+    monkeypatch.delenv("TESTING", raising=False)
+    monkeypatch.delenv("ENVIRONMENT", raising=False)
+
+
+@pytest.mark.parametrize("environment", DEFAULT_METRIC_ENVIRONMENTS)
+def test_metrics_are_live_in_the_deployed_environments(clean_env: None, environment: str) -> None:
+    assert metrics_enabled_from_env(environment) is True
+
+
+@pytest.mark.parametrize("environment", ["development", "dev", "local", "preview", "test"])
+def test_metrics_are_silent_everywhere_else(clean_env: None, environment: str) -> None:
+    assert metrics_enabled_from_env(environment) is False
+
+
+@pytest.mark.parametrize("value", ["true", "True", "TRUE", " true ", "1", "yes", "on"])
+def test_the_testing_variable_wins_over_an_allowed_environment(
+    clean_env: None, monkeypatch: pytest.MonkeyPatch, value: str
+) -> None:
+    """A test suite emitting real EMF would put test data on the production metric."""
+    monkeypatch.setenv("TESTING", value)
+    assert metrics_enabled_from_env("production") is False
+
+
+@pytest.mark.parametrize("value", ["false", "False", "0", "no", "", "  "])
+def test_a_falsey_testing_variable_does_not_suppress_metrics(
+    clean_env: None, monkeypatch: pytest.MonkeyPatch, value: str
+) -> None:
+    monkeypatch.setenv("TESTING", value)
+    assert metrics_enabled_from_env("production") is True
+
+
+def test_the_environment_is_read_from_the_environment_when_not_passed(
+    clean_env: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A service without a settings object passes nothing and still gets the right answer."""
+    monkeypatch.setenv("ENVIRONMENT", "staging")
+    assert metrics_enabled_from_env() is True
+    monkeypatch.setenv("ENVIRONMENT", "development")
+    assert metrics_enabled_from_env() is False
+
+
+def test_an_unset_environment_is_silent_rather_than_live(clean_env: None) -> None:
+    """A missing variable must fail closed: silence beats noise from an unknown source."""
+    assert metrics_enabled_from_env() is False
+
+
+@pytest.mark.parametrize("environment", ["", "   "])
+def test_a_blank_environment_is_silent(clean_env: None, environment: str) -> None:
+    assert metrics_enabled_from_env(environment) is False
+
+
+@pytest.mark.parametrize("environment", ["Production", " STAGING ", "pRoDuCtIoN"])
+def test_the_environment_is_matched_case_insensitively_after_a_strip(
+    clean_env: None, environment: str
+) -> None:
+    """These values arrive from Terraform and a task definition, not from code."""
+    assert metrics_enabled_from_env(environment) is True
+
+
+def test_the_allowed_set_can_be_overridden(clean_env: None) -> None:
+    assert metrics_enabled_from_env("preview", allowed=("preview",)) is True
+    assert metrics_enabled_from_env("production", allowed=("preview",)) is False
+
+
+def test_the_allowed_set_is_normalised_too(clean_env: None) -> None:
+    assert metrics_enabled_from_env("preview", allowed=(" Preview ",)) is True
+
+
+def test_the_variable_names_can_be_overridden(
+    clean_env: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("PYTEST_RUNNING", "true")
+    monkeypatch.setenv("APP_ENV", "production")
+    assert (
+        metrics_enabled_from_env(testing_var="PYTEST_RUNNING", environment_var="APP_ENV") is False
+    )
+    monkeypatch.delenv("PYTEST_RUNNING")
+    assert metrics_enabled_from_env(testing_var="PYTEST_RUNNING", environment_var="APP_ENV") is True
+
+
+def test_the_gate_composes_with_enabled_rather_than_replacing_it(clean_env: None) -> None:
+    """The helper returns a bool and touches nothing; `enabled` still defaults to True."""
+    stream = io.StringIO()
+    assert (
+        emit(
+            namespace="WebbPulse/Test",
+            metrics={"Ingested": 1},
+            enabled=metrics_enabled_from_env("development"),
+            stream=stream,
+        )
+        is None
+    )
+    assert stream.getvalue() == ""
+
+    line = emit(
+        namespace="WebbPulse/Test",
+        metrics={"Ingested": 1},
+        enabled=metrics_enabled_from_env("production"),
+        stream=stream,
+    )
+    assert line is not None
+    assert json.loads(line)["Ingested"] == 1
+
+
+def test_metrics_emitter_still_defaults_to_enabled(clean_env: None) -> None:
+    """0.8.0 adds a helper; it does not move the constructor default under anyone."""
+    assert MetricsEmitter(namespace="WebbPulse/Test").enabled is True

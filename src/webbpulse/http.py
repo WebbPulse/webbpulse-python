@@ -4,18 +4,49 @@
 into the single app that local development, the test suite and a plain container run, which
 is the second composition root: one entrypoint per domain in production, one mounted app
 everywhere else, from the same routers.
+
+## The sync dependency trap, and `user_id_dependency`
+
+`webbpulse.log_context.set_user_id` binds a ContextVar, and a ContextVar bound inside a
+**sync** (`def`) FastAPI dependency is invisible to the handler and to every log line after
+it. This is not a bug in either package. Starlette runs a sync dependency in a threadpool
+through `anyio.to_thread.run_sync`, which copies the context into the worker thread; the
+copy is what the dependency mutates, and the copy is discarded when the call returns. The
+request's own context never sees the value.
+
+Nothing fails. The dependency runs, the principal resolves, the endpoint returns 200, and
+every log line for the rest of the request carries `user_id` of `"-"`. WebbPulse-Portfolio
+shipped exactly that to production, and the only symptom was a field quietly reading `"-"`
+in CloudWatch.
+
+`bind_user_id` and `user_id_dependency` exist so the shape that works is the one that is
+easy to reach. `user_id_dependency` wraps a service's own user-resolving dependency in an
+`async def`, which runs in the request's context, and binds the id there::
+
+    from webbpulse.http import user_id_dependency
+
+    CurrentUser = user_id_dependency(get_current_user)
+
+    @router.get("/me")
+    async def me(user: User = Depends(CurrentUser)) -> UserRead:
+        ...
+
+The wrapped dependency may itself be `def` or `async def`: FastAPI resolves it as a
+sub-dependency and the binding happens in the async wrapper either way, after the value has
+come back across the thread boundary.
 """
 
 from __future__ import annotations
 
+import inspect
 import json
 import logging
 import uuid
-from collections.abc import Iterable, Mapping, Sequence
+from collections.abc import Awaitable, Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Final
 
-from fastapi import APIRouter, FastAPI, Request
+from fastapi import APIRouter, Depends, FastAPI, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
@@ -23,7 +54,7 @@ from starlette.exceptions import HTTPException as StarletteHTTPException
 from starlette.middleware.base import BaseHTTPMiddleware, RequestResponseEndpoint
 from starlette.responses import Response
 
-from webbpulse.log_context import request_id_var, set_request_id
+from webbpulse.log_context import request_id_var, set_request_id, set_user_id
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
     from webbpulse.config import BaseServiceSettings
@@ -36,6 +67,7 @@ __all__ = [
     "ErrorSpec",
     "ExceptionMap",
     "RequestIdMiddleware",
+    "bind_user_id",
     "client_ip",
     "create_app",
     "error_body",
@@ -44,6 +76,7 @@ __all__ = [
     "mount_all",
     "register_error_handlers",
     "request_id",
+    "user_id_dependency",
 ]
 
 _log = logging.getLogger(__name__)
@@ -148,6 +181,93 @@ def request_id(request: Request) -> str:
     """
     value = getattr(request.state, _REQUEST_ID_STATE, None)
     return value if isinstance(value, str) else "-"
+
+
+async def bind_user_id(user_id: object) -> str:
+    """Bind the user id for the rest of the request. **Await this; never call it from a
+    `def` dependency.**
+
+    A thin async wrapper over `webbpulse.log_context.set_user_id`, and the whole of the
+    difference is the `async`. A coroutine runs in the caller's own context, so the binding
+    it makes is visible to the handler and to every log line after it. The same call inside
+    a sync (`def`) dependency binds a context that Starlette's threadpool discards on
+    return, and nothing anywhere reports that it happened.
+
+    Being a coroutine is what makes the wrong shape hard to write rather than merely
+    documented: `bind_user_id(user.id)` in a `def` dependency binds nothing, but it also
+    leaves an un-awaited coroutine, which Python warns about at runtime and which this
+    package's `-W error` test configuration turns into a failure. `set_user_id` is still
+    there and still correct wherever the caller controls the context: a middleware, a
+    `task_context` block, a CLI entry point.
+
+    Returns the bound value as the cleaned string, so a caller can log or assert on exactly
+    what was bound rather than repeating the coercion.
+    """
+    set_user_id(user_id)
+    from webbpulse.log_context import user_id_var
+
+    return user_id_var.get()
+
+
+def user_id_dependency[UserT](
+    get_user: Callable[..., UserT | Awaitable[UserT]],
+    *,
+    attribute: str = "id",
+    extract: Callable[[UserT], object] | None = None,
+) -> Callable[..., Awaitable[UserT]]:
+    """Wrap a user-resolving dependency so the resolved id reaches the log context.
+
+    Returns an `async def` dependency that resolves `get_user` as a FastAPI sub-dependency,
+    binds the id from whatever it returned, and returns that same object unchanged. The
+    return value is passed straight through, so this is a drop-in replacement at the call
+    site: a handler that took `Depends(get_current_user)` takes `Depends(CurrentUser)` and
+    receives the identical object.
+
+    ::
+
+        CurrentUser = user_id_dependency(get_current_user)
+
+        @router.get("/me")
+        async def me(user: User = Depends(CurrentUser)) -> UserRead:
+            ...
+
+    `get_user` may be `def` or `async def`, and it keeps its own dependencies: FastAPI
+    inspects its signature through `Depends`, so a resolver taking a `Session`, a token or
+    a `Request` works untouched. The threadpool problem does not apply, because the binding
+    happens in the async wrapper after the value has come back across the thread boundary.
+
+    Args:
+        get_user: The service's existing dependency, returning a user object or `None`.
+        attribute: The attribute holding the id, `"id"` by default. A user object with a
+            different name for it passes `attribute="user_id"` or `attribute="sub"`.
+        extract: A callable taking the resolved object and returning the id, for the case
+            where it is not a plain attribute: a dict, a tuple, a nested claim. Takes
+            precedence over `attribute` when given.
+
+    Returns:
+        An `async def` dependency suitable for `Depends`.
+
+    Notes:
+        A `get_user` that returns `None`, which is the shape of an optional-authentication
+        dependency, binds nothing and leaves `user_id` at its `"-"` placeholder rather than
+        binding the string `"None"`. An object with neither `attribute` nor a usable
+        `extract` result binds nothing too: a missing id is a reason to log without one, not
+        a reason to fail the request that was otherwise going to succeed.
+    """
+
+    async def dependency(resolved: Any = Depends(get_user)) -> UserT:
+        user: UserT = resolved
+        if user is not None:
+            value = extract(user) if extract is not None else getattr(user, attribute, None)
+            if value is not None:
+                await bind_user_id(value)
+        return user
+
+    # Carried across so FastAPI's own error messages and the OpenAPI operation ids name the
+    # service's dependency rather than this module's inner function.
+    dependency.__name__ = getattr(get_user, "__name__", "user_id_dependency")
+    dependency.__doc__ = inspect.getdoc(get_user)
+    return dependency
 
 
 class RequestIdMiddleware(BaseHTTPMiddleware):

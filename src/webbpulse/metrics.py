@@ -48,25 +48,38 @@ surfaces. `Unit` is omitted from the document when it is `None`, which CloudWatc
 High-resolution metrics are supported by passing `storage_resolution=1`, which stores at
 one-second granularity for the first three hours. The default of 60 is standard resolution
 and is what almost everything should use.
+
+## When metrics are live
+
+`enabled` stays a plain constructor argument, and it stays `True` by default, because the
+policy for when metrics are on belongs to the service that holds the settings object rather
+than to this module. What 0.8.0 adds is `metrics_enabled_from_env`, the one gate every
+adopter was going to write anyway: silent while the testing variable is truthy, and live
+only in the environments named. It reads environment variables and returns a bool, so it
+composes with `enabled=` rather than replacing it, and a service that never calls it sees
+no change at all.
 """
 
 from __future__ import annotations
 
 import json
 import logging
+import os
 import sys
 import time
-from collections.abc import Iterator, Mapping
+from collections.abc import Iterable, Iterator, Mapping
 from contextlib import contextmanager
 from types import TracebackType
 from typing import Final, Literal, TextIO
 
 __all__ = [
+    "DEFAULT_METRIC_ENVIRONMENTS",
     "EMF_MAX_DIMENSIONS",
     "UNITS",
     "MetricUnit",
     "MetricsEmitter",
     "emit",
+    "metrics_enabled_from_env",
     "timed",
 ]
 
@@ -115,6 +128,69 @@ _DEFAULT_STORAGE_RESOLUTION: Final = 60
 
 MetricUnit = str
 """The unit of a metric value. Must be a member of `UNITS`."""
+
+#: The environments metrics are live in by default. Deliberately excludes development and
+#: any per-branch preview: a metric emitted from a workstation lands in the same namespace
+#: as production and skews the alarm it is next to, which is worse than not having it.
+DEFAULT_METRIC_ENVIRONMENTS: Final[tuple[str, ...]] = ("staging", "production")
+
+#: Values of the testing variable that count as "yes". Compared case-insensitively after a
+#: strip, so `TESTING=True` from a shell profile and `TESTING=true` from a compose file mean
+#: the same thing rather than one of them silently emitting metrics from a test run.
+_TRUE_VALUES: Final[frozenset[str]] = frozenset({"1", "true", "yes", "on"})
+
+
+def metrics_enabled_from_env(
+    environment: str | None = None,
+    *,
+    testing_var: str = "TESTING",
+    environment_var: str = "ENVIRONMENT",
+    allowed: Iterable[str] = DEFAULT_METRIC_ENVIRONMENTS,
+) -> bool:
+    """Whether metrics should be live, as a bool to hand to `enabled=`.
+
+    This is the gate every adopter writes anyway, hoisted so the next one does not write it
+    a third time slightly differently. It reads environment variables and returns a bool; it
+    does not touch `MetricsEmitter`, whose `enabled` still defaults to `True`, so nothing
+    that does not call this changes behaviour::
+
+        emit(
+            namespace="CarModPicker/Crawlers",
+            metrics={"Ingested": ingested},
+            enabled=metrics_enabled_from_env(settings.environment),
+        )
+
+    Two conditions, both of which must hold:
+
+    * The testing variable is not truthy. A test suite that emitted real EMF documents would
+      put test data on the same metric as production, and the test's own stdout assertions
+      would have to tolerate a metric line appearing in the middle of them.
+    * The environment is in `allowed`, which defaults to staging and production.
+
+    Args:
+        environment: The environment name. When `None` it is read from `environment_var`,
+            so a service with a settings object passes `settings.environment` and one
+            without passes nothing.
+        testing_var: The variable that suppresses metrics when truthy. `"TESTING"` is the
+            name CarModPicker's deleted gate used and the name its pytest configuration
+            already sets.
+        environment_var: The variable consulted when `environment` is `None`.
+        allowed: The environment names metrics are live in. Matched case-insensitively
+            after a strip, because these values arrive from Terraform and a task definition
+            rather than from code.
+
+    Returns:
+        `True` only when the testing variable is not truthy and the environment is allowed.
+        An unset or blank environment is not allowed, so the failure mode of a missing
+        variable is silence rather than production-namespaced noise from an unknown source.
+    """
+    if os.environ.get(testing_var, "").strip().lower() in _TRUE_VALUES:
+        return False
+    name = environment if environment is not None else os.environ.get(environment_var, "")
+    resolved = name.strip().lower()
+    if not resolved:
+        return False
+    return resolved in {value.strip().lower() for value in allowed}
 
 
 class MetricsEmitter:
