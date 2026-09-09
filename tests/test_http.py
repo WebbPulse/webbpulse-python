@@ -8,6 +8,8 @@ supported shapes and the refusal to trust `X-Forwarded-For`.
 
 from __future__ import annotations
 
+import asyncio
+import inspect
 import json
 import logging
 import sys
@@ -16,7 +18,7 @@ from unittest import mock
 
 import pytest
 from botocore.exceptions import ClientError
-from fastapi import APIRouter, FastAPI, HTTPException
+from fastapi import APIRouter, Depends, FastAPI, HTTPException
 from fastapi.testclient import TestClient
 from starlette.requests import Request
 
@@ -25,6 +27,7 @@ from webbpulse.http import (
     REQUEST_CONTEXT_HEADER,
     REQUEST_ID_HEADER,
     ErrorSpec,
+    bind_user_id,
     client_ip,
     create_app,
     error_body,
@@ -32,7 +35,9 @@ from webbpulse.http import (
     mount_all,
     register_error_handlers,
     request_id,
+    user_id_dependency,
 )
+from webbpulse.logging import configure_logging
 
 
 def _request(
@@ -912,3 +917,260 @@ def test_an_impossible_status_is_rejected_when_the_app_is_built() -> None:
 def test_an_empty_map_installs_nothing_and_raises_nothing() -> None:
     response = _mapped_app(ItemNotFound(), exception_map={}).get("/work")
     assert response.status_code == 500, "an empty map is the same as no map"
+
+
+# --------------------------------------------------------------------------------------
+# The sync dependency trap: `set_user_id` in a `def` dependency binds a context that
+# Starlette's threadpool discards, so the handler and every log line after it see `"-"`.
+# WebbPulse-Portfolio shipped that shape to production. These tests demonstrate the failure
+# and then the fix, end to end, by parsing the JSON that `JsonFormatter` actually emitted.
+# --------------------------------------------------------------------------------------
+
+
+class _User:
+    """The minimal shape of a service's user object: something with an `id`."""
+
+    def __init__(self, user_id: str) -> None:
+        self.id = user_id
+
+
+def _resolve_user() -> _User:
+    """A service's own user-resolving dependency, deliberately `def` rather than `async`."""
+    return _User("u-42")
+
+
+def _user_id_app(current_user: Any) -> FastAPI:
+    """An app whose one route logs, and reports the `user_id` the handler itself can see.
+
+    Two readings, because they can disagree and the disagreement is the whole point. The
+    response body is what the handler sees at the moment it runs; the emitted log line is
+    what `JsonFormatter` merged in, which is what actually reaches CloudWatch.
+    """
+    from webbpulse.log_context import user_id_var
+
+    router = APIRouter()
+
+    @router.get("/me")
+    async def me(user: Any = Depends(current_user)) -> dict[str, str]:
+        logging.getLogger("app.me").info("served")
+        return {"handler_user_id": user_id_var.get(), "resolved_id": user.id}
+
+    return create_app([router], instrument=False)
+
+
+def _call_and_read_log(app: FastAPI, capsys: pytest.CaptureFixture[str]) -> tuple[Any, Any]:
+    """Drive `/me` with logging configured, returning the body and the parsed log line."""
+    configure_logging(level="INFO", force=True)
+    # Discard anything `configure_logging` or the client setup wrote before the request.
+    capsys.readouterr()
+
+    body = TestClient(app).get("/me").json()
+
+    lines = [line for line in capsys.readouterr().out.splitlines() if line.strip()]
+    served = [
+        payload
+        for payload in (json.loads(line) for line in lines)
+        if payload.get("message") == "served"
+    ]
+    assert len(served) == 1, lines
+    return body, served[0]
+
+
+def test_set_user_id_in_a_sync_dependency_never_reaches_the_handler_or_the_log(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """The trap itself. Nothing raises; `user_id` is simply still the `"-"` placeholder.
+
+    This is the production shape Portfolio shipped: a `def` dependency calling
+    `set_user_id`. Starlette runs it through `anyio.to_thread.run_sync`, which copies the
+    context into a worker thread, and the copy dies when the call returns.
+    """
+    from webbpulse.log_context import UNSET, set_user_id
+
+    def current_user() -> _User:
+        user = _resolve_user()
+        set_user_id(user.id)  # Binds a context that is about to be thrown away.
+        return user
+
+    body, log_line = _call_and_read_log(_user_id_app(current_user), capsys)
+
+    # The dependency ran and resolved the right user, which is why this is silent.
+    assert body["resolved_id"] == "u-42"
+    # And yet neither the handler nor the log line ever saw the id.
+    assert body["handler_user_id"] == UNSET
+    assert "user_id" not in log_line, (
+        "if this key appears, the threadpool context copy now propagates and the "
+        "user_id_dependency wrapper can be reconsidered"
+    )
+
+
+def test_user_id_dependency_binds_the_id_for_the_handler_and_the_log(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """The fix. The same `def` resolver, wrapped, and the id reaches both readings."""
+    body, log_line = _call_and_read_log(_user_id_app(user_id_dependency(_resolve_user)), capsys)
+
+    assert body["resolved_id"] == "u-42"
+    assert body["handler_user_id"] == "u-42"
+    assert log_line["user_id"] == "u-42"
+
+
+def test_an_async_dependency_that_awaits_bind_user_id_works_too(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """The hand-rolled form of the same fix, for a service that wants its own wrapper."""
+
+    async def current_user() -> _User:
+        user = _resolve_user()
+        await bind_user_id(user.id)
+        return user
+
+    body, log_line = _call_and_read_log(_user_id_app(current_user), capsys)
+
+    assert body["handler_user_id"] == "u-42"
+    assert log_line["user_id"] == "u-42"
+
+
+def test_bind_user_id_returns_the_cleaned_value() -> None:
+    """The coercion is `set_user_id`'s, and the return saves the caller repeating it."""
+    from webbpulse.log_context import user_id_var
+
+    async def run() -> str:
+        return await bind_user_id(" 42\nx ")
+
+    token = user_id_var.set("-")
+    try:
+        assert asyncio.run(run()) == "42 x"
+    finally:
+        user_id_var.reset(token)
+
+
+def test_user_id_dependency_passes_the_resolved_object_through_unchanged() -> None:
+    """A drop-in replacement returns the identical object, not a copy or an id."""
+    sentinel = _User("u-7")
+    dependency = user_id_dependency(lambda: sentinel)
+    router = APIRouter()
+
+    @router.get("/same")
+    async def same(user: Any = Depends(dependency)) -> dict[str, bool]:
+        return {"identical": user is sentinel}
+
+    assert TestClient(create_app([router], instrument=False)).get("/same").json() == {
+        "identical": True
+    }
+
+
+def test_user_id_dependency_wraps_an_async_resolver_too() -> None:
+    async def current_user() -> _User:
+        return _User("u-9")
+
+    router = APIRouter()
+
+    @router.get("/me")
+    async def me(user: Any = Depends(user_id_dependency(current_user))) -> dict[str, str]:
+        from webbpulse.log_context import user_id_var
+
+        return {"user_id": user_id_var.get()}
+
+    assert TestClient(create_app([router], instrument=False)).get("/me").json()["user_id"] == "u-9"
+
+
+def test_user_id_dependency_keeps_the_wrapped_dependencys_own_dependencies() -> None:
+    """FastAPI resolves the wrapped callable normally, so its signature still works."""
+
+    def current_user(request: Request) -> _User:
+        return _User(request.headers["x-test-user"])
+
+    router = APIRouter()
+
+    @router.get("/me")
+    async def me(user: Any = Depends(user_id_dependency(current_user))) -> dict[str, str]:
+        from webbpulse.log_context import user_id_var
+
+        return {"user_id": user_id_var.get()}
+
+    response = TestClient(create_app([router], instrument=False)).get(
+        "/me", headers={"x-test-user": "u-hdr"}
+    )
+    assert response.json()["user_id"] == "u-hdr"
+
+
+def test_user_id_dependency_binds_nothing_when_the_resolver_returns_none() -> None:
+    """Optional authentication must leave the placeholder, not bind the string 'None'."""
+    from webbpulse.log_context import UNSET
+
+    router = APIRouter()
+
+    @router.get("/me")
+    async def me(user: Any = Depends(user_id_dependency(lambda: None))) -> dict[str, Any]:
+        from webbpulse.log_context import user_id_var
+
+        return {"user_id": user_id_var.get(), "user_is_none": user is None}
+
+    body = TestClient(create_app([router], instrument=False)).get("/me").json()
+    assert body == {"user_id": UNSET, "user_is_none": True}
+
+
+def test_user_id_dependency_binds_nothing_when_the_attribute_is_missing() -> None:
+    """A missing id logs without one rather than failing a request that would have worked."""
+    from webbpulse.log_context import UNSET
+
+    class _NoId:
+        pass
+
+    router = APIRouter()
+
+    @router.get("/me")
+    async def me(user: Any = Depends(user_id_dependency(_NoId))) -> dict[str, str]:
+        from webbpulse.log_context import user_id_var
+
+        return {"user_id": user_id_var.get()}
+
+    assert TestClient(create_app([router], instrument=False)).get("/me").json()["user_id"] == UNSET
+
+
+def test_user_id_dependency_honours_a_custom_attribute_name() -> None:
+    class _Principal:
+        sub = "sub-123"
+
+    router = APIRouter()
+
+    @router.get("/me")
+    async def me(
+        user: Any = Depends(user_id_dependency(_Principal, attribute="sub")),
+    ) -> dict[str, str]:
+        from webbpulse.log_context import user_id_var
+
+        return {"user_id": user_id_var.get()}
+
+    body = TestClient(create_app([router], instrument=False)).get("/me").json()
+    assert body["user_id"] == "sub-123"
+
+
+def test_user_id_dependency_honours_an_extract_callable() -> None:
+    """For a claims dict or anything else where the id is not a plain attribute."""
+    router = APIRouter()
+    dependency = user_id_dependency(
+        lambda: {"claims": {"sub": "claim-7"}},
+        extract=lambda payload: payload["claims"]["sub"],
+    )
+
+    @router.get("/me")
+    async def me(user: Any = Depends(dependency)) -> dict[str, str]:
+        from webbpulse.log_context import user_id_var
+
+        return {"user_id": user_id_var.get()}
+
+    assert (
+        TestClient(create_app([router], instrument=False)).get("/me").json()["user_id"] == "claim-7"
+    )
+
+
+def test_user_id_dependency_takes_the_wrapped_callables_name() -> None:
+    """So FastAPI's errors and the OpenAPI operation ids name the service's dependency."""
+    assert user_id_dependency(_resolve_user).__name__ == "_resolve_user"
+    assert user_id_dependency(lambda: None).__name__ == "<lambda>"
+
+
+def test_user_id_dependency_carries_the_wrapped_callables_docstring() -> None:
+    assert user_id_dependency(_resolve_user).__doc__ == inspect.getdoc(_resolve_user)

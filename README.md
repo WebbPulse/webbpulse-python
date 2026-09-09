@@ -134,6 +134,29 @@ what lets a CloudWatch metric filter or an Insights query select on it. `configu
 is idempotent, replaces Lambda's own root handler rather than adding to it, and reattaches
 uvicorn's loggers so access lines are JSON too.
 
+#### Two escape hatches
+
+Both were added in 0.8.0 and neither changes anything for a caller that does not pass them.
+
+```python
+configure_logging(level="DEBUG", formatter="text", stream=sys.stderr)
+```
+
+`stream=` moves **every handler the function installs**, which is what a CLI needs when its
+own commands write data on stdout and are compared byte for byte. A log line leaking onto
+stdout breaks that comparison, and routing only some handlers would leave exactly the
+interleaving the argument exists to remove. It defaults to `sys.stdout`, read at call time
+rather than at import so a runtime that replaced the stream is honoured.
+
+`formatter=` chooses the rendering: `"json"` (the default, byte identical to 0.7.0),
+`"text"` for a human readable `time level logger message` line on a TTY, or a
+`logging.Formatter` instance for a service that wants its own. A one-line JSON object is
+right in CloudWatch and unreadable in a terminal. `"text"` drops `service` and `environment`
+rather than rendering them, since locally there is one of each; a service that wants the
+request context in a text line uses `LogContextFilter` and a `%(request_id)s` in its own
+format string. A bad selector raises before the existing handlers are torn down, so a typo
+does not leave the root logger with nothing attached.
+
 ### `webbpulse.log_context`
 
 Two context variables, `request_id` and `user_id`, and the helpers that bind them. The
@@ -177,6 +200,60 @@ same values onto the active OpenTelemetry span as `webbpulse.request_id` and
 Values are coerced to strings, stripped of newlines and truncated to 128 characters,
 because both can originate from a caller: the request id from an inbound `X-Request-ID`
 and the user id from a token claim.
+
+#### Do not call `set_user_id` from a sync (`def`) FastAPI dependency
+
+**This is the one way to get `log_context` wrong, it fails silently, and Portfolio shipped
+it to production.** A ContextVar bound inside a `def` dependency is invisible to the
+handler and to every log line after it:
+
+```python
+def get_current_user(token: str = Depends(oauth2)) -> User:   # WRONG: `def`
+    user = lookup(token)
+    set_user_id(user.id)     # binds a context that is about to be discarded
+    return user
+```
+
+Nothing raises. The dependency runs, the user resolves, the endpoint returns 200, and
+`user_id` reads `"-"` on every line for the rest of the request. Starlette runs a sync
+dependency in a threadpool through `anyio.to_thread.run_sync`, which **copies** the context
+into the worker thread; the copy is what gets mutated, and it dies when the call returns.
+
+Use `webbpulse.http.user_id_dependency`, which wraps the service's own resolver in an
+`async def` and binds the id in the request's own context:
+
+```python
+from webbpulse.http import user_id_dependency
+
+CurrentUser = user_id_dependency(get_current_user)   # `get_current_user` may stay `def`
+
+@router.get("/me")
+async def me(user: User = Depends(CurrentUser)) -> UserRead:
+    ...
+```
+
+The resolved object is passed straight through, so this is a drop-in swap at every call
+site: the handler receives the identical object it received before. The wrapped resolver
+keeps its own dependencies, may be `def` or `async def`, and needs no change. Pass
+`attribute="sub"` when the id is not on `.id`, or `extract=lambda claims: claims["sub"]`
+when it is not a plain attribute at all. A resolver returning `None`, which is the optional
+authentication shape, binds nothing and leaves the `"-"` placeholder rather than the string
+`"None"`.
+
+For a service that prefers its own wrapper, `webbpulse.http.bind_user_id` is the same
+binding as an awaitable:
+
+```python
+async def get_current_user(...) -> User:
+    user = lookup(token)
+    await bind_user_id(user.id)
+    return user
+```
+
+Being a coroutine is the point: writing it in a `def` dependency leaves an un-awaited
+coroutine, which Python warns about at runtime and which a suite running under `-W error`
+fails on, so the wrong shape stops being silent. `set_user_id` remains correct wherever the
+caller owns the context: a middleware, a `task_context` block, a CLI entry point.
 
 ### `webbpulse.metrics`
 
@@ -229,6 +306,25 @@ a value array that CloudWatch aggregates, rather than producing a document each.
 `enabled=False` makes emission a no-op while still validating, so a typo fails in a test
 suite rather than only in production; it is a constructor argument rather than an
 environment variable so the policy stays with the service that owns the settings.
+
+`metrics_enabled_from_env` (0.8.0) is the gate that policy usually turns out to be, hoisted
+so the next adopter does not hand-roll it a third time:
+
+```python
+from webbpulse.metrics import emit, metrics_enabled_from_env
+
+emit(..., enabled=metrics_enabled_from_env(settings.environment))
+```
+
+It returns `True` only when `TESTING` is not truthy and the environment is one of
+`staging` or `production`, which is exactly the gate CarModPicker's deleted
+`core/cloudwatch_emf.py` carried. Both are arguments: `testing_var=`, `environment_var=`
+and `allowed=` cover a service that names them differently. Passing no environment reads
+`ENVIRONMENT`, so a service without a settings object still works. An unset or blank
+environment returns `False`, because a missing variable should fail closed to silence
+rather than to production-namespaced noise from an unidentified source. It reads
+environment variables and returns a bool, nothing else: `MetricsEmitter(enabled=...)` still
+defaults to `True` and a service that never calls this sees no change.
 
 `flush` never raises. A metric reports on the work, and losing the report is better than
 failing the work, so a closed stream or a serialisation failure is logged at ERROR and
@@ -521,6 +617,11 @@ that the framework would otherwise emit.
 
 Validation errors return only the location and the reason, never the offending input, which
 can be a password or a token.
+
+`user_id_dependency` and `bind_user_id` live here too, and they are how a service gets
+`user_id` onto its log lines without hitting the sync-dependency trap. See
+[the warning under `log_context`](#do-not-call-set_user_id-from-a-sync-def-fastapi-dependency),
+which is the shape to read before wiring authentication.
 
 #### Carrying more than the four fields
 
@@ -1124,6 +1225,10 @@ already migrated.
   mounted, since that middleware now sets `request.state` and binds the ContextVar and
   echoes the header, which is everything the local one did. Until then the local
   middleware keeps working: it sets the same ContextVar under the same name.
+- `core/logging.py`'s local `configure_logging` wrapper can go as of 0.8.0. It existed for
+  two reasons and both are now arguments: `stream=sys.stderr` for the commands whose stdout
+  is data and is compared byte for byte, and `formatter="text"` for a readable line on a
+  TTY. The deployed call passes neither and is byte identical to what it emits today.
 - `core/cloudwatch_emf.py` is a straight deletion, not a swap. It has no call site left:
   `emit_crawler_run_metrics` served a crawler tree that the DynamoDB and Lambda migration
   removed, which CarModPicker's own `docs/migration/split-plan.md` already lists as dead
@@ -1135,6 +1240,9 @@ already migrated.
   `namespace`, three `Count` and `Seconds` metrics and `AdapterName`/`Environment`/`RunType`
   dimensions reproduces the old document byte for byte, so a restored crawler would keep
   plan 02-05's alarm matching. That equivalence is pinned by a test in this package.
+- The gate that module carried, silent unless `TESTING` is not `"true"` and the environment
+  is staging or production, is `metrics_enabled_from_env` as of 0.8.0 rather than something
+  to reimplement at the next call site.
 
 **WebbPulse-Portfolio** gains capability rather than replacing any.
 
@@ -1145,6 +1253,9 @@ already migrated.
   wrapper does not run under the Web Adapter, since there is no handler to decorate. That
   is the gap `log_context` fills, and it is why the Powertools dependency can go at the
   same time as `core/logging.py`.
+- Its `get_current_user` is a `def` dependency, so the `set_user_id` call in it binds
+  nothing. That is the trap above, and the fix is to wrap it once at the call site with
+  `user_id_dependency`; the resolver itself does not have to change and can stay `def`.
 - It emits no custom metrics. `webbpulse.metrics` is what it uses when it starts, with its
   own namespace; nothing has to change for the adoption itself.
 

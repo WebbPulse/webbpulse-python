@@ -7,15 +7,23 @@ silently, so the names are pinned by test.
 
 from __future__ import annotations
 
+import io
 import json
 import logging
 import re
+import sys
 from datetime import datetime
 from typing import Any
+from unittest import mock
 
 import pytest
 
-from webbpulse.logging import JsonFormatter, configure_logging, get_logger
+from webbpulse.logging import (
+    JsonFormatter,
+    TextFormatter,
+    configure_logging,
+    get_logger,
+)
 
 # RFC 3339 with milliseconds and a Z suffix. Lambda requires this exact shape to parse the
 # timestamp; anything else makes it stamp its own time and force the level to INFO.
@@ -186,3 +194,136 @@ def test_trace_ids_are_absent_outside_a_span() -> None:
     payload = _format(_record())
     assert "trace_id" not in payload
     assert "span_id" not in payload
+
+
+# --------------------------------------------------------------------------------------
+# The 0.8.0 escape hatches. CarModPicker kept a local wrapper module because neither of
+# these existed. The first assertion in each pair is that the default did not move.
+# --------------------------------------------------------------------------------------
+
+
+def test_the_default_stream_is_still_stdout(capsys: pytest.CaptureFixture[str]) -> None:
+    configure_logging(level="INFO", force=True)
+    get_logger("app.api").info("served")
+
+    captured = capsys.readouterr()
+    assert json.loads(captured.out.strip())["message"] == "served"
+    assert captured.err == "", "the default must not have moved to stderr"
+
+
+def test_stream_routes_every_handler_the_function_installs(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Two CMP commands write data on stdout and are diffed byte for byte.
+
+    A single log line leaking onto stdout breaks that comparison, so the assertion is that
+    stdout is *empty*, not merely that stderr has the line.
+    """
+    configure_logging(level="INFO", force=True, stream=sys.stderr)
+    get_logger("app.api").info("served")
+    get_logger("uvicorn.access").warning("slow")
+
+    captured = capsys.readouterr()
+    assert captured.out == "", "stdout must stay clean for the command's own output"
+    messages = [json.loads(line)["message"] for line in captured.err.splitlines() if line.strip()]
+    assert messages == ["served", "slow"]
+
+
+def test_the_root_still_carries_exactly_one_handler_with_a_custom_stream() -> None:
+    """A second handler left on the root is the shape that would defeat `stream=`."""
+    configure_logging(force=True, stream=io.StringIO())
+    assert len(logging.getLogger().handlers) == 1
+
+
+def test_stream_is_read_at_call_time_not_at_import() -> None:
+    """A runtime that replaced `sys.stdout` after import must still be honoured."""
+    replacement = io.StringIO()
+    with mock.patch.object(sys, "stdout", replacement):
+        configure_logging(level="INFO", force=True)
+        get_logger("app.api").info("served")
+    assert json.loads(replacement.getvalue().strip())["message"] == "served"
+
+
+def test_the_default_formatter_is_json_and_unchanged(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    configure_logging(level="INFO", service="posts", environment="staging", force=True)
+    handler = logging.getLogger().handlers[0]
+    assert isinstance(handler.formatter, JsonFormatter)
+
+    get_logger("app.api").info("served")
+    payload = json.loads(capsys.readouterr().out.strip())
+    assert payload["service"] == "posts"
+    assert payload["environment"] == "staging"
+
+
+def test_the_text_formatter_is_one_readable_line(capsys: pytest.CaptureFixture[str]) -> None:
+    configure_logging(level="INFO", formatter="text", force=True)
+    get_logger("app.api").warning("served")
+
+    line = capsys.readouterr().out.strip()
+    assert "\n" not in line
+    with pytest.raises(json.JSONDecodeError):
+        json.loads(line)
+    assert line.endswith("WARNING  app.api served")
+
+
+def test_the_text_formatter_still_renders_a_traceback(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    configure_logging(level="INFO", formatter="text", force=True)
+    try:
+        raise RuntimeError("boom")
+    except RuntimeError:
+        get_logger("app.api").exception("failed")
+
+    out = capsys.readouterr().out
+    assert "RuntimeError: boom" in out
+    assert "Traceback (most recent call last)" in out
+
+
+def test_text_ignores_service_and_environment_rather_than_rendering_them(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Locally there is one service and one environment, so repeating them is noise."""
+    configure_logging(formatter="text", service="posts", environment="dev", force=True)
+    get_logger("app.api").info("served")
+
+    line = capsys.readouterr().out.strip()
+    assert "posts" not in line
+    assert "dev" not in line
+
+
+def test_a_formatter_instance_is_installed_as_given(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """The escape hatch for a service whose format is neither of the two selectors."""
+    supplied = logging.Formatter("custom|%(levelname)s|%(message)s")
+    configure_logging(formatter=supplied, service="posts", force=True)
+
+    assert logging.getLogger().handlers[0].formatter is supplied
+    get_logger("app.api").info("served")
+    assert capsys.readouterr().out.strip() == "custom|INFO|served"
+
+
+def test_an_unknown_formatter_selector_is_rejected() -> None:
+    with pytest.raises(ValueError, match=re.escape("'json', 'text' or a logging.Formatter")):
+        configure_logging(formatter="logfmt", force=True)  # type: ignore[arg-type]
+
+
+def test_a_bad_formatter_leaves_the_previous_configuration_in_place(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Resolving before teardown is what keeps the root logger from ending up handlerless."""
+    configure_logging(level="INFO", force=True)
+    with pytest.raises(ValueError):
+        configure_logging(formatter="logfmt", force=True)  # type: ignore[arg-type]
+
+    assert len(logging.getLogger().handlers) == 1
+    get_logger("app.api").info("still here")
+    assert json.loads(capsys.readouterr().out.strip())["message"] == "still here"
+
+
+def test_the_text_formatter_accepts_a_format_string() -> None:
+    assert TextFormatter().format(_record()).endswith("INFO     app.api hello")
+    assert TextFormatter("%(message)s").format(_record()) == "hello"
