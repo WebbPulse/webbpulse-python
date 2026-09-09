@@ -252,6 +252,43 @@ that function already makes for itself. The fallback is refused when `environmen
 `production`, so a missing authorizer can never silently degrade into in-app verification
 in a deployed environment.
 
+**The claims are forwarded, and M0's 401 was our own parsing bug.** The paragraph above
+says the mechanism is proven in this codebase because the package already parses the header
+for the source IP. That is exactly right, and it is worth recording how nearly the opposite
+conclusion got written down instead.
+
+On 2026-09-09 a token the authorizer had already accepted, on a route that had already
+invoked the function, still produced a 401 from the handler. The obvious reading was that
+the Lambda Web Adapter had not forwarded `x-amzn-request-context` and that the image needed
+extra configuration. That reading was wrong. The adapter forwards the request context by
+default and no `AWS_LWA_*` variable governs it. What differed was the decoding:
+`webbpulse.http.client_ip` parses the header value as **plain JSON**, matching the adapter's
+own documentation ("forwarded in the `x-amzn-request-context` header as a JSON string"),
+while the spike's `spike.py` base64-decoded it first. Base64-decoding a plain JSON string
+raises, `spike.py` caught the error and returned an empty mapping, and the empty mapping
+became a 401 indistinguishable from a rejected token.
+
+The lesson is not about the adapter. It is that **a decoding assumption that fails closed
+into "unauthenticated" is indistinguishable from a real authorization failure**, and that is
+what turned a one-line bug into an afternoon of suspecting the gateway, the image and the
+key. Three requirements come out of it, and all belong to M1 rather than to a product:
+
+- **One parser for this header, in the package.** Two independent readings of
+  `x-amzn-request-context` already exist, `webbpulse.http.client_ip` and `spike.py`, and they
+  disagreed about the encoding. `authorizer_claims()` must be the only implementation, and it
+  must parse plain JSON, since that is what the adapter actually sends and what the package's
+  own working code has always assumed.
+- **`authorizer_claims()` must distinguish "no header" from "unparseable header" from "no
+  claims".** A missing header is a deployment fault, a header that will not parse is a bug in
+  our own code, and a present header with no `authorizer.jwt.claims` section is a routing
+  fault. None of the three is an anonymous caller, and all three should raise with a message
+  naming which one it was.
+- **Never swallow a decode error into an empty mapping.** `spike.py` caught
+  `binascii.Error`, `ValueError` and `UnicodeDecodeError` and returned `{}` on all of them,
+  which is what made a parsing bug present as an authorization outcome. Failing loudly here
+  costs nothing, because a handler behind the authorizer has no legitimate path on which the
+  header is absent or malformed.
+
 ### 2.5 The staging access gate interaction, and why it is a blocker
 
 CarModPicker's staging API already attaches a REQUEST authorizer to every route for the
@@ -657,6 +694,38 @@ discovery URL. Both `.well-known` routes carry `authorization_type = "NONE"` in
 `terraform/identity_spike.tf` for exactly this reason, and 9.2's `identity` module must keep
 both exempt rather than only the discovery one.
 
+**The key cache is not two hours in practice, and the documents are refetched per host.**
+The first verification against this authorizer happened at 06:39:33Z, 48 minutes after the
+create-time fetches above. Both documents were fetched again, and not once:
+
+```
+06:39:33Z  /.well-known/openid-configuration  200  44.234.30.83  (AWS us-west-2)
+06:39:33Z  /.well-known/jwks.json             200  44.234.30.83  (AWS us-west-2)
+06:39:34Z  /.well-known/openid-configuration  200  44.234.30.73  (AWS us-west-2)
+06:39:34Z  /.well-known/jwks.json             200  44.234.30.73  (AWS us-west-2)
+06:40:18Z  /.well-known/openid-configuration  200  44.234.28.67  (AWS us-west-2)
+```
+
+Three distinct source addresses in 45 seconds, each fetching the discovery document before
+the JWKS, and none of them reusing what a create-time fetch 48 minutes earlier had already
+retrieved. The plain reading is that the cache is **per authorizer host rather than per
+authorizer**, so "cached for two hours" is a per-host ceiling and a request landing on a
+host that has not seen the key yet pays a fresh discovery-plus-JWKS round trip.
+
+A second run later the same day behaved identically: every request to the protected route
+was accompanied by its own discovery-then-`jwks.json` pair from a distinct AWS address, over
+a span far longer than any plausible cache window. So this is the steady-state behaviour
+rather than a warm-up effect.
+
+Two things follow, and only one of them is a caution. The caution: **the discovery and JWKS
+routes are on the hot path, not just the deployment path.** They are served by the identity
+Lambda, so a cold start there adds latency to somebody's first authorized request, and an
+outage of that function breaks verification for tokens that were already validly issued.
+Serving both documents cheaply matters, which is what 3.4's module-state caching of the
+parsed JWK is for. The non-caution: this makes rotation **safer** than the two-hour figure
+suggests, not riskier, since a new `kid` propagates faster than the ceiling implies. The
+three-hour wait in 3.5 stays anyway, for the reason given there.
+
 Serving discovery at the API root as well as at `<issuer>/.well-known/openid-configuration`
 is therefore no longer load-bearing. It is harmless and can stay, but the path is known and
 the design need not hedge on it.
@@ -713,7 +782,10 @@ a `kid` no longer served. Explicit two-key rotation is clearer:
    the first being the active signer.
 2. Deploy. JWKS now serves **both** JWKs. Nothing signs with the new key yet.
 3. Wait for the caches to turn over. API Gateway "can cache the public key for two hours",
-   so wait comfortably longer than that; **three hours** is the documented procedure.
+   so wait comfortably longer than that; **three hours** is the documented procedure. Keep
+   the three hours even though M0 observed refetching far more often than the cache ceiling
+   implies (3.4): the two-hour figure is a documented maximum, and a rotation has to be safe
+   for the slowest cache in the fleet, not the fastest one seen in one trace.
 4. Promote the new key to active signer and deploy. Tokens now carry the new `kid`, and the
    old key is still served so tokens issued in the last 10 minutes still verify.
 5. After one full access-token lifetime plus margin (an hour is ample), drop the old key
@@ -745,6 +817,65 @@ refresh, at roughly 10 to 30 ms. At a 10-minute token this is about 6 signs per 
 per hour. That is acceptable, and it is the price of never holding a signing secret. Note
 KMS request quotas are regional and shared: a product expecting a burst of thousands of
 logins per second would need a quota increase, which neither product is near.
+
+**Verified end to end by M0, 2026-09-09.** A token minted by the spike from
+`alias/webbpulse-staging-identity-signing` was accepted by the staging JWT authorizer. The
+header and claims were exactly what this section and 3.2 specify:
+
+```json
+{"alg": "RS256", "typ": "JWT", "kid": "ZMAdbmKxC7lsl8jc9-McfmfpjHi1cc5e-6-waagXTSw"}
+{"typ": "access", "sub": "spike-1", "iss": "https://api.staging.webbpulse.com",
+ "aud": "webbpulse-staging", "iat": 1788935958, "nbf": 1788935958,
+ "exp": 1788936558, "jti": "a1a1818c2f364e1396951d1cd5382801"}
+```
+
+`exp - iat` is 600 seconds, the signature segment decodes to 256 bytes, which is the
+RSA_2048 modulus size, and the `kid` matches the JWKS. So `MessageType: DIGEST` with
+`RSASSA_PKCS1_V1_5_SHA_256`, and base64url of the raw PKCS #1 signature octet string,
+produce a JWS that a verifier nobody here wrote accepts.
+
+The same token was also verified locally against the DER `kms:GetPublicKey` returns, with
+`PKCS1v15` padding and SHA-256, and it verifies. So the acceptance is not merely API
+Gateway's opinion: the signature is a well-formed RS256 signature over the exact signing
+input, checkable by any RSA implementation. The `kid` closes the loop on which key made it.
+Three values are byte-identical: the base64url SHA-256 of the DER from `kms:GetPublicKey`,
+the `kid` the live JWKS serves, and the `kid` in the token header. The modulus in the JWKS
+and the modulus in the KMS DER are the same integer. There is therefore no room for the
+token to have been signed by anything other than that KMS key.
+
+**Three forgeries, all rejected by the gateway.** Each returned the gateway's own 26-byte
+`{"message":"Unauthorized"}` with no `integrationLatency`, so none of them reached the
+function:
+
+| Forgery | Result |
+|---|---|
+| One character of the signature changed | 401 at the gateway |
+| `alg: none` with the signature segment removed | 401 at the gateway |
+| HS256, HMAC-signed with the JWKS public modulus as the secret | 401 at the gateway |
+
+The third is the algorithm-confusion attack that the standard's own `alg` allowlist exists
+to prevent, and the authorizer rejects it without our help. That is worth knowing precisely
+because M1 owns an in-process fallback verifier for local development (2.4): the gateway
+gets this right, and the fallback path has to be held to the same standard rather than
+assumed to inherit it.
+
+**How to read the access log for this, because the status code alone lies.** Both an
+accepted and a rejected request can end up as a 401, and the field that separates them is
+`integrationLatency`. A request the authorizer rejects never reaches the integration, so the
+field is empty; a request it accepts is invoked, and the field is a number:
+
+```
+06:39:33  GET /api/identity/spike/whoami  401  integrationLatency=26  respLen=229   accepted, Lambda ran
+06:39:33  GET /api/identity/spike/whoami  401  integrationLatency=-   respLen=26    rejected by the gateway
+```
+
+The first row is the valid token: the signature verified, the gateway invoked the function,
+and the 401 came from the application. The second is the same token with one character of
+the signature flipped, and the gateway's own `{"message":"Unauthorized"}` at 26 bytes. A
+payload edited to carry a different `aud`, which invalidates the signature, is rejected the
+same way. That contrast is the actual proof of verification, and it is worth writing down
+because a reader checking only the status column would conclude both requests failed
+identically.
 
 ---
 
@@ -1529,7 +1660,7 @@ Effort is rough, in days of focused work, and assumes one person.
 
 | M | Scope | Package version | Effort |
 |---|---|---|---|
-| **M0** | Spike: deploy a throwaway HTTP API with a JWT authorizer against a hand-rolled JWKS from a KMS RSA_2048 key. Answer the 3.4 discovery-path question and confirm RS256 end to end. **Nothing else starts until this passes.** *Verified 2026-09-09 for the resolution half: both `.well-known` documents are fetched by API Gateway at `CreateAuthorizer` time, the JWKS from the discovery document's `jwks_uri` (3.4, 10.6), and the served JWKS modulus matches `kms:GetPublicKey` byte for byte. RS256 end to end is still unverified: the mint route is not reachable, see 9.1's note below.* | none | 1 to 2 |
+| **M0** | Spike: deploy a throwaway HTTP API with a JWT authorizer against a hand-rolled JWKS from a KMS RSA_2048 key. Answer the 3.4 discovery-path question and confirm RS256 end to end. **Nothing else starts until this passes.** *Passed 2026-09-09. The authorizer verifies a KMS-signed RS256 token against our own JWKS, resolved through the discovery document, and rejects a tampered signature, an `alg: none` token and an HS256 confusion attempt (3.4, 3.6). Two bugs found on the way, both in our own plumbing rather than in the design: a route declared only in FastAPI has no gateway route key and is unreachable, and the spike base64-decoded a request-context header the adapter sends as plain JSON. The second one still stands in the spike, so `whoami` returns the application's 401 rather than a 200 body; it changes nothing about what M0 set out to measure, because acceptance is established by the gateway invoking the function at all.* | none | 1 to 2 |
 | **M1** | `webbpulse.identity` skeleton: `IdentitySettings`, `IdentityHooks`, `build_identity_router`, storage classes, `authorizer_claims()`. Token service: KMS signing, JWKS, discovery, rotation by `kid`. No flows yet | 0.6.0 | 4 to 6 |
 | **M2** | Password flows: register, login, change, policy, dummy-hash equalisation, lockout, `credentials` table. Sessions: families, rotation, reuse detection, grace window, logout, logout-all | 0.7.0 | 5 to 7 |
 | **M3** | Email: SES sender, templates, verification, reset. Contract tests for JWKS and discovery against a real deployed authorizer | 0.7.0 | 3 to 4 |
@@ -1545,17 +1676,40 @@ Roughly 8 to 10 weeks of focused work. M0 is deliberately first and deliberately
 every later milestone assumes the authorizer verifies a KMS-signed RS256 token from our own
 JWKS, and that assumption is cheap to test now and expensive to discover is wrong at M9.
 
-**M0 is not finished, and the gap is a missing route rather than a wrong design.**
-`backend/app/domains/identity/spike.py` declares `POST /api/identity/spike/token`, but
-`terraform/identity_spike.tf` never creates an API Gateway route for it. The route table on
-the staging API has the two `.well-known` keys and `GET /api/identity/spike/whoami` and
-nothing else, so the mint endpoint returns the gateway's own `{"message":"Not Found"}` with
-a 404 and no token can be obtained through the public API. Everything that does not need a
-token is confirmed; the two measurements that do need one, a 200 from `whoami` carrying the
-authorizer's claims and a rejection of a tampered signature, are still outstanding. Adding
-the route key `POST /api/identity/spike/token` to the gated routes map, where the access
-gate rather than the JWT authorizer protects it, is the whole fix and is what the module
-docstring already assumes exists.
+**M0's verdict, and the two bugs it found that were not about the authorizer.** The thing
+M0 existed to test is confirmed: API Gateway's JWT authorizer verifies an RS256 token signed
+by a real KMS key against our own JWKS, and it resolves the JWKS through the discovery
+document's `jwks_uri` (3.4, 3.6). Every later milestone's central assumption holds. Both
+bugs M0 surfaced were in the plumbing around it, and both are worth carrying forward because
+both will recur in the real implementation.
+
+**A route declared only in the application is not reachable.** `spike.py` declared
+`POST /api/identity/spike/token`, but no route key for it existed in the Terraform routes
+map, so the endpoint returned the gateway's own `{"message":"Not Found"}` and no token could
+be minted at all until the key was added (Portfolio PR #152). On an HTTP API with explicit
+route keys rather than a single greedy proxy, **the route table is the contract and the
+FastAPI router is not**. A handler with no matching route key is dead code that looks live
+in the source, and it fails as a 404 that reads exactly like a path typo. This is a standing
+hazard for 9.2's module and for every product adopting it: the identity router's paths and
+the module's route keys are two lists that must be edited together, and nothing in either
+repository will complain when they drift. Whatever ships in M7 should generate the route
+keys from one declaration rather than restate them.
+
+**Two readings of the same header disagreed, and the loser failed closed into a 401.** With
+the mint route live, a valid token was accepted by the authorizer and the Lambda was
+invoked, and the handler still answered 401. The cause was not the gateway, the image or the
+key: `spike.py` base64-decoded `x-amzn-request-context`, while the adapter sends it as a
+plain JSON string and `webbpulse.http.client_ip` has always parsed it as one. The decode
+raised, the handler caught the exception and returned an empty mapping, and an empty mapping
+was turned into a 401 that looked exactly like a rejected token.
+
+Two things are worth carrying into M1. The first is that `authorizer_claims()` has to be the
+single implementation of this parse, because the moment there are two they can disagree
+about the encoding and only one of them is exercised by a test. The second is that it must
+fail loudly and distinguishably: a missing header, a header that will not parse, and a
+header with no `authorizer.jwt.claims` section are a deployment fault, a bug in our own code
+and a routing fault respectively, and collapsing all three into an empty mapping is what
+made a one-line bug read as an authorization outcome. Section 2.4 has the full statement.
 
 Three prerequisites sit outside the milestones and should land on their own schedule:
 
@@ -1664,18 +1818,20 @@ Stated plainly, since each is a place the design could be wrong.
    issuer, or expects the issuer itself to serve it.**~~ **Closed by M0.** It appends. It
    also fetches at `CreateAuthorizer` time rather than only at request time, so the
    discovery route and the service behind it are deployment prerequisites of the authorizer;
-   3.4 has the error, the exact wording and the ordering that follows from it. What remains
-   open is narrower and is now item 6 below: the JWKS fetch itself has not been observed.
-2. **moto's fidelity for `kms:Sign` with `RSASSA_PKCS1_V1_5_SHA_256`** against a real JWT
-   verifier. Mitigated by making the signer a seam and testing against real KMS in M0. Still
-   open as of 2026-09-09: no signature has been produced by the real key yet, because the
-   spike's mint route is not reachable through the gateway (9.1). What the same run did
-   confirm is the key half of the pair. `kms:GetPublicKey` on
-   `alias/webbpulse-staging-identity-signing` returns an `RSA_2048` `SIGN_VERIFY` key whose
-   modulus is byte-identical to the `n` the live JWKS serves, under kid
-   `ZMAdbmKxC7lsl8jc9-McfmfpjHi1cc5e-6-waagXTSw`, and `RSASSA_PKCS1_V1_5_SHA_256` is among
-   its advertised signing algorithms. So the DER parsing and the `kid` derivation in 3.4 and
-   3.5 are verified against real KMS; only the signing call is not.
+   3.4 has the error, the exact wording and the ordering that follows from it. The JWKS
+   fetch that item 6 kept open has since been observed too, so nothing about the resolution
+   path remains unverified.
+2. ~~**moto's fidelity for `kms:Sign` with `RSASSA_PKCS1_V1_5_SHA_256`** against a real JWT
+   verifier.~~ **Closed by M0, 2026-09-09.** A token signed by the real KMS key is accepted
+   by API Gateway's JWT authorizer, so the signing path is verified end to end against a
+   verifier nobody in this project wrote. The signature is 256 bytes, which is the RSA_2048
+   modulus size, and the `kid` in the token header matches the JWKS. 3.6 has the evidence
+   and the access-log rows that separate an accepted token from a rejected one.
+
+   What this closes is the real-KMS half. It does not make moto faithful by demonstration;
+   it makes moto's fidelity no longer load-bearing, because the seam is now exercised against
+   real KMS in a real gateway. The unit suite keeps using moto for speed, and the contract
+   test in M3 is what keeps the two honest.
 3. **Whether CarModPicker usernames may contain `@`.** This decides whether the token
    confusion path in 8.1 is a live vulnerability or only a latent one, since
    `verify_email` and `reset_password` tokens put an email in `sub` while session tokens put
@@ -1693,7 +1849,9 @@ Stated plainly, since each is a place the design could be wrong.
    discovery document and `jwks.json` fetched from the same AWS us-west-2 address one second
    apart, immediately before the create call that succeeded; 3.4 has the trace and the
    consequence, which is that the advertised `jwks_uri` must answer anonymously at create
-   time as well.
+   time as well. Re-confirmed at verification time on the same day: every request to the
+   protected route was accompanied by a fresh discovery-then-`jwks.json` pair from an AWS
+   address, which is the observation 3.4 draws the per-host cache conclusion from.
 
 ---
 
