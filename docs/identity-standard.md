@@ -226,6 +226,12 @@ so the mechanism is proven in this codebase rather than assumed. Claims land at
 > After validating the JWT, API Gateway passes the claims in the token to the API route's
 > integration. Backend resources, such as Lambda functions, can access the JWT claims.
 
+M0 observed that directly rather than taking the documentation's word for it: the request
+context carried exactly one authorizer key, `jwt`, with the claims beneath it, and 9.1 has
+the full body. It also turned up something the documentation does not say, which is that
+every claim value arrives as a string, `exp` and `iat` included. `authorizer_claims()` has
+to coerce the numeric claims rather than pass them through.
+
 `webbpulse.identity` therefore ships a dependency in the **http** module's spirit, not a
 new envelope:
 
@@ -1660,7 +1666,7 @@ Effort is rough, in days of focused work, and assumes one person.
 
 | M | Scope | Package version | Effort |
 |---|---|---|---|
-| **M0** | Spike: deploy a throwaway HTTP API with a JWT authorizer against a hand-rolled JWKS from a KMS RSA_2048 key. Answer the 3.4 discovery-path question and confirm RS256 end to end. **Nothing else starts until this passes.** *Passed 2026-09-09. The authorizer verifies a KMS-signed RS256 token against our own JWKS, resolved through the discovery document, and rejects a tampered signature, an `alg: none` token and an HS256 confusion attempt (3.4, 3.6). Two bugs found on the way, both in our own plumbing rather than in the design: a route declared only in FastAPI has no gateway route key and is unreachable, and the spike base64-decoded a request-context header the adapter sends as plain JSON. The second one still stands in the spike, so `whoami` returns the application's 401 rather than a 200 body; it changes nothing about what M0 set out to measure, because acceptance is established by the gateway invoking the function at all.* | none | 1 to 2 |
+| **M0** | Spike: deploy a throwaway HTTP API with a JWT authorizer against a hand-rolled JWKS from a KMS RSA_2048 key. Answer the 3.4 discovery-path question and confirm RS256 end to end. **Nothing else starts until this passes.** *Passed 2026-09-09. The authorizer verifies a KMS-signed RS256 token against our own JWKS, resolved through the discovery document, and rejects a tampered signature, an `alg: none` token and an HS256 confusion attempt (3.4, 3.6). Two bugs found on the way, both in our own plumbing rather than in the design: a route declared only in FastAPI has no gateway route key and is unreachable, and the spike base64-decoded a request-context header the adapter sends as plain JSON. Both are fixed, and with the parser corrected (Portfolio PR #155) `whoami` returns 200 carrying the authorizer's claims, which also settles the payload-shape question in section 10.* | none | 1 to 2 |
 | **M1** | `webbpulse.identity` skeleton: `IdentitySettings`, `IdentityHooks`, `build_identity_router`, storage classes, `authorizer_claims()`. Token service: KMS signing, JWKS, discovery, rotation by `kid`. No flows yet | 0.6.0 | 4 to 6 |
 | **M2** | Password flows: register, login, change, policy, dummy-hash equalisation, lockout, `credentials` table. Sessions: families, rotation, reuse detection, grace window, logout, logout-all | 0.7.0 | 5 to 7 |
 | **M3** | Email: SES sender, templates, verification, reset. Contract tests for JWKS and discovery against a real deployed authorizer | 0.7.0 | 3 to 4 |
@@ -1710,6 +1716,33 @@ fail loudly and distinguishably: a missing header, a header that will not parse,
 header with no `authorizer.jwt.claims` section are a deployment fault, a bug in our own code
 and a routing fault respectively, and collapsing all three into an empty mapping is what
 made a one-line bug read as an authorization outcome. Section 2.4 has the full statement.
+
+**With the parser fixed, `whoami` answers 200 and the payload shape is settled.** Portfolio
+PR #155 replaced the base64 decode with a plain JSON read and deployed it, and the same
+request that had been answering 401 returned the claims:
+
+```json
+{"claims": {"typ": "access", "sub": "spike-2", "iss": "https://api.staging.webbpulse.com",
+            "aud": "webbpulse-staging", "iat": "1788938046", "nbf": "1788938046",
+            "exp": "1788938646", "jti": "976037a1ea4847da8a633b3338d61f65"},
+ "authorizer_context_keys": ["jwt"],
+ "request_context_keys": ["accountId", "apiId", "authorizer", "domainName", "domainPrefix",
+                          "http", "requestId", "routeKey", "stage", "time", "timeEpoch"]}
+```
+
+Three things in that body are worth keeping. The first is that `authorizer_context_keys` is
+exactly `["jwt"]`, so the claims sit at `authorizer.jwt.claims` under payload format 2.0,
+which is what the AWS documentation describes and what 2.4 assumed without having seen it.
+That was an open payload-shape question in section 10 and it is now answered rather than
+inferred. The second is that `request_context_keys` carries `http` but no `identity`
+section, which is the 2.0 shape `webbpulse.http.client_ip` already prefers, so the source-IP
+reading and the claims reading agree about the format they are parsing. The third is easy to
+miss and matters most: **every claim value is a string.** `iat`, `nbf` and `exp` come back as
+`"1788938046"` and not as integers, because API Gateway flattens the claim set to a string
+map before putting it in the request context. Any code that treats `exp` as a number, which
+is what the JWT specification says it is, has to coerce it first. `authorizer_claims()` owns
+that coercion in M1, and it should be explicit about which claims it converts rather than
+leaving each caller to discover the type by tripping over it.
 
 Three prerequisites sit outside the milestones and should land on their own schedule:
 
