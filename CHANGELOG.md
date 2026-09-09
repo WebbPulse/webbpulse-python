@@ -5,6 +5,121 @@ Notable changes to the `webbpulse` package. The version here is the one in
 
 This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## 0.7.0
+
+The two observability primitives CarModPicker grew on its own, hoisted so Portfolio can
+have them too: request and correlation context on ContextVars, and CloudWatch metrics as
+Embedded Metric Format.
+
+Neither is a new dependency. `webbpulse.log_context` and `webbpulse.metrics` are standard
+library only and have no extra, so every consumer gets them on the base install.
+
+**Additive, with one behaviour change to `RequestIdMiddleware` described below.**
+
+### Added
+
+- `webbpulse.log_context`, request and correlation context on two ContextVars:
+
+  ```python
+  from webbpulse.log_context import set_user_id, task_context
+
+  set_user_id(user.id)                    # in the authentication dependency
+  with task_context("crawler", job_id):   # for work outside any request
+      run()
+  ```
+
+  - `request_id_var` and `user_id_var`, both defaulting to the `"-"` placeholder rather
+    than `None`, because a metric filter pattern cannot distinguish a missing key from an
+    empty one and a constant placeholder makes "no request scope" visible.
+  - `set_request_id(value)` and `set_user_id(value)`, returning the reset token. Values are
+    coerced to `str`, stripped of newlines and truncated to 128 characters, since the
+    request id can arrive on an inbound `X-Request-ID` and the user id from a token claim.
+  - `bind_context(request_id=..., user_id=...)` and `task_context(name, job_id)`, scope
+    managers that restore the previous values on exit, including when the block raises, and
+    that nest. `task_context` produces `bg:<name>:<job_id or "-">` with `user_id` of
+    `"bg"`, which is the exact string CarModPicker's `bg_log_context` emits, so a saved
+    Logs Insights query keeps matching. `log_context` is an alias of `task_context`.
+  - `current_context()`, the bound values as a dict, omitting anything unset.
+  - `LogContextFilter` and `attach_log_context(logger=None)`, for a service keeping its own
+    formatter. Unlike the JSON path the filter always sets both attributes so a
+    `%(request_id)s` format string does not raise, and it leaves a value passed explicitly
+    at the call site alone. `attach_log_context` is idempotent per handler.
+  - `set_span_context_attributes()`, copying the same values onto the active OpenTelemetry
+    span as `webbpulse.request_id` and `webbpulse.user_id`, the names `webbpulse.http`
+    already uses. A no-op without the `otel` extra or without a recording span, and it
+    never raises.
+
+- `webbpulse.metrics`, CloudWatch Embedded Metric Format on stdout:
+
+  ```python
+  from webbpulse.metrics import emit
+
+  emit(
+      namespace="CarModPicker/Crawlers",
+      dimensions={"AdapterName": name, "Environment": env, "RunType": "live"},
+      metrics={"Ingested": (n, "Count"), "ElapsedSeconds": (elapsed, "Seconds")},
+      enabled=settings.environment in {"staging", "production"},
+  )
+  ```
+
+  - `MetricsEmitter(namespace=..., dimensions=..., properties=..., enabled=..., stream=...)`
+    with `set_dimensions`, `set_properties`, `put`, `document` and `flush`, usable as a
+    context manager that flushes on exit including on an exception.
+  - `emit(...)`, the one-shot form, and `timed(emitter, name, unit=...)`, which records a
+    `perf_counter` duration and does so in a `finally` so a block that raised still reports
+    how long it ran.
+  - `UNITS` and `EMF_MAX_DIMENSIONS`.
+  - `namespace` is required and never defaulted, so no service can inherit a shared
+    namespace by accident.
+
+### Changed
+
+- `webbpulse.logging.JsonFormatter` merges the bound `log_context` values into every record
+  it formats. A service calling `configure_logging` therefore gets `request_id` and
+  `user_id` as top-level keys with no filter to attach. The merge fills gaps only, so an
+  explicit `extra={"request_id": ...}` at a call site still wins.
+- `webbpulse.http.RequestIdMiddleware` binds `request_id_var` for the life of the request
+  in addition to setting `request.state` and echoing the header, and resets it in a
+  `finally`. This is the one behaviour change in the release: an existing consumer's log
+  lines start carrying `request_id` where they did not before. Nothing that read the id
+  before reads it differently.
+
+### Why the EMF document is written directly
+
+`aws-embedded-metrics` was the obvious dependency and is not used, for two reasons that
+both present as metrics silently not appearing:
+
+- **Its sink auto-detection is wrong in this estate.** It falls back to a CloudWatch Agent
+  sink over TCP when it cannot positively identify the runtime, and that agent exists on
+  none of Lambda, ECS Fargate or App Runner. The documented fix is setting
+  `AWS_EMF_ENVIRONMENT=Local` in every function and task definition, which is a thing to
+  remember forever in Terraform. Writing to stdout unconditionally removes the setting and
+  the failure mode together.
+- **Its flush is asynchronous and can lose the last record a process emits.** CarModPicker
+  worked around that by ordering an unrelated summary log line after the emission and
+  pinning that ordering with a static-analysis test. `flush` here writes and flushes the
+  stream synchronously before returning, so there is nothing to order and the test can go.
+
+The wire format is AWS's, not the library's, and is unchanged: a document this module
+writes and a document the library writes are the same document.
+
+### Cardinality, which is the part that costs money
+
+CloudWatch bills per distinct combination of namespace, metric name and dimension values,
+so a dimension carrying a user id, a request id or a URL mints a billable metric per user,
+per request or per URL. `set_dimensions` refuses more than nine, the documented ceiling,
+and refuses a blank value, which would void the whole document and take every metric in it.
+Unbounded values belong in `properties`: written into the log event, queryable in Logs
+Insights, and creating no metric at all.
+
+### Adoption
+
+CarModPicker deletes `core/log_context.py` and `core/cloudwatch_emf.py` and swaps the
+imports; the metric names, units, dimension names and namespace are unchanged, so plan
+02-05's alarm keeps matching, and `AWS_EMF_ENVIRONMENT=Local` can come out of the
+Terraform. Portfolio has neither today, so both are new capability there rather than a
+replacement. The README's per-app migration notes carry the file-by-file detail.
+
 ## 0.6.0
 
 The M0 slice of the identity standard (`docs/identity-standard.md`): enough of

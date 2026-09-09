@@ -60,7 +60,8 @@ extra to import at all, and `webbpulse.testing` needs the `testing` extra.
 `webbpulse.identity` imports on the base install: it takes a KMS client rather than
 building one, and it defers both the `cryptography` and the FastAPI import to the call
 that needs it, so serving a JWKS needs the `identity` extra but importing the module
-does not.
+does not. `webbpulse.log_context` and `webbpulse.metrics` need nothing beyond the standard
+library and have no extra of their own.
 
 ## Modules
 
@@ -132,6 +133,113 @@ join on the same value. Anything passed as `extra={...}` becomes a top-level key
 what lets a CloudWatch metric filter or an Insights query select on it. `configure_logging`
 is idempotent, replaces Lambda's own root handler rather than adding to it, and reattaches
 uvicorn's loggers so access lines are JSON too.
+
+### `webbpulse.log_context`
+
+Two context variables, `request_id` and `user_id`, and the helpers that bind them. The
+point is reach: `webbpulse.http.request_id(request)` needs the `Request` object, so a
+repository three layers down, a background task or a CLI command cannot use it. A context
+variable is visible to all of them, and to a `logging.Filter`, without being threaded
+through call signatures.
+
+```python
+from webbpulse.log_context import set_user_id, task_context
+
+set_user_id(user.id)                       # in the authentication dependency
+
+with task_context("crawler", job_id):      # for work outside any request
+    run()
+```
+
+`RequestIdMiddleware` binds `request_id_var` itself, so a service that already mounts it
+gets this for free. `JsonFormatter` merges the bound values into every record it formats,
+which means `configure_logging` plus the middleware is the whole wiring:
+
+```json
+{"timestamp":"...","level":"INFO","message":"...","request_id":"01J...","user_id":"42"}
+```
+
+An explicit `extra={"request_id": ...}` at a call site wins over the ambient value.
+
+`task_context(name, job_id)` binds `request_id` to `bg:<name>:<job_id or "-">` and
+`user_id` to `bg`, so one background task's output is selectable in Logs Insights with
+`filter request_id like /^bg:crawler:/`. `bind_context(request_id=..., user_id=...)` is the
+general form; both restore the previous values on exit, including when the block raises,
+and both nest.
+
+Two escape hatches. `LogContextFilter` is a `logging.Filter` for a service keeping its own
+formatter, and unlike the JSON path it always sets both attributes, using `"-"` when
+nothing is bound, so a `%(request_id)s` format string does not raise; `attach_log_context()`
+installs it on every root handler exactly once. `set_span_context_attributes()` copies the
+same values onto the active OpenTelemetry span as `webbpulse.request_id` and
+`webbpulse.user_id`, the names `webbpulse.http` already uses.
+
+Values are coerced to strings, stripped of newlines and truncated to 128 characters,
+because both can originate from a caller: the request id from an inbound `X-Request-ID`
+and the user id from a token claim.
+
+### `webbpulse.metrics`
+
+CloudWatch metrics as Embedded Metric Format, one JSON line per flush on stdout.
+CloudWatch Logs extracts the metrics from the `_aws` block asynchronously, so a metric
+costs a log line and nothing else: no `PutMetricData` in the request path, no
+`cloudwatch:PutMetricData` on the execution role, no agent and no extension. The document
+is also an ordinary log event, so its dimensions and properties stay queryable in Logs
+Insights after the metric has been extracted.
+
+```python
+from webbpulse.metrics import emit
+
+emit(
+    namespace="CarModPicker/Crawlers",
+    dimensions={"AdapterName": name, "Environment": env, "RunType": "live"},
+    metrics={
+        "Ingested": (ingested, "Count"),
+        "ParseFailures": (parse_failures, "Count"),
+        "ElapsedSeconds": (elapsed, "Seconds"),
+    },
+    enabled=settings.environment in {"staging", "production"},
+)
+```
+
+`MetricsEmitter` is the same thing held open, for several values sharing one dimension set
+or for a loop emitting one document per iteration:
+
+```python
+with MetricsEmitter(namespace=ns, dimensions={"Environment": env}, enabled=on) as m:
+    with timed(m, "ElapsedSeconds", unit="Seconds"):
+        results = run()
+    m.put("Ingested", len(results), "Count")
+```
+
+`namespace` is required and never defaulted. A package-wide default would be one namespace
+every service dumped metrics into, which is the one choice that cannot be undone later
+without rebuilding every alarm.
+
+**Dimensions must be bounded.** CloudWatch bills per distinct combination of namespace,
+metric name and dimension values, so a dimension carrying a user id, a request id or a URL
+mints a billable metric per user, per request or per URL. Put unbounded values in
+`properties` instead: they are written into the log event, are queryable in Logs Insights,
+and create no metric. `set_dimensions` refuses more than nine, which is the CloudWatch
+ceiling, and refuses a blank value, which would void the whole document.
+
+`put` rejects a unit outside the CloudWatch set rather than passing it through, because
+CloudWatch drops an unknown unit silently. Repeat `put` calls for one name accumulate into
+a value array that CloudWatch aggregates, rather than producing a document each.
+`enabled=False` makes emission a no-op while still validating, so a typo fails in a test
+suite rather than only in production; it is a constructor argument rather than an
+environment variable so the policy stays with the service that owns the settings.
+
+`flush` never raises. A metric reports on the work, and losing the report is better than
+failing the work, so a closed stream or a serialisation failure is logged at ERROR and
+swallowed. The stream is flushed explicitly, because Lambda freezes the execution
+environment the moment the response is written and a buffered line is lost rather than
+late.
+
+There is no `aws-embedded-metrics` dependency. Its runtime auto-detection falls back to a
+CloudWatch Agent sink that does not exist on Lambda, Fargate or App Runner, which drops
+metrics silently unless `AWS_EMF_ENVIRONMENT=Local` is set everywhere, and its asynchronous
+flush can lose the last record a process emits. Writing the document directly removes both.
 
 ### `webbpulse.otel`
 
@@ -916,7 +1024,9 @@ follows is what each app replaces, and what has to stay.
 | Shared module | Replaces |
 | --- | --- |
 | `config` | the pydantic-settings base and `.env` wiring in `core/config.py`, and the CORS origin parsing. The app's own fields become a subclass |
-| `logging` | `core/logging.py`, `core/log_context.py`, and the inline `logging.basicConfig` block in `main.py` |
+| `logging` | `core/logging.py` and the inline `logging.basicConfig` block in `main.py` |
+| `log_context` | `core/log_context.py` in full: both ContextVars, `RequestContextFilter` and `bg_log_context` |
+| `metrics` | `core/cloudwatch_emf.py` in full, and the `aws-embedded-metrics` dependency with it |
 | `otel` | `core/sentry.py` in full, and its call from `main.py` |
 | `http` | `api/utils/response_patterns.py`, `api/middleware/error_handler.py`, `api/middleware/request_context.py`, and the CORS block in `main.py` |
 | `ratelimit` | `api/middleware/rate_limiter.py` in full, including `RateLimitConfig` and the eight `RATE_LIMIT_*` settings fields |
@@ -944,7 +1054,7 @@ Secret loading also changes shape. `core/secrets.py` writes every key of the sec
 alone.
 
 Staying in the app: the 25 `TableSpec` definitions, `car_inference.py` and
-`category_inference.py`, `cloudwatch_emf.py`, the SES templates, `db/dynamo/search.py`,
+`category_inference.py`, the SES templates, `db/dynamo/search.py`,
 `authorization.py`, the `chrome-extension://` CORS regex and the `null` origin, the
 `X-Admin-Cron-Key` header, the `RUN_STARTUP_TASKS` seeding, and the sitemap routes. The
 CORS regex and extra header mean `create_app` gets `cors_allow_origins` explicitly and the
@@ -959,6 +1069,8 @@ and no request id at all.
 | --- | --- |
 | `config` | the `SECRET_FIELDS` / `resolve_secrets` validator, `LOCALHOST_ORIGINS` and `parse_cors_origins` in `config.py` |
 | `logging` | `core/logging.py`, `RequestLoggingMiddleware` in `core/middleware.py`, and the `POWERTOOLS_*` settings |
+| `log_context` | nothing. Portfolio has no request id or correlation context at all, so this is new capability |
+| `metrics` | nothing. Portfolio emits no custom metrics today; this is what it would use when it starts |
 | `otel` | the Powertools `inject_lambda_context` correlation wrapper |
 | `http` | `TrailingSlashMiddleware`, the CORS block and the `/health` route in `main.py`. The error envelope and request id are new capability, not a replacement |
 | `ratelimit` | `core/login_limiter.py` in full, including its `client_ip()` |
@@ -991,6 +1103,48 @@ Staying in the app: `PostRepository` and the per-entity ordering, `core/admin.py
 `core/site_content.py` and `SeedMiddleware` (which must not be wired into the public
 entrypoint), `api/seo.py`, the constant-time `_DUMMY_HASH` timing equaliser, the integer ids
 and `skip`/`limit` the frontend depends on, and the trailing-slash tolerance.
+
+### Adopting `log_context` and `metrics`
+
+Both are additive, so each can land on its own without touching the other or anything
+already migrated.
+
+**CarModPicker** is an import swap and one deletion each.
+
+- `core/log_context.py` is deleted. The three call sites that import from it,
+  `api/dependencies/auth.py`, `api/middleware/request_context.py` and `core/sentry.py`,
+  import from `webbpulse.log_context` instead. `RequestContextFilter` becomes
+  `LogContextFilter` and `bg_log_context` becomes `task_context`, which is the same
+  contract under a name that is not abbreviated; both emit the identical
+  `bg:<task>:<job>` string, so no saved Logs Insights query changes. `tests/conftest.py`'s
+  `caplog_with_context` fixture and `tests/test_log_propagation.py` follow the same
+  rename. `core/logging.py`'s `_attach_request_context` becomes a call to
+  `attach_log_context()`.
+- `api/middleware/request_context.py` can go entirely once `RequestIdMiddleware` is
+  mounted, since that middleware now sets `request.state` and binds the ContextVar and
+  echoes the header, which is everything the local one did. Until then the local
+  middleware keeps working: it sets the same ContextVar under the same name.
+- `core/cloudwatch_emf.py` is deleted and `emit_crawler_run_metrics` becomes a four-line
+  wrapper over `emit`, or the two call sites in `runner.py` and `ecs_rescrape_runner.py`
+  call `emit` directly. The namespace, the three metric names, their units and the three
+  dimension names are unchanged, so plan 02-05's alarm keeps matching. The env gate moves
+  into the `enabled=` argument rather than being read inside the emitter.
+- Two landmines stop being landmines. The emission no longer has to precede the summary
+  log line, because nothing is dropped on a trailing flush, so
+  `test_runner_emits_before_summary` can go; and `AWS_EMF_ENVIRONMENT=Local` can come out
+  of `apprunner.tf` and `ecs.tf`, because there is no sink to auto-detect.
+
+**WebbPulse-Portfolio** gains capability rather than replacing any.
+
+- It has no request id today. Mounting `RequestIdMiddleware`, which the `http` migration
+  already brings, is what starts populating `request_id` on every log line, with no other
+  change.
+- Its logger is `aws_lambda_powertools.Logger`, whose `inject_lambda_context` correlation
+  wrapper does not run under the Web Adapter, since there is no handler to decorate. That
+  is the gap `log_context` fills, and it is why the Powertools dependency can go at the
+  same time as `core/logging.py`.
+- It emits no custom metrics. `webbpulse.metrics` is what it uses when it starts, with its
+  own namespace; nothing has to change for the adoption itself.
 
 ### Not shared, deliberately
 
