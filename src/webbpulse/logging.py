@@ -92,6 +92,23 @@ def _trace_context() -> dict[str, str]:
     }
 
 
+def _request_context() -> dict[str, str]:
+    """Return the bound request and user ids, or `{}` when nothing is bound.
+
+    `webbpulse.log_context` is in the base install like this module, so unlike
+    `_trace_context` there is nothing optional to guard: the import cannot fail. Merging it
+    here rather than making every service attach a `logging.Filter` is what makes the two
+    keys appear on a log line for free once `configure_logging` has run.
+
+    Merged after the `extra={...}` loop below and only into keys that are still absent, so
+    `logger.info(..., extra={"request_id": explicit})` at a call site wins over the ambient
+    value rather than being overwritten by it.
+    """
+    from webbpulse.log_context import current_context
+
+    return current_context()
+
+
 class JsonFormatter(logging.Formatter):
     """Render a `LogRecord` as one line of JSON.
 
@@ -143,6 +160,12 @@ class JsonFormatter(logging.Formatter):
         for key, value in record.__dict__.items():
             if key not in _RESERVED and key not in payload and not key.startswith("_"):
                 payload[key] = value
+
+        # The ambient request context is merged last and only fills gaps, so an explicit
+        # `extra={"request_id": ...}` at the call site beats the bound value rather than
+        # being silently overwritten by it.
+        for key, value in _request_context().items():
+            payload.setdefault(key, value)
 
         # `default=str` keeps a stray UUID, Decimal or datetime from turning a log call into
         # a TypeError. Losing exact typing in a log line is always better than losing the line.

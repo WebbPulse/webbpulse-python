@@ -23,6 +23,8 @@ from starlette.exceptions import HTTPException as StarletteHTTPException
 from starlette.middleware.base import BaseHTTPMiddleware, RequestResponseEndpoint
 from starlette.responses import Response
 
+from webbpulse.log_context import request_id_var, set_request_id
+
 if TYPE_CHECKING:  # pragma: no cover - typing only
     from webbpulse.config import BaseServiceSettings
 
@@ -149,11 +151,23 @@ def request_id(request: Request) -> str:
 
 
 class RequestIdMiddleware(BaseHTTPMiddleware):
-    """Assign every request an id, expose it on `request.state`, echo it on the response.
+    """Assign every request an id, expose it everywhere the id is needed, echo it back.
 
     An inbound `X-Request-ID` is honoured so a value set at the edge survives, and a new
-    UUID4 is minted otherwise. The id is also attached to the active OpenTelemetry span, so
-    a log line, a trace and a support ticket can all be joined on the same string.
+    UUID4 is minted otherwise. The id then goes to three places, because each reaches
+    something the others cannot:
+
+    * `request.state`, which `request_id()` and therefore the error envelope read.
+    * `webbpulse.log_context.request_id_var`, which `JsonFormatter` reads, so every log
+      record emitted anywhere under this request carries the id without the `Request`
+      object having to be threaded down to the code doing the logging.
+    * The active OpenTelemetry span, as `webbpulse.request_id`, so a log line and a trace
+      join on one string.
+
+    The context variable is reset in a `finally`. Starlette copies the context into the
+    request's task, so the binding would die with the task regardless, but resetting keeps
+    a `BaseHTTPMiddleware` stack that shares a context across the chain from leaking one
+    request's id into the next.
     """
 
     async def dispatch(self, request: Request, call_next: RequestResponseEndpoint) -> Response:
@@ -161,6 +175,7 @@ class RequestIdMiddleware(BaseHTTPMiddleware):
         # Bound the length so a hostile header cannot inflate every log line downstream.
         rid = incoming[:128] if incoming else str(uuid.uuid4())
         setattr(request.state, _REQUEST_ID_STATE, rid)
+        token = set_request_id(rid)
 
         try:
             from opentelemetry import trace
@@ -171,7 +186,10 @@ class RequestIdMiddleware(BaseHTTPMiddleware):
         except ImportError:  # pragma: no cover - otel extra absent
             pass
 
-        response = await call_next(request)
+        try:
+            response = await call_next(request)
+        finally:
+            request_id_var.reset(token)
         response.headers[REQUEST_ID_HEADER] = rid
         return response
 

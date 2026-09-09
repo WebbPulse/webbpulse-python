@@ -3,8 +3,9 @@
 None of these modules run AWS calls at import time. Install only what a service needs
 through the extras: `fastapi`, `dynamodb`, `otel`, `security`, `testing`.
 
-`config`, `logging`, `dynamodb`, `ratelimit`, `otel`, `security` and `lambda_entry` import
-on the base install and degrade at call time when their extra is absent. `http` requires
+`config`, `logging`, `log_context`, `metrics`, `dynamodb`, `ratelimit`, `otel`, `security`
+and `lambda_entry` import on the base install and degrade at call time when their extra is
+absent. `log_context` and `metrics` need nothing beyond the standard library at all. `http` requires
 the `fastapi` extra and `testing` requires the `testing` extra to import at all. See the
 README for the module map and the per-app migration notes.
 """
