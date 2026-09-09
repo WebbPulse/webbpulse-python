@@ -5,6 +5,91 @@ Notable changes to the `webbpulse` package. The version here is the one in
 
 This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## 0.5.0
+
+Both backends carried a near-identical `security.py`: bcrypt password hashing plus JWT
+sign and verify. The README said there would be no shared auth module, on the grounds that
+the two apps used `python-jose` against PyJWT and bcrypt 4.3.0 against 5.0.0, and that
+merging them would change how existing hashes verify. Half of that turned out to be true
+and half of it did not, so this release shares the half that is genuinely common and leaves
+the half that is not.
+
+**No stored hash changes and no issued token is invalidated.** Adoption is a drop-in.
+
+### Added
+
+- `webbpulse.security`, behind a new `security` extra (`PyJWT`, `bcrypt`):
+
+  ```python
+  from webbpulse.security import hash_password, verify_password, create_token, decode_token
+
+  hashed = hash_password(password)
+  if verify_password(password, user.hashed_password):
+      token = create_token({"sub": user.username}, secret, expires_in=timedelta(minutes=30))
+
+  claims = decode_token(token, secret)  # raises ExpiredToken / InvalidToken
+  ```
+
+- `hash_password(password, *, rounds=12)` and `verify_password(password, hashed)`.
+- `needs_rehash(hashed, *, rounds=12)`, for upgrading a hash's cost on the next successful
+  login, which is the only moment the plaintext is available to re-hash.
+- `create_token(claims, secret, *, expires_in=None, algorithm="HS256", issuer=None,
+  audience=None, now=None)` and `decode_token(token, secret, *, algorithms=None,
+  issuer=None, audience=None, require=None, leeway=0)`.
+- `bearer_claims(secret, *, ..., auto_error=True)`, an optional FastAPI dependency returning
+  the decoded claims. It needs the `fastapi` extra, and the rest of the module does not.
+- `TokenError` and its subclasses `ExpiredToken` and `InvalidToken`.
+- `BCRYPT_MAX_BYTES`, `DEFAULT_ROUNDS` and `DEFAULT_ALGORITHM`.
+
+### The two claims in the 0.4.0 README, checked
+
+- **The rounds did not actually differ.** bcrypt's default cost is 12 on both 4.3.0 and
+  5.0.0, and CarModPicker passes `rounds=12` explicitly, so both apps have been writing cost
+  12 hashes all along. `DEFAULT_ROUNDS` is 12 and every existing hash verifies unchanged.
+- **The 72 byte handling really did differ, and it is a live bug.** bcrypt 4.x silently
+  truncates a password over 72 bytes; bcrypt 5.0 raises `ValueError`. Portfolio truncates to
+  `[:72]` by hand, so it is safe on either. CarModPicker does not, and it is pinned to
+  bcrypt 5.0.0, so **a password longer than 72 bytes is currently a 500 rather than a
+  login** on both signup and password reset. This module truncates internally, so it behaves
+  the same on 4.x and 5.x and that failure goes away on adoption.
+- Hashes are mutually verifiable across bcrypt 4.3.0 and 5.0.0, verified both directions.
+
+### Behaviour
+
+- Truncation is on a **byte** boundary, not a character boundary, matching what both apps
+  and bcrypt itself already do. Trimming back to the last whole UTF-8 character would feed
+  bcrypt different bytes and disagree with every existing hash.
+- `verify_password` returns `False` rather than raising for a `None` or empty stored hash
+  (an OAuth-only account has no password) and for a corrupt one. A bad stored value is a
+  failed login, not a 500. It is deliberately not constant time across the "no hash" case;
+  a service wanting that should verify against a fixed dummy hash, as CarModPicker's
+  `_DUMMY_HASH` already does, since that decision is bound up with its user lookup.
+- `needs_rehash` returns `True` only for a **lower** cost. A hash written at a higher cost
+  is left alone rather than re-hashed down, which would weaken accounts a previous, more
+  cautious setting had protected. An unparseable hash returns `True`.
+- `decode_token` always passes an explicit `algorithms` list and never reads `alg` from the
+  token header, which is what refuses both `alg: none` and the RS256-verified-as-an-HMAC
+  confusion. `issuer` and `audience`, when given, are verified rather than merely returned.
+- `InvalidToken`'s message does not say which check failed. Telling a caller whether the
+  signature or the audience was wrong narrows the search for a forgery; the reason stays on
+  the exception chain for the log.
+- `bearer_claims` raises `HTTPException(401)` with a mapping detail, so
+  `register_error_handlers` renders it in **the package's existing envelope**. No new error
+  shape is introduced. The `error_code` is `TOKEN_EXPIRED` or `INVALID_TOKEN`, carried on
+  the raise so the distinction survives whether or not the app sets `error_codes=True`, and
+  the 401 carries `WWW-Authenticate: Bearer`.
+
+### Notes
+
+- **PyJWT, not python-jose.** `python-jose` is effectively unmaintained and validates less
+  by default. An HS256 token is interchangeable between the two libraries, verified both
+  directions, so Portfolio switching invalidates no already-issued session.
+- The module imports on the base install and imports `bcrypt` and `jwt` inside the
+  functions, so a consumer that only wants the JWT half never needs bcrypt present.
+  `bearer_claims` is the only part needing the `fastapi` extra.
+- Nothing about a user, a role, an admin or a `sub` convention is in this module. Those are
+  what actually differ between the two apps, and guessing at them here would force a fork.
+
 ## 0.4.0
 
 CarModPicker's repository layer translates a conditional check failure into its own

@@ -43,6 +43,12 @@ otel = [
 # `opentelemetry-instrument` entry point are deliberately not, so this is additive to
 # `otel` rather than a replacement for it. Needs botocore, which `dynamodb` also brings.
 aws-otel = ["aws-opentelemetry-distro>=0.10", "botocore>=1.35"]
+# webbpulse.security. PyJWT rather than python-jose, which is effectively unmaintained and
+# validates less by default; an HS256 token is interchangeable between the two, so a
+# service switching libraries invalidates no existing session. bcrypt is unpinned across
+# the 4/5 boundary on purpose: the module truncates to 72 bytes itself, which is the only
+# behaviour that differs between those majors.
+security = ["PyJWT>=2.10,<3", "bcrypt>=4.1"]
 # webbpulse.testing. Starlette 1.x TestClient is built on httpx2 and warns (and under
 # `-W error` fails) when only the 0.x httpx is importable, so httpx2 is what is pinned.
 testing = ["moto[dynamodb,secretsmanager]>=5", "pytest>=8", "httpx2>=2"]
@@ -53,7 +59,7 @@ Source = "https://github.com/WebbPulse/webbpulse-python"
 
 [dependency-groups]
 dev = [
-  "webbpulse[aws-otel,dynamodb,fastapi,otel,testing]",
+  "webbpulse[aws-otel,dynamodb,fastapi,otel,security,testing]",
   "boto3-stubs[dynamodb,secretsmanager]",
   "botocore-stubs",
   "mypy>=1.13",

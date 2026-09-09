@@ -2,9 +2,9 @@
 
 Shared infrastructure code for WebbPulse FastAPI services on AWS Lambda.
 
-Every WebbPulse backend had grown its own copy of the same eight concerns: settings and
+Every WebbPulse backend had grown its own copy of the same nine concerns: settings and
 secret loading, JSON logging, tracing, the FastAPI app factory, rate limiting, the DynamoDB
-access layer, the Lambda entrypoint, and the test fixtures. They had drifted, and the
+access layer, password hashing and JWTs, the Lambda entrypoint, and the test fixtures. They had drifted, and the
 drift was where the bugs lived. This package is one implementation of each, typed and
 tested, so a service imports them instead of maintaining them.
 
@@ -27,7 +27,7 @@ For local work on the package itself:
 
 ```bash
 python3.13 -m venv .venv
-.venv/bin/pip install -e ".[aws-otel,dynamodb,fastapi,otel,testing]" mypy ruff pytest-cov \
+.venv/bin/pip install -e ".[aws-otel,dynamodb,fastapi,otel,security,testing]" mypy ruff pytest-cov \
   "boto3-stubs[dynamodb,secretsmanager]" botocore-stubs
 .venv/bin/ruff check . && .venv/bin/ruff format --check .
 .venv/bin/mypy
@@ -44,6 +44,7 @@ needs. Everything else is opt-in.
 | `dynamodb` | `boto3`, `botocore` | `webbpulse.dynamodb`, `webbpulse.ratelimit`, and secret loading in `webbpulse.config` |
 | `fastapi` | `fastapi`, `starlette`, `uvicorn` | `webbpulse.http`, `webbpulse.lambda_entry`, the `webbpulse.ratelimit` dependency |
 | `otel` | the OpenTelemetry SDK, the OTLP HTTP exporter, the FastAPI and botocore instrumentations | `webbpulse.otel` |
+| `security` | `PyJWT`, `bcrypt` | `webbpulse.security` |
 | `testing` | `moto`, `pytest`, `httpx2` | `webbpulse.testing` |
 
 A typical service installs `webbpulse[fastapi,dynamodb,otel]` at runtime and adds
@@ -712,6 +713,75 @@ Each line there is a real failure mode:
 - **`AWS_LWA_READINESS_CHECK_PATH=/health`** must point at a route that does no I/O. The
   adapter's default is `/`.
 
+### `webbpulse.security`
+
+bcrypt password hashing and JWT signing, with nothing product specific in either half.
+Needs the `security` extra.
+
+```python
+from datetime import timedelta
+from webbpulse.security import (
+    create_token, decode_token, hash_password, needs_rehash, verify_password,
+)
+
+hashed = hash_password(password)
+
+if verify_password(password, user.hashed_password):
+    if needs_rehash(user.hashed_password):
+        repos.users.update(user.id, hashed_password=hash_password(password))
+    token = create_token({"sub": user.username}, secret, expires_in=timedelta(minutes=30))
+
+claims = decode_token(token, secret)  # raises ExpiredToken or InvalidToken
+```
+
+What is shared is turning a password into a hash and a claims mapping into a signed token.
+What is **not** shared is what the claims mean: there is no `sub` convention here, no user
+model, no database lookup and no notion of an admin. `decode_token` returns the claims and
+stops. That is the part that genuinely differs between the two apps, and guessing at it
+would force a fork immediately.
+
+**Adoption changes no stored hash and invalidates no issued token.** `DEFAULT_ROUNDS` is
+12, which is what both apps already write: CarModPicker passes `rounds=12` explicitly and
+Portfolio takes bcrypt's default, which is also 12 on both 4.3.0 and 5.0.0.
+
+**The 72 byte cliff is the reason this is worth sharing.** bcrypt reads at most 72 bytes of
+a password, and libraries disagree about what to do with more: bcrypt 4.x truncates
+silently, bcrypt 5.0 raises `ValueError`. Portfolio truncates by hand and is safe on
+either; CarModPicker does not and is pinned to 5.0.0, so a password over 72 bytes is
+currently a 500 rather than a login. This module truncates internally, on a **byte**
+boundary rather than a character boundary, so it behaves identically on 4.x and 5.x and
+still agrees with every hash either app has already written.
+
+`verify_password` returns `False` for a `None` or empty stored hash, because an OAuth-only
+account genuinely has no password and asking every call site to remember that invites the
+one that forgets. It is deliberately not constant time across that case; a service wanting
+that should verify against a fixed dummy hash, which is a decision bound up with its own
+user lookup. `needs_rehash` returns `True` only for a **lower** cost, so a hash written
+under a more cautious setting is never quietly re-hashed down.
+
+**PyJWT rather than python-jose**, because `python-jose` is effectively unmaintained and
+PyJWT validates more by default. An HS256 token is interchangeable between the two, so
+Portfolio switching invalidates no already-issued session. `decode_token` always passes an
+explicit `algorithms` list and never reads `alg` from the token header, which is what
+refuses both `alg: none` and the RS256-verified-as-an-HMAC confusion. `issuer` and
+`audience`, when given, are verified rather than merely returned.
+
+An optional FastAPI dependency returns the decoded claims, and needs the `fastapi` extra:
+
+```python
+Claims = Annotated[dict, Depends(bearer_claims(settings.secret_key))]
+
+@router.get("/me")
+async def me(claims: Claims, repos: Repos = Depends(get_repos)):
+    return repos.users.get_by_username(claims["sub"])
+```
+
+It raises `HTTPException(401)` with a mapping detail, so `register_error_handlers` renders
+it in the package's existing envelope rather than a new shape, with `error_code`
+`TOKEN_EXPIRED` or `INVALID_TOKEN` and a `WWW-Authenticate: Bearer` challenge. With
+`auto_error=False` it returns `None` instead of raising, for a route serving both anonymous
+and authenticated callers.
+
 ### `webbpulse.testing`
 
 Pytest fixtures for a moto-backed table and a `TestClient`. Enable them from a service's
@@ -794,6 +864,7 @@ follows is what each app replaces, and what has to stay.
 | `http` | `api/utils/response_patterns.py`, `api/middleware/error_handler.py`, `api/middleware/request_context.py`, and the CORS block in `main.py` |
 | `ratelimit` | `api/middleware/rate_limiter.py` in full, including `RateLimitConfig` and the eight `RATE_LIMIT_*` settings fields |
 | `dynamodb` | `db/dynamo/client.py`, `serialization.py`, `errors.py`, and the generic body of `repository.py` |
+| `security` | the password and JWT halves of `api/dependencies/auth.py`: `verify_password`, `get_password_hash`, `create_access_token` and the raw `jwt.decode` calls repeated across `endpoints/auth/core.py`. The user lookup, the `disabled` and `email_verified` checks and the admin dependencies stay |
 | `lambda_entry` | `app/lambda_handler.py` entirely. The bare `Mangum(app, lifespan="off")` has no replacement import; the Web Adapter takes its place |
 | `testing` | the moto and `reset_clients` fixture plumbing in `tests/conftest.py` |
 
@@ -835,6 +906,7 @@ and no request id at all.
 | `http` | `TrailingSlashMiddleware`, the CORS block and the `/health` route in `main.py`. The error envelope and request id are new capability, not a replacement |
 | `ratelimit` | `core/login_limiter.py` in full, including its `client_ip()` |
 | `dynamodb` | `db/client.py` and `db/serializer.py` verbatim, the generic `Repository` base, and `table_name()` |
+| `security` | the password and JWT halves of `core/security.py`: `_encode`, `verify_password`, `get_password_hash`, `create_access_token` and `verify_token`. `get_current_user` and `require_admin` stay, rebuilt on `bearer_claims` |
 | `lambda_entry` | `app/lambda_handler.py` and `scripts/build_lambda.sh` |
 | `testing` | the `mock_aws` fixture, `create_all_tables`, `db_client.reset()` and `secrets.reset_cache()` in `tests/conftest.py` |
 
@@ -865,7 +937,16 @@ and `skip`/`limit` the frontend depends on, and the trailing-slash tolerance.
 
 ### Not shared, deliberately
 
-There is no shared `auth` module. The two apps use `python-jose` and PyJWT respectively, and
-bcrypt 4.3.0 against 5.0.0, which differ in 72-byte truncation and default rounds. Merging
-them would silently change how existing password hashes verify, so authentication stays
-per-app until those are reconciled on purpose.
+The **primitives** of authentication are shared as of 0.5.0, in `webbpulse.security`. Up to
+0.4.0 they were not, on the grounds that the two apps disagreed on JWT library, bcrypt major
+version, 72 byte truncation and default rounds. Checking that reasoning found half of it
+wrong: the default cost is 12 on both bcrypt 4.3.0 and 5.0.0, and CarModPicker passes 12
+explicitly, so no stored hash changes. The truncation difference was real, and was already a
+live 500 in CarModPicker rather than a reason to keep two copies. Hashes verify across both
+bcrypt majors and HS256 tokens across both JWT libraries, both verified in the test suite.
+
+What stays per-app is the **policy** above those primitives, and it is most of the file in
+each case: which claim carries the identity, the user lookup behind it, whether an inactive
+or unverified account may authenticate, the admin and superuser checks, the per-user session
+expiry clamp, the constant-time `_DUMMY_HASH` equaliser, and every OAuth, WebAuthn and TOTP
+flow. `decode_token` returns the claims and stops; the rest is the service's.
