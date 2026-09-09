@@ -58,6 +58,7 @@ from typing import Final
 __all__ = [
     "UNSET",
     "LogContextFilter",
+    "attach_log_context",
     "bind_context",
     "current_context",
     "log_context",
