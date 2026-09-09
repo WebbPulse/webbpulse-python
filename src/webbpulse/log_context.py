@@ -204,9 +204,7 @@ def set_span_context_attributes() -> None:
 
 
 @contextmanager
-def bind_context(
-    *, request_id: object = None, user_id: object = None
-) -> Iterator[dict[str, str]]:
+def bind_context(*, request_id: object = None, user_id: object = None) -> Iterator[dict[str, str]]:
     """Bind either field for the duration of the block, restoring both on exit.
 
     Passing `None` for a field leaves whatever is already bound in place, so an inner

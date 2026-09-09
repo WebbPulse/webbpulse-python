@@ -236,9 +236,7 @@ class MetricsEmitter:
                     # billable metric count; a service that wants that emits twice.
                     "Namespace": self.namespace,
                     "Dimensions": [sorted(self._dimensions)],
-                    "Metrics": [
-                        self._metric_definition(name) for name in sorted(self._values)
-                    ],
+                    "Metrics": [self._metric_definition(name) for name in sorted(self._values)],
                 }
             ],
         }

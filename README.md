@@ -1124,15 +1124,17 @@ already migrated.
   mounted, since that middleware now sets `request.state` and binds the ContextVar and
   echoes the header, which is everything the local one did. Until then the local
   middleware keeps working: it sets the same ContextVar under the same name.
-- `core/cloudwatch_emf.py` is deleted and `emit_crawler_run_metrics` becomes a four-line
-  wrapper over `emit`, or the two call sites in `runner.py` and `ecs_rescrape_runner.py`
-  call `emit` directly. The namespace, the three metric names, their units and the three
-  dimension names are unchanged, so plan 02-05's alarm keeps matching. The env gate moves
-  into the `enabled=` argument rather than being read inside the emitter.
-- Two landmines stop being landmines. The emission no longer has to precede the summary
-  log line, because nothing is dropped on a trailing flush, so
-  `test_runner_emits_before_summary` can go; and `AWS_EMF_ENVIRONMENT=Local` can come out
-  of `apprunner.tf` and `ecs.tf`, because there is no sink to auto-detect.
+- `core/cloudwatch_emf.py` is a straight deletion, not a swap. It has no call site left:
+  `emit_crawler_run_metrics` served a crawler tree that the DynamoDB and Lambda migration
+  removed, which CarModPicker's own `docs/migration/split-plan.md` already lists as dead
+  code to delete on the way through. Deleting it drops `aws-embedded-metrics` from
+  `requirements.txt` and `requirements-lambda.txt` and lets `AWS_EMF_ENVIRONMENT=Local`
+  come out of the Terraform, since there is no sink to auto-detect any more.
+- `webbpulse.metrics` is then what CarModPicker uses for its *next* metric rather than a
+  replacement for a current one. The shape is preserved regardless: `emit` with a
+  `namespace`, three `Count` and `Seconds` metrics and `AdapterName`/`Environment`/`RunType`
+  dimensions reproduces the old document byte for byte, so a restored crawler would keep
+  plan 02-05's alarm matching. That equivalence is pinned by a test in this package.
 
 **WebbPulse-Portfolio** gains capability rather than replacing any.
 

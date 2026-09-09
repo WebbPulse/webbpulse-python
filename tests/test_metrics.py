@@ -51,9 +51,7 @@ def test_a_blank_namespace_is_rejected() -> None:
 
 
 def test_dimensions_and_properties_can_be_passed_to_the_constructor() -> None:
-    emitter, stream = _emitter(
-        dimensions={"Environment": "staging"}, properties={"job_id": "abc"}
-    )
+    emitter, stream = _emitter(dimensions={"Environment": "staging"}, properties={"job_id": "abc"})
     emitter.put("Ingested", 1, "Count")
     emitter.flush()
     (payload,) = _lines(stream)
@@ -358,9 +356,10 @@ def test_the_context_manager_flushes_on_exit() -> None:
 
 def test_the_context_manager_flushes_what_it_had_when_the_body_raises() -> None:
     stream = io.StringIO()
-    with pytest.raises(RuntimeError), MetricsEmitter(
-        namespace="WebbPulse/Test", stream=stream
-    ) as emitter:
+    with (
+        pytest.raises(RuntimeError),
+        MetricsEmitter(namespace="WebbPulse/Test", stream=stream) as emitter,
+    ):
         emitter.put("Ingested", 1, "Count")
         raise RuntimeError("boom")
     (payload,) = _lines(stream)

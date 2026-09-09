@@ -114,11 +114,15 @@ Insights, and creating no metric at all.
 
 ### Adoption
 
-CarModPicker deletes `core/log_context.py` and `core/cloudwatch_emf.py` and swaps the
-imports; the metric names, units, dimension names and namespace are unchanged, so plan
-02-05's alarm keeps matching, and `AWS_EMF_ENVIRONMENT=Local` can come out of the
-Terraform. Portfolio has neither today, so both are new capability there rather than a
-replacement. The README's per-app migration notes carry the file-by-file detail.
+CarModPicker deletes `core/log_context.py` and swaps the imports across eight files.
+`core/cloudwatch_emf.py` is a straight deletion rather than a swap: it has no call site
+left, since the crawler tree `emit_crawler_run_metrics` served did not survive the
+DynamoDB and Lambda migration, and CarModPicker's own split plan already lists it as dead
+code. That deletion also drops `aws-embedded-metrics` from both requirements files and
+lets `AWS_EMF_ENVIRONMENT=Local` come out of the Terraform. The old document's shape is
+reproduced exactly by `emit` and pinned by a test here, so a restored crawler would keep
+plan 02-05's alarm matching. Portfolio has neither primitive today, so both are new
+capability there. The README's per-app migration notes carry the file-by-file detail.
 
 ## 0.6.0
 
