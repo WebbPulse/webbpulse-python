@@ -1,10 +1,11 @@
 """`build_identity_router`: the router a product mounts into its identity Lambda.
 
-Always mounts the three anonymous documents:
+Always mounts the three anonymous documents, plus M6's provider discovery route:
 
     GET <prefix>/.well-known/openid-configuration
     GET <prefix>/.well-known/jwks.json
     GET <prefix>/health
+    GET <prefix>/oauth/providers
 
 and, when the product supplies `hooks` **and** a `stores` carrying the credential and
 refresh stores, the M2 password and session flows:
@@ -36,6 +37,12 @@ otherwise be able to switch off the control that bounds what stealing it is wort
 changed in 0.13.0**, where both routes took no body at all.
 
 Passkeys and OAuth are M5 and M6, per section 9.1 of `docs/identity-standard.md`.
+
+`oauth/providers` is the exception to all of the above conditionality. It is unconditional
+from 0.16.0 and answers `{"providers": []}` in a deployment that has no OAuth configured at
+all, so a frontend gets one authoritative answer in every environment rather than a 404 it
+has to interpret. The other five OAuth routes stay conditional. See
+`register_oauth_provider_discovery` for the rest of that reasoning.
 
 ## Where `<prefix>` comes from, and why you mount with no prefix of your own
 
@@ -370,6 +377,27 @@ def build_identity_router(
             "version": version,
         }
 
+    # M6's provider discovery, new in 0.16.0, and the one OAuth route that is unconditional.
+    #
+    # Mounted here rather than inside `_mount_flows` because it must exist in *every*
+    # deployment, including one that mounts no flows at all: a JWKS-only function, a product
+    # with no OAuth stores, a product that configured no provider. The frontend then has one
+    # authoritative answer everywhere instead of a 404 it has to interpret, which is the
+    # ambiguous signal the route exists to replace. See `register_oauth_provider_discovery`.
+    #
+    # The service is built only when both stores are present, because `OAuthService` requires
+    # them. When they are absent the route still mounts and answers `{"providers": []}`,
+    # which is the truth: a product with nowhere to write a state row cannot complete an
+    # OAuth sign-in whatever its client ids say.
+    _mount_oauth_discovery(
+        router,
+        prefix=prefix,
+        settings=settings,
+        hooks=hooks,
+        stores=resolved_stores,
+        oauth_client_secrets=oauth_client_secrets,
+    )
+
     if hooks is not None and resolved_stores.credentials is not None:
         _mount_flows(
             router,
@@ -386,6 +414,50 @@ def build_identity_router(
         )
 
     return router
+
+
+def _mount_oauth_discovery(
+    router: APIRouter,
+    *,
+    prefix: str,
+    settings: IdentitySettings,
+    hooks: IdentityHooks | None,
+    stores: IdentityStores,
+    oauth_client_secrets: Mapping[str, str] | None,
+) -> None:
+    """Mount `GET <prefix>/oauth/providers`, with a service behind it where one can exist.
+
+    Split out of `build_identity_router` so the "can a service be built" question is asked in
+    one place and reads as one thought, rather than as four lines of `and` in the middle of a
+    function that is otherwise about mounting documents.
+
+    The route mounts either way. What varies is whether it can answer anything but an empty
+    list, and that needs the same collaborators the flow routes need: an `OAuthService` takes
+    both OAuth stores and a hooks object. When any of them is missing the route mounts with
+    no service, which is not a degraded answer but the correct one: a deployment with no
+    state table cannot complete an OAuth sign-in no matter which client ids it holds, so
+    advertising a provider would be advertising a button that cannot work.
+
+    `credentials` is passed through where present, matching `_mount_flows`, so a service
+    built here is the same object shape as the one built there and neither can drift into
+    answering differently about the same configuration.
+    """
+    from webbpulse.identity.oauth_routes import register_oauth_provider_discovery
+
+    oauth_service = None
+    if hooks is not None and stores.oauth_states is not None and stores.oauth_links is not None:
+        from webbpulse.identity.oauth import OAuthService
+
+        oauth_service = OAuthService(
+            settings,
+            hooks,
+            states=stores.oauth_states,
+            links=stores.oauth_links,
+            credentials=stores.credentials,
+            client_secrets=oauth_client_secrets,
+        )
+
+    register_oauth_provider_discovery(router, prefix=prefix, oauth=oauth_service)
 
 
 def _mount_flows(

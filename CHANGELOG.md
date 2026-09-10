@@ -5,6 +5,83 @@ Notable changes to the `webbpulse` package. The version here is the one in
 
 This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## 0.16.0
+
+Identity M6 follow-up: a public OAuth provider discovery route, so a frontend can ask which
+providers are available instead of guessing.
+
+WebbPulse-Portfolio PR 170 had to infer availability by probing `GET /oauth/{provider}/start`
+and reading the status code, which is wrong twice over. It spends that route's rate limit
+budget, 20 per 15 minutes per IP, on sign-in *page loads* rather than on sign-ins, so a user
+who reloads the page enough times is refused the sign-in they then attempt. And a non-200
+cannot distinguish "this provider is not configured" from "this provider is configured and
+something is briefly broken", so a transient failure silently removes a sign-in button. An
+explicit list is a different question with an unambiguous answer.
+
+### Added
+
+- **`GET <prefix>/oauth/providers`**, anonymous, answering
+  `{"providers": [{"id": "google", "display_name": "Google"}, ...]}`. Ordered as
+  `PROVIDERS` defines, Google then GitHub, rather than in the order `oauth_providers`
+  happens to be written in, so the buttons do not reshuffle between environments. Carries
+  `Cache-Control: public, max-age=300`, matching the JWKS rather than the discovery
+  document's hour: turning a provider on is exactly the moment somebody is watching for the
+  button to appear.
+
+  A provider appears only when it has **both** a client id and a client secret. See the
+  behaviour change below for why the second half matters.
+
+  **The route mounts in every deployment**, including one with no OAuth configured at all,
+  where it answers `{"providers": []}`. It is the one OAuth route that is unconditional. A
+  route that were absent when OAuth is off would answer 404, and a 404 is exactly the
+  ambiguous signal this route exists to replace: indistinguishable from a routing mistake or
+  an older version of this package. An empty list says "no providers, and I am sure".
+
+- **`OAuthProviderConfig.display_name`**, and `display_name` on both baseline providers
+  (`"Google"`, `"GitHub"`). Fixed in the package rather than left to each frontend, because
+  a provider's name is the provider's to spell and three frontends inventing their own
+  casing is three chances to get a third party's trademark wrong.
+
+- **`OAuthService.available_providers()`**, returning the `OAuthProviderConfig` for each
+  fully configured provider. Stricter than the existing `enabled_providers()`, which asks
+  only for a client id and still decides whether the five flow routes mount.
+
+- **`register_oauth_provider_discovery`**, exported from `webbpulse.identity`, along with
+  `OAUTH_PROVIDERS_PATH` and `OAUTH_PROVIDERS_CACHE_CONTROL`.
+
+  It is tagged `identity` and `oauth` in the OpenAPI document, and is the only identity route
+  that appears there: the `.well-known` documents are `include_in_schema=False` because API
+  Gateway fetches them rather than a client writing against them. It is deliberately
+  annotated `-> Any` with `response_model=None` rather than `-> JSONResponse`, because under
+  `from __future__ import annotations` the latter is an unresolvable string that FastAPI
+  hands pydantic as a response model, which makes `app.openapi()` raise for the whole app.
+  Every other route in this package carries that annotation; this one mounts everywhere, so
+  it must not be what takes `/docs` away from a product that has no OAuth at all.
+
+### Changed
+
+- **`OAuthService.start` now refuses a provider that has a client id but no client secret**,
+  with the existing `OAUTH_PROVIDER_UNAVAILABLE` code and a 503, before redirecting. Until
+  now such a provider mounted, sent the user to Google, collected their consent, and only
+  then failed at the token exchange on the way back, spending a real person's attention on a
+  configuration error. The refusal names no configuration; the operator still gets the detail
+  in a log line. `identity_from_callback` keeps its own check, since it is reachable
+  directly.
+
+  This is the only behaviour change in the release, and it converts a late failure into an
+  early one for a deployment that was already broken. A fully configured provider is
+  unaffected.
+
+### Fixed
+
+- **`_oauth_route_paths` in the M6 suite enumerated `app.routes`**, which under the FastAPI
+  the CI installs (0.141) no longer holds a router's flattened routes: `include_router`
+  mounts the router, so `app.routes` carries an empty-path mount and none of the real paths.
+  The helper therefore returned the empty set for every input, and both "the OAuth routes are
+  absent" tests passed against a fully configured router. It now reads `router.routes`, which
+  is both correct on either FastAPI version and the honest thing to inspect, since the router
+  is what this package builds and what a consumer mounts.
+
 ## 0.15.0
 
 Identity M5: passkeys. WebAuthn registration and passwordless sign-in, credential

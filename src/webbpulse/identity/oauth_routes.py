@@ -1,4 +1,4 @@
-"""The five OAuth HTTP routes, mounted onto the identity router.
+"""The six OAuth HTTP routes, mounted onto the identity router.
 
 Separate from `router.py` for the reason `_mount_mfa` gives for being separate from
 `_mount_flows`: each milestone adds its own mount function rather than growing one file past
@@ -10,11 +10,16 @@ queue consumer without a request object, per section 2.1.
 
 | Method | Path | Auth |
 | --- | --- | --- |
+| `GET` | `/oauth/providers` | none |
 | `GET` | `/oauth/{provider}/start` | none |
 | `GET` | `/oauth/callback` | none |
 | `POST` | `/oauth/{provider}/link` | JWT |
 | `GET` | `/oauth/links` | JWT |
 | `DELETE` | `/oauth/{provider}/link` | JWT |
+
+`/oauth/providers` is the odd one out and mounts through its own
+`register_oauth_provider_discovery`, because it is the only route here that mounts even when
+OAuth is switched off entirely, answering an empty list. See that function for why.
 
 `start` and `callback` are `GET` and answer with a `302`, because both are **browser
 navigations rather than API calls**. The user clicks "Sign in with Google" and the browser
@@ -66,8 +71,11 @@ __all__ = [
     "OAUTH_CALLBACK_PATH",
     "OAUTH_LINKS_PATH",
     "OAUTH_LINK_PATH",
+    "OAUTH_PROVIDERS_CACHE_CONTROL",
+    "OAUTH_PROVIDERS_PATH",
     "OAUTH_START_IP_LIMIT",
     "OAUTH_START_PATH",
+    "register_oauth_provider_discovery",
     "register_oauth_routes",
 ]
 
@@ -75,6 +83,18 @@ OAUTH_START_PATH: Final = "/oauth/{provider}/start"
 OAUTH_CALLBACK_PATH: Final = "/oauth/callback"
 OAUTH_LINK_PATH: Final = "/oauth/{provider}/link"
 OAUTH_LINKS_PATH: Final = "/oauth/links"
+OAUTH_PROVIDERS_PATH: Final = "/oauth/providers"
+
+#: Five minutes, matching the JWKS rather than the hour the discovery document gets.
+#:
+#: The set of providers is configuration, so it changes when a deploy changes it, which is
+#: rarer than a key rotation but not never: turning a provider on is exactly the moment
+#: somebody is watching to see the button appear. An hour would mean a browser that had
+#: loaded the sign-in page before the deploy kept showing the old set for the rest of the
+#: hour, with no way to tell it otherwise. Five minutes bounds that while still taking the
+#: fetch off the Lambda for the overwhelming majority of sign-in page loads, which is the
+#: same trade the JWKS makes and the reason its number is the one copied here.
+OAUTH_PROVIDERS_CACHE_CONTROL: Final = "public, max-age=300"
 
 #: Section 5.1: 20 starts per 15 minutes per IP.
 #:
@@ -108,6 +128,91 @@ def _bind_fastapi_request() -> None:
         from fastapi import Request as _Request
 
         _FastAPIRequest = _Request
+
+
+def register_oauth_provider_discovery(
+    router: APIRouter,
+    *,
+    prefix: str,
+    oauth: OAuthService | None = None,
+) -> None:
+    """Add `GET <prefix>/oauth/providers`, the one route that mounts in every deployment.
+
+    New in 0.16.0. Answers `{"providers": [{"id": ..., "display_name": ...}, ...]}` for the
+    providers that are actually usable, and `{"providers": []}` when OAuth is not configured
+    at all, which is why `oauth` is optional: an unconfigured product has no `OAuthService`
+    to build, since it may have neither store, and the empty answer needs neither.
+
+    ## Why this exists
+
+    Before it, a frontend had no way to ask which providers were available, so it inferred
+    the answer by probing `GET /oauth/{provider}/start` and reading the status code.
+    WebbPulse-Portfolio PR 170 did exactly that, and it is wrong twice over. It spends the
+    start route's rate limit budget, 20 per 15 minutes per IP, on page loads rather than on
+    sign-ins, so a user who reloads a sign-in page enough times is refused the sign-in they
+    then attempt. And a probe cannot distinguish "this provider is not configured" from
+    "this provider is configured and something is briefly broken": both are a non-200, and a
+    frontend that hides a button on a transient failure has turned a blip into a missing
+    sign-in method. An explicit list is a different question with an unambiguous answer.
+
+    ## Why it mounts even when OAuth is off
+
+    So that the frontend has one authoritative answer in every deployment. A route that is
+    absent when OAuth is unconfigured would mean a 404 that the client has to interpret, and
+    a 404 is exactly the ambiguous signal this route exists to replace: it is
+    indistinguishable from a routing mistake or an older version of this package. An empty
+    list says "no providers, and I am sure" in a way a missing route cannot. It is the same
+    reasoning that keeps the `.well-known` documents unconditional.
+
+    ## Anonymous, and rate limited by nothing
+
+    Anonymous because it is read by the sign-in page, which by definition has no token. Not
+    rate limited, matching the `.well-known` documents rather than the flow routes: the
+    response is a constant derived from configuration, it holds nothing about any user, it
+    touches no store and makes no call, and it carries a `Cache-Control` that keeps repeat
+    fetches off the function entirely. Rate limiting it would mean a DynamoDB write per
+    sign-in page load to protect a handler that reads a dict.
+    """
+    from fastapi.responses import JSONResponse as _JSONResponse
+
+    @router.get(
+        f"{prefix}{OAUTH_PROVIDERS_PATH}",
+        # Just "oauth": the router already carries "identity" on every route it holds, and
+        # repeating it here puts the tag in the OpenAPI operation twice.
+        tags=["oauth"],
+        summary="The OAuth providers this deployment can sign a user in with",
+        response_model=None,
+    )
+    async def oauth_providers() -> Any:
+        """The OAuth providers this deployment can actually sign a user in with.
+
+        A provider appears only when it has **both** a client id and a client secret. One
+        with an id and no secret is a misconfiguration whose symptom, before 0.16.0, was a
+        user consenting at the provider and then meeting a 503 on the way back, so it is not
+        advertised and `start` refuses it outright.
+
+        Annotated `-> Any` with `response_model=None`, rather than `-> JSONResponse`, and
+        that is not cosmetic. Under `from __future__ import annotations` the annotation is
+        the *string* `"JSONResponse"`, which FastAPI hands to pydantic as a response model
+        and pydantic cannot resolve, so building the OpenAPI schema raises
+        `PydanticUserError`. The other routes in this package carry that annotation and each
+        one that mounts breaks `app.openapi()` for the whole app; this route mounts in
+        **every** deployment, including the documents-only one whose schema builds fine
+        today, so it must not be the thing that takes `/docs` away from a product that has
+        no OAuth at all.
+        """
+        configs = oauth.available_providers() if oauth is not None else []
+        return _JSONResponse(
+            {
+                "providers": [
+                    {"id": config.name, "display_name": config.display_name}
+                    for config in configs
+                ]
+            },
+            headers={"Cache-Control": OAUTH_PROVIDERS_CACHE_CONTROL},
+        )
+
+    _ = oauth_providers
 
 
 def register_oauth_routes(
