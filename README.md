@@ -964,6 +964,13 @@ would force a fork immediately.
 12, which is what both apps already write: CarModPicker passes `rounds=12` explicitly and
 Portfolio takes bcrypt's default, which is also 12 on both 4.3.0 and 5.0.0.
 
+The cost is read **when the function is called**, so a service can raise it by setting
+`webbpulse.security.DEFAULT_ROUNDS` after importing the module and the next
+`hash_password` picks it up. Before 0.12.1 that was a no-op: the default argument was bound
+once at import and a later change was silently ignored. Passing `rounds=` explicitly
+overrides both. Raising the cost needs no migration, since the cost lives in the hash
+string and `needs_rehash` reports an existing hash as due on its owner's next login.
+
 **The 72 byte cliff is the reason this is worth sharing.** bcrypt reads at most 72 bytes of
 a password, and libraries disagree about what to do with more: bcrypt 4.x truncates
 silently, bcrypt 5.0 raises `ValueError`. Portfolio truncates by hand and is safe on

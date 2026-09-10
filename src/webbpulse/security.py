@@ -50,6 +50,15 @@ inherent to bcrypt and the reason a length cap belongs in the service's own vali
 adopting this module re-verifies every stored hash unchanged. Nothing here needs a
 migration.
 
+The cost is resolved **when the function is called**, not when this module is imported.
+`hash_password` and `needs_rehash` take `rounds: int | None = None` and read
+`DEFAULT_ROUNDS` in the body, so setting `webbpulse.security.DEFAULT_ROUNDS` after import
+changes what the next call writes. The obvious spelling, `rounds: int = DEFAULT_ROUNDS`,
+does not behave that way: a default argument is evaluated once as the `def` executes, so it
+froze 12 into the function object and a consumer configuring the cost afterwards, or a test
+monkeypatching it to bcrypt's minimum to stay fast, was ignored without any error. Passing
+`rounds=` explicitly still wins over both.
+
 ## PyJWT, not python-jose
 
 The two services disagree, so one of them has to move. This module uses PyJWT because
@@ -100,7 +109,13 @@ BCRYPT_MAX_BYTES: Final = 72
 
 #: bcrypt cost. 12 is what both services already write, so adopting this module leaves
 #: every stored hash verifying unchanged.
-DEFAULT_ROUNDS: Final = 12
+#:
+#: Deliberately **not** `Final`. `hash_password` and `needs_rehash` read this at call time
+#: rather than binding it as a default argument, so a service that sets
+#: `webbpulse.security.DEFAULT_ROUNDS` after import, and a test that monkeypatches it, both
+#: take effect. Annotating it `Final` would tell mypy that rebinding is an error and take
+#: that away again.
+DEFAULT_ROUNDS: int = 12
 
 #: Signing algorithm. HS256 is what both services sign with today. It is passed explicitly
 #: to every decode; the token's own `alg` header is never trusted.
@@ -148,11 +163,19 @@ def _truncate(password: str) -> bytes:
     return password.encode("utf-8")[:BCRYPT_MAX_BYTES]
 
 
-def hash_password(password: str, *, rounds: int = DEFAULT_ROUNDS) -> str:
+def hash_password(password: str, *, rounds: int | None = None) -> str:
     """Hash a password with bcrypt, returning the encoded hash as a string.
 
     The returned string carries the algorithm, the cost and the salt as well as the digest,
     which is why `verify_password` needs no other stored state.
+
+    `rounds` defaults to `DEFAULT_ROUNDS`, **read at call time**. The default is written as
+    `None` rather than as `DEFAULT_ROUNDS` itself because a default argument is evaluated
+    once, when the `def` executes at import, and is then frozen into the function object.
+    Writing `rounds: int = DEFAULT_ROUNDS` therefore captured 12 permanently, and a service
+    that lowered the cost after importing this module, or a test that monkeypatched it, was
+    silently ignored while everything kept hashing at 12. Resolving the module attribute
+    inside the body is what makes either of those take effect.
 
     Raises `TypeError` when `password` is not a string. bcrypt would otherwise accept bytes
     and produce a hash that a `str` caller could never reproduce, and `None` reaches the
@@ -162,7 +185,8 @@ def hash_password(password: str, *, rounds: int = DEFAULT_ROUNDS) -> str:
         raise TypeError("password must be a string")
     import bcrypt
 
-    return bcrypt.hashpw(_truncate(password), bcrypt.gensalt(rounds=rounds)).decode("utf-8")
+    cost = DEFAULT_ROUNDS if rounds is None else rounds
+    return bcrypt.hashpw(_truncate(password), bcrypt.gensalt(rounds=cost)).decode("utf-8")
 
 
 def verify_password(password: str, hashed: str | None) -> bool:
@@ -193,8 +217,14 @@ def verify_password(password: str, hashed: str | None) -> bool:
         return False
 
 
-def needs_rehash(hashed: str, *, rounds: int = DEFAULT_ROUNDS) -> bool:
+def needs_rehash(hashed: str, *, rounds: int | None = None) -> bool:
     """Whether a stored hash was produced at a lower cost than `rounds`.
+
+    `rounds` defaults to `DEFAULT_ROUNDS` read at call time, for the same reason
+    `hash_password` does: a default argument would freeze 12 into the function at import and
+    quietly ignore a cost the service raised afterwards. The two have to agree, or a service
+    that raised the cost would re-hash on every single login without the stored hash ever
+    catching up.
 
     Call it after a successful `verify_password`, which is the only moment the plaintext is
     available to re-hash with::
@@ -217,7 +247,8 @@ def needs_rehash(hashed: str, *, rounds: int = DEFAULT_ROUNDS) -> bool:
     parts = hashed.split("$")
     if len(parts) < 4 or not parts[2].isdigit():
         return True
-    return int(parts[2]) < rounds
+    target = DEFAULT_ROUNDS if rounds is None else rounds
+    return int(parts[2]) < target
 
 
 def create_token(

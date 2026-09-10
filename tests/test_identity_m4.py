@@ -201,8 +201,10 @@ def _context_bytes(context: Mapping[str, str]) -> bytes:
 def cheap_bcrypt(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
     """Pin bcrypt to its minimum cost for the whole module. M2's fixture, unchanged.
 
-    Patching `security.DEFAULT_ROUNDS` alone does nothing: `hash_password`'s default binds
-    at definition time. Wrapping the function is the only thing that works.
+    Wrapping the two functions rather than patching `security.DEFAULT_ROUNDS`. Since 0.12.1
+    patching the module attribute would work too, because the cost is read at call time; the
+    wrapper is kept because it also pins the cost for a caller that passes `rounds=`
+    explicitly, which a changed default does not.
     """
     import webbpulse.security as security
 
