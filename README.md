@@ -1208,7 +1208,7 @@ because naming it would enumerate accounts and their verification state.
 sign-in method is permanent lockout: nobody can log in, so nobody can add a method back, and
 the account is unreachable by any path this design has. Another OAuth link, a password in
 the credential store, or a `True` from the `has_other_sign_in_method` hook each count as
-remaining. **That hook is new in 0.15.0 and defaults to `False`**, so a hooks class written
+remaining. **That hook is new in 0.14.0 and defaults to `False`**, so a hooks class written
 before M6 keeps working: `False` can only make the refusal fire more often, while `True`
 would let a product that had not implemented it delete a user's last credential. A product
 holding sign-in methods this package cannot see, passkeys among them, should implement it.

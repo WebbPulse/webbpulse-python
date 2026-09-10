@@ -5,7 +5,7 @@ Notable changes to the `webbpulse` package. The version here is the one in
 
 This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## 0.15.0
+## 0.14.0
 
 Identity M6: OAuth sign-in and account linking against Google and GitHub.
 
