@@ -1,12 +1,15 @@
-"""The M2 flows: register, login, change password, refresh, logout, logout-all.
+"""The flows: register, login, change password, verification, reset, refresh, logout.
 
 Section 2.1 splits routers from services and says the services hold "the flow logic, no
-FastAPI imports". This module is that layer for M2. It imports no web framework, so every
-decision below is reachable from a plain unit test with no client, no app and no transport,
-which is what makes the negative paths cheap enough to write exhaustively.
+FastAPI imports". This module is that layer. It imports no web framework, so every decision
+below is reachable from a plain unit test with no client, no app and no transport, which is
+what makes the negative paths cheap enough to write exhaustively.
 
 `router.py` is the thin part: it parses a body, calls one method here, and renders the
 result. Anything that decides *whether* something is allowed lives here.
+
+M2 added the password and session flows; M3 adds email verification and password reset on
+top of them, so the register path now mails a link and the reset path revokes every session.
 
 ## The rules that shape every method
 
@@ -17,9 +20,15 @@ against the stored hash or the dummy one from `passwords.equalise_password_timin
 why `login` has no early return for "no such user": the shape of the function is the
 control.
 
-**Register never says the email is taken.** It returns the same 200 either way. Section 5.4
-specifies emailing the existing address instead, which is M3's job; this milestone gets the
-non-disclosure right and records the missing email as a hook call the product can implement.
+The same rule shapes the two request-a-link flows differently: they return `None` on every
+path rather than answering identically by convention. `request_password_reset` and
+`request_verification` have no return value a caller could branch on and raise nothing that
+distinguishes a known address from an unknown one, so a router cannot render the two cases
+differently even by mistake.
+
+**Register never says the email is taken.** It returns the same 200 either way, and mails
+the existing address to say somebody tried, which is section 5.4's resolution: the form
+leaks nothing and the person who owns the address still finds out.
 
 **Refusals from a hook are laundered into the same 401.** `may_authenticate` raising is the
 product saying no: a disabled account, an unverified email. Its message is passed through
@@ -58,10 +67,12 @@ from webbpulse.identity.sessions import SessionService
 if TYPE_CHECKING:  # pragma: no cover - typing only
     from collections.abc import Mapping
 
+    from webbpulse.identity.email import EmailMessage, EmailSender
     from webbpulse.identity.hooks import IdentityHooks
     from webbpulse.identity.service import TokenService
     from webbpulse.identity.settings import IdentitySettings
     from webbpulse.identity.storage import IdentityStores
+    from webbpulse.identity.verification import LinkService
 
 __all__ = [
     "INVALID_CREDENTIALS_MESSAGE",
@@ -166,18 +177,36 @@ class IdentityFlows:
         tokens: TokenService,
         *,
         attempts: LoginAttemptStore | None = None,
+        email_sender: EmailSender | None = None,
     ) -> None:
         self._settings = settings
         self._hooks = hooks
         self._stores = stores
         self._tokens = tokens
         self._attempts = attempts
+        self._email = email_sender
         self._sessions = SessionService(settings, stores.require_refresh_tokens())
+        self._links: LinkService | None = None
+        if email_sender is not None and stores.identity_tokens is not None:
+            from webbpulse.identity.verification import LinkService
+
+            self._links = LinkService(settings, stores.identity_tokens)
 
     @property
     def sessions(self) -> SessionService:
         """The session service, for a caller that needs the family lifecycle directly."""
         return self._sessions
+
+    @property
+    def email_enabled(self) -> bool:
+        """Whether the email flows can run: a sender and an `identity-tokens` store.
+
+        The router asks this rather than re-deriving the condition, so the routes that
+        mount and the flows that work are decided by one expression. A flow method called
+        without them raises rather than silently doing nothing, because "we sent you an
+        email" answered by a service that cannot send email is the worst of the outcomes.
+        """
+        return self._links is not None and self._email is not None
 
     # ---- registration --------------------------------------------------------------
 
@@ -232,10 +261,11 @@ class IdentityFlows:
 
         existing = self._hooks.load_user_by_email(normalised_email)
         if existing is not None:
-            # Section 5.4: 200, and M3 emails the existing address to say somebody tried.
-            # Spend a bcrypt round anyway, so the taken and free paths cost the same and the
+            # Section 5.4: 200, and the existing address is told somebody tried. Spend a
+            # bcrypt round anyway, so the taken and free paths cost the same and the
             # non-disclosure holds against a clock as well as against a reader.
             equalise_password_timing(checked)
+            self._send_registration_notice(existing, normalised_email)
             _log.info(
                 "Registration attempted for an address that already has an account.",
                 extra={
@@ -268,15 +298,27 @@ class IdentityFlows:
         )
         self._hooks.on_user_created(user, REGISTRATION_VIA)
 
+        # Section 2.6: verification is requested on register as well as on demand. Sent
+        # before the refusal below, so the user who is about to be told to check their mail
+        # has something waiting there.
+        #
+        # Best effort, and deliberately so: a failed SES call must not roll back an account
+        # that has already been created and whose credential has already been written. The
+        # user asks for another link through the resend route, which exists for exactly
+        # this. The alternative, failing the registration, leaves a real account behind a
+        # 500 and a user who cannot register again because the address is now taken.
+        self._send_verification(user_id, normalised_email, best_effort=True)
+
         _log.info(
             "Account registered.",
             extra={"event": "register.success", "user_id": user_id, "ip": ip},
         )
 
         if self._settings.email_verification_required:
-            # The account exists but cannot sign in until M3's verification lands. Refusing
-            # here rather than issuing a token is the honest reading of the setting: a
-            # product that requires verification does not want an unverified session.
+            # The account exists but must not have a session until the address is confirmed.
+            # Refusing here rather than issuing a token is the honest reading of the
+            # setting: a product that requires verification does not want an unverified
+            # session, and `may_authenticate` would refuse the next login anyway.
             raise LoginRejected(
                 "Check your email to confirm your address before signing in.",
                 error_code="EMAIL_VERIFICATION_REQUIRED",
@@ -477,7 +519,211 @@ class IdentityFlows:
                 "revoked_records": revoked,
             },
         )
+        self._send_password_changed(user_id)
         return revoked
+
+    # ---- email verification --------------------------------------------------------
+
+    def request_verification(self, email: str, *, ip: str = "") -> None:
+        """Send a verification link to an address, on demand. Always succeeds.
+
+        Section 5.4 puts "verification resend" in the table of endpoints that answer
+        identically whether or not the address exists, and this returns `None` on every
+        path for that reason. An unknown address, an address whose account is already
+        verified, and an address that gets a link are the same outcome from outside.
+
+        An **already verified** address gets no second link, and that is not a leak: from
+        outside it is indistinguishable from an unknown address, which is the property
+        section 5.4 asks for. It matters because a verification link is a credential, and
+        minting one for an account that no longer needs it widens the window in which a
+        mailbox compromise is an account compromise for no gain.
+
+        The work is deliberately similar on both paths. Both look the address up, and the
+        one that finds a user writes a row and calls SES. That difference is measurable in
+        principle, and section 5.4 already records the residual: rate limit counters are per
+        address, so a determined attacker infers existence from a 429 boundary whatever this
+        function does. Equalising an SES round trip would mean sending mail to nobody, which
+        is worse than the leak it closes.
+        """
+        self._require_email()
+        normalised = _normalise_email(email)
+        if not normalised:
+            return
+        user = self._hooks.load_user_by_email(normalised)
+        if user is None:
+            _log.info(
+                "Verification requested for an address with no account.",
+                extra={"event": "email.verification_requested", "found": False, "ip": ip},
+            )
+            return
+        if _is_verified(user):
+            _log.info(
+                "Verification requested for an address that is already verified.",
+                extra={"event": "email.verification_requested", "found": True, "ip": ip},
+            )
+            return
+        self._send_verification(_user_id(user), normalised, best_effort=False)
+
+    def confirm_verification(self, token: str, *, ip: str = "") -> str:
+        """Consume a verification link and mark the address verified. Returns the user id.
+
+        Raises `ConfirmationFailed` for an unknown, expired, already used or wrong-purpose
+        token, all with the same message. Unlike the request side, this endpoint does not
+        answer identically on every path: the caller holds a token they were mailed, so
+        telling them it did not work is the whole point of the endpoint, and it discloses
+        nothing about anybody else's address.
+
+        The hook is called **after** the link is consumed, so a link cannot be spent twice
+        by racing the hook. The cost is that a hook that raises leaves the link spent, which
+        the hook's own docstring names.
+        """
+        links = self._require_links()
+        from webbpulse.identity.verification import ConfirmationFailed
+
+        try:
+            record = links.confirm(token, "verify_email")
+        except ConfirmationFailed as exc:
+            links.log_refusal(exc, "verify_email")
+            raise
+
+        self._hooks.mark_email_verified(record.user_id)
+        _log.info(
+            "Email address verified.",
+            extra={"event": "email.verified", "user_id": record.user_id, "ip": ip},
+        )
+        return record.user_id
+
+    # ---- password reset ------------------------------------------------------------
+
+    def request_password_reset(self, email: str, *, ip: str = "") -> None:
+        """Send a reset link. Always succeeds, whatever the address is.
+
+        Section 5.4: "reset request" answers 200 always, with "If that address has an
+        account, a link is on its way." Returning `None` on every path is how that is
+        enforced here rather than left to a router: there is no return value a caller could
+        branch on even by accident, and no exception distinguishing the two cases.
+
+        Same shape as `request_verification`, and the same recorded residual about timing.
+        The one difference is that a reset link is issued regardless of whether the address
+        is verified: a user who never confirmed their address and has forgotten their
+        password still needs the remedy, and holding the reset link back until they verify
+        would need the verification link they also cannot get.
+        """
+        self._require_email()
+        normalised = _normalise_email(email)
+        if not normalised:
+            return
+        user = self._hooks.load_user_by_email(normalised)
+        if user is None:
+            _log.info(
+                "Password reset requested for an address with no account.",
+                extra={"event": "password.reset_requested", "found": False, "ip": ip},
+            )
+            return
+
+        links = self._require_links()
+        issued = links.issue(_user_id(user), "reset_password")
+        from webbpulse.identity.email import render_password_reset
+        from webbpulse.identity.verification import describe_expiry
+
+        self._send(
+            render_password_reset(
+                self._settings,
+                to=normalised,
+                link=issued.url,
+                expiry=describe_expiry(links.ttl_for("reset_password")),
+            ),
+            best_effort=False,
+        )
+
+    def confirm_password_reset(
+        self,
+        *,
+        token: str,
+        new_password: str,
+        ip: str = "",
+        family_ids: list[str] | None = None,
+    ) -> str:
+        """Consume a reset link, set a new password, and end every session. Returns the id.
+
+        The revocation is not optional and is not a courtesy. Section 2.6: "Password reset
+        additionally revokes every refresh family for that user on success, because a reset
+        is the remedy for a compromise and leaving old sessions alive defeats it." Unlike
+        `change_password`, **nothing is kept**: a reset is performed by somebody who may not
+        be signed in at all, and there is no session to spare that is known to be the
+        owner's rather than the attacker's.
+
+        The order is: consume the link, then check the policy, then write, then revoke. The
+        policy check after the consume is deliberate. Checking first would let a caller with
+        a valid link probe the password policy without spending it, which is harmless, but
+        it would also let a typo in the new password burn nothing while a policy violation
+        burns nothing either, and then a user who fails the policy twice still holds a live
+        link they can present a third time. Consuming first makes the link genuinely single
+        use, and the price is that a rejected password costs a new link.
+
+        `family_ids` is the same seam `logout_all` uses, and for the same reason:
+        `refresh-tokens` carries no user index by design, so a DynamoDB-backed store cannot
+        enumerate a user's families without a scan. Passing them is the cheap exact path;
+        passing none falls through to the store, which raises rather than silently revoking
+        nothing. **Raising is correct here.** A reset that reports success while leaving the
+        attacker's session alive is the one outcome this flow exists to prevent.
+        """
+        links = self._require_links()
+        from webbpulse.identity.verification import ConfirmationFailed
+
+        try:
+            record = links.confirm(token, "reset_password")
+        except ConfirmationFailed as exc:
+            links.log_refusal(exc, "reset_password")
+            raise
+
+        checked = check_password(new_password, breach_check=self._settings.password_breach_check)
+
+        from webbpulse.identity.storage import CredentialRecord
+        from webbpulse.security import hash_password
+
+        credentials = self._stores.require_credentials()
+        existing = credentials.get(record.user_id, PASSWORD_CREDENTIAL_TYPE)
+        credentials.put(
+            CredentialRecord(
+                user_id=record.user_id,
+                credential_type=PASSWORD_CREDENTIAL_TYPE,
+                secret=hash_password(checked),
+                created_at=existing.created_at if existing else now_iso(),
+                updated_at=now_iso(),
+                attributes=existing.attributes if existing else {},
+            )
+        )
+
+        revoked = self._revoke_families(record.user_id, family_ids=family_ids)
+
+        # A reset proves control of the mailbox, which is the same thing a verification link
+        # proves. Marking the address verified here saves a user who never confirmed their
+        # address from being locked out by `may_authenticate` immediately after successfully
+        # resetting the password they were told to reset.
+        try:
+            self._hooks.mark_email_verified(record.user_id)
+        except Exception:
+            # Deliberately broad, and deliberately swallowed. A product may not implement
+            # the hook at all, and the reset itself has already succeeded: the password is
+            # written and every family is revoked. Failing here would tell the user their
+            # reset did not work when it did.
+            _log.info(
+                "Password reset did not mark the address verified.",
+                extra={"event": "password.reset_completed", "user_id": record.user_id},
+            )
+
+        self._send_password_changed(record.user_id)
+        _log.info(
+            "Password reset completed.",
+            extra={
+                "event": "password.reset_completed",
+                "user_id": record.user_id,
+                "revoked_records": revoked,
+                "ip": ip,
+            },
+        )
+        return record.user_id
 
     # ---- sessions ------------------------------------------------------------------
 
@@ -599,6 +845,122 @@ class IdentityFlows:
             },
         )
         return revoked
+
+    # ---- internals: email ----------------------------------------------------------
+
+    def _require_email(self) -> None:
+        if not self.email_enabled:
+            raise LoginRejected(
+                "This service is not configured to send email, so this flow is not available.",
+                error_code="EMAIL_NOT_CONFIGURED",
+                status_code=503,
+            )
+
+    def _require_links(self) -> LinkService:
+        self._require_email()
+        assert self._links is not None  # narrowed by _require_email
+        return self._links
+
+    def _send(self, message: EmailMessage, *, best_effort: bool) -> None:
+        """Send one rendered message.
+
+        `best_effort` is the whole difference between the paths that tolerate a send failure
+        and the paths that report one. Registration tolerates it, because the account exists
+        and a resend route exists to try again; a deliberate resend does not, because
+        answering 200 to "send me another link" and sending nothing leaves the user waiting
+        for mail that will never arrive.
+        """
+        from webbpulse.identity.email import EmailSendFailed
+
+        assert self._email is not None  # callers check `email_enabled` first
+        try:
+            self._email.send(message)
+        except EmailSendFailed:
+            if not best_effort:
+                raise
+            _log.warning(
+                "Could not send an identity email; the flow continued.",
+                extra={
+                    "event": "email.send_failed",
+                    "purpose": message.tags.get("purpose", "unknown"),
+                },
+            )
+
+    def _send_verification(self, user_id: str, email: str, *, best_effort: bool) -> None:
+        """Issue a verification link and mail it, when email is configured.
+
+        Silently does nothing when it is not, and only on the `best_effort` path. A product
+        that mounts no email sender still registers accounts, and this is the one place that
+        tolerance lives: every route that promises an email checks `email_enabled` first.
+        """
+        if not self.email_enabled:
+            if not best_effort:
+                self._require_email()
+            return
+        links = self._require_links()
+        issued = links.issue(user_id, "verify_email")
+        from webbpulse.identity.email import render_verification
+        from webbpulse.identity.verification import describe_expiry
+
+        self._send(
+            render_verification(
+                self._settings,
+                to=email,
+                link=issued.url,
+                expiry=describe_expiry(links.ttl_for("verify_email")),
+            ),
+            best_effort=best_effort,
+        )
+
+    def _send_registration_notice(self, user: Mapping[str, Any], email: str) -> None:
+        """Section 5.4's notice to an address somebody tried to register again.
+
+        Always best effort. The caller has already decided to answer 200, and a send failure
+        here must not turn the non-disclosure into a 500 that discloses by its own existence.
+        """
+        if not self.email_enabled:
+            return
+        from webbpulse.identity.email import render_registration_notice
+
+        del user  # The notice names no attribute of the account, deliberately.
+        self._send(
+            render_registration_notice(
+                self._settings,
+                to=email,
+                link=self._require_links().page_for("reset_password"),
+            ),
+            best_effort=True,
+        )
+
+    def _send_password_changed(self, user_id: str) -> None:
+        """Tell a user their password changed. Always best effort.
+
+        A notification, not a control: the password is already changed by the time this
+        runs, and failing the request because a notice did not send would undo nothing.
+        Needs the address, which lives on the product's user record, so a hook that cannot
+        load the user simply means no notice.
+        """
+        if not self.email_enabled:
+            return
+        try:
+            user = self._hooks.load_user_by_id(user_id)
+        except Exception:
+            # A notice must not fail the flow that sent it. The password has already
+            # changed by the time this runs.
+            return
+        address = str((user or {}).get("email", "")).strip()
+        if not address:
+            return
+        from webbpulse.identity.email import render_password_changed
+
+        self._send(
+            render_password_changed(
+                self._settings,
+                to=address,
+                link=self._require_links().page_for("reset_password"),
+            ),
+            best_effort=True,
+        )
 
     # ---- internals -----------------------------------------------------------------
 
@@ -763,6 +1125,21 @@ def _user_id(user: Mapping[str, Any]) -> str:
             status_code=500,
         )
     return str(value)
+
+
+def _is_verified(user: Mapping[str, Any]) -> bool:
+    """Whether the product's user record already says this address is confirmed.
+
+    `email_verified` is the column section 4.2 names on the `users` table, and it is the
+    column `mark_email_verified` sets. Reading it here is the read half of that same seam.
+
+    Absent means **not** verified, which is the safe reading: a product whose user records
+    predate the column, or which spells it something else, gets a second verification link
+    it did not strictly need. The other reading would silently refuse to send a link to an
+    account that genuinely needs one, and a user with no way to verify has no way to sign
+    in either.
+    """
+    return bool(user.get("email_verified", False))
 
 
 def _device_class(user_agent: str) -> str:

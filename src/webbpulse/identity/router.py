@@ -85,6 +85,7 @@ if TYPE_CHECKING:  # pragma: no cover - typing only
 
     from fastapi import APIRouter, Request
 
+    from webbpulse.identity.email import EmailSender
     from webbpulse.identity.hooks import IdentityHooks
     from webbpulse.identity.lockout import LoginAttemptStore
     from webbpulse.identity.service import TokenService
@@ -102,6 +103,15 @@ __all__ = [
     "PASSWORD_PATH",
     "REFRESH_PATH",
     "REGISTER_PATH",
+    "RESET_CONFIRM_PATH",
+    "RESET_EMAIL_LIMIT",
+    "RESET_IP_LIMIT",
+    "RESET_REQUESTED_MESSAGE",
+    "RESET_REQUEST_PATH",
+    "VERIFY_CONFIRM_PATH",
+    "VERIFY_EMAIL_LIMIT",
+    "VERIFY_IP_LIMIT",
+    "VERIFY_REQUEST_PATH",
     "build_identity_router",
     "identity_prefix",
 ]
@@ -128,12 +138,33 @@ REFRESH_PATH = "/refresh"
 LOGOUT_PATH = "/logout"
 LOGOUT_ALL_PATH = "/logout-all"
 
+#: M3's four email routes. All four are anonymous: the link is the credential, which is
+#: what section 2.3's route table says about `verify-email` and `reset/*`.
+VERIFY_REQUEST_PATH = "/verify-email"
+VERIFY_CONFIRM_PATH = "/verify-email/confirm"
+RESET_REQUEST_PATH = "/reset"
+RESET_CONFIRM_PATH = "/reset/confirm"
+
+#: Section 5.4's exact wording for the reset request. It is a true sentence in both cases,
+#: which is what makes it usable as the single answer: it does not claim an email was sent.
+RESET_REQUESTED_MESSAGE: Final = "If that address has an account, a link is on its way."
+
 #: Section 5.1's limits, as (limit, window seconds). Named here rather than inline so the
 #: table in the standard and the code can be diffed against each other by eye.
 LOGIN_IP_LIMIT: Final = (20, 900)
 LOGIN_EMAIL_LIMIT: Final = (10, 900)
 REFRESH_IP_LIMIT: Final = (120, 900)
 REGISTER_IP_LIMIT: Final = (5, 3600)
+
+#: Section 5.1's email limits. Reset request is limited by **both** address and IP, which
+#: the table gives as 3/hour and 10/hour; verification resend is given per address only, and
+#: gets the same per-IP ceiling here because the two routes are the same shape and an
+#: unlimited per-IP resend is a free mail relay pointed at whoever's addresses an attacker
+#: has. That addition is recorded in the M3 decisions.
+RESET_EMAIL_LIMIT: Final = (3, 3600)
+RESET_IP_LIMIT: Final = (10, 3600)
+VERIFY_EMAIL_LIMIT: Final = (3, 3600)
+VERIFY_IP_LIMIT: Final = (10, 3600)
 
 #: `Sec-Fetch-Site` values a state-changing cookie route accepts. Section 5.5's first CSRF
 #: supplement: the header is sent by every current major browser and cannot be set by page
@@ -201,6 +232,7 @@ def build_identity_router(
     service: str = "identity",
     version: str = "",
     attempts: LoginAttemptStore | None = None,
+    email_sender: EmailSender | None = None,
     limiter_enabled: bool = True,
 ) -> APIRouter:
     """The identity router for a product, mounted with no prefix.
@@ -293,6 +325,7 @@ def build_identity_router(
             stores=resolved_stores,
             tokens=tokens,
             attempts=attempts,
+            email_sender=email_sender,
             limiter_enabled=limiter_enabled,
         )
 
@@ -308,9 +341,10 @@ def _mount_flows(
     stores: IdentityStores,
     tokens: TokenService,
     attempts: LoginAttemptStore | None,
+    email_sender: EmailSender | None,
     limiter_enabled: bool,
 ) -> None:
-    """Add the six M2 flow routes to an already-built router.
+    """Add the six M2 flow routes, and M3's four email routes, to an already-built router.
 
     Split out of `build_identity_router` because that function is otherwise readable in one
     screen and this half is three times its length. The split is also the seam M3 to M6 will
@@ -331,7 +365,9 @@ def _mount_flows(
     # Must happen before the first `@router.post` below. See `_FastAPIRequest`.
     _bind_fastapi_request()
 
-    flows = IdentityFlows(settings, hooks, stores, tokens, attempts=attempts)
+    flows = IdentityFlows(
+        settings, hooks, stores, tokens, attempts=attempts, email_sender=email_sender
+    )
 
     def limits(*specs: tuple[str, tuple[int, int], str]) -> list[Any]:
         """Build the rate limit dependencies for one route, or none when disabled."""
@@ -582,6 +618,130 @@ def _mount_flows(
         ip, _ = context(request)
         await run_sync(lambda: flows.logout_all(subject, ip=ip))
         return clear_refresh_cookie(JSONResponse({"signed_out": True}))
+
+    if not flows.email_enabled:
+        # No sender, or no `identity-tokens` store. The four routes below all promise the
+        # caller an email or spend a token, so declaring them here would mean four endpoints
+        # that answer 503 to their first request. Same rule the flow routes themselves
+        # follow: a route that cannot work should not exist.
+        return
+
+    from webbpulse.identity.verification import ConfirmationFailed
+
+    def link_refused(request: Request, exc: ConfirmationFailed) -> JSONResponse:
+        """Render a refused link.
+
+        `exc.message` is the one message every refusal carries, and `exc.reason` is never
+        rendered: whether a token was unknown, expired or already spent is information about
+        somebody else's link, and telling a caller who guessed a value that it was "already
+        used" confirms the guess found a real token.
+        """
+        from webbpulse.http import error_body
+
+        return JSONResponse(
+            error_body(exc.status_code, exc.message, request, error_code=exc.error_code),
+            status_code=exc.status_code,
+        )
+
+    @router.post(
+        f"{prefix}{VERIFY_REQUEST_PATH}",
+        dependencies=limits(
+            ("verify-email", VERIFY_EMAIL_LIMIT, "email"),
+            ("verify-ip", VERIFY_IP_LIMIT, "ip"),
+        ),
+    )
+    async def request_verification(
+        request: _FastAPIRequest, payload: dict[str, Any] = Body(...)
+    ) -> JSONResponse:
+        ip, _ = context(request)
+        try:
+            await run_sync(lambda: flows.request_verification(str(payload.get("email", "")), ip=ip))
+        except LoginRejected as exc:
+            return rejected(request, exc)
+        # Section 5.4: 200 always, with a body that commits to nothing. The same response
+        # for an unknown address, an already verified one and one that just got a link.
+        return JSONResponse({"sent": True})
+
+    @router.post(f"{prefix}{VERIFY_CONFIRM_PATH}")
+    async def confirm_verification(
+        request: _FastAPIRequest, payload: dict[str, Any] = Body(...)
+    ) -> JSONResponse:
+        # Anonymous, and a POST rather than the GET section 2.3's table sketches. The link
+        # in the email points at the frontend, which collects nothing for verification and
+        # calls this. A GET that consumes the token would be spent by the first mail scanner
+        # that follows the link to check it for malware, before the user ever clicks.
+        ip, _ = context(request)
+        try:
+            user_id = await run_sync(
+                lambda: flows.confirm_verification(str(payload.get("token", "")), ip=ip)
+            )
+        except ConfirmationFailed as exc:
+            return link_refused(request, exc)
+        except LoginRejected as exc:
+            return rejected(request, exc)
+        return JSONResponse({"verified": True, "user_id": user_id})
+
+    @router.post(
+        f"{prefix}{RESET_REQUEST_PATH}",
+        dependencies=limits(
+            ("reset-email", RESET_EMAIL_LIMIT, "email"),
+            ("reset-ip", RESET_IP_LIMIT, "ip"),
+        ),
+    )
+    async def request_password_reset(
+        request: _FastAPIRequest, payload: dict[str, Any] = Body(...)
+    ) -> JSONResponse:
+        ip, _ = context(request)
+        try:
+            await run_sync(
+                lambda: flows.request_password_reset(str(payload.get("email", "")), ip=ip)
+            )
+        except LoginRejected as exc:
+            return rejected(request, exc)
+        # Section 5.4's exact wording, which is a message that is true either way rather
+        # than one that pretends something happened.
+        return JSONResponse({"sent": True, "detail": RESET_REQUESTED_MESSAGE})
+
+    @router.post(f"{prefix}{RESET_CONFIRM_PATH}")
+    async def confirm_password_reset(
+        request: _FastAPIRequest, payload: dict[str, Any] = Body(...)
+    ) -> JSONResponse:
+        ip, _ = context(request)
+        try:
+            await run_sync(
+                lambda: flows.confirm_password_reset(
+                    token=str(payload.get("token", "")),
+                    new_password=str(payload.get("new_password", "")),
+                    ip=ip,
+                    family_ids=_string_list(payload.get("family_ids")),
+                )
+            )
+        except ConfirmationFailed as exc:
+            return link_refused(request, exc)
+        except PasswordRejected as exc:
+            return policy_rejected(request, exc)
+        except LoginRejected as exc:
+            return rejected(request, exc)
+        # The refresh cookie is cleared, because the reset revoked every family including
+        # whichever one this browser held. Leaving it would send a dead token on every
+        # subsequent request until it expired.
+        return clear_refresh_cookie(JSONResponse({"reset": True}))
+
+
+def _string_list(value: object) -> list[str] | None:
+    """A JSON array of strings from a request body, or `None`.
+
+    `None` and a list mean different things to `confirm_password_reset`: `None` falls
+    through to the store, which raises on DynamoDB rather than silently revoking nothing,
+    and a list is revoked exactly. An empty list therefore has to stay an empty list rather
+    than becoming `None`, or a caller that genuinely knows there are no other families
+    would trip the raise.
+    """
+    if value is None:
+        return None
+    if isinstance(value, list):
+        return [str(item) for item in value if str(item)]
+    return None
 
 
 async def run_sync[T](work: Callable[[], T]) -> T:

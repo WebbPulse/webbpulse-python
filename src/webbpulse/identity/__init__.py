@@ -19,20 +19,30 @@ the standard fixes is here.
 - `passwords`: section 5.6's policy and section 5.3's dummy-hash timing equalisation.
 - `lockout`: section 5.1's progressive lockout and the `login-attempts` store.
 - `sessions`: `SessionService`, the refresh family state machine.
-- `flows`: `IdentityFlows`, the M2 flow logic with no FastAPI imports.
+- `email`: `EmailSender`, the SES v2 implementation, the recording double for tests, and
+  the four message templates.
+- `verification`: `LinkService`, the single-use link primitive both email verification and
+  password reset are built from.
+- `flows`: `IdentityFlows`, the M2 and M3 flow logic with no FastAPI imports.
 - `router`: `build_identity_router`, which is what a product mounts.
 
-## What 0.10.0 does and does not do
+## What 0.11.0 does and does not do
 
 M1 built the **foundations**: configuration, the policy seam, the storage interfaces, the
 token service, and claim reading.
 
-M2 adds the **password and session flows**: register, login, change password, refresh with
+M2 added the **password and session flows**: register, login, change password, refresh with
 rotation and reuse detection, logout and logout-all. The router mounts them when a product
 supplies hooks and stores, and mounts only the three documents when it does not.
 
-Email verification and reset are M3, TOTP and recovery codes are M4, passkeys are M5 and
-OAuth is M6, per section 9.1 of the standard.
+M3 adds **email verification and password reset over SES**: a single-use hashed link, the
+four routes that issue and spend one, and the four messages that carry them. Both request
+routes answer 200 whatever the address is, per section 5.4, and a completed reset revokes
+every refresh family the user had. The four routes appear only when the product supplies an
+`EmailSender` and an `identity-tokens` store, on the same rule the flow routes follow.
+
+TOTP and recovery codes are M4, passkeys are M5 and OAuth is M6, per section 9.1 of the
+standard.
 
 ## The two things most likely to go wrong
 
@@ -57,6 +67,18 @@ from webbpulse.identity.claims import (
     authorizer_claims,
     coerce_claims,
     read_authorizer_claims,
+)
+from webbpulse.identity.email import (
+    EmailMessage,
+    EmailSender,
+    EmailSendFailed,
+    RecordingEmailSender,
+    SesV2Client,
+    SesV2EmailSender,
+    render_password_changed,
+    render_password_reset,
+    render_registration_notice,
+    render_verification,
 )
 from webbpulse.identity.flows import (
     INVALID_CREDENTIALS_MESSAGE,
@@ -107,6 +129,15 @@ from webbpulse.identity.router import (
     PASSWORD_PATH,
     REFRESH_PATH,
     REGISTER_PATH,
+    RESET_CONFIRM_PATH,
+    RESET_EMAIL_LIMIT,
+    RESET_IP_LIMIT,
+    RESET_REQUEST_PATH,
+    RESET_REQUESTED_MESSAGE,
+    VERIFY_CONFIRM_PATH,
+    VERIFY_EMAIL_LIMIT,
+    VERIFY_IP_LIMIT,
+    VERIFY_REQUEST_PATH,
     build_identity_router,
     identity_prefix,
 )
@@ -164,12 +195,22 @@ from webbpulse.identity.tokens import (
     mint_test_token,
     public_jwk_from_kms,
 )
+from webbpulse.identity.verification import (
+    CONFIRMATION_FAILED_MESSAGE,
+    RESET_LINK_PATH,
+    VERIFY_LINK_PATH,
+    ConfirmationFailed,
+    IssuedLink,
+    LinkService,
+    describe_expiry,
+)
 
 __all__ = [
     "ALLOWED_FETCH_SITES",
     "ARRAY_CLAIMS",
     "ATTEMPT_TTL",
     "BOOLEAN_CLAIMS",
+    "CONFIRMATION_FAILED_MESSAGE",
     "CREDENTIALS_TABLE",
     "DIGEST_MESSAGE_TYPE",
     "DISCOVERY_CACHE_CONTROL",
@@ -199,18 +240,33 @@ __all__ = [
     "REFRESH_TOKENS_TABLE",
     "REGISTERED_CLAIMS",
     "REGISTER_PATH",
+    "RESET_CONFIRM_PATH",
+    "RESET_EMAIL_LIMIT",
+    "RESET_IP_LIMIT",
+    "RESET_LINK_PATH",
+    "RESET_REQUESTED_MESSAGE",
+    "RESET_REQUEST_PATH",
     "USERS_TABLE",
+    "VERIFY_CONFIRM_PATH",
+    "VERIFY_EMAIL_LIMIT",
+    "VERIFY_IP_LIMIT",
+    "VERIFY_LINK_PATH",
+    "VERIFY_REQUEST_PATH",
     "AuthResult",
     "AuthenticationRefused",
     "AuthorizerClaims",
     "BaseIdentityHooks",
     "ClaimsUnavailable",
+    "ConfirmationFailed",
     "CredentialRecord",
     "CredentialStore",
     "DynamoCredentialStore",
     "DynamoIdentityTokenStore",
     "DynamoLoginAttemptStore",
     "DynamoRefreshTokenStore",
+    "EmailMessage",
+    "EmailSendFailed",
+    "EmailSender",
     "HookNotImplemented",
     "IdentityFlows",
     "IdentityHooks",
@@ -223,9 +279,11 @@ __all__ = [
     "InMemoryLoginAttemptStore",
     "InMemoryRefreshTokenStore",
     "InvalidToken",
+    "IssuedLink",
     "IssuedRefresh",
     "KmsClient",
     "KmsSigner",
+    "LinkService",
     "LockoutState",
     "LoginAttempt",
     "LoginAttemptStore",
@@ -234,10 +292,13 @@ __all__ = [
     "NoClaimsSection",
     "PasswordRejected",
     "RateLimited",
+    "RecordingEmailSender",
     "RefreshTokenRecord",
     "RefreshTokenStore",
     "RotationOutcome",
     "RotationResult",
+    "SesV2Client",
+    "SesV2EmailSender",
     "SessionService",
     "TokenMintingDisabled",
     "TokenService",
@@ -249,6 +310,7 @@ __all__ = [
     "check_password",
     "coerce_claims",
     "constant_time_equals",
+    "describe_expiry",
     "email_key",
     "equalise_password_timing",
     "hash_token",
@@ -264,4 +326,8 @@ __all__ = [
     "normalise_password",
     "public_jwk_from_kms",
     "read_authorizer_claims",
+    "render_password_changed",
+    "render_password_reset",
+    "render_registration_notice",
+    "render_verification",
 ]
