@@ -5,6 +5,40 @@ Notable changes to the `webbpulse` package. The version here is the one in
 
 This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## 0.12.1
+
+Housekeeping. The bcrypt cost is resolved when the function is called rather than when the
+module is imported, so configuring it after import actually works.
+
+**No behaviour changes for a caller that does nothing.** `DEFAULT_ROUNDS` is still 12, the
+hash format is unchanged, the 72 byte truncation rule is unchanged and `verify_password` is
+untouched. Every hash this package has ever written still verifies, and nothing needs a
+migration.
+
+### Fixed
+
+- `hash_password` and `needs_rehash` read `DEFAULT_ROUNDS` at call time. Both were declared
+  as `rounds: int = DEFAULT_ROUNDS`, and a default argument is evaluated once, as the `def`
+  executes at import, then frozen into the function object. Rebinding
+  `webbpulse.security.DEFAULT_ROUNDS` afterwards therefore never reached either function, so
+  a service that configured the cost after importing the module, and a test that patched it
+  down to bcrypt's minimum to stay fast, were both ignored, and ignored silently: there was
+  no error, the work simply kept happening at cost 12.
+
+  The signature is now `rounds: int | None = None`, resolved against the module attribute in
+  the body. Passing `rounds=` explicitly still wins, as before. `DEFAULT_ROUNDS` loses its
+  `Final` annotation, since the point is that a consumer may rebind it.
+
+  This package's own identity suites had already hit this and worked around it by wrapping
+  both functions, with a fixture docstring stating that patching the constant "does
+  **nothing**". Those fixtures keep the wrapper, which pins the cost more tightly than a
+  changed default can because it also lowers a call that passes `rounds=` explicitly.
+
+- `uv.lock` is ignored. `uv` reads the `[dependency-groups]` table in `pyproject.toml` and
+  writes a lockfile, which showed up as an untracked file in every checkout. The project
+  pins nothing: CI and the README both install with `pip install -e`, so there is no
+  lockfile to commit and a stray one is noise.
+
 ## 0.12.0
 
 Identity M4: TOTP with KMS envelope encryption, recovery codes, the MFA ticket, step-up and

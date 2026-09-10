@@ -143,11 +143,15 @@ def cheap_bcrypt(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
     two hundred times cheaper than the default 12, and every property under test here is
     about which code path ran rather than how long it took.
 
-    Patching `security.DEFAULT_ROUNDS` alone does **nothing**, which is worth stating because
-    it is the obvious thing to try and it fails silently. `hash_password(..., rounds: int =
-    DEFAULT_ROUNDS)` binds that default at definition time, so rebinding the module attribute
-    afterwards never reaches it and the suite quietly keeps running at cost 12. Wrapping the
-    function is the only thing that works.
+    Patching `security.DEFAULT_ROUNDS` used to do **nothing**: `hash_password(..., rounds:
+    int = DEFAULT_ROUNDS)` bound that default as the `def` executed at import, so rebinding
+    the module attribute afterwards never reached it and the suite quietly kept running at
+    cost 12. 0.12.1 fixed that by reading the module attribute in the body, so patching it
+    now works.
+
+    The wrapper is kept anyway, because it pins the cost more tightly than a changed default
+    does: it also lowers a call that passes `rounds=` explicitly, which `DEFAULT_ROUNDS`
+    never governs.
     """
     import webbpulse.security as security
 

@@ -5,6 +5,10 @@ on is pinned here: the 72 byte boundary is exercised from both sides so the modu
 silently start raising on a long password if bcrypt is upgraded under it. The second is
 that a token is never trusted for the wrong reason, so the algorithm, audience and issuer
 checks all have a negative case.
+
+A third theme joins them from 0.12.1: the bcrypt cost is resolved when the function runs
+rather than when the module imports, so a changed `DEFAULT_ROUNDS` is asserted to actually
+reach both `hash_password` and `needs_rehash`.
 """
 
 from __future__ import annotations
@@ -17,6 +21,7 @@ import pytest
 from fastapi import Depends, FastAPI
 from starlette.testclient import TestClient
 
+from webbpulse import security
 from webbpulse.http import create_app
 from webbpulse.security import (
     BCRYPT_MAX_BYTES,
@@ -77,6 +82,61 @@ def test_hash_password_uses_cost_twelve_by_default() -> None:
 def test_hash_password_honours_an_explicit_cost() -> None:
     # 4 is bcrypt's minimum. Used only here, to keep the test fast.
     assert hash_password("hunter2", rounds=4).split("$")[2] == "04"
+
+
+def test_a_changed_default_rounds_takes_effect(monkeypatch: pytest.MonkeyPatch) -> None:
+    # The regression this guards. `rounds: int = DEFAULT_ROUNDS` evaluated the default once,
+    # as the `def` executed at import, and froze 12 into the function object. Rebinding the
+    # module attribute afterwards then did nothing at all, and did it silently: a service
+    # that configured the cost after importing, and a test that patched it down to bcrypt's
+    # minimum to stay fast, both kept hashing at 12 with no error to notice.
+    monkeypatch.setattr(security, "DEFAULT_ROUNDS", 4)
+
+    assert hash_password("hunter2").split("$")[2] == "04"
+    # Read in the body, so the function object itself carries no frozen copy of the cost.
+    # This is the thing that actually regressed, asserted directly so a future edit that
+    # reintroduces `rounds: int = DEFAULT_ROUNDS` fails here and not only on the cost above.
+    kwdefaults = hash_password.__kwdefaults__
+    assert kwdefaults is not None
+    assert kwdefaults["rounds"] is None
+
+
+def test_a_changed_default_rounds_reaches_needs_rehash(monkeypatch: pytest.MonkeyPatch) -> None:
+    # The two have to move together. If `needs_rehash` kept comparing against a frozen 12
+    # while `hash_password` wrote 4, every login would re-hash and the stored hash would
+    # never catch up.
+    monkeypatch.setattr(security, "DEFAULT_ROUNDS", 4)
+    hashed = hash_password("hunter2")
+
+    assert not needs_rehash(hashed)
+
+    monkeypatch.setattr(security, "DEFAULT_ROUNDS", 5)
+    assert needs_rehash(hashed)
+
+
+def test_an_explicit_cost_still_beats_a_changed_default(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(security, "DEFAULT_ROUNDS", 4)
+
+    assert hash_password("hunter2", rounds=5).split("$")[2] == "05"
+
+
+def test_hashes_written_at_the_old_default_still_verify(monkeypatch: pytest.MonkeyPatch) -> None:
+    # The whole point of the cost living in the hash string: changing the setting must not
+    # lock out a single existing account. A hash written at one cost verifies under another,
+    # and the hash format is unchanged by this fix.
+    # Written at the module's real default of 12, before anything is patched, so this is an
+    # existing stored hash in the only sense that matters.
+    at_twelve = hash_password("hunter2")
+    assert at_twelve.split("$")[2] == "12"
+
+    monkeypatch.setattr(security, "DEFAULT_ROUNDS", 4)
+    cheap = hash_password("hunter2")
+
+    assert verify_password("hunter2", cheap)
+    assert verify_password("hunter2", at_twelve)
+    assert not verify_password("wrong", at_twelve)
+    # Written under the old default, so it is not below the lowered one and is left alone.
+    assert not needs_rehash(at_twelve)
 
 
 def test_hash_password_rejects_non_string_input() -> None:
