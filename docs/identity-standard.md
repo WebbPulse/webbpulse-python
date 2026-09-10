@@ -1090,8 +1090,9 @@ controls:
   registration, change and reset, using k-anonymity (send the first 5 hex of the SHA-1,
   compare suffixes locally) so the password never leaves the service. NIST SP 800-63B
   recommends exactly this check against breach lists. It is a **new outbound dependency**,
-  so it is a feature flag (`password_breach_check`), fails open with a WARNING, and Q4 asks
-  whether to use the public API or ship a bundled list.
+  so it is a feature flag (`password_breach_check`) and fails open with a WARNING when on.
+  **Decided 2026-09-09: off by default and not adopted for now.** A product that wants it
+  opts in; none of ours does.
 - **Global anomaly signal.** `login_attempts` is keyed by both email and IP, so a spike in
   distinct emails failing from one IP, or one email failing from many IPs, is a query rather
   than a guess. This design specifies the data; alarming on it is milestone M6.
@@ -1191,7 +1192,7 @@ NIST SP 800-63B shaped:
   verifiers "SHOULD NOT impose other composition rules".
 - **No periodic expiry.** Rotation only on evidence of compromise.
 - **All Unicode accepted**, including spaces, normalised to NFKC before hashing.
-- **Breach list check** on set (5.2).
+- **Breach list check** on set (5.2), only when a product opts in.
 
 **The 72-byte bcrypt limit.** bcrypt reads at most 72 bytes and libraries disagree about
 longer input: 4.x truncates silently, 5.0 raises. `webbpulse.security` removes the
@@ -1302,7 +1303,7 @@ class IdentitySettings(BaseModel):
     passkeys_enabled: bool = True
     passkeys_passwordless: bool = True
     oauth_providers: list[Literal["google", "github"]] = ["google", "github"]
-    password_breach_check: bool = True
+    password_breach_check: bool = False
     mfa_required_for_roles: list[str] = []
 
     # Lifetimes

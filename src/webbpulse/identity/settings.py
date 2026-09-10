@@ -179,7 +179,13 @@ class IdentitySettings(BaseSettings):
     oauth_providers: list[OAuthProvider] = Field(
         default_factory=lambda: _DEFAULT_OAUTH_PROVIDERS.copy()
     )
-    password_breach_check: bool = True
+    password_breach_check: bool = Field(
+        default=False,
+        description=(
+            "Check new passwords against a breach corpus (section 5.2). Off by default: the "
+            "2026-09-09 decision was no breach corpus check, so a product opts in explicitly."
+        ),
+    )
     mfa_required_for_roles: list[str] = Field(default_factory=list)
 
     # ------------------------------------------------------------------
