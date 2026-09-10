@@ -1809,7 +1809,108 @@ implementing the flows showed something the standard did not say.
    is never cleared and a correct sign-in locks the account. Attempts are stamped to the
    millisecond and the in-memory store breaks remaining ties by insertion order.
 
-| **M3** | Email: SES sender, templates, verification, reset. Contract tests for JWKS and discovery against a real deployed authorizer | 0.7.0 | 3 to 4 |
+| **M3** | Email: SES sender, templates, verification, reset. Contract tests for JWKS and discovery against a real deployed authorizer. *Delivered 2026-09-10 in 0.11.0. The contract suite is skipped unless `WEBBPULSE_IDENTITY_CONTRACT_BASE_URL` names a deployed issuer, so the ordinary test run makes no network request. Decisions recorded below.* | 0.11.0 | 3 to 4 |
+
+#### M3 decisions, 2026-09-10
+
+Same purpose as the M1 and M2 blocks: places where the standard left a choice open, or where
+implementing email showed something the standard did not say.
+
+1. **The links in the emails point at the frontend, not at the API.** Section 2.3's route
+   table sketches `GET /api/auth/verify-email/{token}`, and the implementation mails
+   `<frontend_base_url>/verify-email?token=...` instead, with the API side a `POST` the
+   frontend makes. Three reasons, and the third is the one that decided it. A reset link has
+   no password in it, so something has to collect one, and that something is a page. A `GET`
+   that consumes state is spent by the first mail scanner that follows the link to check it
+   for malware, before the user ever clicks, and every corporate mail gateway does this. And
+   the frontend owns what happens after a confirmation, which the API cannot know.
+
+   `VERIFY_LINK_PATH` and `RESET_LINK_PATH` name the two frontend paths, so a product that
+   routes differently overrides two constants rather than reimplementing the flow.
+
+2. **Verification and reset are one primitive with two purposes, not two flows.** Section 2.6
+   says they are the same primitive; `LinkService` is that sentence made into a class, and
+   the purpose is a field on the stored record rather than a separate table or a separate
+   code path. Writing them twice would let the expiry check, the hashing and the single-use
+   guarantee drift apart, and the one that drifts is always the one nobody is looking at.
+
+3. **The purpose is checked before the token is consumed, and expiry after the read as well
+   as after the write.** A verification link pasted into the reset page is refused **without**
+   being spent, because the user has done nothing wrong and burning their only link would
+   leave them with neither flow available. It is still a real control: what is compared is
+   the stored record's purpose, never the caller's claim about it.
+
+4. **A completed reset revokes every family and keeps none**, unlike `change_password`'s
+   `keep_family_id` from M2 decision 4. Section 2.6 requires the revocation; what it does not
+   say is whether the resetting session survives. It does not, because the person resetting
+   may not be signed in at all and no session is known to be the owner's rather than the
+   attacker's. `family_ids` is passed by the caller for the same reason M2 decision 4 gives,
+   and passing none falls through to the store, which raises rather than silently revoking
+   nothing. Raising is correct here: a reset that reports success while leaving the
+   attacker's session alive is the one outcome the flow exists to prevent.
+
+5. **The link is consumed before the new password is checked against the policy.** The order
+   is consume, check, write, revoke. Checking first would let a caller with a valid link
+   probe the password policy without spending it, and would leave a user who fails the policy
+   twice still holding a live link. The price is that a rejected password costs a new link,
+   which is the cheaper of the two.
+
+6. **`issue` does not revoke a user's outstanding links of the same purpose**, which closes
+   the question M1 decision 3 and M2 decision 4 deferred about a user index on
+   `identity-tokens`. The answer is the same as for `refresh-tokens` and for the same reason:
+   the table has no user index, adding one costs a write on the click path to serve the issue
+   path, and what it would close is a link the user asked for that expires on its own inside
+   an hour. `DynamoIdentityTokenStore.revoke_for_user` stays raising rather than becoming a
+   scan.
+
+7. **A successful reset also marks the address verified.** Not in the standard, and it
+   follows from what a reset proves: control of the mailbox, which is exactly what a
+   verification link proves. Without it a user who never confirmed their address resets the
+   password they were told to reset and is then refused by `may_authenticate` anyway, with no
+   way to get the verification link they also cannot request. The `mark_email_verified` call
+   on this path is best effort, because the password is already written and every family is
+   already revoked by then, and failing would report a reset that did happen as one that did
+   not.
+
+8. **A password change and a completed reset both send a notice, and neither notice carries
+   a live token.** The notice is not in the standard and is included because it is the one
+   signal a user has that a takeover happened: an attacker who changes a password locks the
+   owner out silently otherwise. Both notices, and section 5.4's registration notice, link to
+   the bare reset page rather than to an issued link. Putting a live link in a message
+   triggered by somebody else typing an address into a form would be the reset flow without
+   the rate limit on it.
+
+9. **The verification resend gets a per-IP ceiling that section 5.1's table does not list.**
+   The table gives reset both a per-address and a per-IP limit and gives the verification
+   resend only a per-address one. An unlimited resend route is a free mail relay pointed at
+   addresses an attacker supplies, and it spends the same SES reputation the reset route is
+   rate limited to protect. `VERIFY_IP_LIMIT` is 10 per hour, matching `RESET_IP_LIMIT`.
+
+10. **moto is used for SES v2, unlike KMS.** M1 decision 8 recorded that moto could not stand
+    in for KMS asymmetric signing, and the natural inference is that moto is unusable for
+    this package generally. It is not: moto 5.x implements `sesv2:SendEmail` well enough to
+    accept a real client's serialisation of the request this package builds, which is the
+    part a hand-written fake cannot check. The hand fakes still carry the request-shape
+    assertions, because they are faster and they fail more legibly.
+
+11. **`mark_email_verified` has no default, unlike `claims_for` and `on_user_created`.** "Do
+    nothing" looks harmless and is the worst available answer: a product that mounted the
+    flow and forgot the hook would confirm addresses that never became verified, and
+    `may_authenticate` would go on refusing the login the user was just told was now
+    possible. Raising names the missing hook the first time somebody clicks a link.
+
+12. **The contract suite skips by default and uses `urllib.request`.** It is gated on
+    `WEBBPULSE_IDENTITY_CONTRACT_BASE_URL` rather than on a marker, so no CI configuration is
+    needed to keep it out of the default run and no laptop run depends on staging being up.
+    The client is the standard library rather than `httpx` or `requests`, neither of which is
+    a dependency of this package: a contract suite that skipped itself with "could not import
+    httpx" would be indistinguishable from the intended skip while actually being broken.
+
+    It does not follow redirects and it mints no token. A redirect on either document is
+    itself a finding, since API Gateway's validator is not documented to follow one. Minting
+    would need a real credential against a real product, which turns a read-only probe
+    anybody can run into something that needs secrets.
+
 | **M4** | TOTP with KMS envelope encryption, recovery codes, the MFA ticket, step-up, `amr` | 0.8.0 | 4 to 5 |
 | **M5** | Passkeys: both ceremonies, challenge lifecycle, counter checking, passwordless | 0.9.0 | 5 to 6 |
 | **M6** | OAuth: Google and GitHub, state and PKCE, linking rules, the verified-email branch. Audit events and their alarms | 0.10.0 | 4 to 5 |

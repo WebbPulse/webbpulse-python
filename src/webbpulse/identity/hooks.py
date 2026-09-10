@@ -29,6 +29,13 @@ returns no extra claims, which is correct for a product with no roles, and
 Every other hook raises, because there is no defensible default for "may this user sign in"
 and a hook that silently answers yes is the worst possible shape for that question.
 
+`mark_email_verified` deliberately has **no** default, even though "do nothing" looks
+harmless. A product that mounted the verification flow and forgot the hook would confirm
+addresses that never became verified, and `may_authenticate` would go on refusing the login
+it just told the user was now possible. Raising names the missing hook the first time
+somebody clicks a link, which is loud and early; silently succeeding produces a flow that
+appears to work and never does.
+
 ## `may_authenticate` raises rather than returning a bool
 
 A predicate returning `False` says nothing about why, so the caller has to invent a reason
@@ -181,6 +188,23 @@ class IdentityHooks(Protocol):
         """
         ...
 
+    def mark_email_verified(self, user_id: str) -> None:
+        """Record that this user's email address is now confirmed.
+
+        The `email_verified` column lives on the product's `users` table, which section 4.2
+        gives to the `users` domain rather than to `identity`, so the package cannot write
+        it. This is the same seam `create_user` is, for the same reason: the package owns
+        the token that proves the address, the product owns the row that records it.
+
+        Called only after a verification link has been consumed, so an implementation does
+        not re-check anything. It sets the column and returns.
+
+        Raising fails the confirmation, and the link is already consumed by then, so a
+        product whose write can fail transiently should retry inside the hook rather than
+        let the user's one link be spent on a failure.
+        """
+        ...
+
     def user_repository(self) -> object:
         """The product's own users table, as a `webbpulse.dynamodb.Repository`.
 
@@ -235,6 +259,9 @@ class BaseIdentityHooks:
 
     def create_user(self, *, email: str, attributes: Mapping[str, Any]) -> Mapping[str, Any]:
         raise self._not_implemented("create_user")
+
+    def mark_email_verified(self, user_id: str) -> None:
+        raise self._not_implemented("mark_email_verified")
 
     def user_repository(self) -> object:
         raise self._not_implemented("user_repository")

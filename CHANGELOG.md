@@ -5,6 +5,77 @@ Notable changes to the `webbpulse` package. The version here is the one in
 
 This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## 0.11.0
+
+Identity M3: email verification and password reset over SES, plus a contract suite that
+checks a deployed service against what API Gateway's JWT authorizer actually requires.
+
+**Additive.** The four new routes mount only when a product supplies both an `EmailSender`
+and an `identity-tokens` store, on the same rule the M2 flow routes follow. A service that
+supplies neither mounts exactly what it mounted in 0.10.0. Nothing existing changes shape.
+
+**Still absent**, per section 9.1: TOTP and MFA (M4), passkeys (M5), OAuth (M6).
+
+### Added
+
+- `webbpulse.identity.email`: the `EmailSender` ABC, `SesV2EmailSender` over SES v2
+  `SendEmail`, `RecordingEmailSender` for tests, and the four message templates. No
+  templating dependency: `string.Template` with `substitute` rather than `safe_substitute`,
+  so a missing value raises in a test instead of mailing somebody a body containing `$link`.
+
+  Every message carries both a plain text and an HTML part, rendered from the same values
+  through one function, and the HTML part escapes what the text part takes raw.
+
+  `ses_configuration_set` is omitted from the call when unset rather than sent empty. A
+  configuration set that does not exist is a hard failure on every send, and an empty string
+  is a name that does not exist rather than an absence.
+
+- `webbpulse.identity.verification`: `LinkService`, the single-use link both flows are built
+  from. 256 bits from a CSPRNG, only the SHA-256 stored, consumed by a conditional write so
+  two racing clicks cannot both win, and expiry re-checked in code on every confirmation
+  because a DynamoDB TTL is storage reclamation rather than access control.
+
+  Every refusal carries one message and one code whatever went wrong. Telling a caller who
+  guessed a value that it was "already used" confirms the guess found a real token.
+
+- Four routes under the issuer path: `POST /verify-email`, `POST /verify-email/confirm`,
+  `POST /reset` and `POST /reset/confirm`. Both request routes answer 200 for any address,
+  per section 5.4, and the flow methods behind them return `None` on every path so a router
+  cannot branch on the outcome even by accident.
+
+- `IdentityFlows.request_verification`, `confirm_verification`, `request_password_reset` and
+  `confirm_password_reset`, callable without FastAPI like the rest of the flow layer.
+
+- `IdentityHooks.mark_email_verified`, the seam for the `email_verified` column. It lives on
+  the product's `users` table, which section 4.2 gives to the `users` domain, so the package
+  cannot write it. No default, unlike `claims_for` and `on_user_created`: a product that
+  mounted the flow and forgot the hook would confirm addresses that never became verified.
+
+- `tests/test_identity_contract.py`, skipped unless `WEBBPULSE_IDENTITY_CONTRACT_BASE_URL`
+  names a deployed issuer. It fetches the discovery document and the advertised `jwks_uri`
+  and asserts the shape API Gateway needs. **The default test run makes no network request.**
+
+      WEBBPULSE_IDENTITY_CONTRACT_BASE_URL=https://api.staging.webbpulse.com/api/auth \
+          pytest tests/test_identity_contract.py -v
+
+### Changed
+
+- `register` now mails a verification link on success and, for an address that already has
+  an account, mails that address the notice section 5.4 specifies. Both are best effort: a
+  failed send does not roll back an account that already exists, because that would leave a
+  real account behind a 500 and a user who cannot register again.
+
+- `change_password` and a completed reset both send a password-changed notice. Not required
+  by the standard, and included because it is the one signal a user has that a takeover
+  happened: an attacker who changes a password locks the owner out silently otherwise.
+
+- A completed password reset revokes **every** refresh family for the user, keeping nothing,
+  unlike `change_password`'s `keep_family_id`. The person resetting may not be signed in at
+  all, and no session is known to be the owner's rather than the attacker's.
+
+- `describe_expiry` renders a 24 hour lifetime as "24 hours" rather than "1 day", which is
+  the wording section 4.3 uses and therefore the wording a support conversation will quote.
+
 ## 0.10.0
 
 Identity M2: the password and session flows, on the foundations M1 built. Register, login,

@@ -1005,13 +1005,14 @@ and authenticated callers.
 
 ### `webbpulse.identity`
 
-App-managed identity: password flows, refresh sessions, configuration, the product policy
-seam, storage interfaces, a KMS-backed token service, and the reader for the claims an API
-Gateway HTTP API JWT authorizer leaves on a request. Needs the `identity` extra.
+App-managed identity: password flows, refresh sessions, email verification and password
+reset, configuration, the product policy seam, storage interfaces, a KMS-backed token
+service, and the reader for the claims an API Gateway HTTP API JWT authorizer leaves on a
+request. Needs the `identity` extra.
 
-This is M2 of `docs/identity-standard.md`. M1 built the foundations; M2 adds the password
-and session flows on top of them. Email verification and reset (M3), TOTP and MFA (M4),
-passkeys (M5) and OAuth (M6) are still absent.
+This is M3 of `docs/identity-standard.md`. M1 built the foundations, M2 added the password
+and session flows, and M3 adds the two emailed link flows on top of them. TOTP and MFA
+(M4), passkeys (M5) and OAuth (M6) are still absent.
 
 ```python
 import boto3
@@ -1028,8 +1029,10 @@ app.include_router(build_identity_router(settings, hooks, stores, tokens=tokens)
 | --- | --- |
 | `IdentitySettings` | Section 6.1 as validated settings, `IDENTITY_` prefixed |
 | `IdentityHooks` | The product's own policy: who may sign in, what claims they get, and creating the user row |
-| `IdentityFlows` | Register, login, change password, refresh, logout, logout-all, with no FastAPI dependency |
+| `IdentityFlows` | Register, login, change password, refresh, logout, logout-all, verify email, reset password, with no FastAPI dependency |
 | `SessionService` | Refresh families: rotation, reuse detection, the grace window, revocation |
+| `LinkService` | Single-use emailed links: minting, hashing, expiry, purpose, consumption |
+| `EmailSender` | Sending mail, with an SES v2 implementation and a recording one for tests |
 | `TokenService` | Minting, local verification, JWKS, discovery, rotation across keys |
 | `authorizer_claims` | Reading and coercing what the authorizer put on the request |
 | `CredentialStore` and friends | Storage interfaces, with DynamoDB and in-memory implementations |
@@ -1051,16 +1054,23 @@ gateway builds the discovery URL as `issuer + "/.well-known/openid-configuration
 | `POST /api/auth/refresh` | Rotates the refresh family and returns a new access token |
 | `POST /api/auth/logout` | Revokes the presented family |
 | `POST /api/auth/logout-all` | Revokes every family for the user |
+| `POST /api/auth/verify-email` | Mails a fresh verification link, answering 200 either way |
+| `POST /api/auth/verify-email/confirm` | Spends a verification link and marks the address verified |
+| `POST /api/auth/reset` | Mails a reset link, answering 200 either way |
+| `POST /api/auth/reset/confirm` | Spends a reset link, sets the new password, revokes every session |
 
 An issuer with no path gives the same routes at the origin. Adding a prefix of your own
 doubles the issuer path and hides the documents from the gateway. **This changed in
 0.10.0**: 0.9.0 served the documents at the origin regardless of the issuer, so a product
 that compensated with `prefix="/api/auth"` must drop it when upgrading.
 
-**The flow routes mount conditionally.** The six `POST` routes appear only when the product
-supplies both `hooks` and a credential store. Called without them the router mounts exactly
-what M1 mounted, the two `.well-known` documents and `/health`, so a service that only
-serves a JWKS does not acquire a login endpoint by upgrading.
+**The flow routes mount conditionally.** The six password and session `POST` routes appear
+only when the product supplies both `hooks` and a credential store. Called without them the
+router mounts exactly what M1 mounted, the two `.well-known` documents and `/health`, so a
+service that only serves a JWKS does not acquire a login endpoint by upgrading. The four
+email routes need more still: an `EmailSender` and an identity token store, and without
+both of those the other ten routes mount without them. A route that cannot do its job
+should not exist to be called.
 
 **The access token is returned in the JSON body and the refresh token is a cookie.** The
 access token is short-lived, ten minutes by default, and is never set as a cookie: it is
@@ -1087,6 +1097,40 @@ session rather than an error, for the same reason.
 doubles from one second to a fifteen minute cap, and any success clears it. There is no
 hard lock, because a hard lock on a known address is a denial of service anybody can
 trigger.
+
+**The emailed links point at the frontend, and both confirmations are `POST`.** A reset link
+carries no password, so a page has to collect one, and a `GET` that consumes state is spent
+by the first mail scanner that follows it. `frontend_base_url` plus `VERIFY_LINK_PATH` and
+`RESET_LINK_PATH` build the URL that goes in the mail; the frontend posts the token back to
+the route above.
+
+**Both request routes answer 200 whether or not the address exists.** A reset request
+always returns "If that address has an account, a link is on its way." and a verification
+resend always returns the same shape, so neither route answers the question of who has an
+account here. Rate limits apply per address and per IP on both, so an unlimited resend
+cannot be used as a mail relay pointed at addresses an attacker supplies.
+
+**Links are single use, hashed at rest and short lived.** 256 bits from the system CSPRNG,
+only the SHA-256 stored, consumed by one conditional write. Verification links last 24
+hours and reset links one hour. A confirmation checks the stored record's purpose before
+spending it, so a verification link pasted into the reset page is refused without being
+burned.
+
+**A completed reset revokes every session and keeps none**, unlike `change_password`, which
+takes a `keep_family_id` so the caller stays signed in. The person resetting may not be
+signed in at all, and no session is known to be theirs rather than the attacker's. A reset
+also marks the address verified, because it proves the same control of the mailbox that a
+verification link proves.
+
+**Password changes and completed resets send a notice, and no notice carries a live token.**
+It is the one signal a user has that somebody else took the account over. Every notice links
+to the bare reset page rather than to an issued link, so a message triggered by somebody
+typing an address into a form cannot become an unrate-limited link mailer.
+
+**`SesV2EmailSender` builds both bodies itself, with no templating dependency.** Plain text
+plus a minimal HTML body from `string.Template`, with every interpolation HTML escaped.
+`RecordingEmailSender` keeps what it was asked to send, for tests and for a local run with
+no AWS credentials at all.
 
 **Passwords follow NIST SP 800-63B.** Eight character minimum, no composition rules, no
 expiry, NFKC normalised, and a rejection rather than a silent truncation over 72 UTF-8
@@ -1190,6 +1234,34 @@ package ships `py.typed`, so its annotations are part of its contract.
 publishing to CodeArtifact domain `webbpulse`, repository `python`, in `us-west-2`. That
 workflow is idempotent: it looks the version up first and skips with a notice rather than
 failing, so re-running an already released tag stays green.
+
+### Contract tests against a deployed issuer
+
+`tests/test_identity_contract.py` checks that a real deployment's discovery document and
+JWKS have the shape API Gateway's JWT authorizer requires, which is the one thing a unit
+test cannot tell you: the gateway fetches both documents itself, holding no credentials,
+and caches what it gets. It is **skipped unless `WEBBPULSE_IDENTITY_CONTRACT_BASE_URL` is
+set**, so the ordinary test run and CI make no network request at all.
+
+```bash
+WEBBPULSE_IDENTITY_CONTRACT_BASE_URL=https://api.staging.webbpulse.com/api/auth \
+  .venv/bin/pytest tests/test_identity_contract.py -v
+```
+
+The base URL is the issuer, path included, with no trailing slash. The suite fetches
+`<issuer>/.well-known/openid-configuration`, then the `jwks_uri` that document advertises
+rather than a URL it guessed, and asserts that both answer anonymously, that `issuer` comes
+back byte identical to what was asked for, that `jwks_uri` sits under the issuer on the
+issuer's own scheme, that `RS256` is advertised with no HS algorithm alongside it, that
+every key carries `kty`, `use`, `alg`, `kid`, `n` and `e` with an unpadded base64url
+modulus of at least 256 bytes, that the `kid` values are distinct, and that neither
+document is served with a longer cache lifetime than the other can support.
+
+It uses `urllib.request` rather than `httpx` or `requests`, neither of which is a
+dependency here: a contract suite that skipped itself with "could not import httpx" would
+be indistinguishable from the intended skip. It follows no redirects, since a redirect on
+either document is itself a finding, and it mints no token, so it needs no credential and
+can be run by anybody against any environment.
 
 ### Required repository configuration
 
