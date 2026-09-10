@@ -32,10 +32,20 @@ Logical names; `webbpulse.dynamodb.table_name` prefixes each with the environmen
 | `credentials` | `user_id` | `credential_type` | none | **never** |
 | `refresh_tokens` | `token_hash` | none | `family_id-generation-index` | `expires_at` |
 | `identity_tokens` | `token_hash` | none | none | `expires_at` |
+| `totp_factors` | `user_id` | none | none | **never** |
+| `recovery_codes` | `user_id` | `code_hash` | none | **never** |
 
-The three M1 stores are `credentials`, `refresh_tokens` and `identity_tokens`; `users` is
-reached through the product's own repository behind `IdentityHooks.user_repository`, because
-section 4.2 gives the `users` domain ownership of that record.
+The three M1 stores are `credentials`, `refresh_tokens` and `identity_tokens`; M4 adds
+`totp_factors` and `recovery_codes`. `users` is reached through the product's own repository
+behind `IdentityHooks.user_repository`, because section 4.2 gives the `users` domain
+ownership of that record.
+
+**The two M4 tables must never carry a TTL**, and the reason is the sharper version of the
+general rule above. An expiring refresh token that vanishes early costs a user one extra
+login. A TOTP factor or a recovery code that vanishes early costs them the account: the
+second factor silently disappears, and if MFA is required for their role they cannot get in
+at all. These rows are deleted explicitly, by a user disabling TOTP or regenerating a set,
+and never on a schedule.
 
 **`credentials` is hash `user_id` and range `credential_type`.** Separating the password
 hash from the user record means a route that returns a user cannot accidentally serialise a
@@ -89,23 +99,33 @@ if TYPE_CHECKING:  # pragma: no cover - typing only
 __all__ = [
     "CREDENTIALS_TABLE",
     "IDENTITY_TOKENS_TABLE",
+    "RECOVERY_CODES_TABLE",
     "REFRESH_FAMILY_INDEX",
     "REFRESH_TOKENS_TABLE",
+    "TOTP_FACTORS_TABLE",
     "USERS_TABLE",
     "CredentialRecord",
     "CredentialStore",
     "DynamoCredentialStore",
     "DynamoIdentityTokenStore",
+    "DynamoRecoveryCodeStore",
     "DynamoRefreshTokenStore",
+    "DynamoTotpFactorStore",
     "IdentityStores",
     "IdentityTokenPurpose",
     "IdentityTokenRecord",
     "IdentityTokenStore",
     "InMemoryCredentialStore",
     "InMemoryIdentityTokenStore",
+    "InMemoryRecoveryCodeStore",
     "InMemoryRefreshTokenStore",
+    "InMemoryTotpFactorStore",
+    "RecoveryCodeRecord",
+    "RecoveryCodeStore",
     "RefreshTokenRecord",
     "RefreshTokenStore",
+    "TotpFactorRecord",
+    "TotpFactorStore",
     "constant_time_equals",
     "hash_token",
     "is_expired",
@@ -119,13 +139,21 @@ USERS_TABLE: Final = "users"
 CREDENTIALS_TABLE: Final = "credentials"
 REFRESH_TOKENS_TABLE: Final = "refresh-tokens"
 IDENTITY_TOKENS_TABLE: Final = "identity-tokens"
+TOTP_FACTORS_TABLE: Final = "totp-factors"
+RECOVERY_CODES_TABLE: Final = "recovery-codes"
 
 #: The one GSI on `refresh-tokens`, for revoking a family. Never on the verification path.
 REFRESH_FAMILY_INDEX: Final = "family_id-generation-index"
 
-#: The purposes an `identity_tokens` row can carry. One table for both, because the two
-#: differ only in a TTL and a template, and two tables would double the Terraform for that.
-type IdentityTokenPurpose = Literal["verify_email", "reset_password"]
+#: The purposes an `identity_tokens` row can carry. One table for all three, because they
+#: differ only in a TTL and a template, and three tables would triple the Terraform for that.
+#:
+#: `mfa_ticket` is M4's, and it stores no token: the ticket itself is a signed JWT that is
+#: never written down. What is written is a row keyed on the hash of its `jti`, so that
+#: spending a ticket is the same atomic `consume` a reset link uses, and a replay loses the
+#: race rather than being caught by a read. The TTL matches the ticket's own five minutes,
+#: so the rows clear themselves.
+type IdentityTokenPurpose = Literal["verify_email", "reset_password", "mfa_ticket"]
 
 #: Bits of entropy in a refresh token or a verification link. 256, per sections 2.6 and 4.2.
 TOKEN_BYTES: Final = 32
@@ -228,6 +256,58 @@ class IdentityTokenRecord:
     created_at: str
     expires_at: int
     consumed_at: str = ""
+
+
+@dataclass(frozen=True, slots=True)
+class TotpFactorRecord:
+    """One user's TOTP factor: the sealed seed, its state, and the replay watermark.
+
+    The seed is held as the three base64 strings `EnvelopeCipher` produces, never as
+    plaintext and never as something that could be hashed instead. A TOTP seed is the input
+    to an HMAC that both sides compute, so unlike a password it has to come back out.
+
+    `activated_at` empty means enrolled but not confirmed. A factor in that state is not a
+    factor: it does not gate login and it does not appear in `factors`, because the user has
+    not yet proved their authenticator holds the same seed. Section 2.6 requires the first
+    code before the factor counts, so that a user who scans a QR badly is not locked out of
+    their own account by a factor they cannot satisfy.
+
+    `last_used_step` is the highest time step ever accepted for this user. It is the whole
+    of the replay defence and the reason `totp.verify_code` returns a step rather than a
+    boolean. Zero means nothing has been accepted yet.
+    """
+
+    user_id: str
+    secret_ciphertext: str
+    secret_nonce: str
+    wrapped_data_key: str
+    created_at: str
+    activated_at: str = ""
+    last_used_step: int = 0
+
+    @property
+    def is_active(self) -> bool:
+        """Whether this factor gates login. Enrolled but unconfirmed factors do not."""
+        return bool(self.activated_at)
+
+
+@dataclass(frozen=True, slots=True)
+class RecoveryCodeRecord:
+    """One recovery code, stored as its hash, spent at most once.
+
+    Hashed rather than sealed, the opposite of the TOTP seed, and for the reason that
+    decides every such choice: a recovery code is only ever **compared**, so the plaintext
+    never needs to come back and storing it would be storing a password in the clear.
+
+    `used_at` empty means unspent. Rows are marked rather than deleted so that
+    `recovery.used` in section 5.7 has something to audit against and so a user can be shown
+    how many codes remain without the count being a guess.
+    """
+
+    user_id: str
+    code_hash: str
+    created_at: str
+    used_at: str = ""
 
 
 # ---------------------------------------------------------------------------
@@ -335,6 +415,81 @@ class IdentityTokenStore(ABC):
         """Invalidate outstanding links of a purpose for a user, as issuing a new one does."""
 
 
+class TotpFactorStore(ABC):
+    """The `totp-factors` table: hash `user_id`, no range, no TTL ever.
+
+    One factor per user, so `user_id` alone is the key. A second authenticator is not a
+    second row: the user re-enrols and replaces the seed, which is what every consumer app
+    does and what keeps `factors` in the login challenge a straightforward derivation
+    rather than a query.
+
+    **No TTL.** Section 4.1's rule applies with force here: a TTL attribute on this table
+    that some future code sets by accident silently removes a user's second factor, and the
+    account quietly drops to one. The table must never carry one.
+    """
+
+    @abstractmethod
+    def get(self, user_id: str) -> TotpFactorRecord | None:
+        """The factor, active or merely enrolled. The caller checks `is_active`."""
+
+    @abstractmethod
+    def put(self, record: TotpFactorRecord) -> None:
+        """Write or replace a factor. Re-enrolment overwrites, per the class docstring."""
+
+    @abstractmethod
+    def activate(self, user_id: str, *, step: int, activated_at: str | None = None) -> bool:
+        """Confirm a pending factor with its first verified code.
+
+        Returns `False` if there is no factor or it is already active, so that a replayed
+        activation cannot reset `last_used_step` and reopen the window for a code that was
+        already spent. Setting the step in the same write is what makes the confirming code
+        itself unusable a second time.
+        """
+
+    @abstractmethod
+    def record_use(self, user_id: str, *, step: int) -> bool:
+        """Advance the replay watermark, refusing anything not strictly newer.
+
+        Returns `False` when `step` is not greater than the stored value, which is the
+        replay case. This must be one atomic conditional write: a read-then-write here
+        loses exactly the race the watermark exists to close, since two requests carrying
+        the same captured code would both read the old value and both accept.
+        """
+
+    @abstractmethod
+    def delete(self, user_id: str) -> None:
+        """Remove the factor entirely, for a user disabling TOTP."""
+
+
+class RecoveryCodeStore(ABC):
+    """The `recovery-codes` table: hash `user_id`, range `code_hash`, no TTL ever.
+
+    The range key is the hash, so spending a code is a point write on the primary key with
+    no index and no scan, and a whole set is one `Query` on the partition.
+    """
+
+    @abstractmethod
+    def put_many(self, records: Iterable[RecoveryCodeRecord]) -> None:
+        """Write a fresh set. Called only after `delete_for_user`, never to append."""
+
+    @abstractmethod
+    def list_for_user(self, user_id: str) -> list[RecoveryCodeRecord]:
+        """Every code for a user, spent ones included, so remaining can be counted."""
+
+    @abstractmethod
+    def consume(self, user_id: str, code_hash: str, *, used_at: str | None = None) -> bool:
+        """Atomically spend one code, returning `False` if unknown or already spent.
+
+        Conditional for the same reason `IdentityTokenStore.consume` is: two requests
+        presenting the same code concurrently must not both succeed, and only the database
+        can settle that.
+        """
+
+    @abstractmethod
+    def delete_for_user(self, user_id: str) -> int:
+        """Remove every code for a user, for regeneration or for disabling MFA."""
+
+
 @dataclass(frozen=True, slots=True)
 class IdentityStores:
     """The stores `build_identity_router` takes, in one object.
@@ -348,6 +503,8 @@ class IdentityStores:
     credentials: CredentialStore | None = None
     refresh_tokens: RefreshTokenStore | None = None
     identity_tokens: IdentityTokenStore | None = None
+    totp_factors: TotpFactorStore | None = None
+    recovery_codes: RecoveryCodeStore | None = None
 
     def require_credentials(self) -> CredentialStore:
         return _require(self.credentials, "credentials")
@@ -357,6 +514,12 @@ class IdentityStores:
 
     def require_identity_tokens(self) -> IdentityTokenStore:
         return _require(self.identity_tokens, "identity_tokens")
+
+    def require_totp_factors(self) -> TotpFactorStore:
+        return _require(self.totp_factors, "totp_factors")
+
+    def require_recovery_codes(self) -> RecoveryCodeStore:
+        return _require(self.recovery_codes, "recovery_codes")
 
 
 def _require[StoreT](store: StoreT | None, name: str) -> StoreT:
@@ -480,6 +643,67 @@ class InMemoryIdentityTokenStore(IdentityTokenStore):
                 self._items[token_hash] = dataclasses.replace(record, consumed_at=marker)
                 count += 1
         return count
+
+
+class InMemoryTotpFactorStore(TotpFactorStore):
+    """Dict-backed `TotpFactorStore`, keyed as the table is."""
+
+    def __init__(self) -> None:
+        self._items: dict[str, TotpFactorRecord] = {}
+
+    def get(self, user_id: str) -> TotpFactorRecord | None:
+        return self._items.get(user_id)
+
+    def put(self, record: TotpFactorRecord) -> None:
+        self._items[record.user_id] = record
+
+    def activate(self, user_id: str, *, step: int, activated_at: str | None = None) -> bool:
+        existing = self._items.get(user_id)
+        if existing is None or existing.is_active:
+            return False
+        self._items[user_id] = dataclasses.replace(
+            existing, activated_at=activated_at or now_iso(), last_used_step=step
+        )
+        return True
+
+    def record_use(self, user_id: str, *, step: int) -> bool:
+        existing = self._items.get(user_id)
+        if existing is None or step <= existing.last_used_step:
+            return False
+        self._items[user_id] = dataclasses.replace(existing, last_used_step=step)
+        return True
+
+    def delete(self, user_id: str) -> None:
+        self._items.pop(user_id, None)
+
+
+class InMemoryRecoveryCodeStore(RecoveryCodeStore):
+    """Dict-backed `RecoveryCodeStore`, keyed by the table's composite key."""
+
+    def __init__(self) -> None:
+        self._items: dict[tuple[str, str], RecoveryCodeRecord] = {}
+
+    def put_many(self, records: Iterable[RecoveryCodeRecord]) -> None:
+        for record in records:
+            self._items[(record.user_id, record.code_hash)] = record
+
+    def list_for_user(self, user_id: str) -> list[RecoveryCodeRecord]:
+        return [record for (owner, _), record in self._items.items() if owner == user_id]
+
+    def consume(self, user_id: str, code_hash: str, *, used_at: str | None = None) -> bool:
+        existing = self._items.get((user_id, code_hash))
+        if existing is None or existing.used_at:
+            return False
+        self._items[(user_id, code_hash)] = dataclasses.replace(
+            existing, used_at=used_at or now_iso()
+        )
+        return True
+
+    def delete_for_user(self, user_id: str) -> int:
+        keys = [key for key in self._items if key[0] == user_id]
+        for key in keys:
+            del self._items[key]
+        return len(keys)
 
 
 # ---------------------------------------------------------------------------
@@ -687,6 +911,149 @@ class DynamoIdentityTokenStore(IdentityTokenStore):
         )
 
 
+class DynamoTotpFactorStore(TotpFactorStore):
+    """`TotpFactorStore` over a `webbpulse.dynamodb.Repository`.
+
+    The two methods worth reading are `activate` and `record_use`, both single conditional
+    `UpdateItem` calls. `record_use` in particular is the replay defence, and writing it as
+    a read followed by a write would defeat it entirely: two requests carrying the same
+    captured code would both read the old `last_used_step`, both find it lower, and both
+    accept. The condition moves that decision into the database, where it is settled once.
+    """
+
+    def __init__(self, repository: Repository) -> None:
+        self._repo = repository
+
+    def get(self, user_id: str) -> TotpFactorRecord | None:
+        # Consistent, because the read after enrolment's write decides whether a user can
+        # confirm their factor, and an eventually consistent miss there reads as "you never
+        # enrolled" to somebody holding a QR code they just scanned.
+        item = self._repo.get({"user_id": user_id}, consistent=True)
+        return _totp_factor_from_item(item) if item is not None else None
+
+    def put(self, record: TotpFactorRecord) -> None:
+        self._repo.put(
+            {
+                "user_id": record.user_id,
+                "secret_ciphertext": record.secret_ciphertext,
+                "secret_nonce": record.secret_nonce,
+                "wrapped_data_key": record.wrapped_data_key,
+                "created_at": record.created_at,
+                "activated_at": record.activated_at,
+                "last_used_step": record.last_used_step,
+            }
+        )
+
+    def activate(self, user_id: str, *, step: int, activated_at: str | None = None) -> bool:
+        from boto3.dynamodb.conditions import Attr
+        from botocore.exceptions import ClientError
+
+        try:
+            self._repo.update(
+                {"user_id": user_id},
+                update_expression="SET activated_at = :at, last_used_step = :step",
+                expression_values={":at": activated_at or now_iso(), ":step": step},
+                condition=(
+                    Attr("user_id").exists()
+                    & (Attr("activated_at").not_exists() | Attr("activated_at").eq(""))
+                ),
+            )
+        except ClientError as exc:
+            if exc.response.get("Error", {}).get("Code") == "ConditionalCheckFailedException":
+                return False
+            raise
+        return True
+
+    def record_use(self, user_id: str, *, step: int) -> bool:
+        from boto3.dynamodb.conditions import Attr
+        from botocore.exceptions import ClientError
+
+        try:
+            self._repo.update(
+                {"user_id": user_id},
+                update_expression="SET last_used_step = :step",
+                expression_values={":step": step},
+                # Strictly greater. `not_exists` covers a factor written before this
+                # attribute existed, which a rolling deploy can produce.
+                condition=(
+                    Attr("user_id").exists()
+                    & (Attr("last_used_step").not_exists() | Attr("last_used_step").lt(step))
+                ),
+            )
+        except ClientError as exc:
+            if exc.response.get("Error", {}).get("Code") == "ConditionalCheckFailedException":
+                return False
+            raise
+        return True
+
+    def delete(self, user_id: str) -> None:
+        self._repo.delete({"user_id": user_id})
+
+
+class DynamoRecoveryCodeStore(RecoveryCodeStore):
+    """`RecoveryCodeStore` over a `webbpulse.dynamodb.Repository`."""
+
+    def __init__(self, repository: Repository) -> None:
+        self._repo = repository
+
+    def put_many(self, records: Iterable[RecoveryCodeRecord]) -> None:
+        self._repo.put_many(
+            [
+                {
+                    "user_id": record.user_id,
+                    "code_hash": record.code_hash,
+                    "created_at": record.created_at,
+                    "used_at": record.used_at,
+                }
+                for record in records
+            ]
+        )
+
+    def list_for_user(self, user_id: str) -> list[RecoveryCodeRecord]:
+        from boto3.dynamodb.conditions import Key as KeyCondition
+
+        return [
+            _recovery_code_from_item(item)
+            for item in self._repo.iter_query(KeyCondition("user_id").eq(user_id), consistent=True)
+        ]
+
+    def consume(self, user_id: str, code_hash: str, *, used_at: str | None = None) -> bool:
+        from boto3.dynamodb.conditions import Attr
+        from botocore.exceptions import ClientError
+
+        try:
+            self._repo.update(
+                {"user_id": user_id, "code_hash": code_hash},
+                update_expression="SET used_at = :now",
+                expression_values={":now": used_at or now_iso()},
+                condition=(
+                    Attr("code_hash").exists()
+                    & (Attr("used_at").not_exists() | Attr("used_at").eq(""))
+                ),
+            )
+        except ClientError as exc:
+            if exc.response.get("Error", {}).get("Code") == "ConditionalCheckFailedException":
+                # Unknown code and already-spent code are one answer on purpose. The caller
+                # must not be able to tell them apart, and neither must anybody watching the
+                # caller's response times.
+                return False
+            raise
+        return True
+
+    def delete_for_user(self, user_id: str) -> int:
+        from boto3.dynamodb.conditions import Key as KeyCondition
+
+        hashes = [
+            str(item["code_hash"])
+            for item in self._repo.iter_query(
+                KeyCondition("user_id").eq(user_id), consistent=True, projection="code_hash"
+            )
+        ]
+        for code_hash in hashes:
+            self._repo.delete({"user_id": user_id, "code_hash": code_hash})
+        return len(hashes)
+
+
 # ---------------------------------------------------------------------------
 # Item mapping
 # ---------------------------------------------------------------------------
@@ -728,7 +1095,7 @@ def _refresh_record_from_item(item: Mapping[str, Any]) -> RefreshTokenRecord:
 
 def _identity_token_from_item(item: Mapping[str, Any]) -> IdentityTokenRecord:
     purpose = str(item.get("purpose", ""))
-    if purpose not in {"verify_email", "reset_password"}:
+    if purpose not in {"verify_email", "reset_password", "mfa_ticket"}:
         raise ValueError(
             f"Unknown identity token purpose {purpose!r} on token "
             f"{str(item.get('token_hash', ''))[:8]}."
@@ -740,6 +1107,27 @@ def _identity_token_from_item(item: Mapping[str, Any]) -> IdentityTokenRecord:
         created_at=str(item.get("created_at", "")),
         expires_at=int(item.get("expires_at", 0)),
         consumed_at=str(item.get("consumed_at", "")),
+    )
+
+
+def _totp_factor_from_item(item: Mapping[str, Any]) -> TotpFactorRecord:
+    return TotpFactorRecord(
+        user_id=str(item["user_id"]),
+        secret_ciphertext=str(item.get("secret_ciphertext", "")),
+        secret_nonce=str(item.get("secret_nonce", "")),
+        wrapped_data_key=str(item.get("wrapped_data_key", "")),
+        created_at=str(item.get("created_at", "")),
+        activated_at=str(item.get("activated_at", "")),
+        last_used_step=int(item.get("last_used_step", 0)),
+    )
+
+
+def _recovery_code_from_item(item: Mapping[str, Any]) -> RecoveryCodeRecord:
+    return RecoveryCodeRecord(
+        user_id=str(item["user_id"]),
+        code_hash=str(item["code_hash"]),
+        created_at=str(item.get("created_at", "")),
+        used_at=str(item.get("used_at", "")),
     )
 
 
