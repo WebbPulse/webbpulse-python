@@ -168,9 +168,9 @@ through call signatures.
 ```python
 from webbpulse.log_context import set_user_id, task_context
 
-set_user_id(user.id)                       # in the authentication dependency
+set_user_id(user.id)  # in the authentication dependency
 
-with task_context("crawler", job_id):      # for work outside any request
+with task_context("crawler", job_id):  # for work outside any request
     run()
 ```
 
@@ -208,9 +208,9 @@ it to production.** A ContextVar bound inside a `def` dependency is invisible to
 handler and to every log line after it:
 
 ```python
-def get_current_user(token: str = Depends(oauth2)) -> User:   # WRONG: `def`
+def get_current_user(token: str = Depends(oauth2)) -> User:  # WRONG: `def`
     user = lookup(token)
-    set_user_id(user.id)     # binds a context that is about to be discarded
+    set_user_id(user.id)  # binds a context that is about to be discarded
     return user
 ```
 
@@ -225,11 +225,11 @@ Use `webbpulse.http.user_id_dependency`, which wraps the service's own resolver 
 ```python
 from webbpulse.http import user_id_dependency
 
-CurrentUser = user_id_dependency(get_current_user)   # `get_current_user` may stay `def`
+CurrentUser = user_id_dependency(get_current_user)  # `get_current_user` may stay `def`
+
 
 @router.get("/me")
-async def me(user: User = Depends(CurrentUser)) -> UserRead:
-    ...
+async def me(user: User = Depends(CurrentUser)) -> UserRead: ...
 ```
 
 The resolved object is passed straight through, so this is a drop-in swap at every call
@@ -668,6 +668,7 @@ extra:
 app = create_app([posts_router], dynamodb_handlers=True)
 # or, for an app not built by create_app:
 from webbpulse.http import install_dynamodb_handlers
+
 install_dynamodb_handlers(app)
 ```
 
@@ -734,6 +735,7 @@ handlers changes nothing a caller can see. The details worth knowing:
 
   ```python
   from webbpulse.http import register_error_handlers
+
   register_error_handlers(app, exception_map={ItemNotFound: 404})
   ```
 
@@ -935,7 +937,11 @@ Needs the `security` extra.
 ```python
 from datetime import timedelta
 from webbpulse.security import (
-    create_token, decode_token, hash_password, needs_rehash, verify_password,
+    create_token,
+    decode_token,
+    hash_password,
+    needs_rehash,
+    verify_password,
 )
 
 hashed = hash_password(password)
@@ -985,6 +991,7 @@ An optional FastAPI dependency returns the decoded claims, and needs the `fastap
 ```python
 Claims = Annotated[dict, Depends(bearer_claims(settings.secret_key))]
 
+
 @router.get("/me")
 async def me(claims: Claims, repos: Repos = Depends(get_repos)):
     return repos.users.get_by_username(claims["sub"])
@@ -998,24 +1005,57 @@ and authenticated callers.
 
 ### `webbpulse.identity`
 
-KMS-backed RS256 token signing, and the JWKS and OIDC discovery documents that let an API
-Gateway HTTP API JWT authorizer verify what it signed. Needs the `identity` extra.
+App-managed identity: configuration, the product policy seam, storage interfaces, a
+KMS-backed token service, and the reader for the claims an API Gateway HTTP API JWT
+authorizer leaves on a request. Needs the `identity` extra.
 
-This is the M0 slice of `docs/identity-standard.md` and deliberately not the whole
-standard: there is no user model, no password flow, no session and no storage. Those land
-in 0.7.0 and later.
+This is M1 of `docs/identity-standard.md`. It builds the **foundations** and deliberately
+not the flows: there is no login, no refresh rotation, no MFA, no passkeys and no OAuth
+here. Those are M2 and later. The router mounts the two `.well-known` documents and
+`/health`, and nothing else.
 
 ```python
 import boto3
-from webbpulse.identity import KmsSigner, identity_router, public_jwk_from_kms
+from webbpulse.identity import IdentitySettings, TokenService, build_identity_router
 
-kms = boto3.client("kms")
-signer = KmsSigner(kms, settings.identity_signing_key_id)
+settings = IdentitySettings()  # reads IDENTITY_* from the environment
+tokens = TokenService(settings, boto3.client("kms"))
 
-# Resolved once per execution environment: it is a read of a public key.
-jwk = public_jwk_from_kms(kms, settings.identity_signing_key_id)
-app.include_router(identity_router(issuer=settings.identity_issuer, jwks=lambda: [jwk]))
+# One per execution environment: it caches a JWK per configured key.
+app.include_router(build_identity_router(settings, hooks, stores, tokens=tokens))
 ```
+
+| Piece | What it owns |
+| --- | --- |
+| `IdentitySettings` | Section 6.1 as validated settings, `IDENTITY_` prefixed |
+| `IdentityHooks` | The product's own policy: who may sign in, and what claims they get |
+| `TokenService` | Minting, local verification, JWKS, discovery, rotation across keys |
+| `authorizer_claims` | Reading and coercing what the authorizer put on the request |
+| `CredentialStore` and friends | Storage interfaces, with DynamoDB and in-memory implementations |
+
+**Every authorizer claim arrives as a string**, `exp` and `iat` included. That is a verified
+finding from the M0 staging spike, and it is why `authorizer_claims` exists rather than a
+dictionary access: `exp > time.time()` on a string raises `TypeError`, and `bool("false")`
+is `True`. It coerces integers, booleans, space-separated scopes and the bracketed comma
+form the gateway emits for array claims, and keeps the raw map on `.raw`.
+
+**Rotation is a list, and its head signs.** `signing_key_arns` puts every configured key in
+the JWKS and signs with the first, so each step of section 3.5 is a one-line change: add the
+new key, deploy, move it to the front, deploy, drop the old one once no token it signed can
+still be alive. A token signed by a previous key verifies for as long as that key is listed.
+A `kid` matching no configured key is rejected rather than falling back to trying every key,
+which would quietly undo the retirement.
+
+**A key whose `kms:GetPublicKey` fails is omitted from the JWKS rather than failing it.** A
+retired key id left in configuration must not deny every authorized request in the product.
+Every key failing is still fatal, because an empty JWKS would be cached by the gateway and
+deny everything for its whole interval.
+
+**The stores hash what they hold.** Only the SHA-256 of a refresh or verification token is
+stored, so a read of the table cannot be turned into a working session. `consume` is one
+conditional `UpdateItem` returning the prior state rather than a read followed by a write,
+because two concurrent refreshes both reading an unconsumed record is exactly the condition
+reuse detection exists to notice.
 
 **RS256, and there was no choice.** The API Gateway documentation for HTTP API JWT
 authorizers says, in the token validation workflow, "Check the token's algorithm and
@@ -1040,6 +1080,12 @@ mutating one, and the JWKS serves both through the overlap.
 staging access gate. API Gateway fetches them itself, holding no cookies. A gate in front of
 either one means the JWT authorizer cannot retrieve the key and every authorized route fails
 closed.
+
+`verify_access_token` verifies a token locally against the configured keys. It is **not**
+the production path: behind API Gateway the authorizer has already checked the signature,
+issuer, audience and expiry before the Lambda runs, and re-verifying would add a JWKS lookup
+to every request to re-establish what the platform guarantees. It exists for tests and for a
+service that verifies a token itself.
 
 `mint_test_token` signs an access token without authenticating anybody, for exercising an
 authorizer end to end. It has two independent gates: an `enabled` argument with no default,

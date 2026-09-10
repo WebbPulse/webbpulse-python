@@ -5,6 +5,119 @@ Notable changes to the `webbpulse` package. The version here is the one in
 
 This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## 0.9.0
+
+Identity M1: the foundations the flows rest on. `webbpulse.identity` becomes a package with
+configuration, the product policy seam, storage interfaces, a token service that handles
+rotation, and the claim reader for what the gateway authorizer leaves on the request.
+
+**The flows are deliberately absent.** Login, refresh rotation, MFA, passkeys and OAuth are
+M2 and later, per section 9.1 of `docs/identity-standard.md`. The router mounts the two
+`.well-known` documents and `/health`, and nothing else.
+
+**Additive for anyone on the M0 slice.** `src/webbpulse/identity.py` became
+`src/webbpulse/identity/tokens.py`, and every name that was importable from
+`webbpulse.identity` still is. The M0 test module passes unchanged, which is the test of
+that claim.
+
+### Added
+
+- `IdentitySettings`, section 6.1 as a validated `BaseSettings` with `IDENTITY_` prefix.
+  Safe defaults throughout: `cookie_secure` on, `httponly` not configurable at all, email
+  verification required, a ten-minute access token.
+
+  The validation is the point. A plaintext `issuer` is refused outside `local` and `test`; a
+  trailing slash is stripped rather than trusted to match by hand in three places, which is
+  the classic cause of every request being denied with no useful message; `SameSite=none`
+  without `Secure` is refused; an access token TTL over an hour is refused, because a
+  long-lived access token cannot be revoked.
+
+- `IdentityHooks`, a `Protocol`, and `BaseIdentityHooks`, a concrete class whose
+  unimplemented hooks raise `HookNotImplemented` naming the hook and the class. The product
+  decides who may sign in; the package decides how signing in works.
+
+  `may_authenticate` refuses by raising `AuthenticationRefused` rather than returning a
+  bool. A hook that forgets to return anything returns `None`, and
+  `if hooks.may_authenticate(user)` on a `None` admits the login. Raising has no such pair
+  of readings: not raising is the only way to permit, and every mistake lands on the
+  refusing side.
+
+- `TokenService`: `mint_access_token`, `verify_access_token`, `jwks()`, `discovery()`, over
+  as many keys as are configured.
+
+  Rotation is the whole design. `signing_key_arns` is a list whose head signs and whose
+  every element appears in the JWKS, so each step of section 3.5 is a one-line change.
+  A token signed by a previous key keeps verifying while that key is listed and stops when
+  it is retired, and a `kid` matching no configured key is rejected rather than falling back
+  to trying every key, which would quietly undo the retirement.
+
+  A key whose `kms:GetPublicKey` fails is omitted from the JWKS rather than failing it: a
+  retired key id left in configuration must not deny every authorized request in the
+  product. Every key failing is still fatal, because an empty JWKS would be cached by the
+  gateway and deny everything for its whole interval.
+
+  `verify_access_token` is **not** the production path. Behind API Gateway the authorizer
+  has already checked the signature, issuer, audience and expiry. It exists for tests and
+  for a service that verifies a token itself.
+
+- `authorizer_claims()` and `read_authorizer_claims(request)`, the single parser for what
+  the JWT authorizer leaves on the request.
+
+  **Every claim value arrives as a string, `exp` and `iat` included.** That is a verified
+  finding from the M0 staging spike, not an inference, and it is why this module exists:
+  `exp > time.time()` on a string raises `TypeError`, and `bool("false")` is `True`.
+  Integers, booleans, space-separated scopes and the bracketed comma form the gateway emits
+  for array claims are all coerced, with the raw map kept on `.raw`.
+
+  Three distinct failures, because they have three different causes: `MissingRequestContext`
+  is a deployment fault, `UnparseableRequestContext` is a bug in our own code, and
+  `NoClaimsSection` is a routing fault. All three render as one 401 with a fixed message,
+  and the specific reason goes to the log rather than to the caller.
+
+  A `local_fallback` is refused **at construction** in a production environment, not on the
+  first request. A misconfiguration that only surfaces when an authenticated request
+  arrives is one that reaches production and waits.
+
+- Storage interfaces with a DynamoDB and an in-memory implementation each:
+  `CredentialStore`, `RefreshTokenStore`, `IdentityTokenStore`, gathered in `IdentityStores`.
+
+  Per-entity tables, not single-table, with the key design in the module docstring. TTL is a
+  table-level setting, so mixing an expiring entity with a permanent one means the permanent
+  items carry a TTL attribute that must never be set, and one bug silently deletes accounts.
+
+  Only the SHA-256 of a token is stored, so a read of the table cannot be turned into a
+  working session. `consume` is one conditional `UpdateItem` returning the prior state, not
+  a read followed by a write: two concurrent refreshes both reading an unconsumed record is
+  exactly the condition reuse detection exists to notice.
+
+  The in-memory stores ship in the package rather than in the tests, because every consuming
+  product would otherwise write one slightly differently, and a store whose expiry semantics
+  differ from the real one is a suite that passes on behaviour production does not have.
+
+- `build_identity_router(settings, hooks, stores)`, which a product mounts with no prefix.
+
+  Both `.well-known` documents carry an explicit `Cache-Control`: 300 seconds for the JWKS
+  and 3600 for discovery. The asymmetry is deliberate. Rotation moves through the JWKS, and
+  a long cache there is what turns the promotion step into an outage.
+
+  `hooks` and `stores` are accepted and held but unused in 0.9.0, so a product's composition
+  root is written once rather than gaining an argument at every milestone.
+
+### Changed
+
+- `src/webbpulse/identity.py` is now `src/webbpulse/identity/tokens.py`, and
+  `webbpulse.identity` is a package re-exporting the entire M0 surface. No import changes.
+
+### Notes
+
+- No new dependencies. The `identity` extra is unchanged at `PyJWT[crypto]>=2.9` and
+  `fastapi>=0.115`; boto3 stays out of it, because the module takes a KMS client rather than
+  constructing one.
+- moto cannot be used for the KMS signing tests. Against moto 5.2.3, `create_key` and `sign`
+  succeed but `get_public_key` returns `KeySpec: None` and the signature does not verify
+  against the public key moto itself returns. The tests use a local RSA key behind the same
+  `KmsClient` protocol, which differs from KMS only in who holds the private key.
+
 ## 0.8.0
 
 Adoption ergonomics. Two services took 0.7.0 (WebbPulse-Portfolio #153, CarModPicker #380)
@@ -31,11 +144,11 @@ same stream, and the same `MetricsEmitter` defaults.
   ```python
   from webbpulse.http import user_id_dependency
 
-  CurrentUser = user_id_dependency(get_current_user)   # get_current_user may stay `def`
+  CurrentUser = user_id_dependency(get_current_user)  # get_current_user may stay `def`
+
 
   @router.get("/me")
-  async def me(user: User = Depends(CurrentUser)) -> UserRead:
-      ...
+  async def me(user: User = Depends(CurrentUser)) -> UserRead: ...
   ```
 
   - `user_id_dependency` returns an `async def` dependency that resolves the service's own
@@ -111,8 +224,8 @@ library only and have no extra, so every consumer gets them on the base install.
   ```python
   from webbpulse.log_context import set_user_id, task_context
 
-  set_user_id(user.id)                    # in the authentication dependency
-  with task_context("crawler", job_id):   # for work outside any request
+  set_user_id(user.id)  # in the authentication dependency
+  with task_context("crawler", job_id):  # for work outside any request
       run()
   ```
 
@@ -233,7 +346,7 @@ first.
   from webbpulse.identity import KmsSigner, identity_router, public_jwk_from_kms
 
   signer = KmsSigner(kms_client, key_id)
-  jwk = public_jwk_from_kms(kms_client, key_id)   # cache per execution environment
+  jwk = public_jwk_from_kms(kms_client, key_id)  # cache per execution environment
   app.include_router(identity_router(issuer=issuer, jwks=lambda: [jwk]))
   ```
 

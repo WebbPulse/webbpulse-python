@@ -6,4 +6,4 @@ version from the git tag instead would make an sdist built outside a checkout un
 and CodeArtifact rejects that.
 """
 
-__version__ = "0.8.0"
+__version__ = "0.9.0"
