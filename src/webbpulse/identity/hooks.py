@@ -164,6 +164,23 @@ class IdentityHooks(Protocol):
         """
         ...
 
+    def create_user(self, *, email: str, attributes: Mapping[str, Any]) -> Mapping[str, Any]:
+        """Create the user row for a registration and return it.
+
+        Section 4.2 gives the `users` table to the product's own domain, so the package
+        cannot write that row itself: it does not know the product's schema, its username
+        rules, or which columns are required. Registration therefore hands the product an
+        email and the authentication attributes it computed, and the product decides what a
+        user record is.
+
+        The returned mapping must carry the immutable user id under `id`, because that is
+        what becomes the `sub` claim and the partition key of every credential.
+
+        Called before `on_user_created`, which is for side effects rather than for the row
+        itself. Raising fails the registration.
+        """
+        ...
+
     def user_repository(self) -> object:
         """The product's own users table, as a `webbpulse.dynamodb.Repository`.
 
@@ -215,6 +232,9 @@ class BaseIdentityHooks:
     def on_user_created(self, user: Mapping[str, Any], via: str) -> None:
         """Nothing. Correct for a product with no side effects, so it is the default."""
         return None
+
+    def create_user(self, *, email: str, attributes: Mapping[str, Any]) -> Mapping[str, Any]:
+        raise self._not_implemented("create_user")
 
     def user_repository(self) -> object:
         raise self._not_implemented("user_repository")

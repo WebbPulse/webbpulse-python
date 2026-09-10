@@ -1709,7 +1709,43 @@ implementation had to close it. None of these changes a decision the standard al
    public key it returns, as a raw message or as a prehashed digest. The tests use a local
    RSA key behind the same `KmsClient` protocol instead, which is faithful in the two ways
    the output depends on.
-| **M2** | Password flows: register, login, change, policy, dummy-hash equalisation, lockout, `credentials` table. Sessions: families, rotation, reuse detection, grace window, logout, logout-all | 0.7.0 | 5 to 7 |
+| **M2** | Password flows: register, login, change, policy, dummy-hash equalisation, lockout, `credentials` table. Sessions: families, rotation, reuse detection, grace window, logout, logout-all. *Delivered 2026-09-09 in 0.10.0. Six routes under `/api/auth`, mounted only when a product supplies hooks and a credential store, so M1's three-route surface is unchanged for anyone who does not. Decisions recorded below.* | 0.10.0 | 5 to 7 |
+#### M2 decisions, 2026-09-09
+
+Same purpose as the M1 block: places where the standard left a choice open, or where
+implementing the flows showed something the standard did not say.
+
+1. **`create_user` is a new hook.** Section 4.2 gives the `users` table to the product's own
+   domain, and section 6.3's hook list had no way for the package to create that row, so
+   registration could hash a password and then have nowhere to put the account. The package
+   owns `credentials`, the product owns `users`, and the hook is the seam between them.
+2. **`RefreshTokenRecord` carries `family_started_at`.** The 90 day absolute cap is a
+   property of the family rather than of any one token, and nothing in section 4.4 held it.
+   Without it the cap is unenforceable: each rotation would extend the rolling 30 day window
+   with no memory of when the family began. It defaults to empty, and a record missing it
+   falls back to the current token's own start, so a rolling deploy does not invalidate
+   sessions issued by the previous version.
+3. **The grace window mints a new token rather than re-handing the successor.** Section 2.6
+   describes `refresh_reuse_grace` as returning the same successor to a client that raced
+   itself. Only the successor's SHA-256 is stored, so the plaintext no longer exists to
+   re-hand. The replay instead mints a fresh token at the successor's generation, which
+   gives the racing client a working session without treating the replay as reuse.
+4. **`revoke_all_for_user` stays unimplemented on DynamoDB, and gains `except_family_id`.**
+   M1 decision 3 deferred the index question to M2. The answer is that M2 does not need it:
+   change-password and logout-all both know the family ids they are revoking, so they revoke
+   by id through the existing GSI. Adding a user index would cost a write on every rotation
+   of the hot path to serve a cold one. The `except_family_id` parameter is what lets change
+   password revoke every other session while leaving the caller signed in.
+5. **A refused cross-site request does not clear the refresh cookie.** The `Sec-Fetch-Site`
+   check on refresh and logout returns 403 without touching the cookie. Clearing it would
+   let any attacker page sign a victim out by provoking one refused request, turning a CSRF
+   defence into the denial of service it exists to prevent.
+6. **Login attempts are ordered by a monotonic sequence, not by timestamp alone.** Section
+   5.4 clears the lockout count on any success. `attempted_at` at one second resolution ties
+   a failure with the retry that succeeds, and if the tie resolves the wrong way the count
+   is never cleared and a correct sign-in locks the account. Attempts are stamped to the
+   millisecond and the in-memory store breaks remaining ties by insertion order.
+
 | **M3** | Email: SES sender, templates, verification, reset. Contract tests for JWKS and discovery against a real deployed authorizer | 0.7.0 | 3 to 4 |
 | **M4** | TOTP with KMS envelope encryption, recovery codes, the MFA ticket, step-up, `amr` | 0.8.0 | 4 to 5 |
 | **M5** | Passkeys: both ceremonies, challenge lifecycle, counter checking, passwordless | 0.9.0 | 5 to 6 |

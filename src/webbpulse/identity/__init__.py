@@ -16,18 +16,23 @@ the standard fixes is here.
 - `storage`: the abstract stores, the DynamoDB implementations, and the in-memory ones.
 - `claims`: `authorizer_claims`, reading and coercing what the gateway authorizer put on
   the request.
+- `passwords`: section 5.6's policy and section 5.3's dummy-hash timing equalisation.
+- `lockout`: section 5.1's progressive lockout and the `login-attempts` store.
+- `sessions`: `SessionService`, the refresh family state machine.
+- `flows`: `IdentityFlows`, the M2 flow logic with no FastAPI imports.
 - `router`: `build_identity_router`, which is what a product mounts.
 
-## What 0.9.0 does and does not do
+## What 0.10.0 does and does not do
 
-M1 builds the **foundations**: configuration, the policy seam, the storage interfaces, the
-token service, and claim reading. The router mounts only the two `.well-known` documents
-and `/health`.
+M1 built the **foundations**: configuration, the policy seam, the storage interfaces, the
+token service, and claim reading.
 
-The flows are deliberately absent. Login, refresh rotation, MFA, passkeys and OAuth are M2
-and later, per section 9.1 of the standard. `IdentityHooks` and `IdentityStores` are already
-arguments to `build_identity_router` so that adding them changes routes rather than every
-product's composition root.
+M2 adds the **password and session flows**: register, login, change password, refresh with
+rotation and reuse detection, logout and logout-all. The router mounts them when a product
+supplies hooks and stores, and mounts only the three documents when it does not.
+
+Email verification and reset are M3, TOTP and recovery codes are M4, passkeys are M5 and
+OAuth is M6, per section 9.1 of the standard.
 
 ## The two things most likely to go wrong
 
@@ -53,19 +58,65 @@ from webbpulse.identity.claims import (
     coerce_claims,
     read_authorizer_claims,
 )
+from webbpulse.identity.flows import (
+    INVALID_CREDENTIALS_MESSAGE,
+    PASSWORD_CREDENTIAL_TYPE,
+    AuthResult,
+    IdentityFlows,
+    LoginRejected,
+    RateLimited,
+)
 from webbpulse.identity.hooks import (
     AuthenticationRefused,
     BaseIdentityHooks,
     HookNotImplemented,
     IdentityHooks,
 )
+from webbpulse.identity.lockout import (
+    ATTEMPT_TTL,
+    LOCKOUT_BASE_DELAY,
+    LOCKOUT_MAX_DELAY,
+    LOCKOUT_THRESHOLD,
+    LOGIN_ATTEMPTS_TABLE,
+    DynamoLoginAttemptStore,
+    InMemoryLoginAttemptStore,
+    LockoutState,
+    LoginAttempt,
+    LoginAttemptStore,
+    email_key,
+    ip_key,
+    lockout_state,
+    new_attempt,
+)
+from webbpulse.identity.passwords import (
+    MAX_PASSWORD_BYTES,
+    MIN_PASSWORD_CHARACTERS,
+    PasswordRejected,
+    check_password,
+    equalise_password_timing,
+    normalise_password,
+)
 from webbpulse.identity.router import (
+    ALLOWED_FETCH_SITES,
+    AUTH_PREFIX,
     DISCOVERY_CACHE_CONTROL,
     HEALTH_PATH,
     JWKS_CACHE_CONTROL,
+    LOGIN_PATH,
+    LOGOUT_ALL_PATH,
+    LOGOUT_PATH,
+    PASSWORD_PATH,
+    REFRESH_PATH,
+    REGISTER_PATH,
     build_identity_router,
 )
 from webbpulse.identity.service import REGISTERED_CLAIMS, InvalidToken, TokenService
+from webbpulse.identity.sessions import (
+    IssuedRefresh,
+    RotationOutcome,
+    RotationResult,
+    SessionService,
+)
 from webbpulse.identity.settings import IdentitySettings
 from webbpulse.identity.storage import (
     CREDENTIALS_TABLE,
@@ -115,7 +166,10 @@ from webbpulse.identity.tokens import (
 )
 
 __all__ = [
+    "ALLOWED_FETCH_SITES",
     "ARRAY_CLAIMS",
+    "ATTEMPT_TTL",
+    "AUTH_PREFIX",
     "BOOLEAN_CLAIMS",
     "CREDENTIALS_TABLE",
     "DIGEST_MESSAGE_TYPE",
@@ -124,15 +178,30 @@ __all__ = [
     "HEALTH_PATH",
     "IDENTITY_TOKENS_TABLE",
     "INTEGER_CLAIMS",
+    "INVALID_CREDENTIALS_MESSAGE",
     "JWKS_CACHE_CONTROL",
     "JWKS_PATH",
     "JWS_ALGORITHM",
     "KMS_KEY_SPEC",
     "KMS_SIGNING_ALGORITHM",
+    "LOCKOUT_BASE_DELAY",
+    "LOCKOUT_MAX_DELAY",
+    "LOCKOUT_THRESHOLD",
+    "LOGIN_ATTEMPTS_TABLE",
+    "LOGIN_PATH",
+    "LOGOUT_ALL_PATH",
+    "LOGOUT_PATH",
+    "MAX_PASSWORD_BYTES",
+    "MIN_PASSWORD_CHARACTERS",
+    "PASSWORD_CREDENTIAL_TYPE",
+    "PASSWORD_PATH",
     "REFRESH_FAMILY_INDEX",
+    "REFRESH_PATH",
     "REFRESH_TOKENS_TABLE",
     "REGISTERED_CLAIMS",
+    "REGISTER_PATH",
     "USERS_TABLE",
+    "AuthResult",
     "AuthenticationRefused",
     "AuthorizerClaims",
     "BaseIdentityHooks",
@@ -141,8 +210,10 @@ __all__ = [
     "CredentialStore",
     "DynamoCredentialStore",
     "DynamoIdentityTokenStore",
+    "DynamoLoginAttemptStore",
     "DynamoRefreshTokenStore",
     "HookNotImplemented",
+    "IdentityFlows",
     "IdentityHooks",
     "IdentitySettings",
     "IdentityStores",
@@ -150,14 +221,25 @@ __all__ = [
     "IdentityTokenStore",
     "InMemoryCredentialStore",
     "InMemoryIdentityTokenStore",
+    "InMemoryLoginAttemptStore",
     "InMemoryRefreshTokenStore",
     "InvalidToken",
+    "IssuedRefresh",
     "KmsClient",
     "KmsSigner",
+    "LockoutState",
+    "LoginAttempt",
+    "LoginAttemptStore",
+    "LoginRejected",
     "MissingRequestContext",
     "NoClaimsSection",
+    "PasswordRejected",
+    "RateLimited",
     "RefreshTokenRecord",
     "RefreshTokenStore",
+    "RotationOutcome",
+    "RotationResult",
+    "SessionService",
     "TokenMintingDisabled",
     "TokenService",
     "UnparseableRequestContext",
@@ -165,14 +247,21 @@ __all__ = [
     "build_discovery_document",
     "build_identity_router",
     "build_jwks",
+    "check_password",
     "coerce_claims",
     "constant_time_equals",
+    "email_key",
+    "equalise_password_timing",
     "hash_token",
     "identity_router",
+    "ip_key",
     "is_expired",
     "kid_for_der",
+    "lockout_state",
     "mint_test_token",
+    "new_attempt",
     "new_token",
+    "normalise_password",
     "public_jwk_from_kms",
     "read_authorizer_claims",
 ]
