@@ -19,6 +19,28 @@ endpoint by upgrading. M1's route test passes unchanged.
 **Still absent**, per section 9.1: email verification and reset (M3), TOTP and MFA (M4),
 passkeys (M5), OAuth (M6).
 
+### Breaking
+
+- **Every route now mounts under the issuer's path.** 0.9.0 served the two `.well-known`
+  documents at the origin whatever the issuer said, which is correct only for an issuer with
+  no path. For the standard's own `https://<host>/api/auth` issuer the documents belong at
+  `/api/auth/.well-known/...`, because API Gateway builds the discovery URL by appending to
+  the issuer and `jwks_uri` is advertised the same way. `build_identity_router` now derives
+  the prefix from `settings.issuer` and mounts everything under it, `/health` included.
+
+  The Portfolio pilot hit this against 0.9.0: a test that followed the served `jwks_uri`
+  found a 404, and the workaround was to mount the router with `prefix="/api/auth"`. **Remove
+  that prefix when upgrading**, or every route doubles to `/api/auth/api/auth/...`. A product
+  whose issuer has no path is unaffected: it still gets origin paths.
+
+  `AUTH_PREFIX` is gone, replaced by `identity_prefix(settings)`. The `REGISTER_PATH`,
+  `LOGIN_PATH`, `PASSWORD_PATH`, `REFRESH_PATH`, `LOGOUT_PATH` and `LOGOUT_ALL_PATH`
+  constants are now suffixes relative to that prefix rather than absolute paths.
+
+- **`cookie_path` defaults to the issuer's path** rather than a literal `/api/auth`, so the
+  cookie is scoped to exactly the routes that spend it however the issuer is configured. An
+  explicitly set `cookie_path` still wins. An issuer with no path scopes the cookie to `/`.
+
 ### Added
 
 - `IdentityFlows`, the flow layer, with no FastAPI import anywhere in it. `register`,

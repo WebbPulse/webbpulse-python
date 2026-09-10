@@ -624,8 +624,32 @@ covers that per product.
 
 ### 3.4 JWKS and discovery
 
-`GET /.well-known/jwks.json` returns, per RFC 7517, a `keys` array. Each RSA verification
-key is:
+**Both documents are served under the issuer's path, not at the origin.** For the
+`https://<host>/api/auth` issuer this document specifies in 6.1, that is:
+
+```
+GET /api/auth/.well-known/openid-configuration
+GET /api/auth/.well-known/jwks.json
+```
+
+The paths below are written relative to the issuer for brevity. An issuer with no path,
+such as the one the M0 spike used, gives the origin paths instead, and both shapes are
+supported: `build_identity_router` derives the prefix from `settings.issuer` and mounts
+every route under it, so a product mounts the router with no prefix of its own.
+
+The issuer's path is authoritative because API Gateway builds the discovery URL by
+appending to the issuer, as the M0 evidence below shows, and the discovery document
+advertises `jwks_uri` the same way. Neither URL is ours to choose once the issuer is set.
+
+This is a correction. Package 0.9.0 served both documents at the origin whatever the issuer
+said, which is right only for a path-less issuer. The Portfolio pilot found it against this
+document's own issuer: a test that followed the served `jwks_uri` got a 404, and the
+workaround was to mount the router under a hand-written `/api/auth`. Package 0.10.0 derives
+the prefix, so the workaround is unnecessary and the doubled `/api/auth/api/auth` it would
+otherwise now produce is impossible.
+
+`GET <issuer path>/.well-known/jwks.json` returns, per RFC 7517, a `keys` array. Each RSA
+verification key is:
 
 ```json
 {
@@ -642,7 +666,8 @@ key is:
 the identity service parses it once and caches the JWK in module state for the life of the
 execution environment. This is a read of a public key, so caching it is safe.
 
-`GET /.well-known/openid-configuration` returns the five members OIDC Discovery requires
+`GET <issuer path>/.well-known/openid-configuration` returns the five members OIDC Discovery
+requires
 (`issuer`, plus `jwks_uri`, `response_types_supported`, `subject_types_supported`,
 `id_token_signing_alg_values_supported`), with `issuer` byte-identical to the `iss` claim
 and to the authorizer's configured issuer. A trailing-slash mismatch here is the classic
@@ -651,6 +676,10 @@ failure and presents as every request being denied with no useful message.
 **Confirmed by M0.** API Gateway appends `/.well-known/openid-configuration` to the
 configured issuer. It does not require the issuer to serve the document at its root, and it
 does not go straight to a JWKS.
+
+Note that the M0 spike ran with a path-less issuer, so appending to the issuer and serving
+at the origin happened to be the same thing. That coincidence is why 0.9.0's origin-only
+routing survived M0 and was not found until the Portfolio pilot used the real issuer.
 
 It is stricter than that, in a way nothing in the documentation prepares you for: **the
 fetch happens at `CreateAuthorizer` time, not only when a request is verified.** The
@@ -1392,6 +1421,40 @@ def build() -> APIRouter:
         client_secrets=secrets,
     )
 ```
+
+**Mount the returned router with no prefix**, even in a service whose other routers sit
+under `/api/v1`:
+
+```python
+app.include_router(build())
+```
+
+The router places itself under the issuer's path. With the `issuer` above every route lands
+under `/api/auth`:
+
+```
+GET  /api/auth/.well-known/openid-configuration
+GET  /api/auth/.well-known/jwks.json
+GET  /api/auth/health
+POST /api/auth/register
+POST /api/auth/login
+POST /api/auth/password
+POST /api/auth/refresh
+POST /api/auth/logout
+POST /api/auth/logout-all
+```
+
+An issuer with no path gives the same routes at the origin. Adding a prefix of your own
+doubles the issuer path, giving `/api/auth/api/auth/login`, and puts the `.well-known`
+documents where API Gateway will not look for them.
+
+`cookie_path` follows the same source. Left unset it derives from the issuer's path, which
+scopes the refresh cookie to exactly the routes that spend it. Set it explicitly only to
+widen that deliberately.
+
+Package 0.9.0 served the two documents at the origin regardless of the issuer's path, and a
+product on that version needed `prefix="/api/auth"` to compensate. Remove that prefix when
+upgrading to 0.10.0. See 3.4.
 
 ### 6.3 `IdentityHooks`, the product's own policy
 

@@ -232,8 +232,13 @@ class IdentitySettings(BaseSettings):
         ),
     )
     cookie_path: str = Field(
-        default="/api/auth",
-        description="Scoped so no other domain's function ever receives the refresh cookie.",
+        default="",
+        description=(
+            "Scoped so no other domain's function ever receives the refresh cookie. Empty "
+            "derives it from the issuer's path, which is where the router mounts, so the "
+            "cookie is sent to exactly the routes that spend it. Set it explicitly to "
+            "override."
+        ),
     )
     cookie_samesite: Literal["lax", "strict", "none"] = Field(default="lax")
     cookie_secure: bool = Field(default=True)
@@ -327,6 +332,28 @@ class IdentitySettings(BaseSettings):
                 "same `kid` twice in the JWKS, which some verifiers reject."
             )
         return cleaned
+
+    @model_validator(mode="after")
+    def _default_cookie_path_to_issuer_path(self) -> IdentitySettings:
+        """Derive `cookie_path` from the issuer when it was not set explicitly.
+
+        The router mounts every route under the issuer's path, because that is where API
+        Gateway fetches discovery and where the advertised `jwks_uri` points. The refresh
+        cookie should be scoped to the same place: narrow enough that no other function on
+        the host ever receives it, wide enough to cover the routes that spend it.
+
+        Deriving rather than defaulting to a literal `/api/auth` is what keeps the two from
+        drifting. A product that moves its issuer to `https://host/auth` and leaves a
+        hardcoded cookie path behind gets a cookie the browser never sends to the refresh
+        route, and the symptom is a login that succeeds and then silently will not persist.
+
+        Ordered **before** `_check_cookie`, so the absolute-path check validates the value
+        that will actually be used rather than the empty sentinel. An origin issuer has no
+        path, and `/` is the correct scope there.
+        """
+        if not self.cookie_path:
+            self.cookie_path = urlparse(self.issuer).path.rstrip("/") or "/"
+        return self
 
     @model_validator(mode="after")
     def _check_cookie(self) -> IdentitySettings:

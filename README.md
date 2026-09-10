@@ -1034,13 +1034,17 @@ app.include_router(build_identity_router(settings, hooks, stores, tokens=tokens)
 | `authorizer_claims` | Reading and coercing what the authorizer put on the request |
 | `CredentialStore` and friends | Storage interfaces, with DynamoDB and in-memory implementations |
 
-**The flow routes mount conditionally.** `build_identity_router` adds the six `/api/auth`
-routes only when the product supplies both `hooks` and a credential store. Called without
-them it mounts exactly what M1 mounted, the two `.well-known` documents and `/health`, so a
-service that only serves a JWKS does not acquire a login endpoint by upgrading.
+**Every route mounts under the issuer's path, so mount the router with no prefix.** The
+gateway builds the discovery URL as `issuer + "/.well-known/openid-configuration"` and
+`jwks_uri` is advertised the same way, so the issuer decides where the routes live.
+`build_identity_router` derives the prefix and places itself there. With the standard's
+`https://<host>/api/auth` issuer:
 
 | Route | What it does |
 | --- | --- |
+| `GET /api/auth/.well-known/openid-configuration` | Discovery, fetched by the gateway at authorizer creation |
+| `GET /api/auth/.well-known/jwks.json` | The verification keys, followed out of discovery |
+| `GET /api/auth/health` | The probe shape every service in the estate shares |
 | `POST /api/auth/register` | Creates an account through the `create_user` hook and signs it in |
 | `POST /api/auth/login` | Verifies a password, applies lockout, starts a refresh family |
 | `POST /api/auth/password` | Changes a password and revokes every other session |
@@ -1048,11 +1052,23 @@ service that only serves a JWKS does not acquire a login endpoint by upgrading.
 | `POST /api/auth/logout` | Revokes the presented family |
 | `POST /api/auth/logout-all` | Revokes every family for the user |
 
+An issuer with no path gives the same routes at the origin. Adding a prefix of your own
+doubles the issuer path and hides the documents from the gateway. **This changed in
+0.10.0**: 0.9.0 served the documents at the origin regardless of the issuer, so a product
+that compensated with `prefix="/api/auth"` must drop it when upgrading.
+
+**The flow routes mount conditionally.** The six `POST` routes appear only when the product
+supplies both `hooks` and a credential store. Called without them the router mounts exactly
+what M1 mounted, the two `.well-known` documents and `/health`, so a service that only
+serves a JWKS does not acquire a login endpoint by upgrading.
+
 **The access token is returned in the JSON body and the refresh token is a cookie.** The
 access token is short-lived, ten minutes by default, and is never set as a cookie: it is
 carried in an `Authorization` header where no browser will send it automatically. The
 refresh token is the opposite, an httpOnly Secure SameSite=Lax cookie scoped to
-`cookie_path`, so no script can read it and no cross-site form can spend it.
+`cookie_path`, so no script can read it and no cross-site form can spend it. `cookie_path`
+defaults to the issuer's path, the same place the routes mount, so the cookie reaches
+exactly what spends it.
 
 **Rotation detects reuse, and reuse revokes the family.** Every refresh consumes the
 presented token and mints its successor in one conditional write, so two concurrent

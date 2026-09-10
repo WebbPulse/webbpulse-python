@@ -49,6 +49,7 @@ from webbpulse.identity import (
     build_identity_router,
     coerce_claims,
     hash_token,
+    identity_prefix,
     is_expired,
     new_token,
     read_authorizer_claims,
@@ -509,18 +510,28 @@ def build_app(kms: MultiKeyFakeKms, **kwargs: Any) -> Any:
 
 
 def test_router_exposes_exactly_the_intended_routes(kms: MultiKeyFakeKms) -> None:
-    """M1 mounts three routes. A flow route appearing here is a milestone leaking early."""
+    """M1 mounts three routes. A flow route appearing here is a milestone leaking early.
+
+    The paths carry the issuer's own path, `/api/auth` for this suite's `ISSUER`, because
+    that is where API Gateway fetches discovery and where the advertised `jwks_uri` points.
+    0.10.0 corrected this: 0.9.0 served them at the origin whatever the issuer said, so the
+    documents answered 200 at a path nothing fetched.
+    """
     from fastapi import FastAPI
 
     app = FastAPI()
-    router = build_identity_router(make_settings(), kms_client=kms)
+    settings = make_settings()
+    router = build_identity_router(settings, kms_client=kms)
     app.include_router(router)
+
+    prefix = identity_prefix(settings)
+    assert prefix == "/api/auth"
 
     paths = {route.path for route in router.routes}  # type: ignore[attr-defined]
     assert paths == {
-        "/.well-known/openid-configuration",
-        "/.well-known/jwks.json",
-        "/health",
+        f"{prefix}/.well-known/openid-configuration",
+        f"{prefix}/.well-known/jwks.json",
+        f"{prefix}/health",
     }
 
 
@@ -530,12 +541,12 @@ def test_documents_are_served_with_cache_control(kms: MultiKeyFakeKms) -> None:
 
     client = TestClient(build_app(kms))
 
-    discovery = client.get("/.well-known/openid-configuration")
+    discovery = client.get("/api/auth/.well-known/openid-configuration")
     assert discovery.status_code == 200
     assert discovery.headers["cache-control"] == DISCOVERY_CACHE_CONTROL
     assert discovery.json()["issuer"] == ISSUER
 
-    jwks = client.get("/.well-known/jwks.json")
+    jwks = client.get("/api/auth/.well-known/jwks.json")
     assert jwks.status_code == 200
     assert jwks.headers["cache-control"] == JWKS_CACHE_CONTROL
     assert len(jwks.json()["keys"]) == 1
@@ -555,7 +566,7 @@ def test_health_matches_the_package_shape(kms: MultiKeyFakeKms) -> None:
     app.include_router(
         build_identity_router(make_settings(), kms_client=kms, service="identity", version="0.9.0")
     )
-    body = TestClient(app).get("/health").json()
+    body = TestClient(app).get("/api/auth/health").json()
     assert body == {"status": "healthy", "service": "identity", "version": "0.9.0"}
 
 

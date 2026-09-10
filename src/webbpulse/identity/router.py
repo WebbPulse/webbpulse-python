@@ -2,21 +2,35 @@
 
 Always mounts the three anonymous documents:
 
-    GET /.well-known/openid-configuration
-    GET /.well-known/jwks.json
-    GET /health
+    GET <prefix>/.well-known/openid-configuration
+    GET <prefix>/.well-known/jwks.json
+    GET <prefix>/health
 
 and, when the product supplies `hooks` **and** a `stores` carrying the credential and
 refresh stores, the M2 password and session flows:
 
-    POST /api/auth/register
-    POST /api/auth/login
-    POST /api/auth/password
-    POST /api/auth/refresh
-    POST /api/auth/logout
-    POST /api/auth/logout-all
+    POST <prefix>/register
+    POST <prefix>/login
+    POST <prefix>/password
+    POST <prefix>/refresh
+    POST <prefix>/logout
+    POST <prefix>/logout-all
 
 MFA, passkeys and OAuth are M4 to M6, per section 9.1 of `docs/identity-standard.md`.
+
+## Where `<prefix>` comes from, and why you mount with no prefix of your own
+
+`<prefix>` is the issuer's path: `/api/auth` for the standard's
+`https://<host>/api/auth`, and empty for an issuer with no path, which gives origin paths.
+The router places itself there, so **mount it with no prefix**.
+
+It is the issuer's path because that is where API Gateway and the advertised `jwks_uri`
+look. The gateway builds the discovery URL as `issuer + "/.well-known/openid-configuration"`
+at `CreateAuthorizer` time, and `settings.jwks_uri` advertises the JWKS the same way.
+Neither URL is ours to choose once the issuer is set, so the routes go where they point.
+
+0.9.0 served the documents at the origin regardless of the issuer's path, which was wrong
+for the standard's own issuer and is fixed here. See `identity_prefix`.
 
 ## Why the flows mount conditionally
 
@@ -61,6 +75,7 @@ definition, and treating it as sensitive would be cargo cult.
 from __future__ import annotations
 
 from typing import TYPE_CHECKING, Any, Final, Literal
+from urllib.parse import urlsplit
 
 from webbpulse.identity.storage import IdentityStores
 from webbpulse.identity.tokens import DISCOVERY_PATH, JWKS_PATH
@@ -78,7 +93,6 @@ if TYPE_CHECKING:  # pragma: no cover - typing only
 
 __all__ = [
     "ALLOWED_FETCH_SITES",
-    "AUTH_PREFIX",
     "DISCOVERY_CACHE_CONTROL",
     "HEALTH_PATH",
     "JWKS_CACHE_CONTROL",
@@ -89,6 +103,7 @@ __all__ = [
     "REFRESH_PATH",
     "REGISTER_PATH",
     "build_identity_router",
+    "identity_prefix",
 ]
 
 #: One hour. The discovery document changes only when the issuer changes.
@@ -101,19 +116,17 @@ JWKS_CACHE_CONTROL = "public, max-age=300"
 #: path as every other service in the estate.
 HEALTH_PATH = "/health"
 
-#: The prefix every flow route sits under, and the value `cookie_path` defaults to.
+#: Flow route suffixes, relative to the issuer path the router mounts under.
 #:
-#: The two must agree. `Path=/api/auth` on the refresh cookie is what stops the cookie being
-#: attached to any other domain's routes (section 5.5), and a flow mounted outside this
-#: prefix would never receive it.
-AUTH_PREFIX = "/api/auth"
-
-REGISTER_PATH = f"{AUTH_PREFIX}/register"
-LOGIN_PATH = f"{AUTH_PREFIX}/login"
-PASSWORD_PATH = f"{AUTH_PREFIX}/password"
-REFRESH_PATH = f"{AUTH_PREFIX}/refresh"
-LOGOUT_PATH = f"{AUTH_PREFIX}/logout"
-LOGOUT_ALL_PATH = f"{AUTH_PREFIX}/logout-all"
+#: Suffixes rather than absolute paths, because the prefix is not knowable here: it comes
+#: from `settings.issuer`, and a product is free to issue from an origin or from a path.
+#: `identity_prefix()` computes it and `build_identity_router` joins the two.
+REGISTER_PATH = "/register"
+LOGIN_PATH = "/login"
+PASSWORD_PATH = "/password"
+REFRESH_PATH = "/refresh"
+LOGOUT_PATH = "/logout"
+LOGOUT_ALL_PATH = "/logout-all"
 
 #: Section 5.1's limits, as (limit, window seconds). Named here rather than inline so the
 #: table in the standard and the code can be diffed against each other by eye.
@@ -151,6 +164,33 @@ def _bind_fastapi_request() -> None:
         _FastAPIRequest = _Request
 
 
+def identity_prefix(settings: IdentitySettings) -> str:
+    """The path every identity route mounts under, taken from the issuer.
+
+    Returns the issuer's path with any trailing slash removed, so
+    `https://host/api/auth` gives `/api/auth` and `https://host` gives `""`. Joining a
+    suffix onto the result is always well formed: an empty prefix leaves the suffix's own
+    leading slash to do the work.
+
+    **Derived rather than configured, because the issuer already decides it.** API Gateway
+    builds the discovery URL as `issuer + "/.well-known/openid-configuration"` at
+    `CreateAuthorizer` time, and `settings.jwks_uri` advertises the JWKS the same way. Those
+    two URLs are not ours to choose once the issuer is set, so the routes have to be where
+    they point. A second setting for the mount path would be a second source of truth for
+    one fact, and the failure it invites is silent: the documents serve 200 at a path
+    nothing fetches, while the gateway gets a 404 and every authorized route in the product
+    fails closed.
+
+    This is a behaviour change from 0.9.0, which served the documents at the origin whatever
+    the issuer's path was. That was wrong for the standard's own `https://<host>/api/auth`
+    issuer, and the Portfolio pilot hit it: a test that followed the served `jwks_uri` found
+    a 404, and the workaround was to mount the router under a hand-written prefix. Deriving
+    the prefix here makes that workaround unnecessary, and makes the doubled
+    `/api/auth/api/auth` it would now produce impossible.
+    """
+    return urlsplit(settings.issuer).path.rstrip("/")
+
+
 def build_identity_router(
     settings: IdentitySettings,
     hooks: IdentityHooks | None = None,
@@ -185,9 +225,14 @@ def build_identity_router(
     `service` and `version` are what `/health` reports, matching the arguments
     `webbpulse.http.health_router` takes for the same purpose.
 
-    The paths are absolute, so mount this with no prefix even in a service whose other
-    routers sit under `/api/v1`. RFC 8615 defines `.well-known` paths relative to an origin,
-    and one moved under a prefix is not discoverable.
+    **Mount this with no prefix**, even in a service whose other routers sit under
+    `/api/v1`. The router places itself under the issuer's path, because that is where API
+    Gateway and the advertised `jwks_uri` look for it: the gateway builds the discovery URL
+    as `issuer + "/.well-known/openid-configuration"`, and `settings.jwks_uri` advertises
+    the JWKS the same way. For the standard's `https://<host>/api/auth` issuer every route
+    lands under `/api/auth`; for an issuer with no path they land at the origin. Adding a
+    prefix of your own puts the documents where nothing will look for them, or doubles the
+    issuer path if you mount under it by hand.
 
     Every route here is anonymous, deliberately. See the module docstring.
     """
@@ -206,6 +251,10 @@ def build_identity_router(
 
     resolved_stores = stores if stores is not None else IdentityStores()
 
+    # Every route hangs off the issuer's path. See `identity_prefix` for why this is derived
+    # rather than configured, and the docstring above for why the caller adds no prefix.
+    prefix = identity_prefix(settings)
+
     router = APIRouter(tags=["identity"])
 
     # Each returns an explicit `JSONResponse` rather than taking a `response: Response`
@@ -215,15 +264,15 @@ def build_identity_router(
     # parameter and answers 422 to every request. Returning the response sidesteps the
     # resolution problem entirely.
 
-    @router.get(DISCOVERY_PATH, include_in_schema=False)
+    @router.get(f"{prefix}{DISCOVERY_PATH}", include_in_schema=False)
     async def discovery_document() -> JSONResponse:
         return JSONResponse(tokens.discovery(), headers={"Cache-Control": DISCOVERY_CACHE_CONTROL})
 
-    @router.get(JWKS_PATH, include_in_schema=False)
+    @router.get(f"{prefix}{JWKS_PATH}", include_in_schema=False)
     async def jwks_document() -> JSONResponse:
         return JSONResponse(tokens.jwks(), headers={"Cache-Control": JWKS_CACHE_CONTROL})
 
-    @router.get(HEALTH_PATH, include_in_schema=False)
+    @router.get(f"{prefix}{HEALTH_PATH}", include_in_schema=False)
     async def health() -> dict[str, Any]:
         # Shape matches `webbpulse.http.health_router` so one probe configuration works
         # across every service. Deliberately does not call KMS: a health check that depends
@@ -238,6 +287,7 @@ def build_identity_router(
     if hooks is not None and resolved_stores.credentials is not None:
         _mount_flows(
             router,
+            prefix=prefix,
             settings=settings,
             hooks=hooks,
             stores=resolved_stores,
@@ -252,6 +302,7 @@ def build_identity_router(
 def _mount_flows(
     router: APIRouter,
     *,
+    prefix: str,
     settings: IdentitySettings,
     hooks: IdentityHooks,
     stores: IdentityStores,
@@ -376,7 +427,10 @@ def _mount_flows(
             **dict(result.extra),
         }
 
-    @router.post(REGISTER_PATH, dependencies=limits(("register", REGISTER_IP_LIMIT, "ip")))
+    @router.post(
+        f"{prefix}{REGISTER_PATH}",
+        dependencies=limits(("register", REGISTER_IP_LIMIT, "ip")),
+    )
     async def register(
         request: _FastAPIRequest, payload: dict[str, Any] = Body(...)
     ) -> JSONResponse:
@@ -409,7 +463,7 @@ def _mount_flows(
         )
 
     @router.post(
-        LOGIN_PATH,
+        f"{prefix}{LOGIN_PATH}",
         dependencies=limits(
             ("login-ip", LOGIN_IP_LIMIT, "ip"),
             ("login-email", LOGIN_EMAIL_LIMIT, "email"),
@@ -430,7 +484,7 @@ def _mount_flows(
             return rejected(request, exc)
         return set_refresh_cookie(JSONResponse(success_body(result)), result.refresh_token)
 
-    @router.post(PASSWORD_PATH)
+    @router.post(f"{prefix}{PASSWORD_PATH}")
     async def change_password(
         request: _FastAPIRequest, payload: dict[str, Any] = Body(...)
     ) -> JSONResponse:
@@ -464,7 +518,10 @@ def _mount_flows(
             return rejected(request, exc)
         return JSONResponse({"changed": True})
 
-    @router.post(REFRESH_PATH, dependencies=limits(("refresh", REFRESH_IP_LIMIT, "ip")))
+    @router.post(
+        f"{prefix}{REFRESH_PATH}",
+        dependencies=limits(("refresh", REFRESH_IP_LIMIT, "ip")),
+    )
     async def refresh(request: _FastAPIRequest) -> JSONResponse:
         if not _fetch_site_allowed(request):
             # The cookie is deliberately **not** cleared here, unlike every other refusal on
@@ -491,7 +548,7 @@ def _mount_flows(
             return clear_refresh_cookie(rejected(request, exc))
         return set_refresh_cookie(JSONResponse(success_body(result)), result.refresh_token)
 
-    @router.post(LOGOUT_PATH)
+    @router.post(f"{prefix}{LOGOUT_PATH}")
     async def logout(request: _FastAPIRequest) -> JSONResponse:
         if not _fetch_site_allowed(request):
             return rejected(
@@ -510,7 +567,7 @@ def _mount_flows(
         # their cookie was already dead is also a signal they should not get.
         return clear_refresh_cookie(JSONResponse({"signed_out": True}))
 
-    @router.post(LOGOUT_ALL_PATH)
+    @router.post(f"{prefix}{LOGOUT_ALL_PATH}")
     async def logout_all(request: _FastAPIRequest) -> JSONResponse:
         subject = _subject_from_request(request, tokens)
         if not subject:

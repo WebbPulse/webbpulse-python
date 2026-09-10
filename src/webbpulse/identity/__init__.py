@@ -98,7 +98,6 @@ from webbpulse.identity.passwords import (
 )
 from webbpulse.identity.router import (
     ALLOWED_FETCH_SITES,
-    AUTH_PREFIX,
     DISCOVERY_CACHE_CONTROL,
     HEALTH_PATH,
     JWKS_CACHE_CONTROL,
@@ -109,6 +108,7 @@ from webbpulse.identity.router import (
     REFRESH_PATH,
     REGISTER_PATH,
     build_identity_router,
+    identity_prefix,
 )
 from webbpulse.identity.service import REGISTERED_CLAIMS, InvalidToken, TokenService
 from webbpulse.identity.sessions import (
@@ -169,7 +169,6 @@ __all__ = [
     "ALLOWED_FETCH_SITES",
     "ARRAY_CLAIMS",
     "ATTEMPT_TTL",
-    "AUTH_PREFIX",
     "BOOLEAN_CLAIMS",
     "CREDENTIALS_TABLE",
     "DIGEST_MESSAGE_TYPE",
@@ -253,6 +252,7 @@ __all__ = [
     "email_key",
     "equalise_password_timing",
     "hash_token",
+    "identity_prefix",
     "identity_router",
     "ip_key",
     "is_expired",

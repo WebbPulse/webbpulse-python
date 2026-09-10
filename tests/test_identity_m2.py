@@ -30,6 +30,7 @@ from __future__ import annotations
 
 from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING, Any
+from urllib.parse import urlsplit
 
 import pytest
 
@@ -49,6 +50,7 @@ from webbpulse.identity import (
     check_password,
     email_key,
     hash_token,
+    identity_prefix,
     ip_key,
     lockout_state,
     new_attempt,
@@ -1140,9 +1142,9 @@ def test_the_documents_alone_mount_without_hooks_or_stores(kms: FakeKms) -> None
     router = build_identity_router(make_settings(), kms_client=kms)
     paths = {route.path for route in router.routes}  # type: ignore[attr-defined]
     assert paths == {
-        "/.well-known/openid-configuration",
-        "/.well-known/jwks.json",
-        "/health",
+        "/api/auth/.well-known/openid-configuration",
+        "/api/auth/.well-known/jwks.json",
+        "/api/auth/health",
     }
 
 
@@ -1152,9 +1154,9 @@ def test_the_flows_mount_when_hooks_and_stores_are_supplied(
     router = build_identity_router(make_settings(), hooks, stores, kms_client=kms)
     paths = {route.path for route in router.routes}  # type: ignore[attr-defined]
     assert paths == {
-        "/.well-known/openid-configuration",
-        "/.well-known/jwks.json",
-        "/health",
+        "/api/auth/.well-known/openid-configuration",
+        "/api/auth/.well-known/jwks.json",
+        "/api/auth/health",
         "/api/auth/register",
         "/api/auth/login",
         "/api/auth/password",
@@ -1164,17 +1166,128 @@ def test_the_flows_mount_when_hooks_and_stores_are_supplied(
     }
 
 
+def test_an_origin_issuer_mounts_every_route_at_the_origin(
+    kms: FakeKms, hooks: FakeHooks, stores: IdentityStores
+) -> None:
+    """The prefix is the issuer's path, so no path means origin paths.
+
+    The counterpart to the test above. Both shapes have to work: the standard's issuer has
+    a path, and a product that issues from a dedicated host has none.
+    """
+    settings = make_settings(issuer="https://identity.example.com")
+    router = build_identity_router(settings, hooks, stores, kms_client=kms)
+    paths = {route.path for route in router.routes}  # type: ignore[attr-defined]
+    assert paths == {
+        "/.well-known/openid-configuration",
+        "/.well-known/jwks.json",
+        "/health",
+        "/register",
+        "/login",
+        "/password",
+        "/refresh",
+        "/logout",
+        "/logout-all",
+    }
+
+
+@pytest.mark.parametrize(
+    "issuer",
+    ["https://api.staging.example.com/api/auth", "https://identity.example.com"],
+)
+def test_the_advertised_jwks_uri_resolves_to_the_served_jwks(issuer: str, kms: FakeKms) -> None:
+    """Follow the URL the discovery document advertises, rather than a path written here.
+
+    This is the test that would have caught the 0.9.0 bug, and the reason it is written this
+    way. API Gateway does not read our test constants: it fetches
+    `issuer + "/.well-known/openid-configuration"`, reads `jwks_uri` out of the response and
+    fetches that. A test asserting a hardcoded `/.well-known/jwks.json` answers 200 passes
+    happily while the gateway gets a 404 and every authorized route in the product fails
+    closed. Following the served URL is the only version that checks the thing that matters.
+
+    Parametrized over both issuer shapes because the bug lives in the difference between
+    them: an origin issuer worked in 0.9.0 and an issuer with a path did not.
+    """
+    from fastapi import FastAPI
+    from fastapi.testclient import TestClient
+
+    from webbpulse.identity.tokens import DISCOVERY_PATH
+
+    settings = make_settings(issuer=issuer)
+    app = FastAPI()
+    app.include_router(build_identity_router(settings, kms_client=kms))
+
+    origin = urlsplit(issuer)
+    base_url = f"{origin.scheme}://{origin.netloc}"
+    client = TestClient(app, base_url=base_url)
+
+    # The gateway builds this URL itself, from the issuer alone.
+    discovery = client.get(f"{settings.issuer}{DISCOVERY_PATH}")
+    assert discovery.status_code == 200
+    assert discovery.json()["issuer"] == settings.issuer
+
+    # And then follows whatever the document advertises.
+    advertised = discovery.json()["jwks_uri"]
+    assert advertised == settings.jwks_url
+    jwks = client.get(advertised)
+    assert jwks.status_code == 200
+    assert jwks.json()["keys"]
+
+
+@pytest.mark.parametrize(
+    ("issuer", "prefix"),
+    [
+        ("https://api.staging.example.com/api/auth", "/api/auth"),
+        ("https://identity.example.com", ""),
+    ],
+)
+def test_the_flow_routes_sit_under_the_same_prefix_as_the_documents(
+    issuer: str, prefix: str, kms: FakeKms, hooks: FakeHooks, stores: IdentityStores
+) -> None:
+    """One prefix for everything, so the cookie scope covers the routes that spend it."""
+    settings = make_settings(issuer=issuer)
+    router = build_identity_router(settings, hooks, stores, kms_client=kms)
+    paths = {route.path for route in router.routes}  # type: ignore[attr-defined]
+
+    assert identity_prefix(settings) == prefix
+    assert f"{prefix}/login" in paths
+    assert f"{prefix}/refresh" in paths
+    assert f"{prefix}/.well-known/jwks.json" in paths
+    assert all(path.startswith(prefix) for path in paths)
+
+
 def test_the_flow_prefix_matches_the_cookie_path() -> None:
     """A flow mounted outside `cookie_path` would never receive the cookie.
 
-    Section 5.5 scopes the cookie to `/api/auth` so it is not attached to any other domain's
-    routes. That protection only works if the routes that need it live under that path.
+    Section 5.5 scopes the cookie so it is not attached to any other domain's routes. That
+    protection only works if the routes that need it live under that path, which is why
+    both are derived from the issuer rather than written down twice.
     """
-    from webbpulse.identity.router import AUTH_PREFIX, REFRESH_PATH
+    from webbpulse.identity.router import REFRESH_PATH, identity_prefix
 
     settings = make_settings()
-    assert settings.cookie_path == AUTH_PREFIX
-    assert REFRESH_PATH.startswith(settings.cookie_path)
+    prefix = identity_prefix(settings)
+    assert prefix == "/api/auth"
+    assert settings.cookie_path == prefix
+    assert f"{prefix}{REFRESH_PATH}".startswith(settings.cookie_path)
+
+
+def test_an_origin_issuer_scopes_the_cookie_to_the_root() -> None:
+    """An issuer with no path mounts at the origin, so the cookie covers the origin.
+
+    `""` would not be a legal cookie path, so the derivation floors at `/`. Worth its own
+    test because the empty prefix and the empty cookie path are the same input producing
+    two deliberately different answers.
+    """
+    settings = make_settings(issuer="https://identity.example.com")
+    assert identity_prefix(settings) == ""
+    assert settings.cookie_path == "/"
+
+
+def test_an_explicit_cookie_path_overrides_the_issuer() -> None:
+    """Derivation is a default, not a rule. A product that needs a wider scope can say so."""
+    settings = make_settings(cookie_path="/")
+    assert identity_prefix(settings) == "/api/auth"
+    assert settings.cookie_path == "/"
 
 
 def test_login_sets_an_httponly_secure_samesite_lax_cookie(
@@ -1487,6 +1600,6 @@ def test_the_documents_still_answer_when_the_flows_are_mounted(
     either fails the authorizer cannot retrieve the signing key and every authorized route
     in the product fails closed.
     """
-    assert client.get("/.well-known/jwks.json").status_code == 200
-    assert client.get("/.well-known/openid-configuration").status_code == 200
-    assert client.get("/health").json()["status"] == "healthy"
+    assert client.get("/api/auth/.well-known/jwks.json").status_code == 200
+    assert client.get("/api/auth/.well-known/openid-configuration").status_code == 200
+    assert client.get("/api/auth/health").json()["status"] == "healthy"
