@@ -629,7 +629,13 @@ def test_a_redirect_uri_outside_the_allow_list_is_refused(
     """The parameter a provider sends a live authorization code to. It is not a suggestion."""
     settings = make_settings(oauth_redirect_uris=[f"{ISSUER}/oauth/callback"])
     service = OAuthService(
-        settings, hooks, states=stores.require_oauth_states(), links=stores.require_oauth_links()
+        settings,
+        hooks,
+        states=stores.require_oauth_states(),
+        links=stores.require_oauth_links(),
+        # Present so `start` gets past the 0.16.0 client-secret check and reaches the
+        # redirect URI validation this test is about.
+        client_secrets={GOOGLE_PROVIDER: GOOGLE_SECRET},
     )
     with pytest.raises(OAuthRejected) as excinfo:
         service.start(GOOGLE_PROVIDER, redirect_uri="https://attacker.test/steal")
@@ -645,7 +651,11 @@ def test_the_allow_list_is_exact_and_not_a_prefix(hooks: FakeHooks, stores: Iden
     allowed = "https://app.example.com/oauth/callback"
     settings = make_settings(oauth_redirect_uris=[allowed])
     service = OAuthService(
-        settings, hooks, states=stores.require_oauth_states(), links=stores.require_oauth_links()
+        settings,
+        hooks,
+        states=stores.require_oauth_states(),
+        links=stores.require_oauth_links(),
+        client_secrets={GOOGLE_PROVIDER: GOOGLE_SECRET},
     )
     with pytest.raises(OAuthRejected):
         service.start(GOOGLE_PROVIDER, redirect_uri="https://app.example.com.attacker.test/cb")
@@ -864,7 +874,14 @@ def test_a_failed_token_exchange_does_not_leak_the_provider_message(
 def test_a_missing_client_secret_is_a_503_that_names_no_configuration(
     hooks: FakeHooks, stores: IdentityStores, provider: FakeProvider
 ) -> None:
-    """The operator gets the detail in a log line; an anonymous caller gets none."""
+    """The operator gets the detail in a log line; an anonymous caller gets none.
+
+    **The refusal moved to `start` in 0.16.0.** Before that, a provider holding a client id
+    and no secret redirected the user to Google, collected their consent, and only failed on
+    the way back at the token exchange, which spends a real person's attention on a
+    configuration error. Refusing before the redirect is checked here, and the callback leg
+    keeps its own check below because `identity_from_callback` is reachable directly.
+    """
     service = OAuthService(
         make_settings(),
         hooks,
@@ -873,12 +890,25 @@ def test_a_missing_client_secret_is_a_503_that_names_no_configuration(
         client_secrets={},
         http_client=provider.client(),
     )
-    authorization = service.start(GOOGLE_PROVIDER)
-    record = service.consume_state(authorization.state)
     with pytest.raises(OAuthRejected) as excinfo:
-        service.identity_from_callback(GOOGLE_PROVIDER, code="c", state_record=record)
+        service.start(GOOGLE_PROVIDER)
     assert excinfo.value.status_code == 503
+    assert excinfo.value.error_code == "OAUTH_PROVIDER_UNAVAILABLE"
     assert "secret" not in excinfo.value.message.lower()
+
+    # The exchange refuses too, for a caller that reached it by another path.
+    usable = OAuthService(
+        make_settings(),
+        hooks,
+        states=stores.require_oauth_states(),
+        links=stores.require_oauth_links(),
+        client_secrets={GOOGLE_PROVIDER: GOOGLE_SECRET},
+        http_client=provider.client(),
+    )
+    record = usable.consume_state(usable.start(GOOGLE_PROVIDER).state)
+    with pytest.raises(OAuthRejected) as callback_exc:
+        service.identity_from_callback(GOOGLE_PROVIDER, code="c", state_record=record)
+    assert callback_exc.value.status_code == 503
 
 
 def test_the_client_secret_never_appears_in_a_log_record(
@@ -1426,12 +1456,24 @@ def client(hooks: FakeHooks, stores: IdentityStores, kms: FakeKms, provider: Fak
     return TestClient(app, follow_redirects=False)
 
 
-def _oauth_route_paths(app: FastAPI) -> set[str]:
-    """The mounted paths that belong to this module.
+def _oauth_route_paths(router: Any) -> set[str]:
+    """The mounted paths that belong to this module, read off the router.
 
     Matched against the route module's own path constants rather than by searching for the
     substring "oauth", which also matches FastAPI's built-in `/docs/oauth2-redirect` and made
     the "no routes are mounted" assertions pass for the wrong reason.
+
+    **Reads `router.routes`, not `app.routes`.** Under the FastAPI CI runs (0.141) an
+    `include_router` no longer flattens the router's routes into `app.routes`; it mounts the
+    router, so `app.routes` holds an empty-path mount and none of the real paths. This helper
+    used to take the app and therefore returned the empty set for *every* input, which meant
+    both "the routes are absent" tests below passed against a fully configured router. The
+    router is also the honest thing to inspect: it is what this package builds and what a
+    consumer mounts, and it reads the same on either FastAPI version.
+
+    `OAUTH_PROVIDERS_PATH` is deliberately not in `ours`. It is unconditional from 0.16.0, so
+    including it would make the absence assertions unsatisfiable; the tests that care about
+    it assert on it by name.
     """
     from webbpulse.identity.oauth_routes import (
         OAUTH_CALLBACK_PATH,
@@ -1442,7 +1484,7 @@ def _oauth_route_paths(app: FastAPI) -> set[str]:
 
     ours = {OAUTH_START_PATH, OAUTH_CALLBACK_PATH, OAUTH_LINK_PATH, OAUTH_LINKS_PATH}
     prefix = identity_prefix(make_settings())
-    mounted = {getattr(route, "path", "") for route in app.routes}
+    mounted = {getattr(route, "path", "") for route in router.routes}
     return {path for path in ours if f"{prefix}{path}" in mounted}
 
 
@@ -1475,29 +1517,23 @@ def test_the_routes_are_absent_when_no_provider_is_configured(
 ) -> None:
     """A route that can only answer 503 is worse than a route that does not exist."""
     settings = make_settings(google_client_id="", github_client_id="")
-    app = FastAPI()
-    app.include_router(
-        build_identity_router(settings, hooks, stores, kms_client=kms, limiter_enabled=False)
-    )
-    assert _oauth_route_paths(app) == set()
+    router = build_identity_router(settings, hooks, stores, kms_client=kms, limiter_enabled=False)
+    assert _oauth_route_paths(router) == set()
 
 
 def test_the_routes_are_absent_when_the_stores_are_missing(hooks: FakeHooks, kms: FakeKms) -> None:
     settings = make_settings()
-    app = FastAPI()
-    app.include_router(
-        build_identity_router(
-            settings,
-            hooks,
-            IdentityStores(
-                credentials=InMemoryCredentialStore(),
-                refresh_tokens=InMemoryRefreshTokenStore(),
-            ),
-            kms_client=kms,
-            limiter_enabled=False,
-        )
+    router = build_identity_router(
+        settings,
+        hooks,
+        IdentityStores(
+            credentials=InMemoryCredentialStore(),
+            refresh_tokens=InMemoryRefreshTokenStore(),
+        ),
+        kms_client=kms,
+        limiter_enabled=False,
     )
-    assert _oauth_route_paths(app) == set()
+    assert _oauth_route_paths(router) == set()
 
 
 def test_a_callback_with_a_bad_state_redirects_rather_than_rendering_json(client: Any) -> None:
@@ -1783,3 +1819,293 @@ def test_a_provider_boolean_is_read_in_both_spellings(raw: object, expected: boo
     from webbpulse.identity.oauth import _as_bool
 
     assert _as_bool(raw) is expected
+
+
+# ---------------------------------------------------------------------------
+# Provider discovery, 0.16.0
+# ---------------------------------------------------------------------------
+#
+# The route exists so a frontend stops inferring availability from the start route's status
+# code. WebbPulse-Portfolio PR 170 did that, and it is wrong twice: probing spends the start
+# route's 20-per-15-minutes IP budget on page loads rather than sign-ins, and a non-200
+# cannot distinguish "not configured" from "briefly broken", so a blip hides a sign-in
+# button. These tests therefore pin the three things a client depends on: which providers
+# appear, in what order, and that the answer exists in every deployment.
+
+
+def _providers_router(
+    hooks: FakeHooks,
+    stores: IdentityStores,
+    kms: FakeKms,
+    *,
+    secrets: dict[str, str] | None = None,
+    **overrides: Any,
+) -> Any:
+    """A router built the way a product builds one, for the discovery tests."""
+    return build_identity_router(
+        make_settings(**overrides),
+        hooks,
+        stores,
+        kms_client=kms,
+        limiter_enabled=False,
+        oauth_client_secrets=secrets,
+    )
+
+
+def _providers_client(router: Any) -> Any:
+    app = FastAPI()
+    app.include_router(router)
+    return TestClient(app, follow_redirects=False)
+
+
+def _get_providers(client: Any) -> Any:
+    return client.get(f"{identity_prefix(make_settings())}/oauth/providers")
+
+
+def test_discovery_lists_every_fully_configured_provider(
+    hooks: FakeHooks, stores: IdentityStores, kms: FakeKms
+) -> None:
+    """Both halves configured, so both providers are offered."""
+    client = _providers_client(
+        _providers_router(
+            hooks,
+            stores,
+            kms,
+            secrets={GOOGLE_PROVIDER: GOOGLE_SECRET, GITHUB_PROVIDER: GITHUB_SECRET},
+        )
+    )
+    response = _get_providers(client)
+    assert response.status_code == 200
+    assert response.json() == {
+        "providers": [
+            {"id": "google", "display_name": "Google"},
+            {"id": "github", "display_name": "GitHub"},
+        ]
+    }
+
+
+def test_discovery_order_follows_the_provider_table_not_the_settings_list(
+    hooks: FakeHooks, stores: IdentityStores, kms: FakeKms
+) -> None:
+    """Stable order, so the buttons do not reshuffle between environments.
+
+    The settings list is written backwards here on purpose: a frontend that renders in
+    response order must get Google then GitHub either way, and an implementation that simply
+    iterated `oauth_providers` would fail this while passing the test above.
+    """
+    client = _providers_client(
+        _providers_router(
+            hooks,
+            stores,
+            kms,
+            secrets={GOOGLE_PROVIDER: GOOGLE_SECRET, GITHUB_PROVIDER: GITHUB_SECRET},
+            oauth_providers=["github", "google"],
+        )
+    )
+    assert [entry["id"] for entry in _get_providers(client).json()["providers"]] == [
+        "google",
+        "github",
+    ]
+
+
+def test_a_provider_with_an_id_but_no_secret_is_not_advertised(
+    hooks: FakeHooks, stores: IdentityStores, kms: FakeKms
+) -> None:
+    """The partial-configuration case, and the reason this route checks both halves.
+
+    Both client ids are set; only Google has a secret. Advertising GitHub would put a button
+    on the sign-in page that sends the user to GitHub, collects their consent, and then fails
+    on the way back at the token exchange.
+    """
+    client = _providers_client(
+        _providers_router(hooks, stores, kms, secrets={GOOGLE_PROVIDER: GOOGLE_SECRET})
+    )
+    assert _get_providers(client).json() == {
+        "providers": [{"id": "google", "display_name": "Google"}]
+    }
+
+
+def test_the_start_route_refuses_a_provider_with_no_secret_before_redirecting(
+    hooks: FakeHooks, stores: IdentityStores, kms: FakeKms
+) -> None:
+    """The other half of the 0.16.0 decision: do not mount a doomed redirect.
+
+    A 503 with a named code, rather than a 302 to GitHub that wastes the user's consent and
+    fails at the exchange. Google, fully configured on the same router, still redirects, so
+    the refusal is about the provider rather than about the route being broken.
+    """
+    client = _providers_client(
+        _providers_router(hooks, stores, kms, secrets={GOOGLE_PROVIDER: GOOGLE_SECRET})
+    )
+    prefix = identity_prefix(make_settings())
+
+    refused = client.get(f"{prefix}/oauth/github/start")
+    assert refused.status_code == 503
+    assert refused.json()["error_code"] == "OAUTH_PROVIDER_UNAVAILABLE"
+    assert "secret" not in refused.json()["message"].lower()
+
+    assert client.get(f"{prefix}/oauth/google/start").status_code == 302
+
+
+def test_discovery_is_empty_when_no_client_secret_is_supplied_at_all(
+    hooks: FakeHooks, stores: IdentityStores, kms: FakeKms
+) -> None:
+    """Client ids without secrets is still nothing a user can sign in with."""
+    assert _get_providers(_providers_client(_providers_router(hooks, stores, kms))).json() == {
+        "providers": []
+    }
+
+
+def test_discovery_is_empty_when_no_provider_has_a_client_id(
+    hooks: FakeHooks, stores: IdentityStores, kms: FakeKms
+) -> None:
+    client = _providers_client(
+        _providers_router(
+            hooks,
+            stores,
+            kms,
+            secrets={GOOGLE_PROVIDER: GOOGLE_SECRET, GITHUB_PROVIDER: GITHUB_SECRET},
+            google_client_id="",
+            github_client_id="",
+        )
+    )
+    assert _get_providers(client).json() == {"providers": []}
+
+
+def test_discovery_mounts_and_is_empty_when_the_oauth_stores_are_missing(
+    hooks: FakeHooks, kms: FakeKms
+) -> None:
+    """A deployment with nowhere to write a state row cannot complete a sign-in.
+
+    The five flow routes are absent here, and the discovery route is still present, which is
+    the whole point: one authoritative answer in every deployment.
+    """
+    router = build_identity_router(
+        make_settings(),
+        hooks,
+        IdentityStores(
+            credentials=InMemoryCredentialStore(), refresh_tokens=InMemoryRefreshTokenStore()
+        ),
+        kms_client=kms,
+        limiter_enabled=False,
+        oauth_client_secrets={GOOGLE_PROVIDER: GOOGLE_SECRET, GITHUB_PROVIDER: GITHUB_SECRET},
+    )
+    assert _oauth_route_paths(router) == set()
+    assert _get_providers(_providers_client(router)).json() == {"providers": []}
+
+
+def test_discovery_mounts_on_a_documents_only_router(kms: FakeKms) -> None:
+    """The JWKS-only shape, with no hooks and no stores at all, still answers."""
+    router = build_identity_router(make_settings(), kms_client=kms)
+    response = _get_providers(_providers_client(router))
+    assert response.status_code == 200
+    assert response.json() == {"providers": []}
+
+
+def test_discovery_carries_the_same_cache_policy_as_the_jwks(
+    hooks: FakeHooks, stores: IdentityStores, kms: FakeKms
+) -> None:
+    """Five minutes: turning a provider on is exactly when somebody is watching for it."""
+    from webbpulse.identity.oauth_routes import OAUTH_PROVIDERS_CACHE_CONTROL
+
+    client = _providers_client(
+        _providers_router(
+            hooks,
+            stores,
+            kms,
+            secrets={GOOGLE_PROVIDER: GOOGLE_SECRET, GITHUB_PROVIDER: GITHUB_SECRET},
+        )
+    )
+    assert _get_providers(client).headers["cache-control"] == OAUTH_PROVIDERS_CACHE_CONTROL
+    assert OAUTH_PROVIDERS_CACHE_CONTROL == "public, max-age=300"
+
+
+def test_discovery_needs_no_token_and_sets_no_cookie(
+    hooks: FakeHooks, stores: IdentityStores, kms: FakeKms
+) -> None:
+    """It is read by the sign-in page, which by definition holds no token.
+
+    The absent `Authorization` header is the assertion: every management route in this module
+    answers 401 to exactly this request, and this one answers 200.
+    """
+    client = _providers_client(
+        _providers_router(
+            hooks,
+            stores,
+            kms,
+            secrets={GOOGLE_PROVIDER: GOOGLE_SECRET, GITHUB_PROVIDER: GITHUB_SECRET},
+        )
+    )
+    response = _get_providers(client)
+    assert response.status_code == 200
+    assert "authorization" not in {key.lower() for key in response.request.headers}
+    assert "set-cookie" not in {key.lower() for key in response.headers}
+
+
+def test_discovery_never_reveals_a_client_secret_or_a_client_id(
+    hooks: FakeHooks, stores: IdentityStores, kms: FakeKms
+) -> None:
+    """It is an anonymous route, so what it does not say matters as much as what it does."""
+    client = _providers_client(
+        _providers_router(
+            hooks,
+            stores,
+            kms,
+            secrets={GOOGLE_PROVIDER: GOOGLE_SECRET, GITHUB_PROVIDER: GITHUB_SECRET},
+        )
+    )
+    body = _get_providers(client).text
+    for leaked in (GOOGLE_SECRET, GITHUB_SECRET, GOOGLE_CLIENT_ID, GITHUB_CLIENT_ID):
+        assert leaked not in body
+
+
+def test_available_providers_is_stricter_than_enabled_providers(
+    hooks: FakeHooks, stores: IdentityStores, provider: FakeProvider
+) -> None:
+    """The service-level distinction the route rests on, asserted without a request.
+
+    `enabled_providers` decides whether the routes mount and asks only for a client id;
+    `available_providers` decides what is advertised and additionally requires the secret.
+    """
+    service = OAuthService(
+        make_settings(),
+        hooks,
+        states=stores.require_oauth_states(),
+        links=stores.require_oauth_links(),
+        client_secrets={GOOGLE_PROVIDER: GOOGLE_SECRET},
+        http_client=provider.client(),
+    )
+    assert service.enabled_providers() == [GOOGLE_PROVIDER, GITHUB_PROVIDER]
+    assert [config.name for config in service.available_providers()] == [GOOGLE_PROVIDER]
+
+
+def test_every_provider_in_the_table_has_a_display_name() -> None:
+    """A blank button is worse than a missing one, and the casing is the provider's to set."""
+    assert {name: config.display_name for name, config in PROVIDERS.items()} == {
+        GOOGLE_PROVIDER: "Google",
+        GITHUB_PROVIDER: "GitHub",
+    }
+
+
+def test_discovery_appears_in_the_openapi_document_under_an_oauth_tag(kms: FakeKms) -> None:
+    """It is a documented public API, unlike the `.well-known` documents.
+
+    Those are `include_in_schema=False` because they are fetched by API Gateway rather than
+    written against by a client. This one is written against by every frontend, so it belongs
+    in `/docs`, tagged `oauth` so it groups with the rest of the OAuth surface.
+
+    The assertion that the schema *builds at all* is the load-bearing half. Every route in
+    this package annotated `-> JSONResponse` breaks `app.openapi()` for the whole app, since
+    under `from __future__ import annotations` that annotation is an unresolvable string that
+    FastAPI hands to pydantic as a response model. This route mounts in every deployment
+    including the documents-only one, whose schema builds today, so it must not be what takes
+    `/docs` away from a product with no OAuth at all.
+    """
+    router = build_identity_router(make_settings(), kms_client=kms)
+    app = FastAPI()
+    app.include_router(router)
+
+    schema = app.openapi()
+    operation = schema["paths"][f"{identity_prefix(make_settings())}/oauth/providers"]["get"]
+    assert operation["tags"] == ["identity", "oauth"]
+    assert operation["tags"].count("identity") == 1

@@ -321,6 +321,12 @@ class OAuthProviderConfig:
     name: str
     authorize_url: str
     token_url: str
+    #: What a sign-in button says. Fixed here rather than left to each frontend, because a
+    #: provider's name is the provider's to spell: "GitHub" has a capital H and "Google" is
+    #: not "google", and three frontends inventing their own casing is three chances to get
+    #: a third party's trademark wrong. Served by `/oauth/providers` so a client renders the
+    #: button from the response rather than from a hardcoded table it has to keep in step.
+    display_name: str = ""
     #: Where a `sub` and an email come from when there is no ID token. Empty for a provider
     #: whose ID token carries both.
     userinfo_url: str = ""
@@ -350,6 +356,7 @@ class OAuthProviderConfig:
 PROVIDERS: Final[Mapping[str, OAuthProviderConfig]] = {
     GOOGLE_PROVIDER: OAuthProviderConfig(
         name=GOOGLE_PROVIDER,
+        display_name="Google",
         authorize_url="https://accounts.google.com/o/oauth2/v2/auth",
         token_url="https://oauth2.googleapis.com/token",
         jwks_url="https://www.googleapis.com/oauth2/v3/certs",
@@ -363,6 +370,7 @@ PROVIDERS: Final[Mapping[str, OAuthProviderConfig]] = {
     ),
     GITHUB_PROVIDER: OAuthProviderConfig(
         name=GITHUB_PROVIDER,
+        display_name="GitHub",
         authorize_url="https://github.com/login/oauth/authorize",
         token_url="https://github.com/login/oauth/access_token",
         userinfo_url="https://api.github.com/user",
@@ -819,6 +827,34 @@ class OAuthService:
         """
         return [name for name in self._settings.oauth_providers if self._client_id(name)]
 
+    def available_providers(self) -> list[OAuthProviderConfig]:
+        """The providers a sign-in button should actually be drawn for.
+
+        Stricter than `enabled_providers`, and the difference is the whole point of this
+        method. `enabled_providers` asks whether a provider has a client id, which is what
+        decides whether the *routes* mount. This asks whether the provider can complete a
+        sign-in, which additionally needs the client secret: without it the start route
+        redirects the user to the provider, the user consents, and the flow then dies at the
+        token exchange with a 503. A provider that will fail at the last step is worse than
+        one that is simply not offered, so it is not advertised here and, since 0.16.0,
+        `start` refuses it up front rather than mounting a doomed redirect.
+
+        Returned in the order `PROVIDERS` defines, Google then GitHub, rather than in the
+        order the settings list happens to be written in, so a frontend rendering the
+        buttons in response order gets the same layout in every environment.
+        """
+        return [
+            config
+            for name, config in PROVIDERS.items()
+            if name in self._settings.oauth_providers
+            and self._client_id(name)
+            and self._has_secret(name)
+        ]
+
+    def _has_secret(self, provider: str) -> bool:
+        """Whether a client secret is configured, without raising or logging."""
+        return bool(self._secrets.get(provider, ""))
+
     def _provider(self, provider: str) -> OAuthProviderConfig:
         config = PROVIDERS.get(provider)
         if config is None or provider not in self.enabled_providers():
@@ -876,6 +912,15 @@ class OAuthService:
         table means the callback can use the stored value without re-deriving trust.
         """
         config = self._provider(provider)
+        # Refuse a provider whose secret is missing *here*, before the redirect, rather than
+        # letting it fail at the token exchange. New in 0.16.0. Until then a provider with a
+        # client id and no secret mounted, redirected the user to Google, collected their
+        # consent, and only then answered 503 on the way back, which spends a real person's
+        # attention on a configuration error and leaves an unusable button on the sign-in
+        # page. `_client_secret` raises `OAUTH_PROVIDER_UNAVAILABLE` with a 503 and logs the
+        # detail for the operator; the value itself is discarded, and the exchange reads it
+        # again later rather than carrying it through the state row.
+        self._client_secret(provider)
         if mode == "link" and not user_id:
             raise OAuthRejected("Sign in first.", error_code="NOT_AUTHENTICATED", status_code=401)
 

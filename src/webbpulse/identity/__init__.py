@@ -179,8 +179,11 @@ from webbpulse.identity.oauth_routes import (
     OAUTH_CALLBACK_PATH,
     OAUTH_LINK_PATH,
     OAUTH_LINKS_PATH,
+    OAUTH_PROVIDERS_CACHE_CONTROL,
+    OAUTH_PROVIDERS_PATH,
     OAUTH_START_IP_LIMIT,
     OAUTH_START_PATH,
+    register_oauth_provider_discovery,
     register_oauth_routes,
 )
 from webbpulse.identity.passkeys import (
@@ -368,6 +371,8 @@ __all__ = [
     "OAUTH_LINKS_TABLE",
     "OAUTH_LINK_PATH",
     "OAUTH_LINK_USER_INDEX",
+    "OAUTH_PROVIDERS_CACHE_CONTROL",
+    "OAUTH_PROVIDERS_PATH",
     "OAUTH_START_IP_LIMIT",
     "OAUTH_START_PATH",
     "OAUTH_STATES_TABLE",
@@ -533,6 +538,7 @@ __all__ = [
     "provider_account_key",
     "public_jwk_from_kms",
     "read_authorizer_claims",
+    "register_oauth_provider_discovery",
     "register_oauth_routes",
     "render_password_changed",
     "render_password_reset",

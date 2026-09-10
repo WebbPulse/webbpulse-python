@@ -532,6 +532,9 @@ def test_router_exposes_exactly_the_intended_routes(kms: MultiKeyFakeKms) -> Non
         f"{prefix}/.well-known/openid-configuration",
         f"{prefix}/.well-known/jwks.json",
         f"{prefix}/health",
+        # Unconditional from 0.16.0, even with no OAuth configured at all: the frontend
+        # gets one authoritative answer in every deployment instead of a 404 to interpret.
+        f"{prefix}/oauth/providers",
     }
 
 

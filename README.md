@@ -1087,6 +1087,7 @@ gateway builds the discovery URL as `issuer + "/.well-known/openid-configuration
 | `POST /api/auth/totp/disable` | Removes the factor and every recovery code with it, on a `code` |
 | `POST /api/auth/recovery-codes` | Replaces the set on a `code`, invalidating every previous code |
 | `POST /api/auth/step-up` | Re-authenticates inside the session for a fresher `auth_time` |
+| `GET /api/auth/oauth/providers` | The providers this deployment can sign a user in with, anonymous |
 | `GET /api/auth/oauth/{provider}/start` | Mints a state and redirects the browser to the provider |
 | `GET /api/auth/oauth/callback` | Spends the state, verifies the provider's answer, issues the token pair |
 | `POST /api/auth/oauth/{provider}/link` | Starts a link for the authenticated account, returning the URL |
@@ -1300,6 +1301,58 @@ remaining. **That hook is new in 0.14.0 and defaults to `False`**, so a hooks cl
 before M6 keeps working: `False` can only make the refusal fire more often, while `True`
 would let a product that had not implemented it delete a user's last credential. A product
 holding sign-in methods this package cannot see, passkeys among them, should implement it.
+
+#### What the frontend calls, and what comes back on the callback
+
+Two things a client needs and cannot work out for itself: which providers to draw buttons
+for, and what the browser will be carrying when it lands back on the frontend.
+
+**Ask `GET /api/auth/oauth/providers` which providers exist.** It is anonymous, cheap and
+cached for five minutes, and it answers:
+
+```json
+{"providers": [{"id": "google", "display_name": "Google"}, {"id": "github", "display_name": "GitHub"}]}
+```
+
+Render one button per entry, in the order given, labelled with `display_name`, pointing at
+`/api/auth/oauth/{id}/start`. The order is fixed by the package rather than by configuration,
+so the layout is the same in every environment.
+
+**Do not infer availability by probing `start`.** That was the pre-0.16.0 workaround and it
+is wrong twice: it spends the start route's rate limit budget, 20 per 15 minutes per IP, on
+page loads rather than on sign-ins, so a user who reloads the sign-in page enough times is
+refused the sign-in they then attempt; and a non-200 cannot tell "not configured" from
+"configured and briefly broken", so a transient failure hides a sign-in button. The route
+mounts in **every** deployment, answering `{"providers": []}` where OAuth is off, so an empty
+list is a real answer and never a 404 to interpret.
+
+A provider is listed only when it has both a client id and a client secret. From 0.16.0 a
+provider with an id and no secret is refused by `start` with a 503 and
+`OAUTH_PROVIDER_UNAVAILABLE` rather than redirecting the user to the provider and failing at
+the token exchange on the way back.
+
+**The callback comes back to the frontend as a redirect carrying one query parameter.** The
+callback never renders JSON, because the user is looking at a browser and a JSON error body
+renders as text on a blank page. The frontend route named by `return_to`, or
+`frontend_base_url`, should branch on whichever of these is present:
+
+| Parameter | Meaning | What the frontend does |
+| --- | --- | --- |
+| `oauth=1` | A login succeeded. The refresh cookie is set on this redirect. | Call `POST /api/auth/refresh` for an access token, then continue |
+| `oauth_linked=1` | A `link` succeeded for the signed-in account | Refresh the settings page's linked-provider list |
+| `mfa_ticket=<ticket>` | The account has a second factor | Prompt for a code and `POST /api/auth/login/totp` with `{mfa_ticket, code}` |
+| `oauth_error=<code>` | The flow was refused | Render a message for the code |
+
+It is the only identity route that appears in the OpenAPI document, tagged `identity` and
+`oauth`. The `.well-known` documents are `include_in_schema=False` because API Gateway
+fetches them rather than a client writing against them; this one every frontend writes
+against, so it belongs in `/docs`.
+
+`oauth_error` carries one of this package's own error codes, never a provider string, so
+nothing attacker-influenced reaches the URL. The ones worth handling by name are
+`OAUTH_CANCELLED`, which is the user pressing Cancel on the consent screen and deserves no
+error styling at all, and `OAUTH_EMAIL_UNVERIFIED`, which means the user should sign in with
+their password and link from account settings. Anything else is a generic failure.
 
 **The state is server-side, single use, and spent by a conditional delete.** `oauth-states`
 is keyed on `state` with a ten minute TTL, and the callback spends the row with a
