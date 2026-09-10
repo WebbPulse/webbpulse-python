@@ -240,6 +240,7 @@ from webbpulse.identity import authorizer_claims
 
 Principal = Annotated[dict, Depends(authorizer_claims())]
 
+
 @router.get("/api/build-lists")
 async def list_build_lists(principal: Principal, repos: Repositories = Depends(...)):
     return repos.build_lists.for_user(principal["sub"])
@@ -1089,8 +1090,9 @@ controls:
   registration, change and reset, using k-anonymity (send the first 5 hex of the SHA-1,
   compare suffixes locally) so the password never leaves the service. NIST SP 800-63B
   recommends exactly this check against breach lists. It is a **new outbound dependency**,
-  so it is a feature flag (`password_breach_check`), fails open with a WARNING, and Q4 asks
-  whether to use the public API or ship a bundled list.
+  so it is a feature flag (`password_breach_check`) and fails open with a WARNING when on.
+  **Decided 2026-09-09: off by default and not adopted for now.** A product that wants it
+  opts in; none of ours does.
 - **Global anomaly signal.** `login_attempts` is keyed by both email and IP, so a spike in
   distinct emails failing from one IP, or one email failing from many IPs, is a query rather
   than a guess. This design specifies the data; alarming on it is milestone M6.
@@ -1190,7 +1192,7 @@ NIST SP 800-63B shaped:
   verifiers "SHOULD NOT impose other composition rules".
 - **No periodic expiry.** Rotation only on evidence of compromise.
 - **All Unicode accepted**, including spaces, normalised to NFKC before hashing.
-- **Breach list check** on set (5.2).
+- **Breach list check** on set (5.2), only when a product opts in.
 
 **The 72-byte bcrypt limit.** bcrypt reads at most 72 bytes and libraries disagree about
 longer input: 4.x truncates silently, 5.0 raises. `webbpulse.security` removes the
@@ -1288,10 +1290,10 @@ development and to stage a rollout, not to let a product opt out permanently.
 ```python
 class IdentitySettings(BaseModel):
     # Identity of the issuer
-    issuer: str                      # "https://api.carmodpicker.com/api/auth"
-    audience: str                    # "carmodpicker-api"
-    signing_key_arns: list[str]      # active first; more than one during rotation
-    data_key_arn: str                # envelope encryption for TOTP seeds
+    issuer: str  # "https://api.carmodpicker.com/api/auth"
+    audience: str  # "carmodpicker-api"
+    signing_key_arns: list[str]  # active first; more than one during rotation
+    data_key_arn: str  # envelope encryption for TOTP seeds
 
     # Capabilities
     passwords_enabled: bool = True
@@ -1301,7 +1303,7 @@ class IdentitySettings(BaseModel):
     passkeys_enabled: bool = True
     passkeys_passwordless: bool = True
     oauth_providers: list[Literal["google", "github"]] = ["google", "github"]
-    password_breach_check: bool = True
+    password_breach_check: bool = False
     mfa_required_for_roles: list[str] = []
 
     # Lifetimes
@@ -1315,19 +1317,19 @@ class IdentitySettings(BaseModel):
 
     # Cookie
     cookie_name: str = "wp_refresh"
-    cookie_domain: str                # "carmodpicker.com"
+    cookie_domain: str  # "carmodpicker.com"
     cookie_path: str = "/api/auth"
     cookie_samesite: Literal["lax", "strict", "none"] = "lax"
 
     # WebAuthn
-    rp_id: str                        # "carmodpicker.com"
-    rp_name: str                      # "CarModPicker"
-    webauthn_origins: list[str]       # every exact frontend origin
+    rp_id: str  # "carmodpicker.com"
+    rp_name: str  # "CarModPicker"
+    webauthn_origins: list[str]  # every exact frontend origin
 
     # Email
-    email_from: str                   # "no-reply@carmodpicker.com"
+    email_from: str  # "no-reply@carmodpicker.com"
     ses_configuration_set: str | None = None
-    frontend_base_url: str            # where links point
+    frontend_base_url: str  # where links point
 
     # Branding, used in templates and WebAuthn prompts
     product_name: str
@@ -1364,6 +1366,7 @@ per-product rather than central: passkeys cannot be centralised without breaking
 ```python
 # backend/app/domains/identity/wiring.py
 from webbpulse.identity import IdentitySettings, IdentityHooks, build_identity_router
+
 
 def build() -> APIRouter:
     s = settings()
@@ -1667,7 +1670,45 @@ Effort is rough, in days of focused work, and assumes one person.
 | M | Scope | Package version | Effort |
 |---|---|---|---|
 | **M0** | Spike: deploy a throwaway HTTP API with a JWT authorizer against a hand-rolled JWKS from a KMS RSA_2048 key. Answer the 3.4 discovery-path question and confirm RS256 end to end. **Nothing else starts until this passes.** *Passed 2026-09-09. The authorizer verifies a KMS-signed RS256 token against our own JWKS, resolved through the discovery document, and rejects a tampered signature, an `alg: none` token and an HS256 confusion attempt (3.4, 3.6). Two bugs found on the way, both in our own plumbing rather than in the design: a route declared only in FastAPI has no gateway route key and is unreachable, and the spike base64-decoded a request-context header the adapter sends as plain JSON. Both are fixed, and with the parser corrected (Portfolio PR #155) `whoami` returns 200 carrying the authorizer's claims, which also settles the payload-shape question in section 10.* | none | 1 to 2 |
-| **M1** | `webbpulse.identity` skeleton: `IdentitySettings`, `IdentityHooks`, `build_identity_router`, storage classes, `authorizer_claims()`. Token service: KMS signing, JWKS, discovery, rotation by `kid`. No flows yet | 0.6.0 | 4 to 6 |
+| **M1** | `webbpulse.identity` skeleton: `IdentitySettings`, `IdentityHooks`, `build_identity_router`, storage classes, `authorizer_claims()`. Token service: KMS signing, JWKS, discovery, rotation by `kid`. No flows yet. *Delivered 2026-09-09 in 0.9.0. `identity.py` became a package, with the M0 surface re-exported unchanged. Decisions recorded below.* | 0.9.0 | 4 to 6 |
+
+#### M1 decisions, 2026-09-09
+
+Recorded here because each one is a place where the standard left a choice open and the
+implementation had to close it. None of these changes a decision the standard already made.
+
+1. **Per-entity tables, not single-table.** Section 4.1 already argued this; M1 fixes the
+   key design. `credentials` is hash `user_id` range `credential_type`, `refresh-tokens` is
+   hash `token_hash` with a `family_id-generation-index` GSI for revocation only, and
+   `identity-tokens` is hash `token_hash` carrying both the verification and reset purposes.
+   The decisive argument is that TTL is a table-level setting: mixing an expiring entity and
+   a permanent one means users carry a TTL attribute that must never be set, and one bug
+   silently deletes accounts.
+2. **Refresh tokens are stored as a hex SHA-256, not bcrypt.** bcrypt's cost exists to slow
+   an offline attack on a low-entropy secret. These carry 256 bits from a CSPRNG, so there
+   is nothing to brute force, and the cost would be paid on the refresh path.
+3. **`revoke_all_for_user` and `revoke_for_user` raise `NotImplementedError` on DynamoDB.**
+   Neither table carries a user index, because indexing the cold path would cost a write on
+   every rotation of the hot one. Raising is deliberate rather than scanning a production
+   table silently. M2 decides whether the index is worth it when it implements the flows.
+4. **`may_authenticate` raises rather than returning a bool.** A hook that forgets to return
+   admits the login under `if hooks.may_authenticate(user)`. Raising has no such pair of
+   readings: not raising is the only way to permit.
+5. **A key whose `GetPublicKey` fails is omitted from the JWKS rather than failing it.** A
+   retired key id left in configuration must not deny every authorized request in the
+   product. Every key failing is still fatal, because an empty JWKS would be cached by the
+   gateway and deny everything for its whole interval.
+6. **JWKS is cached for 300 seconds and discovery for 3600.** The asymmetry is the point:
+   rotation moves through the JWKS, and a long cache there is what turns the promotion step
+   into an outage.
+7. **`nbf` is not set on access tokens.** `iat` and `exp` already bound the window, and a
+   `nbf` equal to `iat` is a live source of spurious rejections on clock skew.
+8. **moto cannot be used for the signing tests.** Confirmed by experiment against moto
+   5.2.3, closing the question section 9.4 left open: `create_key` and `sign` succeed, but
+   `get_public_key` returns `KeySpec: None` and the signature does not verify against the
+   public key it returns, as a raw message or as a prehashed digest. The tests use a local
+   RSA key behind the same `KmsClient` protocol instead, which is faithful in the two ways
+   the output depends on.
 | **M2** | Password flows: register, login, change, policy, dummy-hash equalisation, lockout, `credentials` table. Sessions: families, rotation, reuse detection, grace window, logout, logout-all | 0.7.0 | 5 to 7 |
 | **M3** | Email: SES sender, templates, verification, reset. Contract tests for JWKS and discovery against a real deployed authorizer | 0.7.0 | 3 to 4 |
 | **M4** | TOTP with KMS envelope encryption, recovery codes, the MFA ticket, step-up, `amr` | 0.8.0 | 4 to 5 |
