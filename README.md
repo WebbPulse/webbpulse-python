@@ -46,6 +46,7 @@ needs. Everything else is opt-in.
 | `otel` | the OpenTelemetry SDK, the OTLP HTTP exporter, the FastAPI and botocore instrumentations | `webbpulse.otel` |
 | `security` | `PyJWT`, `bcrypt` | `webbpulse.security` |
 | `identity` | `PyJWT[crypto]`, `fastapi` | `webbpulse.identity` |
+| `oauth` | `httpx` | OAuth sign-in in `webbpulse.identity`, on top of `identity` |
 | `testing` | `moto`, `pytest`, `httpx2` | `webbpulse.testing` |
 
 A typical service installs `webbpulse[fastapi,dynamodb,otel]` at runtime and adds
@@ -1017,11 +1018,15 @@ reset, TOTP and recovery codes, configuration, the product policy seam, storage 
 a KMS-backed token service, and the reader for the claims an API Gateway HTTP API JWT
 authorizer leaves on a request. Needs the `identity` extra.
 
-This is M4 of `docs/identity-standard.md`. M1 built the foundations, M2 added the password
-and session flows, M3 added the two emailed link flows, and M4 adds multi-factor
-authentication: TOTP with its seed envelope encrypted under KMS, single-use recovery codes,
-the two-leg login the MFA ticket carries, step-up re-authentication, and `amr` on the access
-token. Passkeys (M5) and OAuth (M6) are still absent.
+This is M6 of `docs/identity-standard.md`. M1 built the foundations, M2 added the password
+and session flows, M3 added the two emailed link flows, M4 added multi-factor
+authentication, and M6 adds federated sign-in: the authorization code flow against Google
+and GitHub, account linking, and the two rules that make linking safe. Passkeys (M5) land
+separately.
+
+OAuth needs the `oauth` extra on top of `identity`, for `httpx`. A product that mounts no
+OAuth routes does not need it: the client is constructed lazily, so importing the package
+without the extra works.
 
 ```python
 import boto3
@@ -1042,6 +1047,8 @@ app.include_router(build_identity_router(settings, hooks, stores, tokens=tokens)
 | `SessionService` | Refresh families: rotation, reuse detection, the grace window, revocation |
 | `LinkService` | Single-use emailed links: minting, hashing, expiry, purpose, consumption |
 | `MfaService` | TOTP enrolment and verification, recovery codes, and the MFA ticket |
+| `OAuthService` | The provider leg, the linking rules, and the last-sign-in-method count |
+| `OAuthStateStore` and `OAuthLinkStore` | The in-flight authorization and the provider-to-user attachment |
 | `EnvelopeCipher` | Sealing a TOTP seed under a per-secret KMS data key with a per-user encryption context |
 | `EmailSender` | Sending mail, with an SES v2 implementation and a recording one for tests |
 | `TokenService` | Minting, local verification, JWKS, discovery, rotation across keys |
@@ -1075,6 +1082,11 @@ gateway builds the discovery URL as `issuer + "/.well-known/openid-configuration
 | `POST /api/auth/totp/disable` | Removes the factor and every recovery code with it, on a `code` |
 | `POST /api/auth/recovery-codes` | Replaces the set on a `code`, invalidating every previous code |
 | `POST /api/auth/step-up` | Re-authenticates inside the session for a fresher `auth_time` |
+| `GET /api/auth/oauth/{provider}/start` | Mints a state and redirects the browser to the provider |
+| `GET /api/auth/oauth/callback` | Spends the state, verifies the provider's answer, issues the token pair |
+| `POST /api/auth/oauth/{provider}/link` | Starts a link for the authenticated account, returning the URL |
+| `GET /api/auth/oauth/links` | The providers attached to this account, for a settings page |
+| `DELETE /api/auth/oauth/{provider}/link` | Detaches a provider, unless it is the last way in |
 
 An issuer with no path gives the same routes at the origin. Adding a prefix of your own
 doubles the issuer path and hides the documents from the gateway. **This changed in
@@ -1180,6 +1192,93 @@ typing an address into a form cannot become an unrate-limited link mailer.
 plus a minimal HTML body from `string.Template`, with every interpolation HTML escaped.
 `RecordingEmailSender` keeps what it was asked to send, for tests and for a local run with
 no AWS credentials at all.
+
+**An OAuth identity attaches to an existing account only when both emails are verified.**
+The provider's must be verified and the local account's must be verified, and either one
+alone is not enough. Both halves are a takeover: an attacker who registers a GitHub account
+with somebody else's address would inherit that account if only the local side were checked,
+and an attacker who registers locally with a victim's address and never verifies it would be
+handed the victim's real Google identity if only the provider side were checked. When the
+rule refuses, the answer is `OAUTH_EMAIL_UNVERIFIED` and the user signs in with their
+password and links from account settings, which needs no email check at all because they
+have proved they hold both sides. The refusal says the same sentence whichever half failed,
+because naming it would enumerate accounts and their verification state.
+
+**Unlinking counts what would remain, and refuses to leave nothing.** Removing the last
+sign-in method is permanent lockout: nobody can log in, so nobody can add a method back, and
+the account is unreachable by any path this design has. Another OAuth link, a password in
+the credential store, or a `True` from the `has_other_sign_in_method` hook each count as
+remaining. **That hook is new in 0.14.0 and defaults to `False`**, so a hooks class written
+before M6 keeps working: `False` can only make the refusal fire more often, while `True`
+would let a product that had not implemented it delete a user's last credential. A product
+holding sign-in methods this package cannot see, passkeys among them, should implement it.
+
+**The state is server-side, single use, and spent by a conditional delete.** `oauth-states`
+is keyed on `state` with a ten minute TTL, and the callback spends the row with a
+`DeleteItem` carrying `attribute_exists(state)` and `ReturnValues=ALL_OLD`, so two concurrent
+callbacks cannot both succeed. TTL is storage reclamation and never access control: DynamoDB
+deletes on its own schedule and an expired row stays readable for days, so expiry is
+re-checked on every read. Every state failure, unknown, expired or already spent, answers
+with one message and one code, because distinguishing them confirms to an attacker that a
+guess found a real row.
+
+**PKCE where the provider supports it, and a nonce where there is an ID token.** Google gets
+an S256 challenge and a nonce; GitHub's web flow documents neither, and sending a challenge
+it ignores would be security theatre. The verifier is written to the state row and never put
+in the authorization URL, since a verifier the browser can read protects against nothing.
+Google's ID token is verified properly: the signature against the published JWKS, then
+`iss`, `aud`, `exp` and the `nonce` this flow generated. The JWKS is fetched through the
+module's own HTTP client rather than `PyJWKClient`, which fetches with `urllib` and no
+timeout, and a provider that accepts a connection and never answers would otherwise hold a
+Lambda execution environment open until the function times out.
+
+**GitHub's identity needs two calls, and only the second one is trustworthy.** `/user` gives
+the subject, but its `email` is the public profile address: user-chosen and never verified.
+`/user/emails` is the only place GitHub says which address it confirmed, and since the
+auto-link rule turns on that being a real assertion, the verified primary is preferred and an
+unverified address is reported as unverified rather than dropped.
+
+**The callback issues exactly what a password login issues, MFA included.** Same token pair,
+same rotating refresh family, same httpOnly cookie, through the same `_issue` path, so an
+OAuth session is not a second kind of session with its own rules. When the account has TOTP
+enabled the callback returns the `mfa_required` challenge instead of tokens: a provider
+proving who somebody is does not prove possession of their second factor, and without this
+"add Google to your account" would be a way to turn MFA off. The access token carries
+`amr: ["oauth", "<provider>"]`, both the general fact and the specific one, so a policy can
+require any federated sign-in or Google in particular.
+
+**Client secrets are arguments, not settings, and are never logged.** They arrive as
+`oauth_client_secrets` on `build_identity_router` because they come from the product's own
+Secrets Manager JSON, not from an `IDENTITY_`-prefixed environment variable, and keeping them
+out of the settings object keeps them out of anything that renders it. A missing secret
+answers 503 with a message that names no configuration; the operator gets the detail in a log
+line instead of the anonymous caller.
+
+**Redirect URIs are matched by exact string equality against an allow-list.** The
+`redirect_uri` is where a provider sends a live authorization code, so an unvalidated one is
+the open-redirect half of an OAuth flow. A prefix match would admit
+`https://app.example.com.attacker.test`, which is a domain an attacker can register today.
+`oauth_redirect_uris` empty means the single derived `<issuer>/oauth/callback`. The value is
+checked when it enters the state table rather than when it is used, so a stored row is safe
+to act on without re-deriving trust, and the exact value is replayed on the token exchange
+because providers refuse an exchange that differs by a byte.
+
+**`oauth-links` is keyed on `provider#subject` with a `user_id-index` GSI**, rather than a
+second table keyed by user. A second table would need two writes kept in step with no
+cross-table transaction available on `Repository`, and a half-failed pair leaves an orphaned
+link that `unlink` cannot find; a GSI cannot disagree with its base table. The price is
+eventual consistency, so the last-method count re-reads the base table by primary key for
+each candidate before counting it, because over-counting there is the one direction that
+permanently loses an account. Attaching an identity is a conditional put on
+`attribute_not_exists(provider_subject)`, so a race resolves to one winner rather than
+silently moving a provider identity between accounts. This diverges from section 4.2 of
+`docs/identity-standard.md`, which sketches a hash of `id` with two GSIs; the key here is the
+uniqueness constraint itself, which needs no synthetic reservation rows to enforce.
+
+**No provider tokens are stored.** Neither the access token nor the refresh token from the
+provider is written down. This design consumes a provider as an identity source and never
+calls a provider API on the user's behalf afterwards, and a stored token nobody spends is a
+stored credential with no use, which is all cost.
 
 **Passwords follow NIST SP 800-63B.** Eight character minimum, no composition rules, no
 expiry, NFKC normalised, and a rejection rather than a silent truncation over 72 UTF-8

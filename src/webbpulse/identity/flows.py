@@ -497,6 +497,54 @@ class IdentityFlows:
 
         return self._issue(user, ip=ip, user_agent=user_agent)
 
+    def issue_for_oauth(
+        self,
+        user: Mapping[str, Any],
+        *,
+        provider: str,
+        ip: str = "",
+        user_agent: str = "",
+    ) -> AuthResult:
+        """Issue the same token pair a password login gets, for a completed OAuth callback.
+
+        M6's callback needs exactly what `login` produces once the password is proved, and
+        it must not produce anything different: an OAuth session and a password session are
+        the same session, with the same refresh family, the same rotation and the same
+        cookie. Anything else would mean two session models to reason about and two places
+        to fix a session bug.
+
+        **MFA is honoured here, exactly as it is for a password.** A provider proving who
+        somebody is does not prove they hold the second factor, and a product that enrolled
+        TOTP did so to require it on sign-in, not to require it on some sign-ins. So this
+        raises `MfaChallengeRequired` on an account with a factor enrolled, and the router
+        answers the same `mfa_required` body the password path answers. Skipping it would
+        make "add Google to your account" a way to turn MFA off.
+
+        `amr` records the provider itself rather than a generic federated value, because a
+        policy that wants to say "this action needs a Google session" cannot express that
+        against a value shared with GitHub. `AMR_OAUTH` sits alongside it so a policy that
+        only cares that it was federated has one value to check.
+
+        `may_authenticate` is consulted for the same reason `login` consults it: a disabled
+        or deleted account must not become reachable through a second front door. A product
+        that suspends a user and finds them signing in through Google would rightly call
+        that a bug in this method.
+        """
+        from webbpulse.identity.oauth import AMR_OAUTH
+
+        self._hooks.may_authenticate(user)
+
+        challenge = self._challenge_for(user)
+        if challenge is not None:
+            raise MfaChallengeRequired(challenge)
+
+        return self._issue(
+            user,
+            ip=ip,
+            user_agent=user_agent,
+            amr=[AMR_OAUTH, provider],
+        )
+
     def _challenge_for(self, user: Mapping[str, Any]) -> MfaChallenge | None:
         """The challenge this user must answer, or `None` to issue tokens directly.
 

@@ -278,6 +278,7 @@ def build_identity_router(
     attempts: LoginAttemptStore | None = None,
     email_sender: EmailSender | None = None,
     limiter_enabled: bool = True,
+    oauth_client_secrets: Mapping[str, str] | None = None,
 ) -> APIRouter:
     """The identity router for a product, mounted with no prefix.
 
@@ -297,6 +298,15 @@ def build_identity_router(
     `tokens` is a `TokenService`. Pass one to share a single instance, and its JWK cache,
     with the rest of the service. Omit it and one is built from `settings` and `kms_client`,
     which is the ordinary case.
+
+    `oauth_client_secrets` maps a provider name to its client secret, for M6. Supply it from
+    `webbpulse.config.load_json_secret` at composition time, reading the `google_client_secret`
+    and `github_client_secret` keys of the product's single app secret. It is an argument
+    rather than an `IdentitySettings` field on purpose, and that is the same rule the settings
+    module states for itself: a secret that is a settings field is a secret that appears in a
+    `repr`, in a pydantic validation error and in whatever log line prints the settings
+    object. Omit it and the OAuth routes still mount but answer 503, because the token
+    exchange cannot be made without it.
 
     `service` and `version` are what `/health` reports, matching the arguments
     `webbpulse.http.health_router` takes for the same purpose.
@@ -372,6 +382,7 @@ def build_identity_router(
             email_sender=email_sender,
             limiter_enabled=limiter_enabled,
             kms_client=kms_client,
+            oauth_client_secrets=oauth_client_secrets,
         )
 
     return router
@@ -389,6 +400,7 @@ def _mount_flows(
     email_sender: EmailSender | None,
     limiter_enabled: bool,
     kms_client: Any = None,
+    oauth_client_secrets: Mapping[str, str] | None = None,
 ) -> None:
     """Add the six M2 flow routes, and M3's four email routes, to an already-built router.
 
@@ -696,6 +708,37 @@ def _mount_flows(
             success_body=success_body,
             set_refresh_cookie=set_refresh_cookie,
         )
+
+    # M6. Mounted when the product has both OAuth stores and at least one provider carrying
+    # a client id, for the same reason MFA is conditional: a route that can only answer 503
+    # is worse than a route that does not exist. Placed before the email early-return
+    # below, because OAuth needs no email sender at all.
+    if stores.oauth_states is not None and stores.oauth_links is not None:
+        from webbpulse.identity.oauth import OAuthService
+        from webbpulse.identity.oauth_routes import register_oauth_routes
+
+        oauth_service = OAuthService(
+            settings,
+            hooks,
+            states=stores.oauth_states,
+            links=stores.oauth_links,
+            credentials=stores.credentials,
+            client_secrets=oauth_client_secrets,
+        )
+        if oauth_service.enabled_providers():
+            register_oauth_routes(
+                router,
+                prefix=prefix,
+                settings=settings,
+                oauth=oauth_service,
+                flows=flows,
+                tokens=tokens,
+                limits=limits,
+                context=context,
+                rejected=rejected,
+                success_body=success_body,
+                set_refresh_cookie=set_refresh_cookie,
+            )
 
     if not flows.email_enabled:
         # No sender, or no `identity-tokens` store. The four routes below all promise the

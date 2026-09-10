@@ -95,6 +95,7 @@ from webbpulse.dynamodb import now_iso
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
     from webbpulse.dynamodb import Repository
+    from webbpulse.identity.oauth import OAuthLinkStore, OAuthStateStore
 
 __all__ = [
     "CREDENTIALS_TABLE",
@@ -505,6 +506,8 @@ class IdentityStores:
     identity_tokens: IdentityTokenStore | None = None
     totp_factors: TotpFactorStore | None = None
     recovery_codes: RecoveryCodeStore | None = None
+    oauth_states: OAuthStateStore | None = None
+    oauth_links: OAuthLinkStore | None = None
 
     def require_credentials(self) -> CredentialStore:
         return _require(self.credentials, "credentials")
@@ -520,6 +523,12 @@ class IdentityStores:
 
     def require_recovery_codes(self) -> RecoveryCodeStore:
         return _require(self.recovery_codes, "recovery_codes")
+
+    def require_oauth_states(self) -> OAuthStateStore:
+        return _require(self.oauth_states, "oauth_states")
+
+    def require_oauth_links(self) -> OAuthLinkStore:
+        return _require(self.oauth_links, "oauth_links")
 
 
 def _require[StoreT](store: StoreT | None, name: str) -> StoreT:
