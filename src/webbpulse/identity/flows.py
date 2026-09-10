@@ -78,9 +78,10 @@ if TYPE_CHECKING:  # pragma: no cover - typing only
 
     from webbpulse.identity.email import EmailMessage, EmailSender
     from webbpulse.identity.hooks import IdentityHooks
+    from webbpulse.identity.passkeys import PasskeyService, RegistrationChallenge
     from webbpulse.identity.service import TokenService
     from webbpulse.identity.settings import IdentitySettings
-    from webbpulse.identity.storage import IdentityStores
+    from webbpulse.identity.storage import IdentityStores, PasskeyRecord
     from webbpulse.identity.verification import LinkService
 
 __all__ = [
@@ -231,6 +232,19 @@ class IdentityFlows:
             and stores.identity_tokens is not None
         ):
             self.mfa = MfaService(settings, stores, tokens, kms_client=kms_client)
+
+        # Passkeys gate the same way M3 and M4 do: both M5 tables present and the capability
+        # switched on, or `None` and no passkey routes. The import is deferred to here so
+        # the `webauthn` extra is only needed by a product that actually turned passkeys on.
+        self.passkeys: PasskeyService | None = None
+        if (
+            settings.passkeys_enabled
+            and stores.passkeys is not None
+            and stores.webauthn_challenges is not None
+        ):
+            from webbpulse.identity.passkeys import PasskeyService
+
+            self.passkeys = PasskeyService(settings, stores)
 
     @property
     def sessions(self) -> SessionService:
@@ -1219,6 +1233,186 @@ class IdentityFlows:
                 link=self._require_links().page_for("reset_password"),
             ),
             best_effort=True,
+        )
+
+    # ---- passkeys ------------------------------------------------------------------
+
+    def _require_passkeys(self) -> PasskeyService:
+        """The passkey service, or a refusal naming the reason it is absent.
+
+        The counterpart of `_require_mfa`. A 501 rather than a 500: the deployment has not
+        created the two M5 tables or has `passkeys_enabled` false, which is a configuration
+        state and not a fault, and the router does not mount these routes in that case
+        anyway. Reaching it means somebody called the flow directly.
+        """
+        if self.passkeys is None:
+            raise LoginRejected(
+                "Passkeys are not available.",
+                error_code="PASSKEYS_DISABLED",
+                status_code=501,
+            )
+        return self.passkeys
+
+    def begin_passkey_registration(self, *, user_id: str) -> RegistrationChallenge:
+        """Options for enrolling a new passkey on an already-authenticated account.
+
+        The caller is authenticated, so the user is loaded rather than guessed, and
+        `may_authenticate` is consulted: a product that has disabled an account should not
+        let that account grow new credentials while the token in hand is still valid.
+        """
+        service = self._require_passkeys()
+        user = self._hooks.load_user_by_id(user_id)
+        if user is None:
+            raise LoginRejected("No such account.", error_code="USER_NOT_FOUND", status_code=404)
+        self._hooks.may_authenticate(user)
+        email = str(user.get("email", "")).strip()
+        return service.begin_registration(
+            user_id,
+            user_name=email or user_id,
+            display_name=str(user.get("name", "")).strip() or email or user_id,
+        )
+
+    def finish_passkey_registration(
+        self,
+        *,
+        user_id: str,
+        challenge_id: str,
+        credential: Mapping[str, Any],
+        name: str = "",
+    ) -> PasskeyRecord:
+        """Verify the attestation and store the credential against the caller's account."""
+        service = self._require_passkeys()
+        record = service.finish_registration(
+            user_id, challenge_id=challenge_id, credential=credential, name=name
+        )
+        _log.info(
+            "Passkey registered.",
+            extra={"event": "passkey.register.success", "user_id": user_id},
+        )
+        return record
+
+    def begin_passkey_login(self, *, email: str = "") -> RegistrationChallenge:
+        """Options for signing in with a passkey.
+
+        Refused outright unless `passkeys_passwordless` is on, because these options are the
+        entire passwordless entry point: with them off, a passkey is a second factor and an
+        enrolment credential, and there is no route into an account that starts here.
+
+        An unknown or absent address produces a discoverable-credential challenge with no
+        `allowCredentials`, which is what a genuine discoverable request looks like. Section
+        5.4 again: this route must not become an account oracle that needs no password.
+        """
+        service = self._require_passkeys()
+        if not self._settings.passkeys_passwordless:
+            raise LoginRejected(
+                "Passwordless sign-in is not available.",
+                error_code="PASSKEY_LOGIN_DISABLED",
+                status_code=403,
+            )
+        user_id = ""
+        normalised = _normalise_email(email)
+        if normalised:
+            try:
+                user = self._hooks.load_user_by_email(normalised)
+            except Exception:  # pragma: no cover - defensive, hook failures
+                user = None
+            if user is not None:
+                user_id = _user_id(user)
+        return service.begin_login(user_id=user_id)
+
+    def login_with_passkey(
+        self,
+        *,
+        challenge_id: str,
+        credential: Mapping[str, Any],
+        ip: str = "",
+        user_agent: str = "",
+    ) -> AuthResult:
+        """The passwordless login leg: verify an assertion, issue the same token pair.
+
+        Identical output to `login`, deliberately. A passkey session is a session: same
+        refresh family, same cookie, same access token lifetime. The only difference is
+        `amr`, and that difference is the point.
+
+        **A user-verified passkey is not challenged for TOTP.** `_challenge_for` is not
+        consulted on this path, because the assertion already carried two factors and asking
+        for a third would be a policy this package has no business inventing. A passkey that
+        reports no user verification is one factor, so the MFA challenge still applies to it
+        exactly as it applies to a password. See `passkeys.amr_for`.
+
+        Lockout is not applied here and the attempt is not recorded against the email
+        counter. There is nothing to grind: an assertion is either signed by the credential's
+        private key or it is not, and a wrong guess costs an attacker a challenge rather than
+        a step towards one. The route is rate limited all the same.
+        """
+        service = self._require_passkeys()
+        if not self._settings.passkeys_passwordless:
+            raise LoginRejected(
+                "Passwordless sign-in is not available.",
+                error_code="PASSKEY_LOGIN_DISABLED",
+                status_code=403,
+            )
+        result = service.finish_login(challenge_id=challenge_id, credential=credential)
+
+        user = self._hooks.load_user_by_id(result.user_id)
+        if user is None:
+            # The assertion verified, so this is a credential outliving its user rather than
+            # an attack. Same refusal as any other passkey failure.
+            from webbpulse.identity.passkeys import PasskeyRejected
+
+            raise PasskeyRejected()
+
+        # The product still gets its say. A disabled account with a working passkey must not
+        # sign in, and `may_authenticate` is where a product expresses that.
+        self._hooks.may_authenticate(user)
+
+        if not result.user_verified and self.mfa is not None:
+            # One factor only, so the second-factor policy applies exactly as it does to a
+            # password. The challenge is raised the same way `login` raises it, so a caller
+            # already handling `MfaChallengeRequired` needs no new branch.
+            challenge = self._challenge_for(user)
+            if challenge is not None:
+                raise MfaChallengeRequired(challenge)
+
+        self._record(
+            str(user.get("email", "")) or result.user_id,
+            "success",
+            user_id=result.user_id,
+            ip=ip,
+            user_agent=user_agent,
+        )
+        _log.info(
+            "Passkey login succeeded.",
+            extra={
+                "event": "passkey.login.success",
+                "user_id": result.user_id,
+                "ip": ip,
+                "user_agent": _device_class(user_agent),
+                "user_verified": result.user_verified,
+            },
+        )
+        return self._issue(user, ip=ip, user_agent=user_agent, amr=result.amr)
+
+    def list_passkeys(self, *, user_id: str) -> list[PasskeyRecord]:
+        """Every passkey on the caller's own account."""
+        return self._require_passkeys().list_passkeys(user_id)
+
+    def rename_passkey(self, *, user_id: str, credential_id: str, name: str) -> PasskeyRecord:
+        """Relabel one of the caller's own passkeys."""
+        return self._require_passkeys().rename_passkey(user_id, credential_id, name=name)
+
+    def delete_passkey(self, *, user_id: str, credential_id: str) -> None:
+        """Remove one of the caller's own passkeys, unless it is the only way in.
+
+        "Has a password" is read from the `credentials` store, which is where this package's
+        own password lives, so no new hook is needed and `IdentityHooks` is unchanged by M5.
+        A product with some other sign-in method the package cannot see still has
+        `may_authenticate` and can refuse the delete in front of the route.
+        """
+        service = self._require_passkeys()
+        credential = self._stores.require_credentials().get(user_id, PASSWORD_CREDENTIAL_TYPE)
+        service.delete_passkey(
+            user_id, credential_id, has_password=credential is not None and bool(credential.secret)
         )
 
     # ---- internals -----------------------------------------------------------------

@@ -67,13 +67,21 @@ identity = ["PyJWT[crypto]>=2.9", "fastapi>=0.115"]
 # whose `httpx2` is there for Starlette's TestClient rather than for this.
 oauth = ["httpx>=0.27"]
 
+# webbpulse.identity.passkeys. Separate from `identity` because WebAuthn is a capability a
+# product turns on rather than part of the base slice, and because py_webauthn pulls in a
+# CBOR and an ASN.1 stack that a deployment doing password login only has no use for.
+# `webbpulse.identity.passkeys` imports it lazily inside its methods, so this extra is
+# needed only where `passkeys_enabled` is true and the two M5 tables exist. Capped below 3
+# because the 2.x line is where `verify_registration_response`'s keyword signature is fixed.
+passkeys = ["webauthn>=2.7,<3"]
+
 [project.urls]
 Homepage = "https://github.com/WebbPulse/webbpulse-python"
 Source = "https://github.com/WebbPulse/webbpulse-python"
 
 [dependency-groups]
 dev = [
-  "webbpulse[aws-otel,dynamodb,fastapi,identity,otel,security,testing]",
+  "webbpulse[aws-otel,dynamodb,fastapi,identity,oauth,otel,passkeys,security,testing]",
   "boto3-stubs[dynamodb,kms,secretsmanager]",
   "botocore-stubs",
   "mypy>=1.13",

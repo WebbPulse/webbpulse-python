@@ -5,6 +5,115 @@ Notable changes to the `webbpulse` package. The version here is the one in
 
 This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## 0.15.0
+
+Identity M5: passkeys. WebAuthn registration and passwordless sign-in, credential
+management, and two new DynamoDB tables. Additive throughout: nothing existing changes
+shape, no route contract moves, and a deployment that does not create the two tables gets
+0.14.0's behaviour with no passkey routes mounted at all.
+
+### Added
+
+- **`webbpulse.identity.passkeys`**, a new module holding `PasskeyService`: the WebAuthn
+  registration and authentication ceremonies, the challenge lifecycle, the signature counter
+  check and the credential management operations. It imports the `webauthn` package lazily
+  inside the methods that need it, so the new `passkeys` extra is required only by a product
+  that actually turns passkeys on.
+
+- **`webbpulse.identity.passkey_routes`**, holding `register_passkey_routes`, which mounts
+  seven routes when both M5 stores are present and `passkeys_enabled` is true:
+
+  | Route | What it does |
+  | --- | --- |
+  | `POST /passkeys/register/options` | Registration options for the authenticated caller |
+  | `POST /passkeys/register/verify` | Verify the attestation and store the credential |
+  | `POST /login/passkey/options` | Authentication options, anonymous |
+  | `POST /login/passkey/verify` | Verify the assertion and issue the session |
+  | `GET /passkeys` | The caller's own passkeys |
+  | `PATCH /passkeys/{credential_id}` | Rename one |
+  | `DELETE /passkeys/{credential_id}` | Remove one |
+
+- **Two tables.** `passkeys`, hash `user_id` and range `credential_id`, with a
+  `credential_id-index` GSI for the login lookup and **no** TTL, because a credential is
+  removed when its owner removes it and never on a timer. `webauthn-challenges`, hash
+  `challenge_id`, TTL attribute `expires_at`. Both come with `PasskeyStore` and
+  `WebAuthnChallengeStore` abstract bases and a Dynamo and an in-memory implementation each,
+  matching every other store in the package, and two new optional fields on `IdentityStores`.
+
+- **A `passkeys` extra**, `webauthn>=2.7,<3`. Separate from `identity` because WebAuthn is a
+  capability a product turns on rather than part of the base slice.
+
+- **`IdentityFlows` gained `begin_passkey_registration`, `finish_passkey_registration`,
+  `begin_passkey_login`, `login_with_passkey`, `list_passkeys`, `rename_passkey` and
+  `delete_passkey`**, plus a `passkeys` attribute that is `None` when the capability is off.
+  `IdentityHooks` is **unchanged**: M5 adds no hook method and no product implementation
+  needs updating.
+
+### Security
+
+- **Challenges are rows, not tokens, and are single use.** A WebAuthn challenge exists to
+  make an assertion unreplayable, which is a claim about state that a signed token cannot
+  make: a JWT verifies exactly as well the second time as the first, so a captured
+  options-and-assertion pair replays for the whole of the token's lifetime. CarModPicker's
+  implementation puts the challenge in a five minute JWT, and porting it unchanged would
+  have carried that hole into the shared package. So a challenge is written to
+  `webauthn-challenges` when options are generated, **deleted** when it is consumed, and
+  refused when its deadline has passed regardless of whether DynamoDB's TTL has reached the
+  row. Five minutes, and the row is spent by one attempt whatever the outcome, so a stolen
+  challenge cannot be ground against.
+
+- **The origin and the RP ID are verified against settings on every ceremony.** Both are
+  required rather than defaulted, and the service raises naming the environment variable if
+  either is missing, because an empty origin list makes the origin check vacuous and the
+  origin check is the whole of what makes a passkey phishing resistant.
+
+- **Signature counter regression is refused and logged at ERROR.** Section 6.1.3 of the
+  WebAuthn specification treats a counter that fails to increase as evidence of a cloned
+  authenticator. The check is this package's own rather than the library's: `finish_login`
+  passes py_webauthn a stored count of zero so that the comparison happens here, where the
+  regression is logged as the finding it is instead of disappearing into a generic
+  verification failure, and where an upgrade to the library cannot quietly change it. Both
+  counts being zero is the specification's documented exception and is allowed, because many
+  authenticators, Apple's included, keep no counter at all.
+
+  Counters **migrate as stored, never as zero**. A credential imported from another system
+  keeps the count that system last saw. Importing at zero would disarm the check for that
+  credential permanently, since every subsequent assertion would exceed zero and so would
+  look correct forever.
+
+- **A user-verified passkey counts as two factors, and the package says so in `amr`.** A
+  passkey login sets `amr` to `["swk"]` when the authenticator did not verify the user, and
+  `["swk", "pin", "mfa"]` when it did; both values are RFC 8176 registered. The reasoning:
+  the assertion proves possession of a private key that never leaves the authenticator, and
+  the `uv` flag proves the authenticator separately checked something the user knows or is
+  before it would sign, which is possession plus knowledge or inherence in one gesture.
+
+  The consequence is deliberate and is the one place the package decides an MFA policy
+  rather than asking the product: a user with TOTP enrolled who signs in with a user-verified
+  passkey is **not** challenged for a code. The same user signing in with a passkey that
+  reports no user verification **is** challenged, exactly as a password is, and that path
+  returns the existing `mfa_required` body so no client needs a new branch.
+
+- **Enumeration resistance reaches the passkey login leg.** `POST /login/passkey/options`
+  answers any input, including an address with no account, with a challenge and an empty
+  `allowCredentials`, which is byte-identical to a genuine discoverable-credential request.
+  Refusing, or answering with a different shape, would turn an unauthenticated route into an
+  account oracle that needs no password. Every verify failure is one refusal with one
+  message, and registering a credential already enrolled elsewhere answers without saying
+  whose it is.
+
+- **Passwordless sign-in is gated on `passkeys_passwordless`.** With it off, both login
+  routes refuse and a passkey is a second factor and a managed credential but not an entry
+  point. Registration, rename and delete require an authenticated subject read from the
+  verified claims and never from the body.
+
+- **The last passkey cannot be deleted by a user with no password.** Not a rule about
+  passkeys so much as about not stranding somebody outside their own account. "Has a
+  password" is read from the `credentials` store, which is where this package's own password
+  lives, so **no new hook was needed**. A product whose users can sign in some other way the
+  package cannot see still has `may_authenticate` and can refuse the delete in front of the
+  route.
+
 ## 0.14.0
 
 Identity M6: OAuth sign-in and account linking against Google and GitHub.
