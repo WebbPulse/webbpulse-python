@@ -16,7 +16,20 @@ refresh stores, the M2 password and session flows:
     POST <prefix>/logout
     POST <prefix>/logout-all
 
-MFA, passkeys and OAuth are M4 to M6, per section 9.1 of `docs/identity-standard.md`.
+and, when TOTP is enabled and the two M4 stores are supplied, the MFA routes:
+
+    POST <prefix>/login/totp        second leg of login, anonymous, holds an MFA ticket
+    POST <prefix>/totp/enrol        behind the authorizer
+    POST <prefix>/totp/activate     behind the authorizer
+    POST <prefix>/totp/disable      behind the authorizer
+    POST <prefix>/recovery-codes    behind the authorizer
+    POST <prefix>/step-up           behind the authorizer
+
+`login/totp` must stay **outside** the authorizer: it carries an MFA ticket whose audience
+is `<issuer>/mfa`, which the gateway's authorizer is not configured with, so putting it
+behind the authorizer rejects the second leg of every MFA login before it runs.
+
+Passkeys and OAuth are M5 and M6, per section 9.1 of `docs/identity-standard.md`.
 
 ## Where `<prefix>` comes from, and why you mount with no prefix of your own
 
@@ -84,6 +97,7 @@ if TYPE_CHECKING:  # pragma: no cover - typing only
     from collections.abc import Callable
 
     from fastapi import APIRouter, Request
+    from fastapi.responses import JSONResponse
 
     from webbpulse.identity.email import EmailSender
     from webbpulse.identity.hooks import IdentityHooks
@@ -98,9 +112,11 @@ __all__ = [
     "HEALTH_PATH",
     "JWKS_CACHE_CONTROL",
     "LOGIN_PATH",
+    "LOGIN_TOTP_PATH",
     "LOGOUT_ALL_PATH",
     "LOGOUT_PATH",
     "PASSWORD_PATH",
+    "RECOVERY_CODES_PATH",
     "REFRESH_PATH",
     "REGISTER_PATH",
     "RESET_CONFIRM_PATH",
@@ -108,6 +124,12 @@ __all__ = [
     "RESET_IP_LIMIT",
     "RESET_REQUESTED_MESSAGE",
     "RESET_REQUEST_PATH",
+    "STEP_UP_PATH",
+    "TOTP_ACTIVATE_PATH",
+    "TOTP_DISABLE_PATH",
+    "TOTP_ENROL_IP_LIMIT",
+    "TOTP_ENROL_PATH",
+    "TOTP_VERIFY_LIMIT",
     "VERIFY_CONFIRM_PATH",
     "VERIFY_EMAIL_LIMIT",
     "VERIFY_IP_LIMIT",
@@ -145,6 +167,15 @@ VERIFY_CONFIRM_PATH = "/verify-email/confirm"
 RESET_REQUEST_PATH = "/reset"
 RESET_CONFIRM_PATH = "/reset/confirm"
 
+#: M4. `LOGIN_TOTP_PATH` is the second leg of login and carries an MFA ticket rather than an
+#: access token, so it must stay outside the authorizer. The rest sit behind it.
+LOGIN_TOTP_PATH = "/login/totp"
+TOTP_ENROL_PATH = "/totp/enrol"
+TOTP_ACTIVATE_PATH = "/totp/activate"
+TOTP_DISABLE_PATH = "/totp/disable"
+RECOVERY_CODES_PATH = "/recovery-codes"
+STEP_UP_PATH = "/step-up"
+
 #: Section 5.4's exact wording for the reset request. It is a true sentence in both cases,
 #: which is what makes it usable as the single answer: it does not claim an email was sent.
 RESET_REQUESTED_MESSAGE: Final = "If that address has an account, a link is on its way."
@@ -165,6 +196,13 @@ RESET_EMAIL_LIMIT: Final = (3, 3600)
 RESET_IP_LIMIT: Final = (10, 3600)
 VERIFY_EMAIL_LIMIT: Final = (3, 3600)
 VERIFY_IP_LIMIT: Final = (10, 3600)
+
+#: Section 5.1: ten TOTP verifications per fifteen minutes. This is the control that makes a
+#: six digit code acceptable at all, so it is per user rather than per IP: an attacker with
+#: many addresses guessing one account is exactly the case it exists to stop.
+TOTP_VERIFY_LIMIT: Final = (10, 900)
+#: Enrolment is per IP and looser: it mints a seed rather than guessing one.
+TOTP_ENROL_IP_LIMIT: Final = (10, 3600)
 
 #: `Sec-Fetch-Site` values a state-changing cookie route accepts. Section 5.5's first CSRF
 #: supplement: the header is sent by every current major browser and cannot be set by page
@@ -327,6 +365,7 @@ def build_identity_router(
             attempts=attempts,
             email_sender=email_sender,
             limiter_enabled=limiter_enabled,
+            kms_client=kms_client,
         )
 
     return router
@@ -343,6 +382,7 @@ def _mount_flows(
     attempts: LoginAttemptStore | None,
     email_sender: EmailSender | None,
     limiter_enabled: bool,
+    kms_client: Any = None,
 ) -> None:
     """Add the six M2 flow routes, and M3's four email routes, to an already-built router.
 
@@ -359,14 +399,25 @@ def _mount_flows(
     from fastapi import Body, Depends
     from fastapi.responses import JSONResponse
 
-    from webbpulse.identity.flows import IdentityFlows, LoginRejected, RateLimited
+    from webbpulse.identity.flows import (
+        IdentityFlows,
+        LoginRejected,
+        MfaChallengeRequired,
+        RateLimited,
+    )
     from webbpulse.identity.passwords import PasswordRejected
 
     # Must happen before the first `@router.post` below. See `_FastAPIRequest`.
     _bind_fastapi_request()
 
     flows = IdentityFlows(
-        settings, hooks, stores, tokens, attempts=attempts, email_sender=email_sender
+        settings,
+        hooks,
+        stores,
+        tokens,
+        attempts=attempts,
+        email_sender=email_sender,
+        kms_client=kms_client,
     )
 
     def limits(*specs: tuple[str, tuple[int, int], str]) -> list[Any]:
@@ -516,6 +567,11 @@ def _mount_flows(
                     user_agent=user_agent,
                 )
             )
+        except MfaChallengeRequired as challenge:
+            # 200, not 401. Nothing was refused: the password was right and the flow is
+            # half done. `@webbpulse/auth` branches on `mfa_required` in the body, so an
+            # error status here would be read as a failed login by every existing client.
+            return JSONResponse(challenge.challenge.as_body())
         except LoginRejected as exc:
             return rejected(request, exc)
         return set_refresh_cookie(JSONResponse(success_body(result)), result.refresh_token)
@@ -618,6 +674,22 @@ def _mount_flows(
         ip, _ = context(request)
         await run_sync(lambda: flows.logout_all(subject, ip=ip))
         return clear_refresh_cookie(JSONResponse({"signed_out": True}))
+
+    # Before the email early-return below, deliberately. MFA needs no sender: a product can
+    # run TOTP with no email configured at all, and mounting these after that `return` meant
+    # the second leg of login silently did not exist for exactly those products.
+    if flows.mfa is not None:
+        _mount_mfa(
+            router,
+            prefix=prefix,
+            flows=flows,
+            tokens=tokens,
+            limits=limits,
+            context=context,
+            rejected=rejected,
+            success_body=success_body,
+            set_refresh_cookie=set_refresh_cookie,
+        )
 
     if not flows.email_enabled:
         # No sender, or no `identity-tokens` store. The four routes below all promise the
@@ -726,6 +798,178 @@ def _mount_flows(
         # whichever one this browser held. Leaving it would send a dead token on every
         # subsequent request until it expired.
         return clear_refresh_cookie(JSONResponse({"reset": True}))
+
+
+def _mount_mfa(
+    router: APIRouter,
+    *,
+    prefix: str,
+    flows: Any,
+    tokens: TokenService,
+    limits: Callable[..., list[Any]],
+    context: Callable[[Request], tuple[str, str]],
+    rejected: Callable[[Request, Any], JSONResponse],
+    success_body: Callable[[Any], dict[str, Any]],
+    set_refresh_cookie: Callable[[JSONResponse, str], JSONResponse],
+) -> None:
+    """Add M4's six MFA routes, given the closures `_mount_flows` already built.
+
+    Called from inside `_mount_flows` rather than from `build_identity_router` because it
+    needs those closures: the cookie writer, the error renderer and the rate limit builder
+    are all bound to settings that only exist there. Passing them in keeps one definition of
+    each, so an MFA route and a login route cannot render the same refusal differently.
+
+    Mounted only when `flows.mfa` is present, which needs both M4 tables and TOTP enabled.
+    Section 6.1 makes TOTP a capability, and a route that answers 503 because the product
+    never created the tables is worse than a route that does not exist.
+
+    ## Which of these sit behind the authorizer
+
+    `login/totp` does **not**: it carries an MFA ticket, and the ticket's audience is
+    `<issuer>/mfa`, which the gateway's authorizer is not configured with. Putting it behind
+    the authorizer means the second leg of every MFA login is rejected before it runs.
+
+    The other five do. They all act on an already-authenticated user, and each reads the
+    subject from the verified claims rather than from the body, for the reason
+    `change_password` does: a user id in the body lets anybody enrol a factor on anybody's
+    account.
+    """
+    from fastapi import Body
+    from fastapi.responses import JSONResponse
+
+    from webbpulse.identity.flows import LoginRejected
+    from webbpulse.identity.mfa import MfaRejected
+
+    def mfa_refused(request: Request, exc: MfaRejected) -> JSONResponse:
+        """Render an MFA refusal in the shared envelope."""
+        from webbpulse.http import error_body
+
+        return JSONResponse(
+            error_body(exc.status_code, exc.message, request, error_code=exc.error_code),
+            status_code=exc.status_code,
+        )
+
+    def require_subject(request: Request) -> str:
+        subject = _subject_from_request(request, tokens)
+        if not subject:
+            raise LoginRejected("Sign in first.", error_code="NOT_AUTHENTICATED", status_code=401)
+        return subject
+
+    @router.post(
+        f"{prefix}{LOGIN_TOTP_PATH}",
+        dependencies=limits(("mfa-verify", TOTP_VERIFY_LIMIT, "ip")),
+    )
+    async def complete_totp_login(
+        request: _FastAPIRequest, payload: dict[str, Any] = Body(...)
+    ) -> JSONResponse:
+        # The body field is `mfa_ticket`, not `ticket`: that is what `AuthClient.completeTotp`
+        # sends, and matching it is what lets the frontend work unchanged.
+        ip, user_agent = context(request)
+        try:
+            result = await run_sync(
+                lambda: flows.complete_mfa(
+                    ticket=str(payload.get("mfa_ticket", "")),
+                    code=str(payload.get("code", "")),
+                    ip=ip,
+                    user_agent=user_agent,
+                )
+            )
+        except MfaRejected as exc:
+            return mfa_refused(request, exc)
+        except LoginRejected as exc:
+            return rejected(request, exc)
+        return set_refresh_cookie(JSONResponse(success_body(result)), result.refresh_token)
+
+    @router.post(
+        f"{prefix}{TOTP_ENROL_PATH}",
+        dependencies=limits(("totp-enrol", TOTP_ENROL_IP_LIMIT, "ip")),
+    )
+    async def enrol_totp(request: _FastAPIRequest) -> JSONResponse:
+        try:
+            subject = require_subject(request)
+        except LoginRejected as exc:
+            return rejected(request, exc)
+
+        claims = _claims_from_request(request, tokens)
+        account = claims.get("email", "") or subject
+        try:
+            enrolment = await run_sync(
+                lambda: flows.mfa.begin_enrolment(subject, account_name=account)
+            )
+        except MfaRejected as exc:
+            return mfa_refused(request, exc)
+        # The seed is returned in plaintext exactly once, here. There is no route that reads
+        # it back: a user who loses it before confirming enrols again.
+        return JSONResponse(
+            {
+                "secret": enrolment.secret,
+                "provisioning_uri": enrolment.provisioning_uri,
+            }
+        )
+
+    @router.post(
+        f"{prefix}{TOTP_ACTIVATE_PATH}",
+        dependencies=limits(("mfa-verify", TOTP_VERIFY_LIMIT, "ip")),
+    )
+    async def activate_totp(
+        request: _FastAPIRequest, payload: dict[str, Any] = Body(...)
+    ) -> JSONResponse:
+        try:
+            subject = require_subject(request)
+        except LoginRejected as exc:
+            return rejected(request, exc)
+        try:
+            codes = await run_sync(
+                lambda: flows.mfa.confirm_enrolment(subject, str(payload.get("code", "")))
+            )
+        except MfaRejected as exc:
+            return mfa_refused(request, exc)
+        # The recovery codes are returned exactly once, with the activation that created
+        # them. Regenerating is the only way to see a set again.
+        return JSONResponse({"activated": True, "recovery_codes": codes.codes})
+
+    @router.post(f"{prefix}{TOTP_DISABLE_PATH}")
+    async def disable_totp(request: _FastAPIRequest) -> JSONResponse:
+        try:
+            subject = require_subject(request)
+        except LoginRejected as exc:
+            return rejected(request, exc)
+        await run_sync(lambda: flows.mfa.disable_totp(subject))
+        return JSONResponse({"disabled": True})
+
+    @router.post(f"{prefix}{RECOVERY_CODES_PATH}")
+    async def regenerate_recovery_codes(request: _FastAPIRequest) -> JSONResponse:
+        try:
+            subject = require_subject(request)
+        except LoginRejected as exc:
+            return rejected(request, exc)
+        codes = await run_sync(lambda: flows.mfa.regenerate_recovery_codes(subject))
+        return JSONResponse({"recovery_codes": codes.codes})
+
+    @router.post(
+        f"{prefix}{STEP_UP_PATH}",
+        dependencies=limits(("mfa-verify", TOTP_VERIFY_LIMIT, "ip")),
+    )
+    async def step_up(
+        request: _FastAPIRequest, payload: dict[str, Any] = Body(...)
+    ) -> JSONResponse:
+        try:
+            subject = require_subject(request)
+        except LoginRejected as exc:
+            return rejected(request, exc)
+        try:
+            result = await run_sync(
+                lambda: flows.step_up(
+                    user_id=subject,
+                    session_id=_session_from_request(request, tokens),
+                    code=str(payload.get("code", "")),
+                )
+            )
+        except MfaRejected as exc:
+            return mfa_refused(request, exc)
+        # No cookie. Step-up does not start a family, so there is nothing new to set, and
+        # rewriting the cookie here would rotate a refresh token that never moved.
+        return JSONResponse(success_body(result))
 
 
 def _string_list(value: object) -> list[str] | None:

@@ -1006,13 +1006,15 @@ and authenticated callers.
 ### `webbpulse.identity`
 
 App-managed identity: password flows, refresh sessions, email verification and password
-reset, configuration, the product policy seam, storage interfaces, a KMS-backed token
-service, and the reader for the claims an API Gateway HTTP API JWT authorizer leaves on a
-request. Needs the `identity` extra.
+reset, TOTP and recovery codes, configuration, the product policy seam, storage interfaces,
+a KMS-backed token service, and the reader for the claims an API Gateway HTTP API JWT
+authorizer leaves on a request. Needs the `identity` extra.
 
-This is M3 of `docs/identity-standard.md`. M1 built the foundations, M2 added the password
-and session flows, and M3 adds the two emailed link flows on top of them. TOTP and MFA
-(M4), passkeys (M5) and OAuth (M6) are still absent.
+This is M4 of `docs/identity-standard.md`. M1 built the foundations, M2 added the password
+and session flows, M3 added the two emailed link flows, and M4 adds multi-factor
+authentication: TOTP with its seed envelope encrypted under KMS, single-use recovery codes,
+the two-leg login the MFA ticket carries, step-up re-authentication, and `amr` on the access
+token. Passkeys (M5) and OAuth (M6) are still absent.
 
 ```python
 import boto3
@@ -1032,6 +1034,8 @@ app.include_router(build_identity_router(settings, hooks, stores, tokens=tokens)
 | `IdentityFlows` | Register, login, change password, refresh, logout, logout-all, verify email, reset password, with no FastAPI dependency |
 | `SessionService` | Refresh families: rotation, reuse detection, the grace window, revocation |
 | `LinkService` | Single-use emailed links: minting, hashing, expiry, purpose, consumption |
+| `MfaService` | TOTP enrolment and verification, recovery codes, and the MFA ticket |
+| `EnvelopeCipher` | Sealing a TOTP seed under a per-secret KMS data key with a per-user encryption context |
 | `EmailSender` | Sending mail, with an SES v2 implementation and a recording one for tests |
 | `TokenService` | Minting, local verification, JWKS, discovery, rotation across keys |
 | `authorizer_claims` | Reading and coercing what the authorizer put on the request |
@@ -1058,6 +1062,12 @@ gateway builds the discovery URL as `issuer + "/.well-known/openid-configuration
 | `POST /api/auth/verify-email/confirm` | Spends a verification link and marks the address verified |
 | `POST /api/auth/reset` | Mails a reset link, answering 200 either way |
 | `POST /api/auth/reset/confirm` | Spends a reset link, sets the new password, revokes every session |
+| `POST /api/auth/login/totp` | The second leg of login: exchanges an MFA ticket plus a code for tokens |
+| `POST /api/auth/totp/enrol` | Starts an enrolment and returns the seed and provisioning URI once |
+| `POST /api/auth/totp/activate` | Confirms an enrolment with its first code and returns recovery codes |
+| `POST /api/auth/totp/disable` | Removes the factor and every recovery code with it |
+| `POST /api/auth/recovery-codes` | Replaces the set, invalidating every previous code |
+| `POST /api/auth/step-up` | Re-authenticates inside the session for a fresher `auth_time` |
 
 An issuer with no path gives the same routes at the origin. Adding a prefix of your own
 doubles the issuer path and hides the documents from the gateway. **This changed in
@@ -1069,8 +1079,26 @@ only when the product supplies both `hooks` and a credential store. Called witho
 router mounts exactly what M1 mounted, the two `.well-known` documents and `/health`, so a
 service that only serves a JWKS does not acquire a login endpoint by upgrading. The four
 email routes need more still: an `EmailSender` and an identity token store, and without
-both of those the other ten routes mount without them. A route that cannot do its job
-should not exist to be called.
+both of those the other ten routes mount without them. The six MFA routes need `totp_enabled`
+plus a TOTP factor store, a recovery code store and an identity token store, and they mount
+independently of the email routes: a product can run TOTP with no sender configured at all.
+A route that cannot do its job should not exist to be called.
+
+**Login answers 200 with a challenge when a factor is enrolled.** The first leg returns
+`{"mfa_required": true, "mfa_ticket": "...", "factors": ["totp"]}` rather than tokens, and
+rather than a 401: nothing was refused, since the password was correct. The second leg posts
+that ticket and a code to `/login/totp` and gets the ordinary token response. The ticket is
+short-lived, single use, and carries an audience of `<issuer>/mfa` rather than the API's, so
+the gateway's authorizer refuses it anywhere else. `/login/totp` therefore has to sit outside
+the authorizer; the other five MFA routes sit behind it and read their subject from the
+verified claims, never from the body.
+
+**A TOTP seed is never stored in the clear.** Each one is sealed under its own KMS data key
+with `{"user_id", "purpose"}` as the encryption context, so a ciphertext moved to another
+user's row fails to decrypt, and reading a seed needs both table access and `kms:Decrypt`.
+Set `IDENTITY_DATA_KEY_ARN` to a symmetric key, distinct from the signing key. Recovery codes
+are the opposite case and are SHA-256 hashed rather than encrypted: verification only ever
+compares them.
 
 **The access token is returned in the JSON body and the refresh token is a cookie.** The
 access token is short-lived, ten minutes by default, and is never set as a cookie: it is

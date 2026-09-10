@@ -77,6 +77,8 @@ if TYPE_CHECKING:  # pragma: no cover - typing only
     from webbpulse.identity.settings import IdentitySettings
 
 __all__ = [
+    "ACCESS_TOKEN_TYPE",
+    "MFA_TICKET_TYPE",
     "REGISTERED_CLAIMS",
     "InvalidToken",
     "TokenService",
@@ -93,6 +95,10 @@ REGISTERED_CLAIMS: Final[frozenset[str]] = frozenset(
 #: stops a refresh token or an MFA ticket being presented where an access token is expected,
 #: which is a real confused-deputy bug and not a hypothetical one.
 ACCESS_TOKEN_TYPE: Final = "access"
+
+#: The `typ` an MFA ticket carries. Distinct from `ACCESS_TOKEN_TYPE` so that the two can
+#: never be confused for one another, per section 3.2.
+MFA_TICKET_TYPE: Final = "mfa_ticket"
 
 _log = logging.getLogger(__name__)
 
@@ -244,6 +250,73 @@ class TokenService:
         if session_id:
             payload["sid"] = session_id
         return self._signer.encode(payload)
+
+    def mint_mfa_ticket(
+        self,
+        subject: str,
+        *,
+        factors: Sequence[str],
+        jti: str,
+        now: int | None = None,
+    ) -> str:
+        """A short-lived ticket standing for "this password was correct, the factor is not".
+
+        This is **not** an access token and must never be usable as one. Three things keep
+        them apart, and all three are needed:
+
+        - `typ` is `MFA_TICKET_TYPE`, not `access`. Section 3.2 requires every token to carry
+          a `typ` that is asserted positively, and `verify_mfa_ticket` refuses anything else.
+        - `aud` is `<issuer>/mfa`, an audience nothing else accepts. The API Gateway
+          authorizer is configured with the product's own audience, so a ticket presented as
+          a bearer token is rejected at the gateway before any code sees it. That is the
+          check that holds even if this package's own verification is bypassed.
+        - `exp` is `mfa_ticket_ttl`, five minutes by default, rather than the access token's
+          lifetime.
+
+        `jti` is supplied by the caller rather than generated here, because the caller has to
+        record it to enforce single use. Generating it here would leave the caller to read it
+        back out of the encoded token, which works but puts the value that guarantees single
+        use somewhere it can be forgotten.
+
+        No `sid`. The ticket precedes the session: there is no refresh family yet, and there
+        will not be one unless the second factor succeeds.
+        """
+        issued_at = int(time.time()) if now is None else now
+        ttl = int(self._settings.mfa_ticket_ttl.total_seconds())
+        payload: dict[str, Any] = {
+            "iss": self._settings.issuer,
+            "sub": subject,
+            "aud": self.mfa_audience,
+            "iat": issued_at,
+            "exp": issued_at + ttl,
+            "jti": jti,
+            "typ": MFA_TICKET_TYPE,
+            "amr": list(factors),
+        }
+        return self._signer.encode(payload)
+
+    @property
+    def mfa_audience(self) -> str:
+        """The audience an MFA ticket carries: `<issuer>/mfa`, per section 3.2."""
+        return f"{self._settings.issuer.rstrip('/')}/mfa"
+
+    def verify_mfa_ticket(self, token: str, *, now: int | None = None) -> dict[str, Any]:
+        """Verify an MFA ticket and return its claims, or raise `InvalidToken`.
+
+        Asserts `typ` **after** the signature and audience are checked. Order matters: a
+        `typ` read from an unverified token is attacker-controlled, so checking it first
+        would be checking a value the attacker wrote.
+        """
+        claims = self.verify_access_token(token, audience=self.mfa_audience, now=now)
+        if claims.get("typ") != MFA_TICKET_TYPE:
+            # An access token presented as a ticket lands here. Refusing it is what stops a
+            # stolen access token being spent as a second factor.
+            raise InvalidToken(f"expected typ {MFA_TICKET_TYPE!r}, got {claims.get('typ')!r}")
+        if not claims.get("jti"):
+            # Without a jti there is nothing to record, so single use cannot be enforced and
+            # the ticket would be replayable for its whole lifetime.
+            raise InvalidToken("mfa ticket carries no jti")
+        return claims
 
     # ---- local verification ------------------------------------------------------
 

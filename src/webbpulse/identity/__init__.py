@@ -23,10 +23,13 @@ the standard fixes is here.
   the four message templates.
 - `verification`: `LinkService`, the single-use link primitive both email verification and
   password reset are built from.
-- `flows`: `IdentityFlows`, the M2 and M3 flow logic with no FastAPI imports.
+- `totp`: RFC 6238 code generation, the provisioning URI, and the replay window.
+- `crypto`: `EnvelopeCipher`, KMS envelope encryption for the TOTP seed at rest.
+- `mfa`: `MfaService`, tying those two to the stores, the ticket and the recovery codes.
+- `flows`: `IdentityFlows`, the M2 to M4 flow logic with no FastAPI imports.
 - `router`: `build_identity_router`, which is what a product mounts.
 
-## What 0.11.0 does and does not do
+## What 0.12.0 does and does not do
 
 M1 built the **foundations**: configuration, the policy seam, the storage interfaces, the
 token service, and claim reading.
@@ -41,8 +44,14 @@ routes answer 200 whatever the address is, per section 5.4, and a completed rese
 every refresh family the user had. The four routes appear only when the product supplies an
 `EmailSender` and an `identity-tokens` store, on the same rule the flow routes follow.
 
-TOTP and recovery codes are M4, passkeys are M5 and OAuth is M6, per section 9.1 of the
-standard.
+M4 adds **TOTP, recovery codes, the MFA ticket, step-up and `amr`**. A login by a user with
+an active factor answers 200 with a challenge rather than tokens, and the second leg
+exchanges the ticket plus a code for the session. Seeds are sealed with KMS envelope
+encryption and never stored in plaintext; a code is accepted once per time step, ever; and
+every access token now carries `amr` and `auth_time`, which is what lets a sensitive route
+assert on the factor actually used rather than on a boolean.
+
+Passkeys are M5 and OAuth is M6, per section 9.1 of the standard.
 
 ## The two things most likely to go wrong
 
@@ -51,6 +60,9 @@ standard.
    signing key and every authorized route in the product fails closed.
 2. **Every authorizer claim arrives as a string**, `exp` and `iat` included. `claims` owns
    the coercion back to integers, lists and booleans, and it is the only place that should.
+3. **`login/totp` must stay outside the authorizer.** It carries an MFA ticket, whose
+   audience is `<issuer>/mfa` and which the gateway's authorizer will not accept, so putting
+   it behind the authorizer breaks the second leg of every MFA login.
 """
 
 from __future__ import annotations
@@ -67,6 +79,14 @@ from webbpulse.identity.claims import (
     authorizer_claims,
     coerce_claims,
     read_authorizer_claims,
+)
+from webbpulse.identity.crypto import (
+    TOTP_ENCRYPTION_PURPOSE,
+    EnvelopeCipher,
+    EnvelopeDecryptionFailed,
+    KmsDataKeyClient,
+    SealedSecret,
+    encryption_context,
 )
 from webbpulse.identity.email import (
     EmailMessage,
@@ -86,6 +106,7 @@ from webbpulse.identity.flows import (
     AuthResult,
     IdentityFlows,
     LoginRejected,
+    MfaChallengeRequired,
     RateLimited,
 )
 from webbpulse.identity.hooks import (
@@ -110,6 +131,21 @@ from webbpulse.identity.lockout import (
     lockout_state,
     new_attempt,
 )
+from webbpulse.identity.mfa import (
+    AMR_MFA,
+    AMR_OTP,
+    AMR_PASSWORD,
+    AMR_RECOVERY,
+    RECOVERY_CODE_COUNT,
+    TOTP_FACTOR,
+    Enrolment,
+    MfaChallenge,
+    MfaRejected,
+    MfaService,
+    RecoveryCodeSet,
+    hash_recovery_code,
+    normalise_recovery_code,
+)
 from webbpulse.identity.passwords import (
     MAX_PASSWORD_BYTES,
     MIN_PASSWORD_CHARACTERS,
@@ -124,9 +160,11 @@ from webbpulse.identity.router import (
     HEALTH_PATH,
     JWKS_CACHE_CONTROL,
     LOGIN_PATH,
+    LOGIN_TOTP_PATH,
     LOGOUT_ALL_PATH,
     LOGOUT_PATH,
     PASSWORD_PATH,
+    RECOVERY_CODES_PATH,
     REFRESH_PATH,
     REGISTER_PATH,
     RESET_CONFIRM_PATH,
@@ -134,6 +172,12 @@ from webbpulse.identity.router import (
     RESET_IP_LIMIT,
     RESET_REQUEST_PATH,
     RESET_REQUESTED_MESSAGE,
+    STEP_UP_PATH,
+    TOTP_ACTIVATE_PATH,
+    TOTP_DISABLE_PATH,
+    TOTP_ENROL_IP_LIMIT,
+    TOTP_ENROL_PATH,
+    TOTP_VERIFY_LIMIT,
     VERIFY_CONFIRM_PATH,
     VERIFY_EMAIL_LIMIT,
     VERIFY_IP_LIMIT,
@@ -141,7 +185,13 @@ from webbpulse.identity.router import (
     build_identity_router,
     identity_prefix,
 )
-from webbpulse.identity.service import REGISTERED_CLAIMS, InvalidToken, TokenService
+from webbpulse.identity.service import (
+    ACCESS_TOKEN_TYPE,
+    MFA_TICKET_TYPE,
+    REGISTERED_CLAIMS,
+    InvalidToken,
+    TokenService,
+)
 from webbpulse.identity.sessions import (
     IssuedRefresh,
     RotationOutcome,
@@ -152,22 +202,32 @@ from webbpulse.identity.settings import IdentitySettings
 from webbpulse.identity.storage import (
     CREDENTIALS_TABLE,
     IDENTITY_TOKENS_TABLE,
+    RECOVERY_CODES_TABLE,
     REFRESH_FAMILY_INDEX,
     REFRESH_TOKENS_TABLE,
+    TOTP_FACTORS_TABLE,
     USERS_TABLE,
     CredentialRecord,
     CredentialStore,
     DynamoCredentialStore,
     DynamoIdentityTokenStore,
+    DynamoRecoveryCodeStore,
     DynamoRefreshTokenStore,
+    DynamoTotpFactorStore,
     IdentityStores,
     IdentityTokenRecord,
     IdentityTokenStore,
     InMemoryCredentialStore,
     InMemoryIdentityTokenStore,
+    InMemoryRecoveryCodeStore,
     InMemoryRefreshTokenStore,
+    InMemoryTotpFactorStore,
+    RecoveryCodeRecord,
+    RecoveryCodeStore,
     RefreshTokenRecord,
     RefreshTokenStore,
+    TotpFactorRecord,
+    TotpFactorStore,
     constant_time_equals,
     hash_token,
     is_expired,
@@ -206,7 +266,12 @@ from webbpulse.identity.verification import (
 )
 
 __all__ = [
+    "ACCESS_TOKEN_TYPE",
     "ALLOWED_FETCH_SITES",
+    "AMR_MFA",
+    "AMR_OTP",
+    "AMR_PASSWORD",
+    "AMR_RECOVERY",
     "ARRAY_CLAIMS",
     "ATTEMPT_TTL",
     "BOOLEAN_CLAIMS",
@@ -229,12 +294,17 @@ __all__ = [
     "LOCKOUT_THRESHOLD",
     "LOGIN_ATTEMPTS_TABLE",
     "LOGIN_PATH",
+    "LOGIN_TOTP_PATH",
     "LOGOUT_ALL_PATH",
     "LOGOUT_PATH",
     "MAX_PASSWORD_BYTES",
+    "MFA_TICKET_TYPE",
     "MIN_PASSWORD_CHARACTERS",
     "PASSWORD_CREDENTIAL_TYPE",
     "PASSWORD_PATH",
+    "RECOVERY_CODES_PATH",
+    "RECOVERY_CODES_TABLE",
+    "RECOVERY_CODE_COUNT",
     "REFRESH_FAMILY_INDEX",
     "REFRESH_PATH",
     "REFRESH_TOKENS_TABLE",
@@ -246,6 +316,15 @@ __all__ = [
     "RESET_LINK_PATH",
     "RESET_REQUESTED_MESSAGE",
     "RESET_REQUEST_PATH",
+    "STEP_UP_PATH",
+    "TOTP_ACTIVATE_PATH",
+    "TOTP_DISABLE_PATH",
+    "TOTP_ENCRYPTION_PURPOSE",
+    "TOTP_ENROL_IP_LIMIT",
+    "TOTP_ENROL_PATH",
+    "TOTP_FACTOR",
+    "TOTP_FACTORS_TABLE",
+    "TOTP_VERIFY_LIMIT",
     "USERS_TABLE",
     "VERIFY_CONFIRM_PATH",
     "VERIFY_EMAIL_LIMIT",
@@ -263,10 +342,15 @@ __all__ = [
     "DynamoCredentialStore",
     "DynamoIdentityTokenStore",
     "DynamoLoginAttemptStore",
+    "DynamoRecoveryCodeStore",
     "DynamoRefreshTokenStore",
+    "DynamoTotpFactorStore",
     "EmailMessage",
     "EmailSendFailed",
     "EmailSender",
+    "Enrolment",
+    "EnvelopeCipher",
+    "EnvelopeDecryptionFailed",
     "HookNotImplemented",
     "IdentityFlows",
     "IdentityHooks",
@@ -277,31 +361,44 @@ __all__ = [
     "InMemoryCredentialStore",
     "InMemoryIdentityTokenStore",
     "InMemoryLoginAttemptStore",
+    "InMemoryRecoveryCodeStore",
     "InMemoryRefreshTokenStore",
+    "InMemoryTotpFactorStore",
     "InvalidToken",
     "IssuedLink",
     "IssuedRefresh",
     "KmsClient",
+    "KmsDataKeyClient",
     "KmsSigner",
     "LinkService",
     "LockoutState",
     "LoginAttempt",
     "LoginAttemptStore",
     "LoginRejected",
+    "MfaChallenge",
+    "MfaChallengeRequired",
+    "MfaRejected",
+    "MfaService",
     "MissingRequestContext",
     "NoClaimsSection",
     "PasswordRejected",
     "RateLimited",
     "RecordingEmailSender",
+    "RecoveryCodeRecord",
+    "RecoveryCodeSet",
+    "RecoveryCodeStore",
     "RefreshTokenRecord",
     "RefreshTokenStore",
     "RotationOutcome",
     "RotationResult",
+    "SealedSecret",
     "SesV2Client",
     "SesV2EmailSender",
     "SessionService",
     "TokenMintingDisabled",
     "TokenService",
+    "TotpFactorRecord",
+    "TotpFactorStore",
     "UnparseableRequestContext",
     "authorizer_claims",
     "build_discovery_document",
@@ -312,7 +409,9 @@ __all__ = [
     "constant_time_equals",
     "describe_expiry",
     "email_key",
+    "encryption_context",
     "equalise_password_timing",
+    "hash_recovery_code",
     "hash_token",
     "identity_prefix",
     "identity_router",
@@ -324,6 +423,7 @@ __all__ = [
     "new_attempt",
     "new_token",
     "normalise_password",
+    "normalise_recovery_code",
     "public_jwk_from_kms",
     "read_authorizer_claims",
     "render_password_changed",

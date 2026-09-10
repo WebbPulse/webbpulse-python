@@ -43,6 +43,7 @@ turn a correct login into a 500, so the write is best-effort and the log line is
 from __future__ import annotations
 
 import logging
+import time
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Any, Final, NoReturn
@@ -57,6 +58,13 @@ from webbpulse.identity.lockout import (
     lockout_state,
     new_attempt,
 )
+from webbpulse.identity.mfa import (
+    AMR_MFA,
+    AMR_PASSWORD,
+    MfaChallenge,
+    MfaRejected,
+    MfaService,
+)
 from webbpulse.identity.passwords import (
     check_password,
     equalise_password_timing,
@@ -65,7 +73,7 @@ from webbpulse.identity.passwords import (
 from webbpulse.identity.sessions import SessionService
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
-    from collections.abc import Mapping
+    from collections.abc import Mapping, Sequence
 
     from webbpulse.identity.email import EmailMessage, EmailSender
     from webbpulse.identity.hooks import IdentityHooks
@@ -80,6 +88,7 @@ __all__ = [
     "AuthResult",
     "IdentityFlows",
     "LoginRejected",
+    "MfaChallengeRequired",
     "RateLimited",
 ]
 
@@ -140,6 +149,23 @@ class RateLimited(LoginRejected):
         self.retry_after = retry_after
 
 
+class MfaChallengeRequired(Exception):
+    """The password was correct and a second factor is enrolled.
+
+    Raised rather than returned because `login` otherwise has two success shapes, and every
+    caller would have to remember to check which one it got. An exception cannot be ignored
+    by accident, so a product that has not handled MFA gets a loud failure rather than
+    quietly handing out a session to a user who never satisfied their factor.
+
+    This is not a `LoginRejected`: nothing was refused, and it answers **200** carrying the
+    challenge, which is the shape `@webbpulse/auth` branches on.
+    """
+
+    def __init__(self, challenge: MfaChallenge) -> None:
+        super().__init__("Multi-factor authentication is required.")
+        self.challenge = challenge
+
+
 @dataclass(frozen=True, slots=True)
 class AuthResult:
     """A successful authentication: the access token and the refresh cookie to set.
@@ -178,6 +204,7 @@ class IdentityFlows:
         *,
         attempts: LoginAttemptStore | None = None,
         email_sender: EmailSender | None = None,
+        kms_client: Any = None,
     ) -> None:
         self._settings = settings
         self._hooks = hooks
@@ -191,6 +218,18 @@ class IdentityFlows:
             from webbpulse.identity.verification import LinkService
 
             self._links = LinkService(settings, stores.identity_tokens)
+
+        # MFA needs both M4 tables and the ticket store. A product that has not created them
+        # gets `None` and M2's behaviour, rather than an import-time failure: section 6.1
+        # makes TOTP a capability, and a capability that cannot be switched off is not one.
+        self.mfa: MfaService | None = None
+        if (
+            settings.totp_enabled
+            and stores.totp_factors is not None
+            and stores.recovery_codes is not None
+            and stores.identity_tokens is not None
+        ):
+            self.mfa = MfaService(settings, stores, tokens, kms_client=kms_client)
 
     @property
     def sessions(self) -> SessionService:
@@ -446,7 +485,119 @@ class IdentityFlows:
                 "user_agent": _device_class(user_agent),
             },
         )
+
+        # The password is proved. If a second factor is enrolled, this is where the flow
+        # stops: a challenge, not a session. The attempt is recorded as a success above
+        # because the password *was* correct, and the lockout counter is about passwords.
+        # An MFA failure is rate limited separately, per section 5.1.
+        challenge = self._challenge_for(user)
+        if challenge is not None:
+            raise MfaChallengeRequired(challenge)
+
         return self._issue(user, ip=ip, user_agent=user_agent)
+
+    def _challenge_for(self, user: Mapping[str, Any]) -> MfaChallenge | None:
+        """The challenge this user must answer, or `None` to issue tokens directly.
+
+        Returns `None` when MFA is not configured at all, so a product that never wired the
+        stores gets M2's behaviour unchanged rather than an exception on every login.
+        """
+        if self.mfa is None:
+            return None
+        user_id = _user_id(user)
+        factors = self.mfa.factors_for(user_id)
+        if not factors:
+            return None
+        return self.mfa.issue_challenge(user_id, factors=factors)
+
+    def complete_mfa(
+        self,
+        *,
+        ticket: str,
+        code: str,
+        ip: str = "",
+        user_agent: str = "",
+    ) -> AuthResult:
+        """The second leg of login: spend a ticket, satisfy a factor, issue the session.
+
+        The ticket is consumed **before** the code is checked, so a ticket is spent by one
+        attempt whatever the outcome. That is deliberate and it is the stricter choice: it
+        means a stolen ticket cannot be used to grind codes, and a user who mistypes starts
+        the login again rather than retrying against a ticket an attacker also holds.
+
+        The rate limit on this route is the other half of that. Ten attempts per fifteen
+        minutes per user, per section 5.1, applied by the router.
+        """
+        service = self._require_mfa()
+        user_id = service.consume_ticket(ticket)
+
+        user = self._hooks.load_user_by_id(user_id)
+        if user is None:
+            # The ticket verified, so this is a user deleted between the two legs rather
+            # than an attack. Same refusal either way.
+            raise MfaRejected(
+                "That sign-in attempt has expired. Start again.",
+                error_code="MFA_TICKET_INVALID",
+            )
+
+        method = service.verify_challenge(user_id, code)
+        _log.info(
+            "MFA login completed.",
+            extra={"event": "mfa.success", "user_id": user_id, "method": method},
+        )
+        return self._issue(user, ip=ip, user_agent=user_agent, amr=[AMR_PASSWORD, method])
+
+    def step_up(
+        self,
+        *,
+        user_id: str,
+        session_id: str,
+        code: str,
+    ) -> AuthResult:
+        """Re-authenticate inside an existing session, returning a fresher access token.
+
+        No new refresh family and no cookie change: the session is not new. What changes is
+        `auth_time`, which becomes now, and `amr`, which gains the factor just satisfied.
+        A sensitive route then asserts on both, per section 2.6, rather than on a boolean
+        that could not express "recently".
+
+        The returned `AuthResult` carries an empty `refresh_token` and the caller's existing
+        `family_id`, because there is nothing new to set and the caller must not be tempted
+        to rotate the cookie on a step-up.
+        """
+        service = self._require_mfa()
+        user = self._hooks.load_user_by_id(user_id)
+        if user is None:
+            raise MfaRejected()
+
+        method = service.verify_challenge(user_id, code)
+        access = self._mint_access(
+            user,
+            session_id=session_id,
+            amr=[AMR_PASSWORD, method],
+            auth_time=int(time.time()),
+        )
+        _log.info(
+            "Step-up authentication succeeded.",
+            extra={"event": "mfa.step_up", "user_id": user_id, "method": method},
+        )
+        return AuthResult(
+            access_token=access,
+            expires_in=int(self._settings.access_token_ttl.total_seconds()),
+            user=user,
+            refresh_token="",
+            family_id=session_id,
+        )
+
+    def _require_mfa(self) -> MfaService:
+        service = self.mfa
+        if service is None:
+            raise MfaRejected(
+                "Multi-factor authentication is not available.",
+                error_code="MFA_NOT_CONFIGURED",
+                status_code=503,
+            )
+        return service
 
     # ---- change password -----------------------------------------------------------
 
@@ -971,11 +1122,12 @@ class IdentityFlows:
         ip: str,
         user_agent: str,
         extra: Mapping[str, Any] | None = None,
+        amr: Sequence[str] = (AMR_PASSWORD,),
     ) -> AuthResult:
         """Start a family and mint the first access token for it."""
         user_id = _user_id(user)
         issued = self._sessions.start_family(user_id, device=_device_class(user_agent), ip=ip)
-        access = self._mint_access(user, session_id=issued.family_id)
+        access = self._mint_access(user, session_id=issued.family_id, amr=amr)
         return AuthResult(
             access_token=access,
             expires_in=int(self._settings.access_token_ttl.total_seconds()),
@@ -985,12 +1137,37 @@ class IdentityFlows:
             extra=dict(extra or {}),
         )
 
-    def _mint_access(self, user: Mapping[str, Any], *, session_id: str) -> str:
-        # `claims_for` supplies the product claims. `mint_access_token` drops any registered
-        # claim a hook returns, so a hook cannot forge an issuer or extend a lifetime.
+    def _mint_access(
+        self,
+        user: Mapping[str, Any],
+        *,
+        session_id: str,
+        amr: Sequence[str] = (AMR_PASSWORD,),
+        auth_time: int | None = None,
+    ) -> str:
+        """The single place an access token is minted, and so the single place `amr` is set.
+
+        `amr` and `auth_time` are applied **after** `claims_for`, so a product hook cannot
+        overwrite them. That matters more than it looks: a hook that returned `amr: ["mfa"]`
+        for every user would silently satisfy every step-up check in the estate.
+
+        `mfa` is added alongside the specific factor whenever more than one method was used,
+        per RFC 8176, which defines it as "multiple-factor authentication". A route asserting
+        on `amr` can then require `mfa` without enumerating every factor that might satisfy
+        it, and can still require `otp` specifically when only a live authenticator will do.
+        """
+        methods = list(dict.fromkeys(amr))
+        if len(methods) > 1 and AMR_MFA not in methods:
+            methods.append(AMR_MFA)
+        claims = dict(self._hooks.claims_for(user))
+        claims["amr"] = methods
+        claims["auth_time"] = int(time.time()) if auth_time is None else auth_time
+        # `mint_access_token` drops any registered claim a hook returns, so a hook cannot
+        # forge an issuer or extend a lifetime. `amr` and `auth_time` are not registered
+        # claims in that set, which is why they are set here rather than passed through.
         return self._tokens.mint_access_token(
             _user_id(user),
-            claims=self._hooks.claims_for(user),
+            claims=claims,
             session_id=session_id,
         )
 

@@ -5,6 +5,105 @@ Notable changes to the `webbpulse` package. The version here is the one in
 
 This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## 0.12.0
+
+Identity M4: TOTP with KMS envelope encryption, recovery codes, the MFA ticket, step-up and
+`amr` on the access token.
+
+**Additive, with one behaviour change confined to users who enrol.** The six MFA routes
+mount only when `totp_enabled` is on and the product supplies a TOTP factor store, a recovery
+code store and an identity token store, on the same rule the M2 and M3 routes follow. A
+service that supplies none of them mounts exactly what it mounted in 0.11.0. `login` changes
+shape only for a user with an **active** factor: it answers 200 with a challenge instead of
+tokens, and raises `MfaChallengeRequired` from the flow rather than returning a second
+success shape, so a product that has not handled MFA fails loudly rather than handing out a
+session.
+
+**No frontend change is required.** The wire contract matches `@webbpulse/auth` 0.4.0: the
+first leg returns `{"mfa_required": true, "mfa_ticket": "...", "factors": ["totp"]}` with
+HTTP 200, and the second leg reads `mfa_ticket` and `code`.
+
+**Still absent**, per section 9.1: passkeys (M5), OAuth (M6).
+
+### Added
+
+- `webbpulse.identity.totp`: RFC 6238 TOTP with no new dependency. Seed generation,
+  the `otpauth://` provisioning URI, code generation and verification. Checked against all
+  six RFC 6238 Appendix B vectors, which is the only test that catches a generator and a
+  verifier that are wrong in the same direction.
+
+  `verify_code` returns the matched **step** rather than a bool, because the caller has to
+  store it: a code is accepted once per time step and a step at or below the stored watermark
+  is refused, which is what stops a shoulder-surfed code being replayed inside its window.
+  The window is one step either side of now, not three: each extra step multiplies an
+  attacker's chance against a million-value space, and the rate limit is the other half of
+  that bound.
+
+  HMAC-SHA1 deliberately. Every mainstream authenticator ignores the `algorithm` parameter,
+  so an SHA-256 seed produces codes the user's app cannot generate, and SHA-1's weakness is
+  collision resistance, which HMAC does not depend on.
+
+- `webbpulse.identity.crypto`: `EnvelopeCipher`, `SealedSecret` and the `KmsDataKeyClient`
+  protocol. A fresh 256-bit data key per secret via `GenerateDataKey`, AES-256-GCM locally,
+  and the wrapped key stored alongside the ciphertext. `{"user_id", "purpose"}` is the
+  encryption context, so a ciphertext moved to another user's row fails to decrypt and a
+  value encrypted for some later feature cannot be replayed as a TOTP seed.
+
+  A key used for exactly one message makes GCM nonce reuse impossible by construction, which
+  is why this is an envelope rather than a direct `kms:Encrypt`. Section 4.4 of the standard
+  is updated to match: it previously argued the other way, on size.
+
+- `webbpulse.identity.mfa`: `MfaService`, covering TOTP enrolment and verification, recovery
+  codes, and the MFA ticket. Enrolment is inactive until a first code confirms it, and the
+  confirming step is recorded at activation so that code cannot then be used to sign in.
+  Recovery codes are issued at activation, ten of them, SHA-256 hashed at rest, single use,
+  and regenerating replaces the whole set. Disabling TOTP deletes the codes too.
+
+  Every refusal is one `MfaRejected` with one message, whatever went wrong. A distinct
+  message for "you have no factor" tells an attacker which accounts to try something else on.
+
+- `IdentityFlows.complete_mfa` and `IdentityFlows.step_up`. `complete_mfa` spends the ticket
+  **before** checking the code, so a stolen ticket cannot be used to grind codes. `step_up`
+  re-authenticates inside the existing session: `auth_time` moves and `amr` gains the factor,
+  no new refresh family is started and no cookie is written.
+
+- `amr` and `auth_time` on the access token. `pwd`, `otp` and `mfa` are RFC 8176 values;
+  `recovery` is deliberately not one, because a printed backup code is a bearer secret rather
+  than a possession factor and a route requiring a real second factor has to tell them apart.
+  Both claims are applied **after** the product's `claims_for` hook, never merged with it: a
+  hook that could set `amr` could assert a factor its user never satisfied.
+
+- Two tables, `totp-factors` and `recovery-codes`, with `TotpFactorStore` and
+  `RecoveryCodeStore` and in-memory and DynamoDB implementations of each. Activation, the
+  step watermark and code consumption are all conditional writes, so two racing requests
+  resolve to exactly one acceptance. The MFA ticket reuses `identity-tokens` with a new
+  `mfa_ticket` purpose rather than taking a sixth table: it is the same entity the table
+  already holds.
+
+- Six routes under the issuer path: `POST /login/totp`, `POST /totp/enrol`,
+  `POST /totp/activate`, `POST /totp/disable`, `POST /recovery-codes` and `POST /step-up`.
+  `login/totp` must stay **outside** the gateway's JWT authorizer, since the ticket's audience
+  is `<issuer>/mfa`; the other five sit behind it and read the subject from verified claims
+  rather than from the body.
+
+- `IDENTITY_DATA_KEY_ARN`, `IDENTITY_TOTP_ENABLED`, `IDENTITY_MFA_TICKET_TTL` and
+  `IDENTITY_MFA_REQUIRED_FOR_ROLES` settings.
+
+### Fixed
+
+- The MFA routes mount before the email early-return in `_mount_flows`, not after it. Mounted
+  after, a product running TOTP with no `EmailSender` configured had no second leg of login
+  at all, silently. MFA needs no sender.
+
+- `webbpulse.identity.totp` accepts a base32 seed that still has its padding. The decoder
+  recomputed the padding from a length that included the padding already present, so an
+  unmodified pasted seed was padded twice and rejected as the wrong length, which is exactly
+  the case the tolerance existed to serve.
+
+- The `otpauth://` provisioning URI is percent-encoded as a URI rather than as a form body. A
+  space in the issuer became `+`, which a compliant authenticator reads literally and shows
+  in the account name.
+
 ## 0.11.0
 
 Identity M3: email verification and password reset over SES, plus a contract suite that

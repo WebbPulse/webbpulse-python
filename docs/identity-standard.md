@@ -1,7 +1,7 @@
 # The WebbPulse unified identity standard
 
 Status: design, not yet implemented. Target package: `webbpulse.identity`, landing across
-0.6.0 to 0.11.0.
+0.6.0 to 0.12.0.
 
 Every WebbPulse product needs the same twelve things: password login, email verification,
 password reset, TOTP, recovery codes, passkeys as a second factor, passkeys as the only
@@ -1061,9 +1061,25 @@ context, so a leaked read-only Dynamo path yields nothing usable, and every decr
 CloudTrail event that can be alarmed on.
 
 The cost is one `kms:Decrypt` per TOTP verification. That is on the login path, but only for
-TOTP users and only on the second leg, so it is a small fraction of logins. `GenerateDataKey`
-with local AES would avoid the per-verify call, but a seed is ~20 bytes: there is nothing to
-gain from a data key, and direct `Encrypt`/`Decrypt` is simpler and less to get wrong.
+TOTP users and only on the second leg, so it is a small fraction of logins.
+
+**A data key per seed, not direct `Encrypt`/`Decrypt`.** An earlier draft of this section
+argued the other way, on the grounds that a seed is ~20 bytes and there is nothing to gain
+from a data key. That reasoning was about size, and size is not what decides it. Two things
+are:
+
+- **The encryption context is enforced identically either way.** `Decrypt` on a wrapped data
+  key checks the context exactly as `Decrypt` on a directly-encrypted seed would, so the
+  property this section is built on is not weakened by the extra layer.
+- **`GenerateDataKey` returns a fresh 256-bit key every time, which makes the AES-GCM nonce
+  impossible to reuse under a repeated key.** A nonce repeated under one key is a total loss
+  of confidentiality for both messages, and the usual defence is a counter somebody has to
+  get right. A key that is used for exactly one message removes the failure mode rather than
+  managing it.
+
+The call count is unchanged: one KMS call to seal and one to open, the same as direct
+`Encrypt`/`Decrypt`. `webbpulse.identity.crypto` holds the whole of it, and the AES-GCM is
+`cryptography`'s, not hand-rolled.
 
 Recovery codes are **hashed, not encrypted**, because verification only needs a comparison.
 They are high-entropy random values, so bcrypt's cost is unnecessary; SHA-256 is used, with
@@ -1911,7 +1927,150 @@ implementing email showed something the standard did not say.
     would need a real credential against a real product, which turns a read-only probe
     anybody can run into something that needs secrets.
 
-| **M4** | TOTP with KMS envelope encryption, recovery codes, the MFA ticket, step-up, `amr` | 0.8.0 | 4 to 5 |
+| **M4** | TOTP with KMS envelope encryption, recovery codes, the MFA ticket, step-up, `amr`. *Delivered 2026-09-10 in 0.12.0. The six MFA routes mount only when TOTP is enabled and both M4 tables are supplied, on the same rule the M2 and M3 routes follow. Decisions recorded below.* | 0.12.0 | 4 to 5 |
+
+#### M4 decisions, 2026-09-10
+
+Same purpose as the M1, M2 and M3 blocks: places where the standard left a choice open, or
+where implementing MFA showed something the standard did not say.
+
+1. **moto is faithful for symmetric KMS, and the envelope is tested against it.** M1
+   decision 8 found moto unusable for KMS *asymmetric* signing, and the natural inference is
+   that KMS is off limits in tests generally. That inference is wrong. moto 5.2 implements
+   `GenerateDataKey` and `Decrypt` for a symmetric key faithfully: the data key comes back
+   the requested length with a wrapped blob, the round trip succeeds, and a mismatched
+   encryption context, a missing context and a tampered blob are each refused with
+   `InvalidCiphertextException`, which is what real KMS does.
+
+   So the three properties the design rests on are asserted against a real implementation
+   rather than only against a fake that was written to agree. A hand fake carries the rest,
+   where moto's behaviour is not the point. The narrower statement to carry forward is that
+   moto is unusable for KMS *asymmetric* operations, not for KMS.
+
+2. **Section 4.4 is reversed on `GenerateDataKey` versus direct `Encrypt`.** The section
+   argued for direct `Encrypt`/`Decrypt` because a seed is ~20 bytes. Size is not what
+   decides it: a fresh data key per seal makes an AES-GCM nonce reuse impossible by
+   construction rather than by a counter somebody has to maintain, and the encryption context
+   is enforced identically either way. The call count is the same. 4.4 now says so, because a
+   document that contradicts the code is worse than either alone.
+
+3. **The MFA ticket reuses `identity-tokens` rather than getting a sixth table.** M1 decision
+   1 is one table per entity, and the question was whether a ticket is a new entity. It is
+   not: it is a single-use short-lived token bound to a user, which is exactly what the table
+   already holds, and `IdentityTokenPurpose` gained `mfa_ticket` alongside `verify_email` and
+   `reset_password`. The row is what makes the ticket single use; the signature alone cannot.
+
+   The two M4 tables that are genuinely new entities, `totp-factors` and `recovery-codes`,
+   are separate tables per that same decision.
+
+4. **The ticket is cryptographically separated from an access token in three ways, and the
+   audience is the one that matters.** Distinct `typ`, an audience of `<issuer>/mfa` rather
+   than the API's audience, and a five minute TTL. The audience is load-bearing because the
+   gateway's JWT authorizer is configured with the API's audience: a ticket presented to any
+   route behind the authorizer is refused by the gateway before it reaches any code of ours.
+   The `typ` check happens **after** signature verification, never before, since an
+   unverified `typ` is attacker-controlled.
+
+   It carries no `sid`, because at the point it is minted the session does not exist.
+
+5. **The first leg of login answers 200 with the challenge, not 401.** Nothing was refused:
+   the password was correct. `@webbpulse/auth` 0.4.0 branches on `mfa_required` in a
+   successful response body, so a 401 here, however tidy it looks, sends every MFA user down
+   the frontend's error path with no way to sign in. The body is exactly
+   `{"mfa_required": true, "mfa_ticket": "...", "factors": ["totp"]}` and the second leg
+   reads `mfa_ticket` and `code`, matching the field names the client already sends. Matching
+   the existing client is what makes M4 a backend-only change.
+
+   `MFA_REQUIRED` is the only new code the client's closed `AUTH_ERROR_CODES` set admits.
+
+6. **The ticket is spent before the code is checked, not after.** A ticket that survives a
+   wrong code is a ticket a thief can grind codes against at leisure. Spending it first means
+   a user who mistypes signs in again, costing them one password entry, and costs an attacker
+   the whole attempt. The 10 per 15 minutes limit from 5.1 is the other half of that bound.
+
+7. **`login` raises `MfaChallengeRequired` rather than returning a second success shape.** A
+   returned union is ignorable by every existing caller, and a caller that ignores it hands a
+   session to a user who never satisfied their factor. An exception cannot be ignored by
+   accident, so a product that has not handled MFA gets a loud failure.
+
+8. **`amr` and `auth_time` are applied after the product's `claims_for` hook, never merged
+   with it.** A hook that could set `amr` could assert a factor its user never satisfied, and
+   every step-up check downstream would believe it. Overwriting is the only safe order.
+
+9. **A recovery code claims `recovery`, which is deliberately not an RFC 8176 value.** RFC
+   8176 has no registered value for a printed one-time backup code, and claiming `otp` for
+   one would be false: a recovery code is a bearer secret off a piece of paper, not a
+   possession factor. A route that requires a real second factor for something sensitive has
+   to be able to tell them apart, and it can only do that if they are named differently.
+   `mfa` is appended whenever more than one method was used.
+
+10. **Enrolment is not active until a code confirms it, and the confirming code is then
+    spent.** A factor active from the moment a QR code is drawn locks out every user who
+    scans badly or closes the tab, with support the only way back. Recording the confirming
+    step at activation closes the other half: without it the code the user just typed stays
+    valid for the rest of its window, and anyone who watched them type it can use it.
+
+11. **Two secrets, two opposite storage choices, one reason each.** The seed is sealed
+    because verification must reproduce it; a recovery code is hashed because verification
+    only compares it. The rule is to store the weakest thing that still supports the
+    operation. SHA-256 rather than bcrypt for the codes, since they are already
+    high-entropy random values and bcrypt's cost buys nothing against them.
+
+12. **Disabling TOTP deletes the recovery codes too.** Always both. Codes left behind after
+    the factor is gone are live credentials satisfying a factor the user believes is
+    removed, and nothing in any UI would ever show them again.
+
+13. **Step-up mints a fresher token inside the existing session and starts no new family.**
+    `auth_time` moves and `amr` gains the factor; `sid` does not change and no cookie is
+    written. Section 2.6 asserts on freshness rather than on a boolean precisely so that
+    "recently" is expressible, and rotating a refresh token that never moved would log the
+    user out of nothing for no reason.
+
+14. **The MFA routes mount before the email early-return, not after it.** Found by a test:
+    `_mount_flows` returns early when no `EmailSender` is configured, and mounting the MFA
+    routes at the end of that function meant a product running TOTP without email had no
+    second leg of login at all, silently. MFA needs no sender, so it is mounted before that
+    return.
+
+15. **`login/totp` must stay outside the gateway's JWT authorizer.** It carries a ticket
+    whose audience is `<issuer>/mfa`, which the authorizer is not configured with, so putting
+    it behind the authorizer rejects the second leg of every MFA login before it runs. The
+    other five MFA routes do sit behind it, and each reads its subject from the verified
+    claims rather than from the body: a user id in the body lets anybody enrol a factor on
+    anybody's account.
+
+16. **A base32 seed with padding already on it is accepted.** Found by a test. The decoder
+    recomputed the padding from a length that still included the padding the user had typed,
+    so an unmodified pasted seed was padded twice and refused as the wrong length, which is
+    exactly the case the tolerance existed to serve. Existing `=` is now stripped first.
+
+17. **The provisioning URI is percent-encoded as a URI, not as a form body.** Found by a
+    test. `urlencode` defaults to form encoding, where a space becomes `+`, and the Key URI
+    format is a URI: a compliant authenticator reads that `+` literally and lists the account
+    under a name with a plus sign in it. `quote_via=quote` fixes it. The URI also omits
+    `algorithm`, `digits` and `period`, all of which are the values every app assumes anyway,
+    and several popular apps ignore `algorithm` outright, so naming it implies a promise the
+    apps do not keep.
+
+18. **TOTP is HMAC-SHA1 and stays that way.** Not an oversight. Every mainstream
+    authenticator ignores the `algorithm` parameter, so an SHA-256 seed produces codes the
+    user's app cannot generate. SHA-1's weakness is collision resistance, which HMAC does not
+    depend on, so HMAC-SHA1 remains sound for this use. The implementation is checked against
+    all six RFC 6238 Appendix B vectors, which is the only test that can catch a generator
+    and a verifier that are wrong in the same direction.
+
+19. **The verification window is one step either side, not three.** Each extra step
+    multiplies an attacker's chance against a 10^6 space, and the window is the only thing
+    bounding that other than the rate limit. Either side rather than only behind, because a
+    phone whose clock runs slightly fast produces the next step's code and refusing it makes
+    the factor unusable for that user.
+
+20. **The seed is returned in plaintext exactly once and there is no route that reads it
+    back.** A user who loses it before confirming enrols again and gets a new one. A
+    read-back route would turn every stolen access token into a copy of the user's second
+    factor. Recovery codes follow the same rule: shown once at activation, and regeneration
+    is the only way to see a set again, which invalidates the previous set as it goes.
+
 | **M5** | Passkeys: both ceremonies, challenge lifecycle, counter checking, passwordless | 0.9.0 | 5 to 6 |
 | **M6** | OAuth: Google and GitHub, state and PKCE, linking rules, the verified-email branch. Audit events and their alarms | 0.10.0 | 4 to 5 |
 | **M7** | `terraform-aws-platform-modules` `identity` module (9.2) | module 1.0.0 | 3 to 4 |
