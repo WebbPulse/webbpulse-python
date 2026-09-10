@@ -1868,7 +1868,10 @@ def test_discovery_lists_every_fully_configured_provider(
     """Both halves configured, so both providers are offered."""
     client = _providers_client(
         _providers_router(
-            hooks, stores, kms, secrets={GOOGLE_PROVIDER: GOOGLE_SECRET, GITHUB_PROVIDER: GITHUB_SECRET}
+            hooks,
+            stores,
+            kms,
+            secrets={GOOGLE_PROVIDER: GOOGLE_SECRET, GITHUB_PROVIDER: GITHUB_SECRET},
         )
     )
     response = _get_providers(client)
@@ -2007,7 +2010,10 @@ def test_discovery_carries_the_same_cache_policy_as_the_jwks(
 
     client = _providers_client(
         _providers_router(
-            hooks, stores, kms, secrets={GOOGLE_PROVIDER: GOOGLE_SECRET, GITHUB_PROVIDER: GITHUB_SECRET}
+            hooks,
+            stores,
+            kms,
+            secrets={GOOGLE_PROVIDER: GOOGLE_SECRET, GITHUB_PROVIDER: GITHUB_SECRET},
         )
     )
     assert _get_providers(client).headers["cache-control"] == OAUTH_PROVIDERS_CACHE_CONTROL
@@ -2024,7 +2030,10 @@ def test_discovery_needs_no_token_and_sets_no_cookie(
     """
     client = _providers_client(
         _providers_router(
-            hooks, stores, kms, secrets={GOOGLE_PROVIDER: GOOGLE_SECRET, GITHUB_PROVIDER: GITHUB_SECRET}
+            hooks,
+            stores,
+            kms,
+            secrets={GOOGLE_PROVIDER: GOOGLE_SECRET, GITHUB_PROVIDER: GITHUB_SECRET},
         )
     )
     response = _get_providers(client)
@@ -2039,7 +2048,10 @@ def test_discovery_never_reveals_a_client_secret_or_a_client_id(
     """It is an anonymous route, so what it does not say matters as much as what it does."""
     client = _providers_client(
         _providers_router(
-            hooks, stores, kms, secrets={GOOGLE_PROVIDER: GOOGLE_SECRET, GITHUB_PROVIDER: GITHUB_SECRET}
+            hooks,
+            stores,
+            kms,
+            secrets={GOOGLE_PROVIDER: GOOGLE_SECRET, GITHUB_PROVIDER: GITHUB_SECRET},
         )
     )
     body = _get_providers(client).text

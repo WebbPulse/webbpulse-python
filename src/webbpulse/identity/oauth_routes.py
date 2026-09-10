@@ -205,8 +205,7 @@ def register_oauth_provider_discovery(
         return _JSONResponse(
             {
                 "providers": [
-                    {"id": config.name, "display_name": config.display_name}
-                    for config in configs
+                    {"id": config.name, "display_name": config.display_name} for config in configs
                 ]
             },
             headers={"Cache-Control": OAUTH_PROVIDERS_CACHE_CONTROL},
