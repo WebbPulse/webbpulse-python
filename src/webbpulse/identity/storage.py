@@ -201,6 +201,17 @@ class RefreshTokenRecord:
     revoked: bool = False
     device: str = ""
     ip_first_seen: str = ""
+    #: When the family this record belongs to began, carried on every generation.
+    #:
+    #: The absolute cap in section 3.3 is a property of the family, not of the token, so a
+    #: rotation has to know when the login happened. Copying it onto each generation keeps
+    #: that a field read rather than a second lookup, and there is nothing to look up
+    #: anyway once the first generation has been reclaimed by TTL.
+    #:
+    #: Empty on a record written before this field existed, which a rolling deploy produces.
+    #: The session service falls back to `created_at`, which is wrong in the permissive
+    #: direction for at most one rotation and never denies a correct session.
+    family_started_at: str = ""
 
     @property
     def is_consumed(self) -> bool:
@@ -291,8 +302,15 @@ class RefreshTokenStore(ABC):
         """
 
     @abstractmethod
-    def revoke_all_for_user(self, user_id: str) -> int:
-        """Revoke every family for a user. What a password reset and "sign out everywhere" call."""
+    def revoke_all_for_user(self, user_id: str, *, except_family_id: str = "") -> int:
+        """Revoke every family for a user. What a password reset and "sign out everywhere" call.
+
+        `except_family_id` spares one family, which is what a password **change** wants: the
+        change is made from a live session, and signing the user out of the tab they did it
+        in is a bad experience with no security value, since that session has just re-proved
+        the password. A **reset** passes nothing and revokes everything, because there the
+        session doing the resetting is exactly the one that might be the attacker's.
+        """
 
 
 class IdentityTokenStore(ABC):
@@ -420,9 +438,11 @@ class InMemoryRefreshTokenStore(RefreshTokenStore):
                 count += 1
         return count
 
-    def revoke_all_for_user(self, user_id: str) -> int:
+    def revoke_all_for_user(self, user_id: str, *, except_family_id: str = "") -> int:
         count = 0
         for token_hash, record in list(self._items.items()):
+            if record.family_id == except_family_id:
+                continue
             if record.user_id == user_id and not record.revoked:
                 self._items[token_hash] = dataclasses.replace(record, revoked=True)
                 count += 1
@@ -541,6 +561,7 @@ class DynamoRefreshTokenStore(RefreshTokenStore):
                 "revoked": record.revoked,
                 "device": record.device,
                 "ip_first_seen": record.ip_first_seen,
+                "family_started_at": record.family_started_at,
             }
         )
 
@@ -586,7 +607,7 @@ class DynamoRefreshTokenStore(RefreshTokenStore):
             )
         )
 
-    def revoke_all_for_user(self, user_id: str) -> int:
+    def revoke_all_for_user(self, user_id: str, *, except_family_id: str = "") -> int:
         # No user GSI on this table by design: the hot path is the token hash, and an extra
         # index costs a write on every rotation to serve an operation that runs on a password
         # reset. Sign-out-everywhere revokes each family instead, which the caller knows.
@@ -701,6 +722,7 @@ def _refresh_record_from_item(item: Mapping[str, Any]) -> RefreshTokenRecord:
         revoked=bool(item.get("revoked", False)),
         device=str(item.get("device", "")),
         ip_first_seen=str(item.get("ip_first_seen", "")),
+        family_started_at=str(item.get("family_started_at", "")),
     )
 
 

@@ -1005,14 +1005,13 @@ and authenticated callers.
 
 ### `webbpulse.identity`
 
-App-managed identity: configuration, the product policy seam, storage interfaces, a
-KMS-backed token service, and the reader for the claims an API Gateway HTTP API JWT
-authorizer leaves on a request. Needs the `identity` extra.
+App-managed identity: password flows, refresh sessions, configuration, the product policy
+seam, storage interfaces, a KMS-backed token service, and the reader for the claims an API
+Gateway HTTP API JWT authorizer leaves on a request. Needs the `identity` extra.
 
-This is M1 of `docs/identity-standard.md`. It builds the **foundations** and deliberately
-not the flows: there is no login, no refresh rotation, no MFA, no passkeys and no OAuth
-here. Those are M2 and later. The router mounts the two `.well-known` documents and
-`/health`, and nothing else.
+This is M2 of `docs/identity-standard.md`. M1 built the foundations; M2 adds the password
+and session flows on top of them. Email verification and reset (M3), TOTP and MFA (M4),
+passkeys (M5) and OAuth (M6) are still absent.
 
 ```python
 import boto3
@@ -1028,10 +1027,71 @@ app.include_router(build_identity_router(settings, hooks, stores, tokens=tokens)
 | Piece | What it owns |
 | --- | --- |
 | `IdentitySettings` | Section 6.1 as validated settings, `IDENTITY_` prefixed |
-| `IdentityHooks` | The product's own policy: who may sign in, and what claims they get |
+| `IdentityHooks` | The product's own policy: who may sign in, what claims they get, and creating the user row |
+| `IdentityFlows` | Register, login, change password, refresh, logout, logout-all, with no FastAPI dependency |
+| `SessionService` | Refresh families: rotation, reuse detection, the grace window, revocation |
 | `TokenService` | Minting, local verification, JWKS, discovery, rotation across keys |
 | `authorizer_claims` | Reading and coercing what the authorizer put on the request |
 | `CredentialStore` and friends | Storage interfaces, with DynamoDB and in-memory implementations |
+
+**Every route mounts under the issuer's path, so mount the router with no prefix.** The
+gateway builds the discovery URL as `issuer + "/.well-known/openid-configuration"` and
+`jwks_uri` is advertised the same way, so the issuer decides where the routes live.
+`build_identity_router` derives the prefix and places itself there. With the standard's
+`https://<host>/api/auth` issuer:
+
+| Route | What it does |
+| --- | --- |
+| `GET /api/auth/.well-known/openid-configuration` | Discovery, fetched by the gateway at authorizer creation |
+| `GET /api/auth/.well-known/jwks.json` | The verification keys, followed out of discovery |
+| `GET /api/auth/health` | The probe shape every service in the estate shares |
+| `POST /api/auth/register` | Creates an account through the `create_user` hook and signs it in |
+| `POST /api/auth/login` | Verifies a password, applies lockout, starts a refresh family |
+| `POST /api/auth/password` | Changes a password and revokes every other session |
+| `POST /api/auth/refresh` | Rotates the refresh family and returns a new access token |
+| `POST /api/auth/logout` | Revokes the presented family |
+| `POST /api/auth/logout-all` | Revokes every family for the user |
+
+An issuer with no path gives the same routes at the origin. Adding a prefix of your own
+doubles the issuer path and hides the documents from the gateway. **This changed in
+0.10.0**: 0.9.0 served the documents at the origin regardless of the issuer, so a product
+that compensated with `prefix="/api/auth"` must drop it when upgrading.
+
+**The flow routes mount conditionally.** The six `POST` routes appear only when the product
+supplies both `hooks` and a credential store. Called without them the router mounts exactly
+what M1 mounted, the two `.well-known` documents and `/health`, so a service that only
+serves a JWKS does not acquire a login endpoint by upgrading.
+
+**The access token is returned in the JSON body and the refresh token is a cookie.** The
+access token is short-lived, ten minutes by default, and is never set as a cookie: it is
+carried in an `Authorization` header where no browser will send it automatically. The
+refresh token is the opposite, an httpOnly Secure SameSite=Lax cookie scoped to
+`cookie_path`, so no script can read it and no cross-site form can spend it. `cookie_path`
+defaults to the issuer's path, the same place the routes mount, so the cookie reaches
+exactly what spends it.
+
+**Rotation detects reuse, and reuse revokes the family.** Every refresh consumes the
+presented token and mints its successor in one conditional write, so two concurrent
+refreshes cannot both succeed. Presenting an already consumed token inside
+`refresh_reuse_grace` is treated as a client that raced itself and returns a working
+successor; presenting one after that window is treated as a stolen token and revokes the
+whole family, signing out both the attacker and the victim.
+
+**Wrong password and unknown email are indistinguishable.** Identical status, body and
+`error_code`, and the same cost: a login for an address that does not exist still runs one
+bcrypt verification against a dummy hash, so the response time does not answer the question
+the body refuses to. Registering an address that is already taken returns 200 with no
+session rather than an error, for the same reason.
+
+**Lockout is progressive, never permanent.** Five consecutive failures start a delay that
+doubles from one second to a fifteen minute cap, and any success clears it. There is no
+hard lock, because a hard lock on a known address is a denial of service anybody can
+trigger.
+
+**Passwords follow NIST SP 800-63B.** Eight character minimum, no composition rules, no
+expiry, NFKC normalised, and a rejection rather than a silent truncation over 72 UTF-8
+bytes. That last cap is bcrypt's, and the message says bytes because a 64 character
+password of emoji is well over it.
 
 **Every authorizer claim arrives as a string**, `exp` and `iat` included. That is a verified
 finding from the M0 staging spike, and it is why `authorizer_claims` exists rather than a

@@ -5,6 +5,107 @@ Notable changes to the `webbpulse` package. The version here is the one in
 
 This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## 0.10.0
+
+Identity M2: the password and session flows, on the foundations M1 built. Register, login,
+change password, refresh with rotation and reuse detection, logout and logout-all, plus the
+progressive lockout and the password policy behind them.
+
+**Additive for anyone on M1.** The six flow routes mount only when a product supplies both
+`hooks` and a credential store. `build_identity_router` called without them mounts exactly
+what it mounted in 0.9.0, so a service that serves only a JWKS does not acquire a login
+endpoint by upgrading. M1's route test passes unchanged.
+
+**Still absent**, per section 9.1: email verification and reset (M3), TOTP and MFA (M4),
+passkeys (M5), OAuth (M6).
+
+### Breaking
+
+- **Every route now mounts under the issuer's path.** 0.9.0 served the two `.well-known`
+  documents at the origin whatever the issuer said, which is correct only for an issuer with
+  no path. For the standard's own `https://<host>/api/auth` issuer the documents belong at
+  `/api/auth/.well-known/...`, because API Gateway builds the discovery URL by appending to
+  the issuer and `jwks_uri` is advertised the same way. `build_identity_router` now derives
+  the prefix from `settings.issuer` and mounts everything under it, `/health` included.
+
+  The Portfolio pilot hit this against 0.9.0: a test that followed the served `jwks_uri`
+  found a 404, and the workaround was to mount the router with `prefix="/api/auth"`. **Remove
+  that prefix when upgrading**, or every route doubles to `/api/auth/api/auth/...`. A product
+  whose issuer has no path is unaffected: it still gets origin paths.
+
+  `AUTH_PREFIX` is gone, replaced by `identity_prefix(settings)`. The `REGISTER_PATH`,
+  `LOGIN_PATH`, `PASSWORD_PATH`, `REFRESH_PATH`, `LOGOUT_PATH` and `LOGOUT_ALL_PATH`
+  constants are now suffixes relative to that prefix rather than absolute paths.
+
+- **`cookie_path` defaults to the issuer's path** rather than a literal `/api/auth`, so the
+  cookie is scoped to exactly the routes that spend it however the issuer is configured. An
+  explicitly set `cookie_path` still wins. An issuer with no path scopes the cookie to `/`.
+
+### Added
+
+- `IdentityFlows`, the flow layer, with no FastAPI import anywhere in it. `register`,
+  `login`, `change_password`, `refresh`, `logout` and `logout_all` are callable directly,
+  which is what lets the flows be tested without a client and reused outside a request.
+
+  `register` returns `None` rather than raising when the address is taken. Deliberately not
+  an exception: an exception invites a caller to render it differently from the success
+  case, and the whole point is that the two are indistinguishable.
+
+- `SessionService`, the refresh family state machine. Rotation is one conditional write
+  returning the prior state, so two concurrent refreshes cannot both succeed, and the six
+  outcomes it distinguishes are `rotated`, `replayed`, `reuse`, `expired`, `revoked` and
+  `unknown`.
+
+  Reuse inside `refresh_reuse_grace` returns a working successor, because a client that
+  raced itself is not an attacker. Reuse outside it revokes the whole family. The window is
+  what keeps a flaky network from signing users out, and the revocation is what makes a
+  stolen refresh token worth less than one use.
+
+- The six routes under `/api/auth`: `register`, `login`, `password`, `refresh`, `logout`
+  and `logout-all`. The access token is returned in the JSON body and never as a cookie;
+  the refresh token is an httpOnly Secure SameSite=Lax cookie scoped to `cookie_path`.
+
+  `refresh` and `logout` also check `Sec-Fetch-Site`. A refused cross-site request does
+  **not** clear the cookie, which sounds like a missing cleanup and is not: clearing it
+  would let any attacker page sign a victim out by provoking one refused request.
+
+- Password policy in `webbpulse.identity.passwords`, NIST SP 800-63B shaped. Eight character
+  minimum, no composition rules, no expiry, NFKC normalisation, and a rejection rather than
+  a silent truncation over 72 UTF-8 bytes. `equalise_password_timing` spends one bcrypt
+  verification on every login path that has no real hash to check, so an unknown address
+  costs what a wrong password costs.
+
+  `password_breach_check` remains a flag only. Passing `True` raises rather than quietly
+  doing nothing, because a product that switched it on and got no check would believe it had
+  a control it does not have.
+
+- Progressive lockout in `webbpulse.identity.lockout`, with `InMemoryLoginAttemptStore` and
+  `DynamoLoginAttemptStore`. Five consecutive failures start a delay doubling from one
+  second to a fifteen minute cap, cleared by any success. Never a hard lock, because a hard
+  lock on a known address is a denial of service anybody can trigger.
+
+- `create_user` on `IdentityHooks`. Section 4.2 gives the `users` table to the product's own
+  domain, so the package cannot write that row itself, and without this hook registration
+  could hash a password and then have nowhere to put the account.
+
+- `family_started_at` on `RefreshTokenRecord`. The 90 day absolute cap is a property of the
+  family rather than of any one token, and without it each rotation would extend the rolling
+  30 day window forever. Defaults to empty and falls back to the current token's own start,
+  so a rolling deploy does not invalidate live sessions.
+
+### Changed
+
+- `RefreshTokenStore.revoke_all_for_user` takes `except_family_id`. Changing a password
+  should revoke every other session and leave the caller signed in, and there was no way to
+  express that. Still `NotImplementedError` on DynamoDB: both callers know the family ids
+  they are revoking, so they revoke by id through the existing GSI rather than paying for a
+  user index on the hot rotation path to serve a cold one.
+
+- Login attempts are stamped to the millisecond and the in-memory store breaks remaining
+  ties by insertion order. At one second resolution a failure and the retry that succeeds
+  share a timestamp, and if that tie resolved the wrong way the consecutive-failure count
+  was never cleared, locking an account that had just signed in correctly.
+
 ## 0.9.0
 
 Identity M1: the foundations the flows rest on. `webbpulse.identity` becomes a package with

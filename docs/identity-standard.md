@@ -624,8 +624,32 @@ covers that per product.
 
 ### 3.4 JWKS and discovery
 
-`GET /.well-known/jwks.json` returns, per RFC 7517, a `keys` array. Each RSA verification
-key is:
+**Both documents are served under the issuer's path, not at the origin.** For the
+`https://<host>/api/auth` issuer this document specifies in 6.1, that is:
+
+```
+GET /api/auth/.well-known/openid-configuration
+GET /api/auth/.well-known/jwks.json
+```
+
+The paths below are written relative to the issuer for brevity. An issuer with no path,
+such as the one the M0 spike used, gives the origin paths instead, and both shapes are
+supported: `build_identity_router` derives the prefix from `settings.issuer` and mounts
+every route under it, so a product mounts the router with no prefix of its own.
+
+The issuer's path is authoritative because API Gateway builds the discovery URL by
+appending to the issuer, as the M0 evidence below shows, and the discovery document
+advertises `jwks_uri` the same way. Neither URL is ours to choose once the issuer is set.
+
+This is a correction. Package 0.9.0 served both documents at the origin whatever the issuer
+said, which is right only for a path-less issuer. The Portfolio pilot found it against this
+document's own issuer: a test that followed the served `jwks_uri` got a 404, and the
+workaround was to mount the router under a hand-written `/api/auth`. Package 0.10.0 derives
+the prefix, so the workaround is unnecessary and the doubled `/api/auth/api/auth` it would
+otherwise now produce is impossible.
+
+`GET <issuer path>/.well-known/jwks.json` returns, per RFC 7517, a `keys` array. Each RSA
+verification key is:
 
 ```json
 {
@@ -642,7 +666,8 @@ key is:
 the identity service parses it once and caches the JWK in module state for the life of the
 execution environment. This is a read of a public key, so caching it is safe.
 
-`GET /.well-known/openid-configuration` returns the five members OIDC Discovery requires
+`GET <issuer path>/.well-known/openid-configuration` returns the five members OIDC Discovery
+requires
 (`issuer`, plus `jwks_uri`, `response_types_supported`, `subject_types_supported`,
 `id_token_signing_alg_values_supported`), with `issuer` byte-identical to the `iss` claim
 and to the authorizer's configured issuer. A trailing-slash mismatch here is the classic
@@ -651,6 +676,10 @@ failure and presents as every request being denied with no useful message.
 **Confirmed by M0.** API Gateway appends `/.well-known/openid-configuration` to the
 configured issuer. It does not require the issuer to serve the document at its root, and it
 does not go straight to a JWKS.
+
+Note that the M0 spike ran with a path-less issuer, so appending to the issuer and serving
+at the origin happened to be the same thing. That coincidence is why 0.9.0's origin-only
+routing survived M0 and was not found until the Portfolio pilot used the real issuer.
 
 It is stricter than that, in a way nothing in the documentation prepares you for: **the
 fetch happens at `CreateAuthorizer` time, not only when a request is verified.** The
@@ -1393,6 +1422,40 @@ def build() -> APIRouter:
     )
 ```
 
+**Mount the returned router with no prefix**, even in a service whose other routers sit
+under `/api/v1`:
+
+```python
+app.include_router(build())
+```
+
+The router places itself under the issuer's path. With the `issuer` above every route lands
+under `/api/auth`:
+
+```
+GET  /api/auth/.well-known/openid-configuration
+GET  /api/auth/.well-known/jwks.json
+GET  /api/auth/health
+POST /api/auth/register
+POST /api/auth/login
+POST /api/auth/password
+POST /api/auth/refresh
+POST /api/auth/logout
+POST /api/auth/logout-all
+```
+
+An issuer with no path gives the same routes at the origin. Adding a prefix of your own
+doubles the issuer path, giving `/api/auth/api/auth/login`, and puts the `.well-known`
+documents where API Gateway will not look for them.
+
+`cookie_path` follows the same source. Left unset it derives from the issuer's path, which
+scopes the refresh cookie to exactly the routes that spend it. Set it explicitly only to
+widen that deliberately.
+
+Package 0.9.0 served the two documents at the origin regardless of the issuer's path, and a
+product on that version needed `prefix="/api/auth"` to compensate. Remove that prefix when
+upgrading to 0.10.0. See 3.4.
+
 ### 6.3 `IdentityHooks`, the product's own policy
 
 This is the seam that keeps the 0.5.0 reasoning intact. Everything genuinely product-specific
@@ -1709,7 +1772,43 @@ implementation had to close it. None of these changes a decision the standard al
    public key it returns, as a raw message or as a prehashed digest. The tests use a local
    RSA key behind the same `KmsClient` protocol instead, which is faithful in the two ways
    the output depends on.
-| **M2** | Password flows: register, login, change, policy, dummy-hash equalisation, lockout, `credentials` table. Sessions: families, rotation, reuse detection, grace window, logout, logout-all | 0.7.0 | 5 to 7 |
+| **M2** | Password flows: register, login, change, policy, dummy-hash equalisation, lockout, `credentials` table. Sessions: families, rotation, reuse detection, grace window, logout, logout-all. *Delivered 2026-09-09 in 0.10.0. Six routes under `/api/auth`, mounted only when a product supplies hooks and a credential store, so M1's three-route surface is unchanged for anyone who does not. Decisions recorded below.* | 0.10.0 | 5 to 7 |
+#### M2 decisions, 2026-09-09
+
+Same purpose as the M1 block: places where the standard left a choice open, or where
+implementing the flows showed something the standard did not say.
+
+1. **`create_user` is a new hook.** Section 4.2 gives the `users` table to the product's own
+   domain, and section 6.3's hook list had no way for the package to create that row, so
+   registration could hash a password and then have nowhere to put the account. The package
+   owns `credentials`, the product owns `users`, and the hook is the seam between them.
+2. **`RefreshTokenRecord` carries `family_started_at`.** The 90 day absolute cap is a
+   property of the family rather than of any one token, and nothing in section 4.4 held it.
+   Without it the cap is unenforceable: each rotation would extend the rolling 30 day window
+   with no memory of when the family began. It defaults to empty, and a record missing it
+   falls back to the current token's own start, so a rolling deploy does not invalidate
+   sessions issued by the previous version.
+3. **The grace window mints a new token rather than re-handing the successor.** Section 2.6
+   describes `refresh_reuse_grace` as returning the same successor to a client that raced
+   itself. Only the successor's SHA-256 is stored, so the plaintext no longer exists to
+   re-hand. The replay instead mints a fresh token at the successor's generation, which
+   gives the racing client a working session without treating the replay as reuse.
+4. **`revoke_all_for_user` stays unimplemented on DynamoDB, and gains `except_family_id`.**
+   M1 decision 3 deferred the index question to M2. The answer is that M2 does not need it:
+   change-password and logout-all both know the family ids they are revoking, so they revoke
+   by id through the existing GSI. Adding a user index would cost a write on every rotation
+   of the hot path to serve a cold one. The `except_family_id` parameter is what lets change
+   password revoke every other session while leaving the caller signed in.
+5. **A refused cross-site request does not clear the refresh cookie.** The `Sec-Fetch-Site`
+   check on refresh and logout returns 403 without touching the cookie. Clearing it would
+   let any attacker page sign a victim out by provoking one refused request, turning a CSRF
+   defence into the denial of service it exists to prevent.
+6. **Login attempts are ordered by a monotonic sequence, not by timestamp alone.** Section
+   5.4 clears the lockout count on any success. `attempted_at` at one second resolution ties
+   a failure with the retry that succeeds, and if the tie resolves the wrong way the count
+   is never cleared and a correct sign-in locks the account. Attempts are stamped to the
+   millisecond and the in-memory store breaks remaining ties by insertion order.
+
 | **M3** | Email: SES sender, templates, verification, reset. Contract tests for JWKS and discovery against a real deployed authorizer | 0.7.0 | 3 to 4 |
 | **M4** | TOTP with KMS envelope encryption, recovery codes, the MFA ticket, step-up, `amr` | 0.8.0 | 4 to 5 |
 | **M5** | Passkeys: both ceremonies, challenge lifecycle, counter checking, passwordless | 0.9.0 | 5 to 6 |
