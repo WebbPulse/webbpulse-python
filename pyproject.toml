@@ -58,6 +58,14 @@ testing = ["moto[dynamodb,secretsmanager]>=5", "pytest>=8", "httpx2>=2"]
 # so a consumer that already has the `dynamodb` extra brings its own and one that does not
 # is not made to install boto3 to serve a JWKS.
 identity = ["PyJWT[crypto]>=2.9", "fastapi>=0.115"]
+# webbpulse.identity.oauth. The only outbound HTTP this package makes is the provider token
+# exchange and userinfo calls in M6, and `httpx` is what makes them: it gives a real
+# per-request timeout, which matters because a provider that hangs would otherwise hold a
+# Lambda execution environment open until the function's own timeout and turn a provider
+# incident into an availability incident here. Declared separately from `identity` so a
+# product that mounts no OAuth routes does not install it, and separately from `testing`,
+# whose `httpx2` is there for Starlette's TestClient rather than for this.
+oauth = ["httpx>=0.27"]
 
 [project.urls]
 Homepage = "https://github.com/WebbPulse/webbpulse-python"

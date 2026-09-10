@@ -275,6 +275,33 @@ class IdentitySettings(BaseSettings):
     google_client_id: str = Field(default="")
     github_client_id: str = Field(default="")
 
+    oauth_redirect_uris: list[str] = Field(
+        default_factory=list,
+        description=(
+            "Absolute redirect URIs an OAuth start may ask the provider to call back. "
+            "Empty means the single default, `<issuer>/oauth/callback`."
+        ),
+    )
+    """The allow-list an OAuth `redirect_uri` is checked against, by exact string equality.
+
+    An OAuth redirect URI is the one parameter a caller supplies that the provider will
+    then send a live authorization code to, so an unchecked one is a code-exfiltration
+    primitive rather than an ordinary open redirect: an attacker who can name the callback
+    receives the code and exchanges it themselves.
+
+    **Exact equality, never a prefix.** A prefix check on `https://app.example.com` also
+    admits `https://app.example.com.attacker.test`, which is a different registrable domain
+    that an attacker can register today. Each URI a product actually uses is listed in full.
+
+    Empty is the ordinary case and means "the one default", `<issuer>/oauth/callback`. A
+    product only populates this when it has more than one host to come back to, such as a
+    preview environment alongside production. Every value here must also be registered with
+    the provider, which is the second, independent check on the same thing.
+
+    This is a list field, so the environment form is a JSON array and not a comma-separated
+    string, matching every other list on this class.
+    """
+
     # ------------------------------------------------------------------
     # Validation
     # ------------------------------------------------------------------

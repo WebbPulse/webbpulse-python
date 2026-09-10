@@ -5,6 +5,110 @@ Notable changes to the `webbpulse` package. The version here is the one in
 
 This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## 0.15.0
+
+Identity M6: OAuth sign-in and account linking against Google and GitHub.
+
+Additive. Every existing route, stored record and hooks implementation keeps working, and a
+product that configures no provider gets no new routes and needs no new tables. The one
+change to a shared interface is a new `IdentityHooks` method with a default, described below.
+
+### Added
+
+- **OAuth sign-in and account linking**, in two new modules: `webbpulse.identity.oauth` for
+  the providers, the stores and the linking rules, and `webbpulse.identity.oauth_routes` for
+  the five routes. Both are mounted automatically by `build_identity_router` when the product
+  has configured at least one provider with a client id and supplied the two new stores; a
+  route that could only answer 503 because nobody set `google_client_id` is worse than a
+  route that is not in the OpenAPI document at all.
+
+  Five routes: `GET /oauth/{provider}/start`, `GET /oauth/callback`,
+  `POST /oauth/{provider}/link`, `GET /oauth/links` and `DELETE /oauth/{provider}/link`. The
+  three management routes take their subject from verified claims and refuse an anonymous
+  caller.
+
+  The authorization code flow, with PKCE where the provider supports it. Google gets an S256
+  challenge and a nonce and its ID token is verified against the published JWKS for
+  signature, `iss`, `aud`, `exp` and `nonce`; GitHub's web flow documents neither PKCE nor an
+  ID token, so its identity comes from `/user` plus `/user/emails`, where the verified
+  primary address is preferred because `/user`'s `email` is an unverified profile field.
+
+  The callback issues the same token pair as a password login, through the same path, and
+  returns the `mfa_required` challenge when the account has TOTP enabled. The access token
+  carries `amr: ["oauth", "<provider>"]`.
+
+- **Two tables.** `oauth-states`, hash key `state`, TTL attribute `expires_at`, holding one
+  in-flight authorization for ten minutes and spent by a conditional `DeleteItem` so a state
+  is single use. `oauth-links`, hash key `provider_subject` (`provider#subject`) with a
+  `user_id-index` GSI, holding one provider identity attached to one local user. Expiry is
+  re-checked on every read, because DynamoDB TTL is storage reclamation and not access
+  control.
+
+  The `oauth-links` key diverges from section 4.2 of `docs/identity-standard.md`, which
+  sketches a hash of `id` with two GSIs. Keying on the provider identity makes the uniqueness
+  constraint the primary key, so attaching is one conditional put on
+  `attribute_not_exists(provider_subject)` and needs no synthetic reservation rows.
+
+- **`IdentityStores.oauth_states` and `IdentityStores.oauth_links`**, both optional and both
+  defaulting to `None`, with `require_oauth_states()` and `require_oauth_links()` alongside
+  the existing accessors. In-memory and DynamoDB implementations of each.
+
+- **`IdentitySettings.oauth_redirect_uris`**, a list defaulting to empty, which means the
+  single derived `<issuer>/oauth/callback`. Entries are matched by exact string equality: a
+  prefix match would admit `https://app.example.com.attacker.test`.
+
+- **`oauth_client_secrets` on `build_identity_router`**, a mapping of provider name to client
+  secret. An argument rather than a settings field because the secrets come from the
+  product's Secrets Manager JSON rather than an `IDENTITY_`-prefixed variable, and keeping
+  them off the settings object keeps them out of anything that renders it. They are never
+  logged, and a missing secret answers 503 with a message that names no configuration.
+
+- **An `oauth` extra**, pulling in `httpx` for the provider calls. Only needed by a product
+  that mounts the OAuth routes: the client is constructed lazily, so the package still
+  imports without it.
+
+- **`IdentityHooks.has_other_sign_in_method(user_id)`**, which reports whether the product
+  holds a sign-in method this package cannot see. **It defaults to `False` on
+  `BaseIdentityHooks`, so every existing hooks implementation stays valid with no change.**
+  `False` is the safe default in the only direction that matters: it can make `unlink` refuse
+  more often, never less, while `True` would let a product that had not implemented it delete
+  a user's last credential. A product holding passkeys or another federated store should
+  implement it.
+
+### Security
+
+- **An OAuth identity auto-links to an existing account only when the provider email and the
+  local account email are both verified.** Either half alone is a takeover. Checking only the
+  local side lets an attacker who registered a provider account with somebody else's address
+  inherit that account; checking only the provider side lets an attacker who registered
+  locally with a victim's address, and never verified it, be handed the victim's real
+  provider identity. A refusal is `OAUTH_EMAIL_UNVERIFIED`, and the user signs in with their
+  password and links from account settings, which needs no email check because they have
+  proved they hold both sides. The message is identical whichever half failed, since naming
+  it would enumerate accounts and their verification state.
+
+- **Unlinking refuses when it would leave the account with no sign-in method.** Another OAuth
+  link, a password, or the new hook each count as remaining, and the count happens before
+  anything is deleted. Removing the last method is permanent lockout: nobody can log in, so
+  nobody can add a method back. Remaining links are read from the GSI and then re-read from
+  the base table by primary key, because the GSI is eventually consistent and over-counting
+  is the one direction that permanently loses an account.
+
+- **`state` is server-side, single use and provider-bound.** Unknown, expired and
+  already-spent states all answer with one message and one code, because distinguishing them
+  confirms that a guess found a real row. The PKCE verifier is written to the state row and
+  never placed in the authorization URL, since a verifier the browser can read protects
+  against nothing.
+
+- **The JWKS is fetched through the module's own HTTP client**, not `PyJWKClient`, which
+  fetches with `urllib` and no timeout. Every provider call now carries the same explicit
+  timeout, so a provider that accepts a connection and never answers cannot hold a Lambda
+  execution environment open until the function times out.
+
+- **No provider tokens are stored.** Neither the access token nor the refresh token from the
+  provider is written down. This design consumes a provider as an identity source and never
+  calls a provider API afterwards, so a stored token would be a credential with no use.
+
 ## 0.13.0
 
 Identity M4 security fix: `POST /totp/disable` and `POST /recovery-codes` now require proof

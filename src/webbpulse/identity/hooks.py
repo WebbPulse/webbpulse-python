@@ -213,6 +213,34 @@ class IdentityHooks(Protocol):
         """
         ...
 
+    def has_other_sign_in_method(self, user_id: str) -> bool:
+        """Whether this user holds a sign-in method the identity package cannot see.
+
+        Added in M6 and **defaulted to `False`**, so every `IdentityHooks` implementation
+        written before it keeps satisfying this Protocol and keeps working unchanged.
+
+        It exists for exactly one caller: `OAuthService.unlink`, which refuses to remove the
+        last way into an account. That check can see two of the three answers itself, the
+        remaining OAuth links and the password credential, and cannot see the third. Passkeys
+        live in M5's `webauthn-credentials` table, and anything else a product invented, such
+        as an SSO assertion or a magic link, is not in this package's tables at all. So the
+        product is asked.
+
+        **`False` is the safe default, and the direction matters.** A product that has not
+        implemented this can only ever be told "no additional methods", which makes `unlink`
+        refuse in cases where it might have allowed. The cost is a user who must set a
+        password before unlinking a provider they could safely have unlinked. A default of
+        `True` would invert that: a product that forgot the hook would let its users delete
+        their last credential, and a locked-out account has no recovery path this design can
+        offer. Refusing too often is a support ticket; allowing too often is a lost account.
+
+        Do **not** count OAuth links or the password here. `unlink` already counts both, and
+        counting them twice cannot make the answer wrong, but a product that counted only
+        those and forgot passkeys would be reporting the very thing this hook was added to
+        ask about.
+        """
+        ...
+
 
 class BaseIdentityHooks:
     """A concrete `IdentityHooks` whose unimplemented hooks raise a clear error.
@@ -265,3 +293,13 @@ class BaseIdentityHooks:
 
     def user_repository(self) -> object:
         raise self._not_implemented("user_repository")
+
+    def has_other_sign_in_method(self, user_id: str) -> bool:
+        """No methods this package cannot see. The conservative default: see the Protocol.
+
+        Unlike the other unimplemented hooks this returns rather than raising, because
+        `unlink` calls it on a path that must keep working for every product written before
+        M6 existed. Raising `HookNotImplemented` here would turn an optional refinement into
+        a required hook and break those products on upgrade.
+        """
+        return False
