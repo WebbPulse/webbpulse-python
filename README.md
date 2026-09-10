@@ -47,6 +47,7 @@ needs. Everything else is opt-in.
 | `security` | `PyJWT`, `bcrypt` | `webbpulse.security` |
 | `identity` | `PyJWT[crypto]`, `fastapi` | `webbpulse.identity` |
 | `oauth` | `httpx` | OAuth sign-in in `webbpulse.identity`, on top of `identity` |
+| `passkeys` | `webauthn` | `webbpulse.identity.passkeys`, only when `passkeys_enabled` |
 | `testing` | `moto`, `pytest`, `httpx2` | `webbpulse.testing` |
 
 A typical service installs `webbpulse[fastapi,dynamodb,otel]` at runtime and adds
@@ -61,8 +62,11 @@ extra to import at all, and `webbpulse.testing` needs the `testing` extra.
 `webbpulse.identity` imports on the base install: it takes a KMS client rather than
 building one, and it defers both the `cryptography` and the FastAPI import to the call
 that needs it, so serving a JWKS needs the `identity` extra but importing the module
-does not. `webbpulse.log_context` and `webbpulse.metrics` need nothing beyond the standard
-library and have no extra of their own.
+does not. `webbpulse.identity.passkeys` follows the same rule one level down: it imports on
+the `identity` extra alone and defers every `webauthn` import to the method that needs it,
+so a deployment with `passkeys_enabled` false never has to install the `passkeys` extra.
+`webbpulse.log_context` and `webbpulse.metrics` need nothing beyond the standard library and
+have no extra of their own.
 
 ## Modules
 
@@ -1018,15 +1022,15 @@ reset, TOTP and recovery codes, configuration, the product policy seam, storage 
 a KMS-backed token service, and the reader for the claims an API Gateway HTTP API JWT
 authorizer leaves on a request. Needs the `identity` extra.
 
-This is M6 of `docs/identity-standard.md`. M1 built the foundations, M2 added the password
+This completes `docs/identity-standard.md`. M1 built the foundations, M2 added the password
 and session flows, M3 added the two emailed link flows, M4 added multi-factor
-authentication, and M6 adds federated sign-in: the authorization code flow against Google
-and GitHub, account linking, and the two rules that make linking safe. Passkeys (M5) land
-separately.
+authentication, M6 added federated sign-in against Google and GitHub, and M5 adds passkeys:
+WebAuthn registration and passwordless sign-in, credential management, and stored
+single-use challenges.
 
-OAuth needs the `oauth` extra on top of `identity`, for `httpx`. A product that mounts no
-OAuth routes does not need it: the client is constructed lazily, so importing the package
-without the extra works.
+OAuth needs the `oauth` extra on top of `identity`, for `httpx`, and passkeys need the
+`passkeys` extra, for `webauthn`. A product that mounts neither set of routes needs
+neither: both are constructed lazily, so importing the package without them works.
 
 ```python
 import boto3
@@ -1043,12 +1047,13 @@ app.include_router(build_identity_router(settings, hooks, stores, tokens=tokens)
 | --- | --- |
 | `IdentitySettings` | Section 6.1 as validated settings, `IDENTITY_` prefixed |
 | `IdentityHooks` | The product's own policy: who may sign in, what claims they get, and creating the user row |
-| `IdentityFlows` | Register, login, change password, refresh, logout, logout-all, verify email, reset password, with no FastAPI dependency |
+| `IdentityFlows` | Register, login, change password, refresh, logout, logout-all, verify email, reset password, passkey registration and sign-in, with no FastAPI dependency |
 | `SessionService` | Refresh families: rotation, reuse detection, the grace window, revocation |
 | `LinkService` | Single-use emailed links: minting, hashing, expiry, purpose, consumption |
 | `MfaService` | TOTP enrolment and verification, recovery codes, and the MFA ticket |
 | `OAuthService` | The provider leg, the linking rules, and the last-sign-in-method count |
 | `OAuthStateStore` and `OAuthLinkStore` | The in-flight authorization and the provider-to-user attachment |
+| `PasskeyService` | WebAuthn ceremonies, the challenge lifecycle, the signature counter check, credential management |
 | `EnvelopeCipher` | Sealing a TOTP seed under a per-secret KMS data key with a per-user encryption context |
 | `EmailSender` | Sending mail, with an SES v2 implementation and a recording one for tests |
 | `TokenService` | Minting, local verification, JWKS, discovery, rotation across keys |
@@ -1087,6 +1092,13 @@ gateway builds the discovery URL as `issuer + "/.well-known/openid-configuration
 | `POST /api/auth/oauth/{provider}/link` | Starts a link for the authenticated account, returning the URL |
 | `GET /api/auth/oauth/links` | The providers attached to this account, for a settings page |
 | `DELETE /api/auth/oauth/{provider}/link` | Detaches a provider, unless it is the last way in |
+| `POST /api/auth/passkeys/register/options` | WebAuthn registration options for the authenticated caller |
+| `POST /api/auth/passkeys/register/verify` | Verifies the attestation and stores the credential |
+| `POST /api/auth/login/passkey/options` | WebAuthn authentication options, anonymous |
+| `POST /api/auth/login/passkey/verify` | Verifies the assertion and issues the same token pair as `/login` |
+| `GET /api/auth/passkeys` | The caller's own passkeys |
+| `PATCH /api/auth/passkeys/{credential_id}` | Renames one of the caller's passkeys |
+| `DELETE /api/auth/passkeys/{credential_id}` | Removes one of the caller's passkeys |
 
 An issuer with no path gives the same routes at the origin. Adding a prefix of your own
 doubles the issuer path and hides the documents from the gateway. **This changed in
@@ -1101,7 +1113,10 @@ email routes need more still: an `EmailSender` and an identity token store, and 
 both of those the other ten routes mount without them. The six MFA routes need `totp_enabled`
 plus a TOTP factor store, a recovery code store and an identity token store, and they mount
 independently of the email routes: a product can run TOTP with no sender configured at all.
-A route that cannot do its job should not exist to be called.
+The seven passkey routes need `passkeys_enabled` plus a passkey store and a WebAuthn
+challenge store, and they mount independently of both: a product can run passwordless
+sign-in with no email and no TOTP. A route that cannot do its job should not exist to be
+called.
 
 **Login answers 200 with a challenge when a factor is enrolled.** The first leg returns
 `{"mfa_required": true, "mfa_ticket": "...", "factors": ["totp"]}` rather than tokens, and
@@ -1125,6 +1140,79 @@ exactly as they were. A missing or blank `code` is a 422 `VALIDATION_ERROR` inst
 a client that forgot the field should be told that rather than shown "that code is not
 valid". **This changed in 0.13.0**: both routes previously took no body at all, so a client
 must be updated to send one.
+
+**The two passkey tables the Terraform platform module has to create.** The identity module
+already creates `users`, `credentials`, `refresh-tokens`, `identity-tokens`, `login-attempts`,
+`totp-factors` and `recovery-codes`; M5 adds two more, and the names and key shapes here are
+the contract between that module and this package.
+
+| Table | Hash key | Range key | Index | TTL attribute |
+| --- | --- | --- | --- | --- |
+| `passkeys` | `user_id` | `credential_id` | `credential_id-index` on `credential_id` | **none** |
+| `webauthn-challenges` | `challenge_id` | none | none | `expires_at` |
+
+`passkeys` is keyed the way it is because the management page reads its own writes: listing
+a user's credentials must be a `query` on the base table, which is consistent, rather than
+on a GSI, which cannot be. The login lookup goes the other way, from a credential id to its
+owner, and that one tolerates eventual consistency because a credential that has just been
+registered is not being signed in with in the same instant. There is deliberately **no TTL**
+on it: a passkey is removed when its owner removes it and never on a timer.
+
+`webauthn-challenges` carries the TTL, on `expires_at`, and the attribute name is part of
+the contract. Pointing the module at a different attribute would not break anything visibly,
+because expiry is enforced in code on every read regardless: the rows would simply never be
+reclaimed and the table would grow forever. TTL here is storage reclamation, not access
+control, which is the same rule every other expiring table in this package follows.
+
+**A passkey challenge is a row, and that is the point of M5.** A challenge exists to make an
+assertion unreplayable, which is a claim about state that a signed token cannot make: a JWT
+verifies exactly as well the second time as the first, so a captured options-and-assertion
+pair replays for the whole of the token's lifetime and adjusting that lifetime only moves
+the window. So a challenge is written when options are generated, deleted when it is
+consumed, and refused once its five minute deadline has passed whether or not DynamoDB has
+reclaimed the row. It is spent by one attempt whatever the outcome, so a stolen challenge
+cannot be ground against.
+
+**A user-verified passkey counts as two factors, and a user with TOTP enrolled is not asked
+for a code.** A passkey login sets `amr` to `["swk"]` when the authenticator did not verify
+the user and `["swk", "pin", "mfa"]` when it did, both RFC 8176 registered values. The
+assertion proves possession of a private key that never leaves the authenticator, and the
+`uv` flag proves the authenticator separately checked something the user knows or is before
+it would sign: possession plus knowledge or inherence, in one gesture. A passkey that reports
+no user verification proves possession only, so it is one factor and **is** challenged for a
+second exactly as a password is, returning the same `mfa_required` body. This is the one
+place the package decides an MFA policy on the product's behalf rather than asking, which is
+why it is written down here: a product that disagrees needs to know it is a choice.
+
+**Signature counters are checked here, not by the library, and migrate as stored.** A counter
+that fails to increase is evidence of a cloned authenticator, per section 6.1.3 of the
+WebAuthn specification. `finish_login` passes py_webauthn a stored count of zero so that the
+comparison happens in this package, where a regression is logged at ERROR as the finding it
+is rather than folded into a generic verification failure, and where a library upgrade cannot
+quietly change it. Both counts being zero is the specification's documented exception and is
+allowed, because many authenticators, Apple's included, keep no counter at all. A credential
+imported from another system keeps the count that system last saw: importing at zero would
+disarm the check for that credential forever, since every later assertion would exceed zero.
+
+**The origin and the RP ID are required, never defaulted.** `IDENTITY_RP_ID` and
+`IDENTITY_WEBAUTHN_ORIGINS` are checked when a ceremony runs and the error names the
+variable, because an empty origin list makes the origin check vacuous and that check is the
+whole of what makes a passkey phishing resistant. `rp_id` is the registrable domain, hashed
+into every credential and immutable for that credential's life.
+
+**`POST /login/passkey/options` answers any input, including an unknown address.** It returns
+a challenge and an empty `allowCredentials`, which is byte-identical to a genuine
+discoverable-credential request, so an unauthenticated route does not become an account
+oracle that needs no password. Passwordless sign-in is gated on `passkeys_passwordless`:
+with it off, both login routes refuse and a passkey is a managed credential and a second
+factor but not an entry point.
+
+**The last passkey cannot be deleted by a user with no password.** Less a rule about passkeys
+than about not stranding somebody outside their own account, and it applies only to the last
+one: two passkeys, delete either. "Has a password" is read from the `credentials` store,
+which is where this package's own password lives, so **M5 added no hook** and `IdentityHooks`
+is unchanged. A product whose users can sign in some other way the package cannot see still
+has `may_authenticate` and can refuse the delete in front of the route.
 
 **A TOTP seed is never stored in the clear.** Each one is sealed under its own KMS data key
 with `{"user_id", "purpose"}` as the encryption context, so a ciphertext moved to another

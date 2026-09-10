@@ -740,6 +740,24 @@ def _mount_flows(
                 set_refresh_cookie=set_refresh_cookie,
             )
 
+    # Before the email early-return too, and for the identical reason: passkeys need no
+    # sender, and mounting them after that `return` would mean a product running passwordless
+    # sign-in with no email configured had no passkey routes at all.
+    if flows.passkeys is not None:
+        from webbpulse.identity.passkey_routes import register_passkey_routes
+
+        register_passkey_routes(
+            router,
+            prefix=prefix,
+            flows=flows,
+            tokens=tokens,
+            limits=limits,
+            context=context,
+            rejected=rejected,
+            success_body=success_body,
+            set_refresh_cookie=set_refresh_cookie,
+        )
+
     if not flows.email_enabled:
         # No sender, or no `identity-tokens` store. The four routes below all promise the
         # caller an email or spend a token, so declaring them here would mean four endpoints

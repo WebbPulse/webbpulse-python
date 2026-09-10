@@ -34,18 +34,25 @@ Logical names; `webbpulse.dynamodb.table_name` prefixes each with the environmen
 | `identity_tokens` | `token_hash` | none | none | `expires_at` |
 | `totp_factors` | `user_id` | none | none | **never** |
 | `recovery_codes` | `user_id` | `code_hash` | none | **never** |
+| `passkeys` | `user_id` | `credential_id` | `credential_id-index` | **never** |
+| `webauthn_challenges` | `challenge_id` | none | none | `expires_at` |
 
 The three M1 stores are `credentials`, `refresh_tokens` and `identity_tokens`; M4 adds
-`totp_factors` and `recovery_codes`. `users` is reached through the product's own repository
-behind `IdentityHooks.user_repository`, because section 4.2 gives the `users` domain
-ownership of that record.
+`totp_factors` and `recovery_codes`; M5 adds `passkeys` and `webauthn_challenges`. `users`
+is reached through the product's own repository behind `IdentityHooks.user_repository`,
+because section 4.2 gives the `users` domain ownership of that record.
 
-**The two M4 tables must never carry a TTL**, and the reason is the sharper version of the
-general rule above. An expiring refresh token that vanishes early costs a user one extra
-login. A TOTP factor or a recovery code that vanishes early costs them the account: the
-second factor silently disappears, and if MFA is required for their role they cannot get in
-at all. These rows are deleted explicitly, by a user disabling TOTP or regenerating a set,
-and never on a schedule.
+**The two M4 tables and `passkeys` must never carry a TTL**, and the reason is the sharper
+version of the general rule above. An expiring refresh token that vanishes early costs a
+user one extra login. A TOTP factor, a recovery code or a passkey that vanishes early costs
+them the account: the factor silently disappears, and if MFA is required for their role, or
+if the passkey was their only credential under `passkeys_passwordless`, they cannot get in
+at all. These rows are deleted explicitly, by a user disabling TOTP, regenerating a set or
+removing a passkey, and never on a schedule.
+
+`webauthn_challenges` is the counterpart and is the one M5 table that **does** expire. Its
+rows live five minutes, are deleted the moment they are spent, and hold nothing whose loss
+costs anybody anything: a challenge that vanishes early is a ceremony the user restarts.
 
 **`credentials` is hash `user_id` and range `credential_type`.** Separating the password
 hash from the user record means a route that returns a user cannot accidentally serialise a
@@ -100,33 +107,44 @@ if TYPE_CHECKING:  # pragma: no cover - typing only
 __all__ = [
     "CREDENTIALS_TABLE",
     "IDENTITY_TOKENS_TABLE",
+    "PASSKEYS_TABLE",
+    "PASSKEY_CREDENTIAL_INDEX",
     "RECOVERY_CODES_TABLE",
     "REFRESH_FAMILY_INDEX",
     "REFRESH_TOKENS_TABLE",
     "TOTP_FACTORS_TABLE",
     "USERS_TABLE",
+    "WEBAUTHN_CHALLENGES_TABLE",
     "CredentialRecord",
     "CredentialStore",
     "DynamoCredentialStore",
     "DynamoIdentityTokenStore",
+    "DynamoPasskeyStore",
     "DynamoRecoveryCodeStore",
     "DynamoRefreshTokenStore",
     "DynamoTotpFactorStore",
+    "DynamoWebAuthnChallengeStore",
     "IdentityStores",
     "IdentityTokenPurpose",
     "IdentityTokenRecord",
     "IdentityTokenStore",
     "InMemoryCredentialStore",
     "InMemoryIdentityTokenStore",
+    "InMemoryPasskeyStore",
     "InMemoryRecoveryCodeStore",
     "InMemoryRefreshTokenStore",
     "InMemoryTotpFactorStore",
+    "InMemoryWebAuthnChallengeStore",
+    "PasskeyRecord",
+    "PasskeyStore",
     "RecoveryCodeRecord",
     "RecoveryCodeStore",
     "RefreshTokenRecord",
     "RefreshTokenStore",
     "TotpFactorRecord",
     "TotpFactorStore",
+    "WebAuthnChallengeRecord",
+    "WebAuthnChallengeStore",
     "constant_time_equals",
     "hash_token",
     "is_expired",
@@ -143,8 +161,32 @@ IDENTITY_TOKENS_TABLE: Final = "identity-tokens"
 TOTP_FACTORS_TABLE: Final = "totp-factors"
 RECOVERY_CODES_TABLE: Final = "recovery-codes"
 
+#: M5's two. `passkeys` is hash `user_id`, range `credential_id`, and **never** a TTL, for
+#: the reason `totp-factors` has none: a passkey that vanishes on a schedule is a second
+#: factor, or with `passkeys_passwordless` the only factor, silently removed from an account.
+#: `webauthn-challenges` is the opposite and is the one table in the identity set whose rows
+#: are meant to disappear, hash `challenge_id` and TTL `expires_at`.
+PASSKEYS_TABLE: Final = "passkeys"
+WEBAUTHN_CHALLENGES_TABLE: Final = "webauthn-challenges"
+
 #: The one GSI on `refresh-tokens`, for revoking a family. Never on the verification path.
 REFRESH_FAMILY_INDEX: Final = "family_id-generation-index"
+
+#: The one GSI on `passkeys`, hash `credential_id`, and it is on the **login** path rather
+#: than off it, which is the opposite of `REFRESH_FAMILY_INDEX`.
+#:
+#: A passwordless assertion arrives carrying a credential id and nothing else: the whole
+#: point of a discoverable credential is that the user never typed a username. So the lookup
+#: "whose passkey is this" has to be answerable without a `user_id`, and the table's own
+#: hash key is `user_id`. The alternative shape, hash `credential_id` with a GSI on
+#: `user_id`, was rejected because listing a user's passkeys would then be the indexed read
+#: and every management route would be eventually consistent: a passkey just registered
+#: would be missing from the list the frontend renders immediately after registering it.
+#:
+#: The consequence is that the login path is eventually consistent, and it is bounded: a
+#: passkey missing from the index for the second after it was written cannot be one the user
+#: is signing in with, because it was written by a request that was already authenticated.
+PASSKEY_CREDENTIAL_INDEX: Final = "credential_id-index"
 
 #: The purposes an `identity_tokens` row can carry. One table for all three, because they
 #: differ only in a TTL and a template, and three tables would triple the Terraform for that.
@@ -155,6 +197,12 @@ REFRESH_FAMILY_INDEX: Final = "family_id-generation-index"
 #: race rather than being caught by a read. The TTL matches the ticket's own five minutes,
 #: so the rows clear themselves.
 type IdentityTokenPurpose = Literal["verify_email", "reset_password", "mfa_ticket"]
+
+#: What a `webauthn-challenges` row was minted for. Checked when the row is spent, so a
+#: challenge issued for a registration cannot be presented to the login verify leg: the two
+#: ceremonies verify different things, and letting one satisfy the other would mean an
+#: attacker who can start a registration can answer a login.
+type WebAuthnChallengePurpose = Literal["register", "login"]
 
 #: Bits of entropy in a refresh token or a verification link. 256, per sections 2.6 and 4.2.
 TOKEN_BYTES: Final = 32
@@ -309,6 +357,86 @@ class RecoveryCodeRecord:
     code_hash: str
     created_at: str
     used_at: str = ""
+
+
+@dataclass(frozen=True, slots=True)
+class PasskeyRecord:
+    """One WebAuthn credential: its public key, its signature counter, and its label.
+
+    A third storage choice, alongside the sealed TOTP seed and the hashed recovery code, and
+    the reason is the same rule applied a third time: store the weakest thing that supports
+    the operation. A passkey's stored half is a **public** key. Nothing here is a secret, so
+    it is neither hashed nor encrypted, and a read of this table proves nothing and
+    authenticates nobody. The private half never left the authenticator.
+
+    `credential_id` and `public_key` are base64url text without padding rather than raw
+    bytes. DynamoDB has a binary type and it would work; text is chosen because these values
+    travel to the browser as base64url in the WebAuthn JSON either way, because a `B`
+    attribute reads back as a `Binary` wrapper that every mapping function would have to
+    unwrap, and because an operator looking at a row in the console can compare the value to
+    the one in a browser's network tab without decoding anything.
+
+    `sign_count` is the authenticator's own monotonic counter, and it is the one field here
+    whose value carries security meaning. It **migrates as stored**: a credential imported
+    from another system keeps the counter that system last saw. Importing it as zero would
+    disarm the clone detection for that credential permanently, because every subsequent
+    assertion would be greater than zero and so would look correct forever. A genuine zero
+    means the authenticator does not implement a counter, which is common, and section 6.1.3
+    of the WebAuthn specification says both being zero is the signal to skip the check.
+
+    `backup_eligible` and `backup_state` are recorded because a synced passkey and a
+    device-bound one are different security propositions, and a product that wants to require
+    a device-bound credential for something sensitive needs the row to say which it has.
+    """
+
+    user_id: str
+    credential_id: str
+    public_key: str
+    sign_count: int = 0
+    name: str = ""
+    created_at: str = ""
+    last_used_at: str = ""
+    transports: tuple[str, ...] = ()
+    aaguid: str = ""
+    backup_eligible: bool = False
+    backup_state: bool = False
+    #: Whether the authenticator verified the user (PIN, biometric) at registration.
+    #:
+    #: Recorded at registration and **not** consulted at login: what counts for the `amr`
+    #: of a passkey login is the `uv` flag on that assertion, because a credential that
+    #: could do user verification is not the same as one that just did.
+    user_verified: bool = False
+
+
+@dataclass(frozen=True, slots=True)
+class WebAuthnChallengeRecord:
+    """One outstanding WebAuthn challenge, spent by the ceremony that follows it.
+
+    ## Why this is a table and not a signed token
+
+    A challenge exists to make one assertion unreplayable, which means the server has to be
+    able to say "this one has been used". A stateless JWT cannot say that: it verifies
+    exactly as well the second time as the first, so a captured options-plus-assertion pair
+    replays for the whole of the token's lifetime. Section 2.6 requires the challenge to be
+    single use, and single use is a property of storage.
+
+    That is a deliberate reversal of CarModPicker's current implementation, which puts the
+    challenge in a five-minute signed token. Migrating it here is the security half of M5.
+
+    `user_id` is empty for a passwordless login challenge, which is not a defect: a
+    discoverable credential means the browser has not yet said who is signing in, and the
+    assertion names the credential that answers it. A **registration** challenge always
+    carries the subject it was issued to, and the verify leg refuses one that does not match
+    the caller, so a challenge minted for one account cannot be spent registering a passkey
+    on another.
+    """
+
+    challenge_id: str
+    challenge: str
+    purpose: WebAuthnChallengePurpose
+    created_at: str
+    expires_at: int
+    user_id: str = ""
 
 
 # ---------------------------------------------------------------------------
@@ -491,6 +619,99 @@ class RecoveryCodeStore(ABC):
         """Remove every code for a user, for regeneration or for disabling MFA."""
 
 
+class PasskeyStore(ABC):
+    """The `passkeys` table: hash `user_id`, range `credential_id`, no TTL ever.
+
+    Two access patterns, and they want opposite keys, which is what the GSI settles. See
+    `PASSKEY_CREDENTIAL_INDEX` for why the table is keyed this way round rather than the
+    other.
+
+    **No TTL**, for the reason `TotpFactorStore` gives with even more force: with
+    `passkeys_passwordless` on, a passkey may be the only way a user signs in, and a row
+    that expires on a schedule is an account locked out by a table setting.
+    """
+
+    @abstractmethod
+    def get(self, user_id: str, credential_id: str) -> PasskeyRecord | None:
+        """One passkey by its primary key, for rename and delete."""
+
+    @abstractmethod
+    def find_by_credential_id(self, credential_id: str) -> PasskeyRecord | None:
+        """The passkey with this credential id, whoever owns it, or `None`.
+
+        The login path, and the only read that goes through the GSI. Returns `None` for an
+        unknown credential rather than raising: an assertion naming a credential this
+        product never registered is an ordinary refusal, not an error.
+        """
+
+    @abstractmethod
+    def list_for_user(self, user_id: str) -> list[PasskeyRecord]:
+        """Every passkey a user has, for the management list and for `exclude_credentials`."""
+
+    @abstractmethod
+    def put(self, record: PasskeyRecord) -> None:
+        """Write a new passkey, refusing a credential id already registered to anyone.
+
+        Conditional on the primary key not existing, which catches a re-registration of the
+        same credential to the same account. The cross-account case is a different check and
+        the caller does it: this method can only condition on its own key.
+        """
+
+    @abstractmethod
+    def record_use(
+        self, user_id: str, credential_id: str, *, sign_count: int, used_at: str
+    ) -> None:
+        """Advance the signature counter and the last-used stamp after a good assertion.
+
+        Unconditional, unlike `TotpFactorStore.record_use`, and the difference is worth
+        stating because the two look alike. A TOTP watermark is the **whole** replay
+        defence, so the comparison has to happen inside the database. A WebAuthn counter is
+        not: the challenge is, and it is single use in its own table. The counter detects a
+        cloned authenticator after the fact, which is a signal to log and refuse rather than
+        a race to win, and the comparison happens in the service before this is called.
+        """
+
+    @abstractmethod
+    def delete(self, user_id: str, credential_id: str) -> bool:
+        """Remove one passkey, returning `False` if it was not there.
+
+        Scoped by `user_id` as well as by credential, so a caller cannot delete a passkey it
+        does not own even if it learns another user's credential id.
+        """
+
+    @abstractmethod
+    def rename(self, user_id: str, credential_id: str, *, name: str) -> bool:
+        """Set the label on one passkey, returning `False` if it was not there."""
+
+
+class WebAuthnChallengeStore(ABC):
+    """The `webauthn-challenges` table: hash `challenge_id`, TTL `expires_at`, single use.
+
+    The TTL attribute is `expires_at`, matching `refresh-tokens` and `identity-tokens`, and
+    like both of those it is storage reclamation and never the access control: `consume`
+    checks the deadline in code, because DynamoDB deletes on its own schedule.
+    """
+
+    @abstractmethod
+    def put(self, record: WebAuthnChallengeRecord) -> None:
+        """Write a freshly minted challenge."""
+
+    @abstractmethod
+    def consume(self, challenge_id: str) -> WebAuthnChallengeRecord | None:
+        """Atomically spend a challenge, returning it, or `None` if unknown or already spent.
+
+        Delete rather than mark, which is the opposite of every other `consume` here. A
+        spent link is kept and stamped so section 5.7 has something to audit and so a user
+        can be told a link was already used; a spent challenge has nothing to audit, has a
+        lifetime of thirty seconds of real use, and its only property is that it does not
+        work twice. Deleting makes that property unconditional, and it means the table holds
+        only live challenges rather than a five-minute backlog of dead ones.
+
+        Expiry is checked here, not left to the TTL, so a challenge whose row DynamoDB has
+        not got round to deleting is still refused.
+        """
+
+
 @dataclass(frozen=True, slots=True)
 class IdentityStores:
     """The stores `build_identity_router` takes, in one object.
@@ -508,6 +729,8 @@ class IdentityStores:
     recovery_codes: RecoveryCodeStore | None = None
     oauth_states: OAuthStateStore | None = None
     oauth_links: OAuthLinkStore | None = None
+    passkeys: PasskeyStore | None = None
+    webauthn_challenges: WebAuthnChallengeStore | None = None
 
     def require_credentials(self) -> CredentialStore:
         return _require(self.credentials, "credentials")
@@ -529,6 +752,12 @@ class IdentityStores:
 
     def require_oauth_links(self) -> OAuthLinkStore:
         return _require(self.oauth_links, "oauth_links")
+
+    def require_passkeys(self) -> PasskeyStore:
+        return _require(self.passkeys, "passkeys")
+
+    def require_webauthn_challenges(self) -> WebAuthnChallengeStore:
+        return _require(self.webauthn_challenges, "webauthn_challenges")
 
 
 def _require[StoreT](store: StoreT | None, name: str) -> StoreT:
@@ -713,6 +942,74 @@ class InMemoryRecoveryCodeStore(RecoveryCodeStore):
         for key in keys:
             del self._items[key]
         return len(keys)
+
+
+class InMemoryPasskeyStore(PasskeyStore):
+    """Dict-backed `PasskeyStore`, keyed by the table's composite key.
+
+    `find_by_credential_id` walks the values rather than keeping a second dict. A user has a
+    handful of passkeys and a test has a handful of users, so the scan is free, and one
+    mapping cannot drift out of step with another the way two would.
+    """
+
+    def __init__(self) -> None:
+        self._items: dict[tuple[str, str], PasskeyRecord] = {}
+
+    def get(self, user_id: str, credential_id: str) -> PasskeyRecord | None:
+        return self._items.get((user_id, credential_id))
+
+    def find_by_credential_id(self, credential_id: str) -> PasskeyRecord | None:
+        for (_, stored_id), record in self._items.items():
+            if stored_id == credential_id:
+                return record
+        return None
+
+    def list_for_user(self, user_id: str) -> list[PasskeyRecord]:
+        return [record for (owner, _), record in self._items.items() if owner == user_id]
+
+    def put(self, record: PasskeyRecord) -> None:
+        key = (record.user_id, record.credential_id)
+        if key in self._items:
+            raise KeyError(f"passkey {record.credential_id[:12]} is already registered")
+        self._items[key] = dataclasses.replace(record, created_at=record.created_at or now_iso())
+
+    def record_use(
+        self, user_id: str, credential_id: str, *, sign_count: int, used_at: str
+    ) -> None:
+        existing = self._items.get((user_id, credential_id))
+        if existing is None:
+            return
+        self._items[(user_id, credential_id)] = dataclasses.replace(
+            existing, sign_count=sign_count, last_used_at=used_at
+        )
+
+    def delete(self, user_id: str, credential_id: str) -> bool:
+        return self._items.pop((user_id, credential_id), None) is not None
+
+    def rename(self, user_id: str, credential_id: str, *, name: str) -> bool:
+        existing = self._items.get((user_id, credential_id))
+        if existing is None:
+            return False
+        self._items[(user_id, credential_id)] = dataclasses.replace(existing, name=name)
+        return True
+
+
+class InMemoryWebAuthnChallengeStore(WebAuthnChallengeStore):
+    """Dict-backed `WebAuthnChallengeStore`, deleting on consumption as the real one does."""
+
+    def __init__(self) -> None:
+        self._items: dict[str, WebAuthnChallengeRecord] = {}
+
+    def put(self, record: WebAuthnChallengeRecord) -> None:
+        self._items[record.challenge_id] = record
+
+    def consume(self, challenge_id: str) -> WebAuthnChallengeRecord | None:
+        existing = self._items.pop(challenge_id, None)
+        if existing is None or is_expired(existing.expires_at):
+            # An expired row is removed by the `pop` above and then refused, which is what
+            # the DynamoDB one does too: the delete succeeds and the deadline check fails.
+            return None
+        return existing
 
 
 # ---------------------------------------------------------------------------
@@ -1063,6 +1360,158 @@ class DynamoRecoveryCodeStore(RecoveryCodeStore):
         return len(hashes)
 
 
+class DynamoPasskeyStore(PasskeyStore):
+    """`PasskeyStore` over a `webbpulse.dynamodb.Repository`.
+
+    `find_by_credential_id` is the one method here that reads an index, and it is the only
+    read in this module that **cannot** be consistent: DynamoDB does not offer consistent
+    reads on a global secondary index at all. See `PASSKEY_CREDENTIAL_INDEX` for why that is
+    the acceptable side of the trade.
+    """
+
+    def __init__(self, repository: Repository) -> None:
+        self._repo = repository
+
+    def get(self, user_id: str, credential_id: str) -> PasskeyRecord | None:
+        item = self._repo.get({"user_id": user_id, "credential_id": credential_id}, consistent=True)
+        return _passkey_from_item(item) if item is not None else None
+
+    def find_by_credential_id(self, credential_id: str) -> PasskeyRecord | None:
+        from boto3.dynamodb.conditions import Key as KeyCondition
+
+        page = self._repo.query(
+            KeyCondition("credential_id").eq(credential_id),
+            index_name=PASSKEY_CREDENTIAL_INDEX,
+            limit=1,
+        )
+        return _passkey_from_item(page.items[0]) if page.items else None
+
+    def list_for_user(self, user_id: str) -> list[PasskeyRecord]:
+        from boto3.dynamodb.conditions import Key as KeyCondition
+
+        return [
+            _passkey_from_item(item)
+            for item in self._repo.iter_query(KeyCondition("user_id").eq(user_id), consistent=True)
+        ]
+
+    def put(self, record: PasskeyRecord) -> None:
+        from boto3.dynamodb.conditions import Attr
+        from botocore.exceptions import ClientError
+
+        try:
+            self._repo.put(
+                {
+                    "user_id": record.user_id,
+                    "credential_id": record.credential_id,
+                    "public_key": record.public_key,
+                    "sign_count": record.sign_count,
+                    "name": record.name,
+                    "created_at": record.created_at or now_iso(),
+                    "last_used_at": record.last_used_at,
+                    "transports": list(record.transports),
+                    "aaguid": record.aaguid,
+                    "backup_eligible": record.backup_eligible,
+                    "backup_state": record.backup_state,
+                    "user_verified": record.user_verified,
+                },
+                condition=Attr("credential_id").not_exists(),
+            )
+        except ClientError as exc:
+            if exc.response.get("Error", {}).get("Code") == "ConditionalCheckFailedException":
+                raise KeyError(
+                    f"passkey {record.credential_id[:12]} is already registered"
+                ) from exc
+            raise
+
+    def record_use(
+        self, user_id: str, credential_id: str, *, sign_count: int, used_at: str
+    ) -> None:
+        self._repo.update(
+            {"user_id": user_id, "credential_id": credential_id},
+            update_expression="SET sign_count = :count, last_used_at = :at",
+            expression_values={":count": sign_count, ":at": used_at},
+        )
+
+    def delete(self, user_id: str, credential_id: str) -> bool:
+        from boto3.dynamodb.conditions import Attr
+        from botocore.exceptions import ClientError
+
+        try:
+            # Conditional, only so the absent case can be reported. `Repository.delete` is
+            # an unconditional upsert-shaped no-op on a missing item and returns nothing, so
+            # the condition is what turns "there was nothing there" into a `False` the route
+            # can render as a 404 rather than a misleading 200.
+            self._repo.delete(
+                {"user_id": user_id, "credential_id": credential_id},
+                condition=Attr("credential_id").exists(),
+            )
+        except ClientError as exc:
+            if exc.response.get("Error", {}).get("Code") == "ConditionalCheckFailedException":
+                return False
+            raise
+        return True
+
+    def rename(self, user_id: str, credential_id: str, *, name: str) -> bool:
+        from boto3.dynamodb.conditions import Attr
+        from botocore.exceptions import ClientError
+
+        try:
+            self._repo.update(
+                {"user_id": user_id, "credential_id": credential_id},
+                # `name` is a DynamoDB reserved word, which is exactly the case
+                # `expression_names` exists for.
+                update_expression="SET #name = :name",
+                expression_values={":name": name},
+                expression_names={"#name": "name"},
+                condition=Attr("credential_id").exists(),
+            )
+        except ClientError as exc:
+            if exc.response.get("Error", {}).get("Code") == "ConditionalCheckFailedException":
+                return False
+            raise
+        return True
+
+
+class DynamoWebAuthnChallengeStore(WebAuthnChallengeStore):
+    """`WebAuthnChallengeStore` over a `webbpulse.dynamodb.Repository`.
+
+    `consume` is a conditional `DeleteItem` returning the old item, which is what makes a
+    challenge single use against concurrent requests: two assertions racing the same
+    challenge both issue the delete, exactly one finds the item there, and the loser gets
+    `None` and is refused.
+    """
+
+    def __init__(self, repository: Repository) -> None:
+        self._repo = repository
+
+    def put(self, record: WebAuthnChallengeRecord) -> None:
+        self._repo.put(
+            {
+                "challenge_id": record.challenge_id,
+                "challenge": record.challenge,
+                "purpose": record.purpose,
+                "user_id": record.user_id,
+                "created_at": record.created_at,
+                "expires_at": record.expires_at,
+            }
+        )
+
+    def consume(self, challenge_id: str) -> WebAuthnChallengeRecord | None:
+        # `Repository.delete` cannot return the old item, so this reaches for the table
+        # directly. It is the one place in this module that does, and the alternative was a
+        # `ReturnValues` parameter on `Repository.delete` that no other caller wants.
+        response = self._repo.table.delete_item(
+            Key={"challenge_id": challenge_id}, ReturnValues="ALL_OLD"
+        )
+        attributes = response.get("Attributes")
+        if not attributes:
+            return None
+        record = _webauthn_challenge_from_item(attributes)
+        # Deleted either way: an expired challenge is spent by being refused, and leaving
+        # the row would let a caller retry against it until TTL got round to it.
+        return None if is_expired(record.expires_at) else record
+
+
 # ---------------------------------------------------------------------------
 # Item mapping
 # ---------------------------------------------------------------------------
@@ -1128,6 +1577,47 @@ def _totp_factor_from_item(item: Mapping[str, Any]) -> TotpFactorRecord:
         created_at=str(item.get("created_at", "")),
         activated_at=str(item.get("activated_at", "")),
         last_used_step=int(item.get("last_used_step", 0)),
+    )
+
+
+def _passkey_from_item(item: Mapping[str, Any]) -> PasskeyRecord:
+    raw_transports = item.get("transports")
+    transports = (
+        tuple(str(value) for value in raw_transports) if isinstance(raw_transports, list) else ()
+    )
+    return PasskeyRecord(
+        user_id=str(item["user_id"]),
+        credential_id=str(item["credential_id"]),
+        public_key=str(item.get("public_key", "")),
+        # `int()` rather than a subscript, because DynamoDB hands back a `Decimal` and a
+        # `Decimal` compared against an `int` counter would work but would serialise into
+        # JSON as `3.0`.
+        sign_count=int(item.get("sign_count", 0)),
+        name=str(item.get("name", "")),
+        created_at=str(item.get("created_at", "")),
+        last_used_at=str(item.get("last_used_at", "")),
+        transports=transports,
+        aaguid=str(item.get("aaguid", "")),
+        backup_eligible=bool(item.get("backup_eligible", False)),
+        backup_state=bool(item.get("backup_state", False)),
+        user_verified=bool(item.get("user_verified", False)),
+    )
+
+
+def _webauthn_challenge_from_item(item: Mapping[str, Any]) -> WebAuthnChallengeRecord:
+    purpose = str(item.get("purpose", ""))
+    if purpose not in {"register", "login"}:
+        raise ValueError(
+            f"Unknown WebAuthn challenge purpose {purpose!r} on challenge "
+            f"{str(item.get('challenge_id', ''))[:8]}."
+        )
+    return WebAuthnChallengeRecord(
+        challenge_id=str(item["challenge_id"]),
+        challenge=str(item.get("challenge", "")),
+        purpose=cast("WebAuthnChallengePurpose", purpose),
+        user_id=str(item.get("user_id", "")),
+        created_at=str(item.get("created_at", "")),
+        expires_at=int(item.get("expires_at", 0)),
     )
 
 
