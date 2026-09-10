@@ -411,6 +411,12 @@ class MfaService:
 
         Both, always. Leaving recovery codes behind after TOTP is disabled leaves a set of
         credentials that satisfy a factor the user believes is gone.
+
+        **This verifies nothing, on purpose.** It is the mechanism; the policy of who may
+        call it is `IdentityFlows.disable_totp`, which requires a current TOTP code or an
+        unused recovery code first. Calling this directly disables the factor with no proof
+        of possession at all, which is what the route did before 0.13.0 and what that
+        release fixed. The same split applies to `regenerate_recovery_codes`.
         """
         self._stores.require_totp_factors().delete(user_id)
         self._stores.require_recovery_codes().delete_for_user(user_id)

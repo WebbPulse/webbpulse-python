@@ -21,13 +21,19 @@ and, when TOTP is enabled and the two M4 stores are supplied, the MFA routes:
     POST <prefix>/login/totp        second leg of login, anonymous, holds an MFA ticket
     POST <prefix>/totp/enrol        behind the authorizer
     POST <prefix>/totp/activate     behind the authorizer
-    POST <prefix>/totp/disable      behind the authorizer
-    POST <prefix>/recovery-codes    behind the authorizer
+    POST <prefix>/totp/disable      behind the authorizer, and takes a `code`
+    POST <prefix>/recovery-codes    behind the authorizer, and takes a `code`
     POST <prefix>/step-up           behind the authorizer
 
 `login/totp` must stay **outside** the authorizer: it carries an MFA ticket whose audience
 is `<issuer>/mfa`, which the gateway's authorizer is not configured with, so putting it
 behind the authorizer rejects the second leg of every MFA login before it runs.
+
+`totp/disable` and `recovery-codes` require `{"code": "..."}` in the body as well as the
+bearer token, and it is checked by the same path `login/totp` uses. Both are destructive to
+the second factor, so the bearer token alone must not be enough: a stolen access token would
+otherwise be able to switch off the control that bounds what stealing it is worth. **This
+changed in 0.13.0**, where both routes took no body at all.
 
 Passkeys and OAuth are M5 and M6, per section 9.1 of `docs/identity-standard.md`.
 
@@ -94,7 +100,7 @@ from webbpulse.identity.storage import IdentityStores
 from webbpulse.identity.tokens import DISCOVERY_PATH, JWKS_PATH
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
-    from collections.abc import Callable
+    from collections.abc import Callable, Mapping
 
     from fastapi import APIRouter, Request
     from fastapi.responses import JSONResponse
@@ -928,22 +934,42 @@ def _mount_mfa(
         # them. Regenerating is the only way to see a set again.
         return JSONResponse({"activated": True, "recovery_codes": codes.codes})
 
-    @router.post(f"{prefix}{TOTP_DISABLE_PATH}")
-    async def disable_totp(request: _FastAPIRequest) -> JSONResponse:
+    @router.post(
+        f"{prefix}{TOTP_DISABLE_PATH}",
+        dependencies=limits(("mfa-verify", TOTP_VERIFY_LIMIT, "ip")),
+    )
+    async def disable_totp(
+        request: _FastAPIRequest, payload: dict[str, Any] = Body(...)
+    ) -> JSONResponse:
         try:
             subject = require_subject(request)
         except LoginRejected as exc:
             return rejected(request, exc)
-        await run_sync(lambda: flows.mfa.disable_totp(subject))
+        code = _required_code(payload)
+        try:
+            await run_sync(lambda: flows.disable_totp(user_id=subject, code=code))
+        except MfaRejected as exc:
+            return mfa_refused(request, exc)
         return JSONResponse({"disabled": True})
 
-    @router.post(f"{prefix}{RECOVERY_CODES_PATH}")
-    async def regenerate_recovery_codes(request: _FastAPIRequest) -> JSONResponse:
+    @router.post(
+        f"{prefix}{RECOVERY_CODES_PATH}",
+        dependencies=limits(("mfa-verify", TOTP_VERIFY_LIMIT, "ip")),
+    )
+    async def regenerate_recovery_codes(
+        request: _FastAPIRequest, payload: dict[str, Any] = Body(...)
+    ) -> JSONResponse:
         try:
             subject = require_subject(request)
         except LoginRejected as exc:
             return rejected(request, exc)
-        codes = await run_sync(lambda: flows.mfa.regenerate_recovery_codes(subject))
+        code = _required_code(payload)
+        try:
+            codes = await run_sync(
+                lambda: flows.regenerate_recovery_codes(user_id=subject, code=code)
+            )
+        except MfaRejected as exc:
+            return mfa_refused(request, exc)
         return JSONResponse({"recovery_codes": codes.codes})
 
     @router.post(
@@ -970,6 +996,39 @@ def _mount_mfa(
         # No cookie. Step-up does not start a family, so there is nothing new to set, and
         # rewriting the cookie here would rotate a refresh token that never moved.
         return JSONResponse(success_body(result))
+
+
+def _required_code(payload: Mapping[str, Any]) -> str:
+    """The `code` field of a re-authentication body, or a 422 saying it is missing.
+
+    Raised as a `RequestValidationError` rather than returned as an `MfaRejected`, so that a
+    client which forgot the field is told it forgot the field. Answering `INVALID_MFA_CODE`
+    to a missing body would be indistinguishable from a wrong code, and the frontend would
+    show the user "that code is not valid" for a bug that never asked them for one. The
+    shared 422 handler in `webbpulse.http` renders it in the same envelope with
+    `VALIDATION_ERROR`.
+
+    A blank or whitespace-only string is the same case as an absent one. It cannot be a real
+    code, and treating it as a wrong code would spend an attempt against the rate limit for
+    what is a client bug.
+
+    This is deliberately not the enumeration concern the code checks are: the field's
+    presence says nothing about the account, only about the request.
+    """
+    from fastapi.exceptions import RequestValidationError
+
+    value = payload.get("code")
+    if not isinstance(value, str) or not value.strip():
+        raise RequestValidationError(
+            [
+                {
+                    "loc": ("body", "code"),
+                    "msg": "Field required",
+                    "type": "missing",
+                }
+            ]
+        )
+    return value
 
 
 def _string_list(value: object) -> list[str] | None:

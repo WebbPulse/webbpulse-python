@@ -1072,8 +1072,8 @@ gateway builds the discovery URL as `issuer + "/.well-known/openid-configuration
 | `POST /api/auth/login/totp` | The second leg of login: exchanges an MFA ticket plus a code for tokens |
 | `POST /api/auth/totp/enrol` | Starts an enrolment and returns the seed and provisioning URI once |
 | `POST /api/auth/totp/activate` | Confirms an enrolment with its first code and returns recovery codes |
-| `POST /api/auth/totp/disable` | Removes the factor and every recovery code with it |
-| `POST /api/auth/recovery-codes` | Replaces the set, invalidating every previous code |
+| `POST /api/auth/totp/disable` | Removes the factor and every recovery code with it, on a `code` |
+| `POST /api/auth/recovery-codes` | Replaces the set on a `code`, invalidating every previous code |
 | `POST /api/auth/step-up` | Re-authenticates inside the session for a fresher `auth_time` |
 
 An issuer with no path gives the same routes at the origin. Adding a prefix of your own
@@ -1099,6 +1099,20 @@ short-lived, single use, and carries an audience of `<issuer>/mfa` rather than t
 the gateway's authorizer refuses it anywhere else. `/login/totp` therefore has to sit outside
 the authorizer; the other five MFA routes sit behind it and read their subject from the
 verified claims, never from the body.
+
+**Disabling TOTP and regenerating recovery codes each need a code, not just a token.**
+Both routes take `{"code": "..."}` alongside the bearer token, and the code is either a
+current TOTP code or an unused recovery code, which is then spent. Both are destructive to
+the second factor, so the access token alone must not be enough: it is short-lived but it is
+still a bearer secret, and a stolen one would otherwise switch off the control that bounds
+what stealing it is worth, or invalidate the codes the real user needs to get back in. The
+code goes through the same verification the second leg of login uses, a wrong one is the
+same 401 `INVALID_MFA_CODE`, and both routes share that route's rate limit. Verification
+runs before anything is deleted, so a refused call leaves the factor and the existing codes
+exactly as they were. A missing or blank `code` is a 422 `VALIDATION_ERROR` instead, because
+a client that forgot the field should be told that rather than shown "that code is not
+valid". **This changed in 0.13.0**: both routes previously took no body at all, so a client
+must be updated to send one.
 
 **A TOTP seed is never stored in the clear.** Each one is sealed under its own KMS data key
 with `{"user_id", "purpose"}` as the encryption context, so a ciphertext moved to another

@@ -64,6 +64,7 @@ from webbpulse.identity.mfa import (
     MfaChallenge,
     MfaRejected,
     MfaService,
+    RecoveryCodeSet,
 )
 from webbpulse.identity.passwords import (
     check_password,
@@ -588,6 +589,65 @@ class IdentityFlows:
             refresh_token="",
             family_id=session_id,
         )
+
+    def disable_totp(self, *, user_id: str, code: str) -> None:
+        """Remove the factor and every recovery code, after proving possession of the factor.
+
+        The code is required and is checked **before** anything is deleted. A bearer access
+        token alone is not enough: an access token is short-lived but it is still a bearer
+        secret, and one that has been stolen would otherwise be able to turn off the very
+        control that limits what the theft is worth. Requiring the factor means the attacker
+        has to hold the second factor as well, which is the thing they were trying to get
+        around.
+
+        Verification goes through `MfaService.verify_challenge`, the same call
+        `complete_mfa` and `step_up` make, so a TOTP code and a recovery code are both
+        accepted, the constant-time comparison and the replay watermark are the ones already
+        tested, and a wrong code raises the same `MfaRejected` carrying `INVALID_MFA_CODE`.
+        A second verification path here would be a second place for the replay defence to be
+        subtly wrong.
+
+        A recovery code presented here is **spent**, exactly as it is on login. That is a
+        harmless-looking asymmetry only until you notice the alternative: a recovery code
+        that survives its use is a code an attacker can present again.
+        """
+        service = self._require_mfa()
+        user = self._hooks.load_user_by_id(user_id)
+        if user is None:
+            raise MfaRejected()
+
+        method = service.verify_challenge(user_id, code)
+        service.disable_totp(user_id)
+        _log.info(
+            "TOTP disabled after re-authentication.",
+            extra={"event": "totp.disabled", "user_id": user_id, "method": method},
+        )
+
+    def regenerate_recovery_codes(self, *, user_id: str, code: str) -> RecoveryCodeSet:
+        """Replace every recovery code, after proving possession of the factor.
+
+        Same reasoning as `disable_totp` and the same verification call. Regenerating is
+        destructive in its own way: it invalidates every code the user is holding, so a
+        stolen access token that could do it unaided could strand the legitimate user
+        without a way back in the moment they lose their phone.
+
+        Verification happens **before** the old set is deleted, so a refused attempt leaves
+        the user's existing codes intact. `MfaService.regenerate_recovery_codes` keeps its
+        own all-or-nothing property: it deletes the old set and writes the new one, and the
+        plaintext it returns is the set that was written.
+        """
+        service = self._require_mfa()
+        user = self._hooks.load_user_by_id(user_id)
+        if user is None:
+            raise MfaRejected()
+
+        method = service.verify_challenge(user_id, code)
+        codes = service.regenerate_recovery_codes(user_id)
+        _log.info(
+            "Recovery codes regenerated after re-authentication.",
+            extra={"event": "recovery.regenerated", "user_id": user_id, "method": method},
+        )
+        return codes
 
     def _require_mfa(self) -> MfaService:
         service = self.mfa
