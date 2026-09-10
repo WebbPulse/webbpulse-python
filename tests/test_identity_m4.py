@@ -1710,8 +1710,17 @@ def test_the_enrolment_route_returns_the_seed_exactly_once(
 
 
 def test_regenerating_over_http_replaces_the_set(
-    client: TestClient, hooks: FakeHooks, stores: IdentityStores, kms: FakeKms
+    client: TestClient,
+    hooks: FakeHooks,
+    stores: IdentityStores,
+    kms: FakeKms,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    """The clock is advanced because the login two lines up already spent its own step.
+
+    Presenting the same code again would be refused by the replay watermark rather than
+    accepted, which is the point of the watermark and not a fault in this route.
+    """
     seed_account(hooks, stores)
     settings = make_settings()
     service = MfaService(settings, stores, TokenService(settings, kms), kms_client=kms)
@@ -1724,7 +1733,10 @@ def test_regenerating_over_http_replaces_the_set(
     )
     auth = {"Authorization": f"Bearer {completed.json()['access_token']}"}
 
-    response = client.post(f"{prefix()}{RECOVERY_CODES_PATH}", headers=auth, json={})
+    with clock_advanced(monkeypatch, 2):
+        response = client.post(
+            f"{prefix()}{RECOVERY_CODES_PATH}", headers=auth, json={"code": code_now(seed)}
+        )
     assert response.status_code == 200
     fresh = response.json()["recovery_codes"]
     assert len(fresh) == RECOVERY_CODE_COUNT
@@ -1767,3 +1779,330 @@ def test_the_verify_limit_matches_section_5_1() -> None:
     out of reach while the number of guesses is bounded, and this is the bound.
     """
     assert TOTP_VERIFY_LIMIT == (10, 900)
+
+
+# ---------------------------------------------------------------------------
+# Re-authentication on the two destructive MFA routes
+# ---------------------------------------------------------------------------
+#
+# `totp/disable` and `recovery-codes` each take a `code` as of 0.13.0. Both are destructive
+# to the second factor, so a bearer access token alone must not be enough to call either:
+# an access token is short-lived but it is still a bearer secret, and one that has been
+# stolen would otherwise switch off the very control that bounds what the theft is worth.
+#
+# The tests below assert the property in both directions. A correct code works, of either
+# kind, and a recovery code spent here is spent for good. A wrong code refuses **and leaves
+# the factor standing**, which is the assertion that actually matters: a route that deleted
+# first and verified afterwards would pass a test that only checked the status code.
+
+
+def test_disabling_requires_a_code_and_a_correct_one_works(
+    flows: IdentityFlows, mfa: MfaService, hooks: FakeHooks, stores: IdentityStores
+) -> None:
+    seed_account(hooks, stores)
+    seed, _ = enrol(mfa)
+    flows.disable_totp(user_id=USER_ID, code=code_now(seed, offset=1))
+    assert stores.require_totp_factors().get(USER_ID) is None
+    assert list(stores.require_recovery_codes().list_for_user(USER_ID)) == []
+
+
+def test_a_recovery_code_disables_and_is_spent_doing_it(
+    flows: IdentityFlows, mfa: MfaService, hooks: FakeHooks, stores: IdentityStores
+) -> None:
+    """One route takes both kinds, as login does, and the recovery code is consumed.
+
+    A recovery code that survived its use here would be a code an attacker could present
+    again, which is the whole reason single use exists.
+    """
+    seed_account(hooks, stores)
+    _, codes = enrol(mfa)
+    flows.disable_totp(user_id=USER_ID, code=codes[0])
+    assert stores.require_totp_factors().get(USER_ID) is None
+    # Every code is gone, the spent one included: disabling removes the whole set.
+    assert list(stores.require_recovery_codes().list_for_user(USER_ID)) == []
+
+
+def test_a_wrong_code_refuses_the_disable_and_leaves_the_factor_standing(
+    flows: IdentityFlows, mfa: MfaService, hooks: FakeHooks, stores: IdentityStores
+) -> None:
+    """The assertion that matters. Verification has to happen before the delete.
+
+    A route that deleted first and verified afterwards would still return 401 here and would
+    still have destroyed the user's second factor.
+    """
+    seed_account(hooks, stores)
+    enrol(mfa)
+    with pytest.raises(MfaRejected) as caught:
+        flows.disable_totp(user_id=USER_ID, code="000000")
+    assert caught.value.error_code == "INVALID_MFA_CODE"
+    assert caught.value.status_code == 401
+
+    factor = stores.require_totp_factors().get(USER_ID)
+    assert factor is not None and factor.is_active
+    assert mfa.remaining_recovery_codes(USER_ID) == RECOVERY_CODE_COUNT
+
+
+def test_a_reauthentication_code_cannot_be_replayed(
+    flows: IdentityFlows, mfa: MfaService, hooks: FakeHooks, stores: IdentityStores
+) -> None:
+    """The same watermark `step_up` and `login/totp` rely on, reached through the same call.
+
+    Shown on `regenerate` rather than on `disable`, because disabling removes the factor and
+    a second attempt would then be refused for having nothing enrolled: a different refusal
+    wearing the same message, which would pass against an implementation with no replay
+    defence at all. `regenerate` leaves the factor in place, so the second refusal here can
+    only be the watermark.
+    """
+    seed_account(hooks, stores)
+    seed, _ = enrol(mfa)
+    code = code_now(seed, offset=1)
+    flows.regenerate_recovery_codes(user_id=USER_ID, code=code)
+
+    with pytest.raises(MfaRejected):
+        flows.regenerate_recovery_codes(user_id=USER_ID, code=code)
+
+
+def test_regenerating_requires_a_code_and_a_correct_one_replaces_the_set(
+    flows: IdentityFlows, mfa: MfaService, hooks: FakeHooks, stores: IdentityStores
+) -> None:
+    seed_account(hooks, stores)
+    seed, old = enrol(mfa)
+    fresh = flows.regenerate_recovery_codes(user_id=USER_ID, code=code_now(seed, offset=1))
+    assert len(fresh.codes) == RECOVERY_CODE_COUNT
+    assert set(fresh.codes).isdisjoint(old)
+    assert mfa.remaining_recovery_codes(USER_ID) == RECOVERY_CODE_COUNT
+
+
+def test_a_recovery_code_can_authorise_its_own_replacement(
+    flows: IdentityFlows, mfa: MfaService, hooks: FakeHooks, stores: IdentityStores
+) -> None:
+    """The user who lost their phone still has a way to rotate a printout they no longer
+    trust, and the code they used does not survive into the new set."""
+    seed_account(hooks, stores)
+    _, old = enrol(mfa)
+    fresh = flows.regenerate_recovery_codes(user_id=USER_ID, code=old[0])
+    assert set(fresh.codes).isdisjoint(old)
+    assert mfa.remaining_recovery_codes(USER_ID) == RECOVERY_CODE_COUNT
+
+
+def test_a_wrong_code_refuses_the_regenerate_and_keeps_every_existing_code(
+    flows: IdentityFlows, mfa: MfaService, hooks: FakeHooks, stores: IdentityStores
+) -> None:
+    """All or nothing, and the "nothing" half.
+
+    `regenerate_recovery_codes` deletes the old set before writing the new one, so a refused
+    attempt that reached it would leave the user holding no codes at all.
+    """
+    seed_account(hooks, stores)
+    _, old = enrol(mfa)
+    with pytest.raises(MfaRejected) as caught:
+        flows.regenerate_recovery_codes(user_id=USER_ID, code="000000")
+    assert caught.value.error_code == "INVALID_MFA_CODE"
+
+    assert mfa.remaining_recovery_codes(USER_ID) == RECOVERY_CODE_COUNT
+    # Not merely the right count: the codes the user is actually holding still work.
+    assert mfa.verify_challenge(USER_ID, old[0]) == AMR_RECOVERY
+
+
+def test_neither_route_can_be_used_against_a_user_with_no_factor(
+    flows: IdentityFlows, hooks: FakeHooks, stores: IdentityStores
+) -> None:
+    """A user with nothing enrolled has no code to present, so both refuse.
+
+    Refusing rather than waving through is what stops "no factor" being an easier path than
+    "a factor I cannot satisfy".
+    """
+    seed_account(hooks, stores)
+    with pytest.raises(MfaRejected):
+        flows.disable_totp(user_id=USER_ID, code="000000")
+    with pytest.raises(MfaRejected):
+        flows.regenerate_recovery_codes(user_id=USER_ID, code="000000")
+
+
+def test_neither_route_works_for_an_unknown_user(flows: IdentityFlows) -> None:
+    with pytest.raises(MfaRejected):
+        flows.disable_totp(user_id="user-9999", code="123456")
+    with pytest.raises(MfaRejected):
+        flows.regenerate_recovery_codes(user_id="user-9999", code="123456")
+
+
+def test_one_users_code_cannot_disable_anothers_factor(
+    flows: IdentityFlows, mfa: MfaService, hooks: FakeHooks, stores: IdentityStores
+) -> None:
+    """The subject comes from the verified claims, and the code has to match that subject.
+
+    Without this, anybody holding a valid code of their own could disable somebody else's
+    factor by pointing the call at their user id.
+    """
+    seed_account(hooks, stores)
+    seed_account(hooks, stores, email="other@example.com", user_id="user-0002")
+    enrol(mfa)
+    other_seed, _ = enrol(mfa, "user-0002")
+
+    with pytest.raises(MfaRejected):
+        flows.disable_totp(user_id=USER_ID, code=code_now(other_seed, offset=1))
+    factor = stores.require_totp_factors().get(USER_ID)
+    assert factor is not None and factor.is_active
+
+
+# ---- the same two routes over HTTP -------------------------------------------------
+
+
+def _signed_in(client: TestClient, seed: str) -> dict[str, str]:
+    """Complete a two-leg login and return the Authorization header for it."""
+    challenge = client.post(f"{prefix()}{LOGIN_PATH}", json={"email": EMAIL, "password": PASSWORD})
+    completed = client.post(
+        f"{prefix()}{LOGIN_TOTP_PATH}",
+        json={"mfa_ticket": challenge.json()["mfa_ticket"], "code": code_now(seed, offset=1)},
+    )
+    return {"Authorization": f"Bearer {completed.json()['access_token']}"}
+
+
+def test_disabling_over_http_needs_the_code(
+    client: TestClient,
+    hooks: FakeHooks,
+    stores: IdentityStores,
+    kms: FakeKms,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    seed_account(hooks, stores)
+    settings = make_settings()
+    service = MfaService(settings, stores, TokenService(settings, kms), kms_client=kms)
+    seed, _ = enrol(service)
+    auth = _signed_in(client, seed)
+
+    with clock_advanced(monkeypatch, 2):
+        response = client.post(
+            f"{prefix()}{TOTP_DISABLE_PATH}", headers=auth, json={"code": code_now(seed)}
+        )
+    assert response.status_code == 200
+    assert response.json()["disabled"] is True
+    assert stores.require_totp_factors().get(USER_ID) is None
+
+
+def test_a_bearer_token_alone_no_longer_disables_the_factor(
+    client: TestClient, hooks: FakeHooks, stores: IdentityStores, kms: FakeKms
+) -> None:
+    """The whole point of 0.13.0, asserted on the wire.
+
+    Before it, this exact request switched off the user's second factor. A stolen access
+    token is the threat, and the factor is what limits what the theft is worth.
+    """
+    seed_account(hooks, stores)
+    settings = make_settings()
+    service = MfaService(settings, stores, TokenService(settings, kms), kms_client=kms)
+    seed, _ = enrol(service)
+    auth = _signed_in(client, seed)
+
+    response = client.post(f"{prefix()}{TOTP_DISABLE_PATH}", headers=auth, json={})
+    assert response.status_code == 422
+    assert response.json()["error_code"] == "VALIDATION_ERROR"
+    factor = stores.require_totp_factors().get(USER_ID)
+    assert factor is not None and factor.is_active
+
+
+def test_a_bearer_token_alone_no_longer_regenerates_the_codes(
+    client: TestClient, hooks: FakeHooks, stores: IdentityStores, kms: FakeKms
+) -> None:
+    seed_account(hooks, stores)
+    settings = make_settings()
+    service = MfaService(settings, stores, TokenService(settings, kms), kms_client=kms)
+    seed, old = enrol(service)
+    auth = _signed_in(client, seed)
+
+    response = client.post(f"{prefix()}{RECOVERY_CODES_PATH}", headers=auth, json={})
+    assert response.status_code == 422
+    assert response.json()["error_code"] == "VALIDATION_ERROR"
+    # The codes the user is holding are untouched, not merely un-returned.
+    assert service.verify_challenge(USER_ID, old[0]) == AMR_RECOVERY
+
+
+@pytest.mark.parametrize("path", [TOTP_DISABLE_PATH, RECOVERY_CODES_PATH])
+def test_a_blank_code_is_a_validation_error_not_a_wrong_code(
+    client: TestClient, hooks: FakeHooks, stores: IdentityStores, kms: FakeKms, path: str
+) -> None:
+    """A client bug is reported as a client bug.
+
+    Answering `INVALID_MFA_CODE` to an empty string would show the user "that code is not
+    valid" for a field they were never asked to fill in, and would spend an attempt against
+    the rate limit while doing it.
+    """
+    seed_account(hooks, stores)
+    settings = make_settings()
+    service = MfaService(settings, stores, TokenService(settings, kms), kms_client=kms)
+    seed, _ = enrol(service)
+    auth = _signed_in(client, seed)
+
+    response = client.post(f"{prefix()}{path}", headers=auth, json={"code": "   "})
+    assert response.status_code == 422
+    assert response.json()["error_code"] == "VALIDATION_ERROR"
+
+
+@pytest.mark.parametrize("path", [TOTP_DISABLE_PATH, RECOVERY_CODES_PATH])
+def test_a_wrong_code_over_http_is_the_shared_mfa_envelope(
+    client: TestClient, hooks: FakeHooks, stores: IdentityStores, kms: FakeKms, path: str
+) -> None:
+    """The same status and the same `error_code` `login/totp` answers with.
+
+    One envelope for every MFA refusal in the product, so the frontend has one error shape
+    to read whichever route produced it.
+    """
+    seed_account(hooks, stores)
+    settings = make_settings()
+    service = MfaService(settings, stores, TokenService(settings, kms), kms_client=kms)
+    seed, _ = enrol(service)
+    auth = _signed_in(client, seed)
+
+    response = client.post(f"{prefix()}{path}", headers=auth, json={"code": "000000"})
+    assert response.status_code == 401
+    assert response.json()["error_code"] == "INVALID_MFA_CODE"
+
+
+def test_the_missing_body_is_refused_before_the_code_is_read(client: TestClient) -> None:
+    """An unauthenticated caller gets 401, not 422, on both routes.
+
+    Authentication is checked first, so the routes do not become an oracle for whether a
+    body shape is right to somebody who cannot call them at all.
+    """
+    for path in (TOTP_DISABLE_PATH, RECOVERY_CODES_PATH):
+        response = client.post(f"{prefix()}{path}", json={"code": "123456"})
+        assert response.status_code == 401, path
+        assert response.json()["error_code"] == "NOT_AUTHENTICATED"
+
+
+def test_both_routes_carry_the_same_number_of_limits_as_the_second_leg(
+    hooks: FakeHooks, stores: IdentityStores, kms: FakeKms
+) -> None:
+    """Counted against the same `mfa-verify` limit as `login/totp`.
+
+    A million-value code space is only out of reach while the number of guesses is bounded,
+    and these two routes now accept the same codes, so they have to share the same bound.
+    Asserted by comparing the dependency count against `login/totp` rather than by driving
+    the limiter, which needs a DynamoDB table: the failure this guards against is a route
+    declared with no limit at all, and that shows up as a count of zero.
+    """
+    router = build_identity_router(make_settings(), hooks, stores, kms_client=kms)
+    counts = {
+        route.path: len(route.dependencies)  # type: ignore[attr-defined]
+        for route in router.routes
+    }
+    expected = counts[f"{prefix()}{LOGIN_TOTP_PATH}"]
+    assert expected == 1, "the second leg of login carries exactly the mfa-verify limit"
+    assert counts[f"{prefix()}{TOTP_DISABLE_PATH}"] == expected
+    assert counts[f"{prefix()}{RECOVERY_CODES_PATH}"] == expected
+
+
+def test_the_two_routes_have_no_limit_when_the_limiter_is_off(
+    hooks: FakeHooks, stores: IdentityStores, kms: FakeKms
+) -> None:
+    """`limiter_enabled=False` is what the fixtures use, so the check above is meaningful
+    only if the limits really are absent in that mode."""
+    router = build_identity_router(
+        make_settings(), hooks, stores, kms_client=kms, limiter_enabled=False
+    )
+    for route in router.routes:
+        if route.path in (  # type: ignore[attr-defined]
+            f"{prefix()}{TOTP_DISABLE_PATH}",
+            f"{prefix()}{RECOVERY_CODES_PATH}",
+        ):
+            assert route.dependencies == []  # type: ignore[attr-defined]

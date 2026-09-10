@@ -5,6 +5,59 @@ Notable changes to the `webbpulse` package. The version here is the one in
 
 This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## 0.13.0
+
+Identity M4 security fix: `POST /totp/disable` and `POST /recovery-codes` now require proof
+of possession of the second factor, not just a bearer access token.
+
+**Breaking, for two route contracts.** Both routes previously took no body and acted on the
+bearer subject alone. Both now require `{"code": "<string>"}`, and a request without it is a
+422 rather than a success. Every other route is unchanged, and no stored data changes shape,
+so there is no migration: the upgrade is a client change on the two calls.
+
+### Security
+
+- `POST /totp/disable` and `POST /recovery-codes` require a current TOTP code or an unused
+  recovery code. Both routes are destructive to the second factor, and both were reachable
+  with a short-lived access token and nothing else. An access token is short-lived but it is
+  still a bearer secret, so a stolen one could switch off the very control that bounds what
+  stealing it is worth, or invalidate the recovery codes the legitimate user would need to
+  get back in. Requiring the factor means an attacker has to hold the second factor as well,
+  which is the thing they were trying to get around.
+
+  The code is verified by `MfaService.verify_challenge`, the same call the second leg of
+  login and step-up already make, so a TOTP code and a recovery code are both accepted, the
+  replay watermark and the single-use consumption are the ones already in place, and a
+  recovery code presented to either route is spent exactly as it is on login. There is no
+  second verification path to keep in step. A refusal is the existing `INVALID_MFA_CODE`
+  envelope with the 401 `POST /login/totp` answers, and both routes now carry the same
+  `mfa-verify` rate limit as that route: they accept the same codes, so they share the
+  bound that makes a six digit code space out of reach.
+
+  Verification happens **before** anything is deleted on both routes. A refused disable
+  leaves the factor active and the recovery codes intact, and a refused regenerate leaves
+  every existing code working, which matters because regenerating deletes the old set before
+  writing the new one.
+
+  There is deliberately **no step-up alternative** on these routes. Accepting a recently
+  stepped-up access token instead of a code would reintroduce the same bearer-token-only
+  path through a second door, and `code` is the single mechanism.
+
+### Changed
+
+- **Breaking.** `POST /api/auth/totp/disable` and `POST /api/auth/recovery-codes` take a
+  required `code` field. A missing, non-string or blank one is a 422 `VALIDATION_ERROR`
+  rather than an `INVALID_MFA_CODE`, so a client that forgot the field is told it forgot the
+  field instead of showing the user "that code is not valid" for a request that never asked
+  them for one. `@webbpulse/auth` sends `code` on both routes as of its matching release.
+
+- `IdentityFlows` grows `disable_totp` and `regenerate_recovery_codes`, both taking a
+  `user_id` and a `code`. The router calls these rather than reaching past the flows into
+  `MfaService` as it did before, which is what puts the verification and the destructive
+  write behind one call. `MfaService.disable_totp` and
+  `MfaService.regenerate_recovery_codes` are unchanged and still verify nothing themselves:
+  they are the mechanism, and the flow is the policy.
+
 ## 0.12.1
 
 Housekeeping. The bcrypt cost is resolved when the function is called rather than when the
