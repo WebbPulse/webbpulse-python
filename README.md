@@ -1543,6 +1543,62 @@ pytest_plugins = ["webbpulse.testing"]
 peer address and a service's rate limit tests pass while never covering the branch that
 actually runs in production.
 
+### `webbpulse.ci`
+
+Domain discovery for the per-domain pytest matrix in the organisation's reusable
+`python-ci.yml`. A service's test suite grows with its domains, and running it as one pytest
+invocation makes CI slower every time a domain is added. The reusable workflow runs one job
+per domain instead, so wall clock time tracks the largest domain rather than the sum of all
+of them, and this module is what tells that workflow which jobs to create.
+
+The convention is declarative and lives in the service's own `pyproject.toml`, so adding a
+domain to CI is adding a line rather than editing a workflow:
+
+```toml
+[tool.webbpulse.ci]
+# The directory the `shared` job sweeps. Defaults to "tests".
+test-root = "tests"
+
+[tool.webbpulse.ci.domains]
+identity = ["tests/auth", "tests/dependencies"]
+catalog = ["tests/api/endpoints/test_parts.py", "tests/api/endpoints/test_categories.py"]
+vehicles = ["tests/api/endpoints/test_car_generations.py"]
+```
+
+Every path is relative to the directory holding `pyproject.toml`, which is the workflow's
+`working-directory`, so the strings reach pytest unchanged. A value may name a directory or
+a single test file: a suite that is not yet split by directory still has to be splittable,
+and requiring the files to move first would make adopting this a refactor rather than a
+configuration change.
+
+Everything under `test-root` that no domain claims runs in a job called `shared`, which the
+module computes as a deselection rather than a list. `shared` runs the whole test root with
+an `--ignore` for every claimed path, so the two kinds of job together run each test exactly
+once and a new test file is covered by CI the moment it is written. The failure mode of
+forgetting to claim a file is that it runs in `shared`, which is slower but never silent.
+
+`shared` is reserved and cannot also be a domain name, because the two would produce one
+colliding matrix job. A domain that claims no paths is rejected for the same reason: its job
+would run pytest with no path arguments and collect the entire suite.
+
+Two commands, both of which write to stdout:
+
+| Command | Output |
+| --- | --- |
+| `python -m webbpulse.ci domains` | A JSON array of domain names, for `fromJson` in a matrix `strategy`. `--include-shared` appends `shared`. |
+| `python -m webbpulse.ci pytest-args --domain <name>` | That job's pytest path arguments, shell quoted. For `shared`, the test root plus an `--ignore` per claimed path. |
+
+`--project-dir` points both at the directory holding `pyproject.toml`, and defaults to the
+working directory.
+
+A repository with no `[tool.webbpulse.ci]` table gets an empty array and a `shared` job
+carrying its whole suite, which is exactly the behaviour it had before the split existed.
+That is what lets the shared workflow call this unconditionally.
+
+The module imports only the standard library. The workflow calls it in a bare interpreter
+before the service's dependencies are installed, so it must not need an extra, and
+`tests/test_ci.py` asserts that in a subprocess rather than trusting the reading.
+
 ## CI and releases
 
 `.github/workflows/ci.yml` calls `WebbPulse/.github/.github/workflows/python-ci.yml@v1` on
