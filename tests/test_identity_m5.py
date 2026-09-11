@@ -67,9 +67,12 @@ from webbpulse.identity import (
 )
 from webbpulse.identity import totp as totp_module
 from webbpulse.identity.flows import PASSWORD_CREDENTIAL_TYPE, IdentityFlows, MfaChallengeRequired
+from webbpulse.identity.oauth_routes import OAUTH_PROVIDERS_CACHE_CONTROL
 from webbpulse.identity.passkey_routes import (
     LOGIN_PASSKEY_OPTIONS_PATH,
     LOGIN_PASSKEY_VERIFY_PATH,
+    PASSKEY_AVAILABILITY_CACHE_CONTROL,
+    PASSKEY_AVAILABILITY_PATH,
     PASSKEY_REGISTER_OPTIONS_PATH,
     PASSKEY_REGISTER_VERIFY_PATH,
     PASSKEYS_PATH,
@@ -1502,3 +1505,301 @@ def _enrol_over_http(client: TestClient, token: str) -> str:
     )
     assert registered.status_code == 201, registered.text
     return str(registered.json()["passkey"]["credential_id"])
+
+
+# ---------------------------------------------------------------------------
+# Availability discovery, 0.17.0
+# ---------------------------------------------------------------------------
+#
+# The route exists so a frontend stops inferring availability by probing
+# `POST /login/passkey/options` on sign-in page load. WebbPulse-Portfolio does that today,
+# and it is wrong twice: the probe spends that route's 30-per-15-minutes IP budget on page
+# loads rather than on sign-ins, and `begin_passkey_login` writes a WebAuthn challenge row
+# per call, so every page load in the estate leaves a row in the challenge table to expire.
+# PR 182 there added a sessionStorage cache as a stopgap and asked for this route. These
+# tests pin the three things a client depends on: the body shape, that `passwordless` cannot
+# contradict `enabled`, and that the answer exists in every deployment.
+
+
+class CountingChallengeStore(InMemoryWebAuthnChallengeStore):
+    """An `InMemoryWebAuthnChallengeStore` that counts writes.
+
+    The availability route's promise is that it writes nothing, and the only way to assert
+    "nothing" is to count. A subclass rather than a reach into the fake's private dict, so
+    the assertion survives a change to how the fake stores its rows.
+    """
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.puts = 0
+
+    def put(self, record: WebAuthnChallengeRecord) -> None:
+        self.puts += 1
+        super().put(record)
+
+
+def _availability_router(
+    hooks: FakeHooks | None = None,
+    stores: IdentityStores | None = None,
+    kms: FakeKms | None = None,
+    **overrides: Any,
+) -> Any:
+    """A router built the way a product builds one, for the availability tests."""
+    assert kms is not None
+    if hooks is None or stores is None:
+        return build_identity_router(make_settings(**overrides), kms_client=kms)
+    return build_identity_router(
+        make_settings(**overrides),
+        hooks,
+        stores,
+        kms_client=kms,
+        limiter_enabled=False,
+    )
+
+
+def _availability_client(router: Any) -> TestClient:
+    app = FastAPI()
+    app.include_router(router)
+    return TestClient(app)
+
+
+def _get_availability(client: TestClient) -> Any:
+    return client.get(f"{prefix()}{PASSKEY_AVAILABILITY_PATH}")
+
+
+class TestAvailability:
+    def test_enabled_and_passwordless_is_the_default_shape(
+        self, hooks: FakeHooks, stores: IdentityStores, kms: FakeKms
+    ) -> None:
+        """Both capabilities default on, so a stock deployment offers the button."""
+        client = _availability_client(_availability_router(hooks, stores, kms))
+        response = _get_availability(client)
+        assert response.status_code == 200
+        assert response.json() == {"enabled": True, "passwordless": True}
+
+    def test_enabled_but_not_passwordless(
+        self, hooks: FakeHooks, stores: IdentityStores, kms: FakeKms
+    ) -> None:
+        """A passkey as a managed credential and a second factor, but not an entry point.
+
+        The distinction `begin_passkey_login` already enforces, reported so a settings page
+        can offer enrolment while a sign-in page does not offer the button.
+        """
+        client = _availability_client(
+            _availability_router(hooks, stores, kms, passkeys_passwordless=False)
+        )
+        assert _get_availability(client).json() == {"enabled": True, "passwordless": False}
+
+    def test_disabled_reports_passwordless_false_whatever_the_setting_says(
+        self, hooks: FakeHooks, stores: IdentityStores, kms: FakeKms
+    ) -> None:
+        """`passkeys_passwordless` defaults on, so the pair can disagree unless gated.
+
+        A deployment with `passkeys_enabled=False` keeps the passwordless default of `True`
+        and means nothing by it, because no login route mounted. Reporting that pair would
+        tell a frontend to draw a "Sign in with a passkey" button against routes that do not
+        exist, which is the failure this route was added to prevent rather than cause.
+        """
+        client = _availability_client(
+            _availability_router(hooks, stores, kms, passkeys_enabled=False)
+        )
+        body = _get_availability(client).json()
+        assert body == {"enabled": False, "passwordless": False}
+        # The setting itself is untouched: the gate is in the route, not in the settings.
+        assert make_settings(passkeys_enabled=False).passkeys_passwordless is True
+
+    def test_disabled_with_passwordless_off_too(
+        self, hooks: FakeHooks, stores: IdentityStores, kms: FakeKms
+    ) -> None:
+        client = _availability_client(
+            _availability_router(
+                hooks, stores, kms, passkeys_enabled=False, passkeys_passwordless=False
+            )
+        )
+        assert _get_availability(client).json() == {"enabled": False, "passwordless": False}
+
+    def test_the_route_mounts_when_passkeys_are_disabled(
+        self, hooks: FakeHooks, stores: IdentityStores, kms: FakeKms
+    ) -> None:
+        """The seven flow routes are absent and this one is still present.
+
+        That is the whole point: one authoritative answer in every deployment. A route that
+        were absent here would answer 404, which is indistinguishable from a routing mistake
+        or an older version of this package, and is the ambiguous signal the route replaces.
+        """
+        router = _availability_router(hooks, stores, kms, passkeys_enabled=False)
+        paths = _router_paths(router)
+        assert f"{prefix()}{LOGIN_PASSKEY_OPTIONS_PATH}" not in paths
+        assert f"{prefix()}{PASSKEYS_PATH}" not in paths
+        assert f"{prefix()}{PASSKEY_AVAILABILITY_PATH}" in paths
+
+    def test_the_route_mounts_when_the_stores_are_missing(
+        self, hooks: FakeHooks, kms: FakeKms
+    ) -> None:
+        """No passkey table and no challenge table, and the answer is still served.
+
+        It reports what the operator configured rather than what the stores can support, so
+        a capability switched on with no table behind it stays visible as the configuration
+        error it is instead of being hidden by a frontend that quietly stops offering
+        passkeys.
+        """
+        stores = IdentityStores(
+            credentials=InMemoryCredentialStore(),
+            refresh_tokens=InMemoryRefreshTokenStore(),
+        )
+        router = _availability_router(hooks, stores, kms)
+        assert f"{prefix()}{LOGIN_PASSKEY_OPTIONS_PATH}" not in _router_paths(router)
+        assert _get_availability(_availability_client(router)).json() == {
+            "enabled": True,
+            "passwordless": True,
+        }
+
+    def test_the_route_mounts_on_a_documents_only_router(self, kms: FakeKms) -> None:
+        """The JWKS-only shape, with no hooks and no stores at all, still answers."""
+        response = _get_availability(_availability_client(_availability_router(kms=kms)))
+        assert response.status_code == 200
+        assert response.json() == {"enabled": True, "passwordless": True}
+
+    def test_the_route_carries_the_same_cache_policy_as_oauth_discovery(
+        self, hooks: FakeHooks, stores: IdentityStores, kms: FakeKms
+    ) -> None:
+        """Five minutes: turning passkeys on is exactly when somebody is watching for it."""
+        client = _availability_client(_availability_router(hooks, stores, kms))
+        header = _get_availability(client).headers["cache-control"]
+        assert header == PASSKEY_AVAILABILITY_CACHE_CONTROL
+        assert PASSKEY_AVAILABILITY_CACHE_CONTROL == OAUTH_PROVIDERS_CACHE_CONTROL
+        assert PASSKEY_AVAILABILITY_CACHE_CONTROL == "public, max-age=300"
+
+    def test_the_route_needs_no_token_and_sets_no_cookie(
+        self, hooks: FakeHooks, stores: IdentityStores, kms: FakeKms
+    ) -> None:
+        """It is read by the sign-in page, which by definition holds no token.
+
+        The absent `Authorization` header is the assertion: every management route in this
+        module answers 401 to exactly this request, and this one answers 200.
+        """
+        client = _availability_client(_availability_router(hooks, stores, kms))
+        response = _get_availability(client)
+        assert response.status_code == 200
+        assert "authorization" not in {key.lower() for key in response.request.headers}
+        assert "set-cookie" not in {key.lower() for key in response.headers}
+
+    def test_the_management_routes_refuse_the_same_anonymous_request(
+        self, client: TestClient
+    ) -> None:
+        """The control for the test above, on the router the rest of this suite uses."""
+        assert client.get(f"{prefix()}{PASSKEYS_PATH}").status_code == 401
+        assert _get_availability(client).status_code == 200
+
+    def test_the_route_consumes_no_rate_limit_budget_and_writes_no_challenge(
+        self,
+        hooks: FakeHooks,
+        kms: FakeKms,
+        attempts: InMemoryLoginAttemptStore,
+    ) -> None:
+        """The reason the route exists, asserted against the two costs the probe paid.
+
+        Forty calls is past the 30-per-15-minutes budget `PASSKEY_OPTIONS_LIMIT` sets, and
+        every one answers 200 with the limiter left on, so no bucket is consumed. The
+        counting challenge store is the other half: a probe of `login/passkey/options` would
+        have written forty rows into it.
+        """
+        challenges = CountingChallengeStore()
+        stores = IdentityStores(
+            credentials=InMemoryCredentialStore(),
+            refresh_tokens=InMemoryRefreshTokenStore(),
+            identity_tokens=InMemoryIdentityTokenStore(),
+            passkeys=InMemoryPasskeyStore(),
+            webauthn_challenges=challenges,
+        )
+        app = FastAPI()
+        app.include_router(
+            build_identity_router(
+                make_settings(),
+                hooks,
+                stores,
+                kms_client=kms,
+                attempts=attempts,
+                limiter_enabled=False,
+            )
+        )
+        client = TestClient(app)
+        for _ in range(40):
+            assert _get_availability(client).status_code == 200
+        assert challenges.puts == 0
+
+    def test_the_probe_this_replaces_does_write_a_challenge_row(
+        self, hooks: FakeHooks, kms: FakeKms, attempts: InMemoryLoginAttemptStore
+    ) -> None:
+        """The control for the test above, and the cost the stopgap cache only defers.
+
+        One call to the route a frontend probes today, and the challenge table has a row in
+        it. That is the storage cost paid per sign-in page load, and the reason a
+        sessionStorage cache in one frontend is not a fix: the first load of every session
+        still pays it and every other consumer pays it in full.
+        """
+        challenges = CountingChallengeStore()
+        stores = IdentityStores(
+            credentials=InMemoryCredentialStore(),
+            refresh_tokens=InMemoryRefreshTokenStore(),
+            identity_tokens=InMemoryIdentityTokenStore(),
+            passkeys=InMemoryPasskeyStore(),
+            webauthn_challenges=challenges,
+        )
+        app = FastAPI()
+        app.include_router(
+            build_identity_router(
+                make_settings(),
+                hooks,
+                stores,
+                kms_client=kms,
+                attempts=attempts,
+                limiter_enabled=False,
+            )
+        )
+        client = TestClient(app)
+        assert challenges.puts == 0
+        assert client.post(f"{prefix()}{LOGIN_PASSKEY_OPTIONS_PATH}", json={}).status_code == 200
+        assert challenges.puts == 1
+
+    def test_the_route_appears_in_the_openapi_document_under_a_passkeys_tag(
+        self, kms: FakeKms
+    ) -> None:
+        """It is a documented public API, unlike the `.well-known` documents.
+
+        The assertion that the schema *builds at all* is the load-bearing half. Every other
+        route in this module is annotated `-> JSONResponse`, which under
+        `from __future__ import annotations` is an unresolvable string that FastAPI hands
+        pydantic as a response model, breaking `app.openapi()` for the whole app. This route
+        mounts in every deployment including the documents-only one, whose schema builds
+        today, so it must not be what takes `/docs` away from a product with no passkeys.
+        """
+        app = FastAPI()
+        app.include_router(_availability_router(kms=kms))
+
+        schema = app.openapi()
+        operation = schema["paths"][f"{prefix()}{PASSKEY_AVAILABILITY_PATH}"]["get"]
+        assert operation["tags"] == ["identity", "passkeys"]
+        assert operation["tags"].count("identity") == 1
+
+    def test_the_path_sits_under_the_passkeys_collection(self) -> None:
+        """`/passkeys/availability` rather than `/passkeys-availability`.
+
+        It reads as a property of the passkey surface, and it cannot collide with
+        `PASSKEY_ITEM_PATH`: FastAPI matches the literal segment before the parameterised
+        one, and a credential id is opaque bytes that never spells `availability`.
+        """
+        assert PASSKEY_AVAILABILITY_PATH.startswith(f"{PASSKEYS_PATH}/")
+        assert PASSKEY_AVAILABILITY_PATH.removeprefix(PASSKEYS_PATH) == "/availability"
+
+    def test_a_credential_named_availability_does_not_shadow_the_route(
+        self, client: TestClient, hooks: FakeHooks, stores: IdentityStores
+    ) -> None:
+        """The ordering claim above, exercised rather than asserted about.
+
+        `/passkeys/availability` is declared before `/passkeys/{credential_id}`, so the
+        literal wins. If it did not, this GET would fall into the item route and answer 401
+        to an anonymous caller.
+        """
+        seed_account(hooks, stores)
+        assert _get_availability(client).json() == {"enabled": True, "passwordless": True}

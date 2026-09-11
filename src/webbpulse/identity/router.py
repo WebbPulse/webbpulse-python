@@ -1,11 +1,12 @@
 """`build_identity_router`: the router a product mounts into its identity Lambda.
 
-Always mounts the three anonymous documents, plus M6's provider discovery route:
+Always mounts the three anonymous documents, plus the two discovery routes:
 
     GET <prefix>/.well-known/openid-configuration
     GET <prefix>/.well-known/jwks.json
     GET <prefix>/health
     GET <prefix>/oauth/providers
+    GET <prefix>/passkeys/availability
 
 and, when the product supplies `hooks` **and** a `stores` carrying the credential and
 refresh stores, the M2 password and session flows:
@@ -38,11 +39,13 @@ changed in 0.13.0**, where both routes took no body at all.
 
 Passkeys and OAuth are M5 and M6, per section 9.1 of `docs/identity-standard.md`.
 
-`oauth/providers` is the exception to all of the above conditionality. It is unconditional
-from 0.16.0 and answers `{"providers": []}` in a deployment that has no OAuth configured at
-all, so a frontend gets one authoritative answer in every environment rather than a 404 it
-has to interpret. The other five OAuth routes stay conditional. See
-`register_oauth_provider_discovery` for the rest of that reasoning.
+`oauth/providers` and `passkeys/availability` are the exception to all of the above
+conditionality. Both are unconditional, `oauth/providers` from 0.16.0 and
+`passkeys/availability` from 0.17.0, and each answers the negative case in a deployment that
+has no OAuth and no passkeys configured at all, so a frontend gets one authoritative answer
+in every environment rather than a 404 it has to interpret. The other five OAuth routes and
+the seven passkey routes stay conditional. See `register_oauth_provider_discovery` and
+`register_passkey_availability` for the rest of that reasoning.
 
 ## Where `<prefix>` comes from, and why you mount with no prefix of your own
 
@@ -397,6 +400,20 @@ def build_identity_router(
         stores=resolved_stores,
         oauth_client_secrets=oauth_client_secrets,
     )
+
+    # M5's availability route, new in 0.17.0, and the one passkey route that is
+    # unconditional. Mounted here for the reason the OAuth discovery route is: the frontend
+    # needs one authoritative answer in every deployment, including one that mounts no flows
+    # at all, rather than a 404 it has to interpret.
+    #
+    # It takes settings and nothing else. There is no service to build and no store to reach,
+    # because the answer is two configuration booleans, which is exactly what makes it safe
+    # to mount unconditionally and cheap enough to leave unlimited. See
+    # `register_passkey_availability` for why a frontend probing `login/passkey/options`
+    # instead is wrong twice over.
+    from webbpulse.identity.passkey_routes import register_passkey_availability
+
+    register_passkey_availability(router, prefix=prefix, settings=settings)
 
     if hooks is not None and resolved_stores.credentials is not None:
         _mount_flows(
