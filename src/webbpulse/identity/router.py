@@ -779,7 +779,13 @@ def _mount_flows(
                 ),
             )
         ip, _ = context(request)
-        await run_sync(lambda: flows.logout_all(subject, ip=ip))
+        session_id = _session_from_request(request, tokens)
+        presented = request.cookies.get(settings.cookie_name, "")
+        await run_sync(
+            lambda: flows.logout_all(
+                subject, ip=ip, family_ids=[session_id] if session_id else [], presented=presented
+            )
+        )
         return clear_refresh_cookie(JSONResponse({"signed_out": True}))
 
     # Before the email early-return below, deliberately. MFA needs no sender: a product can
