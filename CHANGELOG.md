@@ -5,6 +5,47 @@ Notable changes to the `webbpulse` package. The version here is the one in
 
 This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## 0.18.0
+
+`webbpulse.ci`: domain discovery for the per-domain pytest matrix in the organisation's
+reusable `python-ci.yml`.
+
+A service's test suite grows with its domains, and running it as one pytest invocation made
+CI slower every time a domain was added. The reusable workflow now runs one job per domain,
+so wall clock time tracks the largest domain rather than the sum of all of them. This module
+is what tells that workflow which jobs to create.
+
+The convention is declarative and lives in the service's own `pyproject.toml`, so adding a
+domain to CI is adding a line rather than editing a workflow:
+
+```toml
+[tool.webbpulse.ci]
+test-root = "tests"
+
+[tool.webbpulse.ci.domains]
+identity = ["tests/auth", "tests/dependencies"]
+catalog = ["tests/api/endpoints/test_parts.py"]
+```
+
+A value may name a directory or a single test file, because a suite that is not yet split by
+directory still has to be splittable: requiring the files to move first would make adopting
+this a refactor rather than a configuration change.
+
+Everything under `test-root` that no domain claims runs in a `shared` job, computed as a
+deselection (`--ignore` per claimed path) rather than a list, so a new test file is covered
+the moment it is written. Forgetting to claim a file makes it run in `shared`, which is
+slower but never silent.
+
+Two commands, both consumed by the workflow:
+
+- `python -m webbpulse.ci domains` prints a JSON array of domain names for `fromJson` in a
+  matrix `strategy`.
+- `python -m webbpulse.ci pytest-args --domain <name>` prints that job's pytest path
+  arguments, shell quoted.
+
+The module imports only the standard library, so the workflow can call it in a bare
+interpreter before the service's dependencies are installed.
+
 ## 0.17.0
 
 Identity M5 follow-up: a public passkey availability route, so a frontend can ask whether
