@@ -5,6 +5,64 @@ Notable changes to the `webbpulse` package. The version here is the one in
 
 This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## 0.19.0
+
+`webbpulse.otel`: two fixes for span export failures that were flapping CloudWatch alarms in
+the CarModPicker staging environment. Both are defects in dependencies rather than in this
+package, and both are worked around here because both only bite under Lambda.
+
+### SigV4 credentials no longer latch at cold start
+
+Exports to the X-Ray OTLP endpoint were being signed with whatever credentials the process
+resolved on its very first export, for the entire life of the execution environment.
+
+`aws-opentelemetry-distro`'s `AwsAuthSession` resolves credentials once, caches the object
+and sets `_credentials_resolved` permanently, then builds a `SigV4Auth` from that one object
+for every request. Its own comment says this is safe because `RefreshableCredentials` rotates
+on attribute access, and on EC2 or ECS that is true. Under Lambda it is not: the execution
+role arrives in `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY` and `AWS_SESSION_TOKEN`, so
+botocore's `EnvProvider` wins the chain, and that provider only returns `RefreshableCredentials`
+when `AWS_CREDENTIAL_EXPIRATION` is also set. Lambda does not set it, so what comes back is a
+plain `Credentials` object that never re-reads the environment. `botocore.session.Session`
+memoises its result too, so asking it again returns the same stale object.
+
+The consequence is invisible until a container outlives its credentials, which needs a
+function busy enough never to cold start inside the credential lifetime. The staging Python
+domain Lambdas were exactly that: no `INIT_START` in twenty four hours. Past the expiry every
+export was signed with a dead session token and rejected with
+`Failed to export span batch code: 403, reason: Forbidden`, on every invocation, with nothing
+in the application at fault and no path back short of the sandbox being recycled.
+
+The session handed to `OTLPAwsSpanExporter` is now wrapped so its `get_credentials` returns a
+credentials object that resolves afresh on each signature. Credentials that can already
+refresh themselves are left alone to do so, since their own machinery may be talking to IMDS
+or the container credential endpoint; only the non-refreshable case re-runs the provider
+chain, which is three environment reads on an export that is already making an HTTPS request.
+
+### A frozen and thawed sandbox no longer raises out of the exporter
+
+`OTLPSpanExporter.export` fixes one deadline for the whole export and gives each retry the
+remainder of it as that attempt's HTTP timeout. That assumes wall clock time tracks the work.
+A Lambda sandbox frozen mid-export and thawed later breaks the assumption by however long the
+freeze lasted, so the remainder goes negative and urllib3 rejects it outright:
+
+```
+ValueError: Attempted to set connect timeout to -221.00219130516052, but the timeout cannot
+be set to a value less than or equal to 0.
+```
+
+`ValueError` is not a `requests.exceptions.RequestException`, so upstream's own retry loop
+does not catch it and it escaped into this package's `_export`, which logged it at ERROR and
+tripped the log metric filter behind it.
+
+Two changes. The exporter's `requests` session is wrapped so a non-positive timeout is raised
+to a one millisecond floor before urllib3 sees it, which preserves the caller's intent (the
+deadline has passed, fail fast) while failing as a timeout that upstream already knows how to
+account for. And `_export` now logs this one specific condition at WARNING rather than ERROR,
+because a request that was served correctly and lost only some of its telemetry to a freeze
+is not an application fault and should not page anyone. Every other exporter error keeps its
+ERROR and its traceback.
+
 ## 0.18.0
 
 `webbpulse.ci`: domain discovery for the per-domain pytest matrix in the organisation's

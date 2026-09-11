@@ -338,6 +338,19 @@ def _span_signals_error(span: ReadableSpan) -> bool:
     return any(event.name == _EXCEPTION_EVENT_NAME for event in span.events or ())
 
 
+def _is_non_positive_timeout_error(error: ValueError) -> bool:
+    """Whether a `ValueError` is urllib3 rejecting a timeout that had already expired.
+
+    Matched on the message because that is all urllib3 gives: it raises a bare `ValueError`
+    from `Timeout._validate_timeout` with no dedicated subclass and no structured attribute,
+    so there is nothing else to key on. The match is kept deliberately tight, on the two
+    phrases that together are specific to that one check, so an unrelated `ValueError` from
+    the exporter still gets its ERROR and its traceback.
+    """
+    message = str(error).lower()
+    return "timeout" in message and "less than or equal to 0" in message
+
+
 class TailSamplingSpanProcessor:
     """Buffers spans per trace and decides at flush time whether to export the trace.
 
@@ -617,6 +630,31 @@ class TailSamplingSpanProcessor:
             return
         try:
             self._exporter.export(spans)
+        except ValueError as error:
+            # Narrowly: the exporter computed a non-positive HTTP timeout and urllib3
+            # rejected it. `_PositiveTimeoutSession` clamps that at the source, so reaching
+            # here means the clamp did not apply, most likely because a newer upstream
+            # release renamed the private `_session` attribute `_guard_export_timeouts`
+            # swaps. It stays WARNING rather than ERROR either way.
+            #
+            # The distinction that matters is whose fault it is. This one is nobody's: a
+            # Lambda sandbox was frozen part way through an export and thawed after the
+            # deadline had passed, so some spans from an already finished invocation are
+            # lost. The application served its request correctly. Paging an on-call engineer
+            # for it, which is what ERROR does here through the log metric filter, is a false
+            # alarm, and a false alarm that repeats is how a real one gets ignored. Losing
+            # telemetry is still worth recording, so it is logged, just not at a level that
+            # wakes anyone.
+            if _is_non_positive_timeout_error(error):
+                _log.warning(
+                    "Dropping a span batch: the exporter deadline had already passed. This is "
+                    "expected when a frozen Lambda sandbox is thawed mid-export and does not "
+                    "indicate an application fault.",
+                    extra={"span_count": len(spans), "exporter_error": str(error)},
+                )
+                return
+            # Any other ValueError is a genuine exporter fault and keeps its ERROR.
+            _log.exception("The span exporter raised while exporting a sampled trace.")
         except Exception:  # pragma: no cover - an exporter must never break the request
             _log.exception("The span exporter raised while exporting a sampled trace.")
 
@@ -742,6 +780,187 @@ def _region_for_endpoint(endpoint: str) -> str:
     return os.environ.get("AWS_REGION") or os.environ.get("AWS_DEFAULT_REGION") or "us-west-2"
 
 
+class _ReresolvingCredentials:
+    """Credentials that ask botocore for the current values on every signature.
+
+    This exists to work around a latch in `aws-opentelemetry-distro`. Its `AwsAuthSession`
+    resolves credentials once, on the first export, stores the resulting object and sets
+    `_credentials_resolved = True` permanently; from then on every request builds a fresh
+    `SigV4Auth(self._credentials, ...)` from that one cached object. The distro's own comment
+    says caching the reference is safe because "RefreshableCredentials handles rotation
+    internally on attribute access", and for an EC2 or ECS container role that is true.
+
+    It is not true in Lambda, which is where this package runs. Lambda injects the execution
+    role into `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY` and `AWS_SESSION_TOKEN`, so
+    botocore's `EnvProvider` wins the resolver chain. `EnvProvider.load` only returns a
+    `RefreshableCredentials` when `AWS_CREDENTIAL_EXPIRATION` is also set, and Lambda does
+    not set it: the provider falls through to a plain `Credentials` object, whose
+    `get_frozen_credentials` just hands back the three strings it was built from and never
+    looks at the environment again. The Lambda runtime does rewrite those variables when it
+    renews the role, but on this path nothing re-reads them.
+
+    The result is a signing key frozen at cold start. That is invisible for as long as a
+    sandbox lives less than the credential lifetime, which is the usual case and the reason
+    the defect is not obvious. A busy function is the exception: its execution environment is
+    kept warm for longer than the credentials last, so the container outlives them, every
+    export is signed with an expired session token, and X-Ray answers
+    `code: 403, reason: Forbidden` on every attempt until the sandbox is finally recycled.
+    Nothing in the application is wrong and nothing recovers on its own.
+
+    Note that simply calling `Session.get_credentials()` again is not enough, and this was
+    checked against the installed botocore rather than assumed. That method memoises into
+    `session._credentials` on first use and returns the same object forever after, so a
+    second call hands back the very object that went stale. Only a credentials object that
+    can refresh itself escapes that, which brings the argument back to the same place: the
+    Lambda env-var path does not produce one.
+
+    So the rule below is: if the session's credentials already know how to refresh, leave
+    them alone and let their own machinery do it, because that machinery is better than
+    anything reimplemented here and may be talking to IMDS or the container credential
+    endpoint. Only when they cannot refresh is the resolver chain re-run, by clearing the
+    session's memo. That confines the extra work to precisely the case that is broken, and
+    on that case it is cheap: the broken case is the env-var provider, and re-running it is
+    three `os.environ` reads against an export that is already making an HTTPS request.
+
+    `SigV4Auth` reads `get_frozen_credentials` when it signs and the three attributes below
+    when it builds the credential scope and the `X-Amz-Security-Token` header, so this
+    presents the same surface botocore's own `Credentials` does.
+    """
+
+    def __init__(self, session: Any) -> None:
+        self._session = session
+
+    def _current(self) -> Any:
+        """The credentials to sign with right now, re-resolved if they cannot refresh.
+
+        A failure here is not swallowed into `None`. `AwsAuthSession.request` catches signing
+        errors itself and logs them at ERROR with the reason attached, and turning a
+        misconfigured role into an unexplained silence is the failure mode this whole module
+        is written to avoid.
+        """
+        from botocore.credentials import RefreshableCredentials
+
+        credentials = self._session.get_credentials()
+        if isinstance(credentials, RefreshableCredentials):
+            return credentials
+        # Non-refreshable, so drop the session's memo and let the provider chain run again.
+        # `_credentials` is private to botocore, hence the guarded reset: if it ever goes
+        # away, signing carries on with whatever the session returns rather than breaking.
+        if getattr(self._session, "_credentials", None) is not None:
+            self._session._credentials = None
+            credentials = self._session.get_credentials()
+        return credentials
+
+    def get_frozen_credentials(self) -> Any:
+        credentials = self._current()
+        if credentials is None:
+            from botocore.exceptions import NoCredentialsError
+
+            raise NoCredentialsError()
+        return credentials.get_frozen_credentials()
+
+    @property
+    def access_key(self) -> Any:
+        return self.get_frozen_credentials().access_key
+
+    @property
+    def secret_key(self) -> Any:
+        return self.get_frozen_credentials().secret_key
+
+    @property
+    def token(self) -> Any:
+        return self.get_frozen_credentials().token
+
+
+class _RefreshingCredentialSession:
+    """A botocore session whose `get_credentials` hands back `_ReresolvingCredentials`.
+
+    `OTLPAwsSpanExporter` takes a `botocore.session.Session` and passes it straight into
+    `AwsAuthSession`, which calls `get_credentials()` on it exactly once. Wrapping the
+    session rather than subclassing the exporter or the auth session is what keeps this
+    small: the distro's latch still happens, it just latches onto an object that resolves
+    afresh every time it is read, so no ADOT behaviour has to be copied here or kept in step
+    with it as the distro changes.
+
+    Everything other than `get_credentials` is delegated to the real session, so anything the
+    distro reaches for on it keeps working.
+    """
+
+    def __init__(self, session: Any) -> None:
+        self._session = session
+        self._credentials = _ReresolvingCredentials(session)
+
+    def get_credentials(self) -> Any:
+        return self._credentials
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._session, name)
+
+
+#: The floor for a per-attempt HTTP timeout, in seconds. Small enough to be a real deadline
+#: on a request that has already blown its budget, large enough that urllib3 accepts it.
+_MIN_EXPORT_TIMEOUT_SECONDS: Final = 0.001
+
+
+class _PositiveTimeoutSession:
+    """A `requests` session that refuses to pass a non-positive timeout to urllib3.
+
+    This defends against an upstream defect in `OTLPSpanExporter.export`. That method takes
+    one deadline for the whole export, `deadline_sec = time() + self._timeout`, and then
+    hands each retry whatever is left of it as that attempt's `requests` timeout:
+    `self._export(serialized_data, deadline_sec - time())`. The arithmetic assumes wall clock
+    time advances roughly in step with the work being done.
+
+    In Lambda it does not. A sandbox is frozen the moment the handler returns and thawed
+    whenever the next invocation arrives, which can be minutes or hours later, and `time()`
+    is wall clock, so it jumps by the whole of the freeze. An export that is mid-flight when
+    that happens resumes with a deadline far in the past, subtracts, and passes a negative
+    number down. urllib3 does not treat that as "already expired", it rejects it outright:
+
+        ValueError: Attempted to set connect timeout to -221.00219130516052, but the timeout
+        cannot be set to a value less than or equal to 0.
+
+    `ValueError` is not a `requests.exceptions.RequestException`, so the retry loop in
+    `export` does not catch it. It propagates out of the exporter and into this package's own
+    `_export`, which is where it turned up as an ERROR log and, through the log metric filter
+    behind it, as an alarm. Nothing was actually wrong: a handful of spans from a previous
+    invocation were lost, which is what losing a race with the freeze always costs.
+
+    Clamping here rather than reimplementing `export` is the narrow fix. The timeout is the
+    only value corrupted by the clock jump, this is the last point before urllib3 sees it,
+    and a floor of a millisecond preserves the meaning the caller intended: the deadline has
+    passed, so this attempt should fail fast rather than wait. It fails as a timeout, which
+    is a `RequestException`, which the upstream retry loop already knows how to account for.
+    """
+
+    def __init__(self, session: Any) -> None:
+        self._session = session
+
+    def post(self, *args: Any, timeout: Any = None, **kwargs: Any) -> Any:
+        return self._session.post(*args, timeout=_clamp_timeout(timeout), **kwargs)
+
+    def request(self, *args: Any, timeout: Any = None, **kwargs: Any) -> Any:
+        return self._session.request(*args, timeout=_clamp_timeout(timeout), **kwargs)
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._session, name)
+
+
+def _clamp_timeout(timeout: Any) -> Any:
+    """Raise a non-positive timeout to the floor, leaving anything else alone.
+
+    `None` means "no timeout" to `requests` and is passed through untouched. A tuple is the
+    `(connect, read)` form, and both halves get the same treatment. A value that is not a
+    number at all is handed on unchanged rather than guessed at, so a future `requests` that
+    accepts some other shape is not broken here.
+    """
+    if isinstance(timeout, tuple):
+        return tuple(_clamp_timeout(part) for part in timeout)
+    if isinstance(timeout, bool) or not isinstance(timeout, int | float):
+        return timeout
+    return max(_MIN_EXPORT_TIMEOUT_SECONDS, timeout)
+
+
 def _build_span_exporter(endpoint: str, timeout_millis: int) -> SpanExporter:
     """The exporter for an endpoint: SigV4 signing for X-Ray, plain OTLP for anything else.
 
@@ -776,7 +995,9 @@ def _build_span_exporter(endpoint: str, timeout_millis: int) -> SpanExporter:
     timeout_seconds = max(1, round(timeout_millis / 1000))
 
     if not _is_xray_endpoint(endpoint):
-        return OTLPSpanExporter(endpoint=endpoint, timeout=timeout_seconds)
+        exporter = OTLPSpanExporter(endpoint=endpoint, timeout=timeout_seconds)
+        _guard_export_timeouts(exporter)
+        return exporter
 
     try:
         import botocore.session
@@ -791,21 +1012,41 @@ def _build_span_exporter(endpoint: str, timeout_millis: int) -> SpanExporter:
             "Install it with the 'aws-otel' extra: pip install 'webbpulse[otel,aws-otel]'.",
             extra={"otlp_endpoint": endpoint},
         )
-        return OTLPSpanExporter(endpoint=endpoint, timeout=timeout_seconds)
+        exporter = OTLPSpanExporter(endpoint=endpoint, timeout=timeout_seconds)
+        _guard_export_timeouts(exporter)
+        return exporter
 
     # botocore resolves credentials lazily, on the first signed request rather than here, so
     # building this at cold start does not add an IMDS or STS round trip to the critical path.
+    # The session is wrapped so that resolution also happens on every *later* request rather
+    # than only the first one; `_ReresolvingCredentials` explains why the distro's own caching
+    # goes stale under Lambda.
     # `OTLPAwsSpanExporter` subclasses `OTLPSpanExporter`, but the distro ships no stubs so
     # mypy sees it as Any; the cast restores the contract this function promises.
-    return cast(
-        "SpanExporter",
-        OTLPAwsSpanExporter(
-            aws_region=_region_for_endpoint(endpoint),
-            session=botocore.session.Session(),
-            endpoint=endpoint,
-            timeout=timeout_seconds,
-        ),
+    signing_exporter = OTLPAwsSpanExporter(
+        aws_region=_region_for_endpoint(endpoint),
+        session=_RefreshingCredentialSession(botocore.session.Session()),
+        endpoint=endpoint,
+        timeout=timeout_seconds,
     )
+    _guard_export_timeouts(signing_exporter)
+    return cast("SpanExporter", signing_exporter)
+
+
+def _guard_export_timeouts(exporter: Any) -> None:
+    """Wrap an exporter's `requests` session so a clock jump cannot produce a `ValueError`.
+
+    Done by swapping `_session` after construction rather than by passing a session into the
+    constructor, because the signing exporter builds its own `AwsAuthSession` internally and
+    there is no seam to pass one in. The attribute is private to upstream, so the swap is
+    guarded: if a future release renames it, exports keep working exactly as they do today
+    and only the clamp is lost. See `_PositiveTimeoutSession` for what is being defended
+    against.
+    """
+    session = getattr(exporter, "_session", None)
+    if session is None:  # pragma: no cover - upstream has had `_session` since 1.0
+        return
+    exporter._session = _PositiveTimeoutSession(session)
 
 
 def configure_tracing(
