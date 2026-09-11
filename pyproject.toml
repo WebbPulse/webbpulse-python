@@ -86,6 +86,9 @@ dev = [
   "botocore-stubs",
   "mypy>=1.13",
   "pytest-cov>=6",
+  # The reusable python-ci workflow runs pytest with `-n auto` by default, which is
+  # an unrecognized argument rather than a no-op when xdist is absent.
+  "pytest-xdist>=3",
   "ruff>=0.8",
 ]
 
