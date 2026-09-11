@@ -5,6 +5,43 @@ Notable changes to the `webbpulse` package. The version here is the one in
 
 This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## 0.20.0
+
+`webbpulse.identity`: `POST /logout-all` no longer answers 500 on a DynamoDB deployment. The
+release also carries the repository wide comment cleanup, which changes no behaviour.
+
+### `logout-all` names its own token families
+
+The route called `flows.logout_all(subject, ip=ip)` with no `family_ids`, which falls through
+`_revoke_families` to `SessionService.revoke_all_for_user` and then to
+`DynamoRefreshTokenStore.revoke_all_for_user`. That method raises `NotImplementedError` by
+design: `refresh-tokens` is keyed by token hash and carries no user index, because indexing
+the cold path would cost a write on every rotation of the hot one. So every call to the route
+on a DynamoDB backed deployment returned 500, CarModPicker staging included, while the
+in-memory store used by every route level test has a working happy path and never reached the
+raise.
+
+The M2 docstrings already described the resolution, which is for the caller to name the
+families, and the route now does. The access token's `sid` claim is the caller's own family
+id, and the refresh cookie names a second one, resolved through the store by a new
+`SessionService.family_of`. Both are handed to `flows.logout_all`, which gains a `presented`
+argument for the cookie half. `_revoke_families` already takes the safe path for any
+non-`None` list, the empty one included, so the raise is no longer reachable from this route.
+
+New route level tests run over a store that refuses the user indexed scan the way the deployed
+one does, so the gap that hid this cannot reopen silently.
+
+### Docstrings are the only documentation surface
+
+Every prose `#` comment is gone from `src/` and `tests/`, and docstrings now cover every
+module, class, function and method. Directive comments are preserved exactly: the `noqa`,
+`type: ignore` and `pragma: no cover` counts match the previous release, and any prose tail on
+one was trimmed to the bare directive.
+
+This is a documentation change only. Each Python file is AST-identical to 0.19.0 once
+docstrings are normalised away, and `pyproject.toml` parses to the same values it did before,
+so no consumer needs to do anything beyond taking the pin.
+
 ## 0.19.0
 
 `webbpulse.otel`: two fixes for span export failures that were flapping CloudWatch alarms in
