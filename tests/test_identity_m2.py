@@ -1366,3 +1366,98 @@ def test_the_documents_still_answer_when_the_flows_are_mounted(
     assert client.get("/api/auth/.well-known/jwks.json").status_code == 200
     assert client.get("/api/auth/.well-known/openid-configuration").status_code == 200
     assert client.get("/api/auth/health").json()["status"] == "healthy"
+
+
+class _NoUserIndexRefreshTokenStore(InMemoryRefreshTokenStore):
+    """An `InMemoryRefreshTokenStore` that refuses the user-indexed scan, like DynamoDB.
+
+    `DynamoRefreshTokenStore.revoke_all_for_user` raises because `refresh-tokens` has no
+    user index, and the in-memory store's happy path hid that from every route level test.
+    """
+
+    def revoke_all_for_user(self, user_id: str, *, except_family_id: str = "") -> int:
+        raise NotImplementedError("revoke_all_for_user needs the caller's family ids")
+
+
+@pytest.fixture
+def no_user_index_stores() -> IdentityStores:
+    """Stores whose refresh table behaves like the deployed DynamoDB one."""
+    return IdentityStores(
+        credentials=InMemoryCredentialStore(),
+        refresh_tokens=_NoUserIndexRefreshTokenStore(),
+    )
+
+
+@pytest.fixture
+def no_user_index_client(
+    kms: FakeKms,
+    hooks: FakeHooks,
+    no_user_index_stores: IdentityStores,
+    attempts: InMemoryLoginAttemptStore,
+) -> Iterator[TestClient]:
+    """The router over a refresh store with no user index."""
+    from webbpulse.http import register_error_handlers
+
+    settings = make_settings()
+    app = FastAPI()
+    register_error_handlers(app, error_codes=True)
+    app.include_router(
+        build_identity_router(
+            settings,
+            hooks,
+            no_user_index_stores,
+            kms_client=kms,
+            attempts=attempts,
+            limiter_enabled=False,
+        )
+    )
+    with TestClient(app, base_url="https://api.example.com") as test_client:
+        yield test_client
+
+
+def test_logout_all_succeeds_when_the_refresh_store_has_no_user_index(
+    no_user_index_client: TestClient, hooks: FakeHooks, no_user_index_stores: IdentityStores
+) -> None:
+    """The regression: the route supplies the families rather than asking for a scan.
+
+    Deployed on DynamoDB this answered 500, because the route passed no `family_ids` and
+    the store raises rather than scanning `refresh-tokens`.
+    """
+    seed_account(hooks, no_user_index_stores)
+    login = no_user_index_client.post(
+        "/api/auth/login", json={"email": EMAIL, "password": PASSWORD}
+    )
+    access = login.json()["access_token"]
+
+    response = no_user_index_client.post(
+        "/api/auth/logout-all", headers={"Authorization": f"Bearer {access}"}
+    )
+    assert response.status_code == 200
+    assert response.json() == {"signed_out": True}
+
+
+def test_logout_all_revokes_the_caller_own_family(
+    no_user_index_client: TestClient, hooks: FakeHooks, no_user_index_stores: IdentityStores
+) -> None:
+    """Signing out everywhere kills the family the caller is signed in with."""
+    seed_account(hooks, no_user_index_stores)
+    login = no_user_index_client.post(
+        "/api/auth/login", json={"email": EMAIL, "password": PASSWORD}
+    )
+    access = login.json()["access_token"]
+
+    assert (
+        no_user_index_client.post(
+            "/api/auth/logout-all", headers={"Authorization": f"Bearer {access}"}
+        ).status_code
+        == 200
+    )
+    assert no_user_index_client.post("/api/auth/refresh").status_code == 401
+
+
+def test_family_of_resolves_a_presented_refresh_token(sessions: SessionService) -> None:
+    """`family_of` names a token's family, and answers empty for one it does not know."""
+    issued = sessions.start_family(USER_ID)
+    assert sessions.family_of(issued.token) == issued.family_id
+    assert sessions.family_of("not-a-token") == ""
+    assert sessions.family_of("") == ""

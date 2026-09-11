@@ -841,13 +841,26 @@ class IdentityFlows:
         )
         return result.revoked
 
-    def logout_all(self, user_id: str, *, ip: str = "", family_ids: list[str] | None = None) -> int:
+    def logout_all(
+        self,
+        user_id: str,
+        *,
+        ip: str = "",
+        family_ids: list[str] | None = None,
+        presented: str = "",
+    ) -> int:
         """Revoke every family for a user. The sign-out-everywhere button.
 
         See `SessionService.revoke_all_for_user` for why the family ids may have to come
-        from the caller: `refresh-tokens` carries no user index by design.
+        from the caller: `refresh-tokens` carries no user index by design. `presented` is a
+        refresh token whose own family is resolved through the store and revoked too.
         """
-        revoked = self._revoke_families(user_id, family_ids=family_ids)
+        targets = list(family_ids) if family_ids is not None else None
+        if presented:
+            family = self._sessions.family_of(presented)
+            if family:
+                targets = (targets or []) + [family]
+        revoked = self._revoke_families(user_id, family_ids=targets)
         _log.info(
             "Signed out of every session.",
             extra={

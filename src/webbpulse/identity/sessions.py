@@ -308,6 +308,17 @@ class SessionService:
             revoked=revoked,
         )
 
+    def family_of(self, presented: str) -> str:
+        """The family id a presented refresh token belongs to, or `""` for an unknown one.
+
+        Lets sign-out-everywhere name the caller's own family without rotating or revoking
+        it first, since `refresh-tokens` is keyed by token hash rather than by user.
+        """
+        if not presented:
+            return ""
+        record = self._store.get(hash_token(presented))
+        return record.family_id if record is not None else ""
+
     def revoke_all_for_user(
         self,
         user_id: str,
