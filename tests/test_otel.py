@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import threading
 import time
-from typing import Any, cast
+from typing import Any, ClassVar, cast
 
 import pytest
 from opentelemetry import trace as trace_api
@@ -1497,3 +1497,310 @@ def test_the_fips_endpoint_is_detected_and_signed_for_its_own_region(
 
     assert otel._is_xray_endpoint(endpoint) is True
     assert otel._region_for_endpoint(endpoint) == "us-gov-west-1"
+
+
+# --------------------------------------------------------------------------------------
+# SigV4 credential freshness
+#
+# These drive the real `AwsAuthSession` from `aws-opentelemetry-distro` rather than a stand
+# in for it, because the defect being guarded against lives in that class: it resolves
+# credentials once and signs from the cached object forever. A fake session would prove
+# nothing about whether the workaround actually lands.
+# --------------------------------------------------------------------------------------
+
+
+def _lambda_style_env(monkeypatch: MonkeyPatch, access_key: str) -> None:
+    """The credential environment a Lambda execution environment has.
+
+    Three variables and deliberately no `AWS_CREDENTIAL_EXPIRATION`, which is what makes
+    botocore's `EnvProvider` hand back a plain non-refreshable `Credentials` object. Any
+    ambient profile is cleared too: `AWS_PROFILE` makes the resolver skip the env provider
+    entirely, so a developer's shell would otherwise change what is under test.
+    """
+    monkeypatch.setenv("AWS_ACCESS_KEY_ID", access_key)
+    monkeypatch.setenv("AWS_SECRET_ACCESS_KEY", f"secret-for-{access_key}")
+    monkeypatch.setenv("AWS_SESSION_TOKEN", f"token-for-{access_key}")
+    for name in ("AWS_CREDENTIAL_EXPIRATION", "AWS_PROFILE", "AWS_DEFAULT_PROFILE"):
+        monkeypatch.delenv(name, raising=False)
+
+
+def _signing_probe(monkeypatch: MonkeyPatch, exporter: Any) -> tuple[Any, list[str]]:
+    """A callable that posts once through the exporter's signing session, and the keys it used.
+
+    The real `AwsAuthSession.request` runs, so the signing under test is the distro's own.
+    Only the `requests.Session.request` underneath it is replaced, which is the first point
+    at which the finished `Authorization` header is observable. The access key id is read
+    back out of that header, which is where X-Ray reads it from too.
+    """
+    import requests
+
+    signed: list[str] = []
+    auth_session = exporter._session._session
+
+    def fake_request(
+        self: Any, method: Any = None, url: Any = None, *args: Any, **kwargs: Any
+    ) -> Any:
+        header = dict(kwargs.get("headers") or {}).get("Authorization", "")
+        signed.append(header.split("Credential=")[1].split("/")[0])
+
+        class _Response:
+            ok = True
+            status_code = 200
+            reason = "OK"
+
+        return _Response()
+
+    monkeypatch.setattr(requests.Session, "request", fake_request)
+
+    def post_once() -> None:
+        auth_session.request("POST", "https://xray.us-west-2.amazonaws.com/v1/traces", data=b"")
+
+    return post_once, signed
+
+
+def test_rotated_lambda_credentials_are_picked_up_by_the_next_export(
+    monkeypatch: MonkeyPatch,
+) -> None:
+    """The 403 loop this fixes: a warm sandbox outliving the credentials it started with.
+
+    Lambda rewrites the credential environment variables when it renews the execution role,
+    but the plain `Credentials` object botocore builds from them never re-reads them, and the
+    distro caches that object for the life of the process. A container that survives longer
+    than its credentials then signs every export with an expired token and X-Ray rejects all
+    of them. The second signature here must use the new key, not the one from cold start.
+    """
+    _lambda_style_env(monkeypatch, "AKIAFIRSTKEY")
+
+    exporter = otel._build_span_exporter("https://xray.us-west-2.amazonaws.com/v1/traces", 1000)
+    post_once, signed = _signing_probe(monkeypatch, exporter)
+
+    post_once()
+    _lambda_style_env(monkeypatch, "AKIASECONDKEY")
+    post_once()
+
+    assert signed == ["AKIAFIRSTKEY", "AKIASECONDKEY"]
+
+
+def test_unchanged_credentials_still_sign_consistently(monkeypatch: MonkeyPatch) -> None:
+    """Re-resolving must not be mistaken for something that changes on its own.
+
+    The steady state is by far the common one, so it gets an assertion of its own: nothing
+    rotated, so both exports sign with the same key.
+    """
+    _lambda_style_env(monkeypatch, "AKIASTABLEKEY")
+
+    exporter = otel._build_span_exporter("https://xray.us-west-2.amazonaws.com/v1/traces", 1000)
+    post_once, signed = _signing_probe(monkeypatch, exporter)
+
+    post_once()
+    post_once()
+
+    assert signed == ["AKIASTABLEKEY", "AKIASTABLEKEY"]
+
+
+def test_refreshable_credentials_are_left_to_refresh_themselves() -> None:
+    """A provider that already rotates is not second guessed.
+
+    `RefreshableCredentials` talks to IMDS or the container credential endpoint on its own
+    schedule, and re-running the resolver chain around it would throw that away. The
+    workaround must apply only to the credentials that genuinely cannot refresh.
+    """
+    from botocore.credentials import RefreshableCredentials
+
+    refreshable = RefreshableCredentials(
+        "AKIAREFRESHABLE",
+        "secret",
+        "token",
+        _far_future(),
+        refresh_using=lambda: {},
+        method="test",
+    )
+
+    class _Session:
+        _credentials = refreshable
+        cleared = False
+
+        def get_credentials(self) -> Any:
+            return refreshable
+
+    session = _Session()
+    credentials = otel._ReresolvingCredentials(session)
+
+    assert credentials._current() is refreshable
+    # The memo is untouched, so the provider chain was never re-run.
+    assert session._credentials is refreshable
+
+
+def test_missing_credentials_raise_rather_than_sign_unsigned() -> None:
+    """No credentials is a real failure and must surface as one.
+
+    Returning `None` here would let the request go out unsigned and collect a 403 that says
+    nothing about why, which is the exact silent failure the rest of this module exists to
+    prevent. `AwsAuthSession` catches and logs the raise with its reason attached.
+    """
+    from botocore.exceptions import NoCredentialsError
+
+    class _Session:
+        _credentials = None
+
+        def get_credentials(self) -> Any:
+            return None
+
+    credentials = otel._ReresolvingCredentials(_Session())
+
+    with pytest.raises(NoCredentialsError):
+        credentials.get_frozen_credentials()
+
+
+def _far_future() -> Any:
+    """An expiry far enough out that `RefreshableCredentials` never tries to refresh."""
+    import datetime
+
+    return datetime.datetime.now(datetime.UTC) + datetime.timedelta(days=365)
+
+
+# --------------------------------------------------------------------------------------
+# Export timeouts across a sandbox freeze
+#
+# `OTLPSpanExporter.export` derives each retry's HTTP timeout by subtracting wall clock time
+# from a deadline it fixed at the start. A Lambda freeze makes that difference negative and
+# urllib3 raises `ValueError` rather than treating it as expired, which is not a
+# `RequestException` and so escapes upstream's own retry handling entirely.
+# --------------------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("given", "expected"),
+    [
+        (-221.002, otel._MIN_EXPORT_TIMEOUT_SECONDS),
+        (0, otel._MIN_EXPORT_TIMEOUT_SECONDS),
+        (0.0, otel._MIN_EXPORT_TIMEOUT_SECONDS),
+        (5.0, 5.0),
+        (None, None),
+    ],
+)
+def test_a_non_positive_timeout_is_raised_to_the_floor(given: Any, expected: Any) -> None:
+    """Only the non-positive values move. `None` means "no timeout" and is left alone."""
+    assert otel._clamp_timeout(given) == expected
+
+
+def test_both_halves_of_a_connect_read_timeout_are_clamped() -> None:
+    """`requests` also accepts the tuple form, and urllib3 validates each half separately."""
+    assert otel._clamp_timeout((-3.0, 4.0)) == (otel._MIN_EXPORT_TIMEOUT_SECONDS, 4.0)
+
+
+def test_a_frozen_then_thawed_export_does_not_raise(monkeypatch: MonkeyPatch) -> None:
+    """The end to end shape of the bug, driven through the real upstream exporter.
+
+    Time is moved forward past the exporter's own deadline between constructing it and
+    exporting, which is what a sandbox freeze does. Without the clamp the session receives a
+    negative timeout; with it the post still happens and nothing propagates.
+    """
+    import opentelemetry.exporter.otlp.proto.http.trace_exporter as upstream
+
+    exporter = otel._build_span_exporter("http://localhost:4318/v1/traces", 1000)
+
+    seen: list[Any] = []
+
+    class _Transport:
+        headers: ClassVar[dict[str, str]] = {}
+
+        def post(self, *args: Any, timeout: Any = None, **kwargs: Any) -> Any:
+            seen.append(timeout)
+
+            class _Response:
+                ok = True
+                status_code = 200
+                reason = "OK"
+
+            return _Response()
+
+    # Swapped *underneath* whatever `_build_span_exporter` installed, so the clamp that is
+    # under test is the one the real wiring put there rather than one this test added.
+    guarded = cast("Any", exporter)._session
+    assert isinstance(guarded, otel._PositiveTimeoutSession)
+    guarded._session = _Transport()
+
+    # The freeze: wall clock jumps well past the deadline `export` fixed for itself.
+    monkeypatch.setattr(upstream, "time", lambda: time.time() + 3600)
+
+    exporter.export([])
+
+    assert seen, "the exporter never reached the session"
+    assert all(value > 0 for value in seen), seen
+
+
+def test_a_thawed_sandbox_does_not_log_an_error(caplog: pytest.LogCaptureFixture) -> None:
+    """Losing spans to a freeze is not an application fault and must not page anyone.
+
+    `_export` logs at ERROR, and a log metric filter turns that into a CloudWatch alarm. A
+    request that was served correctly and only lost some of its telemetry has to come out
+    below that line, while still being recorded.
+    """
+
+    class _RaisingExporter:
+        def export(self, spans: Any) -> None:
+            raise ValueError(
+                "Attempted to set connect timeout to -221.00219130516052, but the timeout "
+                "cannot be set to a value less than or equal to 0."
+            )
+
+    processor = TailSamplingSpanProcessor(cast("Any", _RaisingExporter()), sample_ratio=1.0)
+
+    with caplog.at_level("WARNING", logger="webbpulse.otel"):
+        processor._export([cast("Any", object())])
+
+    assert not [record for record in caplog.records if record.levelname == "ERROR"]
+    warnings = [record for record in caplog.records if record.levelname == "WARNING"]
+    assert len(warnings) == 1
+    assert "deadline had already passed" in warnings[0].message
+
+
+def test_a_genuine_exporter_error_is_still_an_error(caplog: pytest.LogCaptureFixture) -> None:
+    """The downgrade is narrow on purpose: everything else keeps its ERROR and its traceback.
+
+    Blanket-silencing the exporter would trade a false alarm for a missing one, which is the
+    worse of the two.
+    """
+
+    class _RaisingExporter:
+        def export(self, spans: Any) -> None:
+            raise ValueError("encoded span batch is malformed")
+
+    processor = TailSamplingSpanProcessor(cast("Any", _RaisingExporter()), sample_ratio=1.0)
+
+    with caplog.at_level("WARNING", logger="webbpulse.otel"):
+        processor._export([cast("Any", object())])
+
+    errors = [record for record in caplog.records if record.levelname == "ERROR"]
+    assert len(errors) == 1
+    assert "The span exporter raised" in errors[0].message
+
+
+def test_a_non_value_error_from_the_exporter_is_still_an_error(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """The pre-existing catch-all is unchanged: an exporter must never break the request."""
+
+    class _RaisingExporter:
+        def export(self, spans: Any) -> None:
+            raise RuntimeError("the endpoint went away")
+
+    processor = TailSamplingSpanProcessor(cast("Any", _RaisingExporter()), sample_ratio=1.0)
+
+    with caplog.at_level("WARNING", logger="webbpulse.otel"):
+        processor._export([cast("Any", object())])
+
+    assert [record for record in caplog.records if record.levelname == "ERROR"]
+
+
+def test_the_timeout_guard_survives_an_upstream_rename(caplog: pytest.LogCaptureFixture) -> None:
+    """`_session` is private to upstream, so losing it must degrade rather than crash."""
+
+    class _NoSession:
+        pass
+
+    exporter = _NoSession()
+    otel._guard_export_timeouts(exporter)
+
+    assert not hasattr(exporter, "_session")
