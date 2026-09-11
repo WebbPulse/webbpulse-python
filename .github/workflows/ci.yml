@@ -24,7 +24,7 @@ concurrency:
 
 jobs:
   ci:
-    uses: WebbPulse/.github/.github/workflows/python-ci.yml@v1
+    uses: WebbPulse/.github/.github/workflows/python-ci.yml@v2
     # A called workflow cannot hold more permission than its caller grants, and the
     # shared workflow requests id-token: write for its optional CodeArtifact login.
     # Without this grant the run fails at startup before any job is created.
@@ -73,3 +73,31 @@ jobs:
 
       - name: Mypy
         run: mypy
+
+  # The one stable name for `main-protection` to require, so auto-merge means merge on
+  # green rather than merge on mergeable.
+  #
+  # It has to be a job in this workflow rather than the reusable workflow's own gate: a
+  # job inside a called workflow reports as `<caller-job> / <job>`, which here would be
+  # `ci / all-checks-passed`, and that is not a bare name a ruleset can require.
+  #
+  # `skipped` counts as success, `failure` and `cancelled` do not. Cancellation matters
+  # because a cancelled job has proven nothing, and treating it as success would let a run
+  # cancelled mid-flight satisfy the ruleset.
+  all-checks-passed:
+    name: all-checks-passed
+    runs-on: ubuntu-latest
+    needs: [ci, types]
+    if: always()
+    steps:
+      - name: Fail unless every upstream job succeeded or was skipped
+        env:
+          RESULTS: ${{ toJSON(needs) }}
+        run: |
+          set -euo pipefail
+          echo "$RESULTS"
+          if echo "$RESULTS" | grep -Eq '"result": *"(failure|cancelled)"'; then
+            echo "::error::at least one upstream job failed or was cancelled"
+            exit 1
+          fi
+          echo "Every upstream job succeeded or was skipped."
