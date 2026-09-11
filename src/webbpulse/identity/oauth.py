@@ -1,100 +1,7 @@
 """OAuth sign-in and account linking: providers, the state store, and the link service.
 
-M6 of `docs/identity-standard.md`. Section 2.6 names Google and GitHub as the two providers
-in the mandatory baseline, section 3.4's sequence diagram fixes the shape of the flow, and
-section 4.2 gives the two tables. This module is the whole of that, minus the routes, which
-live in `oauth_routes.py` for the reason given there.
-
-Everything here is synchronous and imports no FastAPI, matching the `services/` rule in
-section 2.1: a flow must be callable from a test, a CLI or a queue consumer without a
-request object. The provider HTTP calls go through `httpx` behind a small `HttpClient`
-protocol, so a test substitutes a transport rather than monkeypatching a module.
-
-## The authorization code flow, with PKCE where it exists
-
-Both providers get `state`; only Google gets PKCE and a nonce.
-
-**PKCE** (RFC 7636) is offered by Google and not by GitHub. GitHub's web application flow
-documents no `code_challenge` parameter and ignores one sent, so sending it would be
-security theatre: a verifier the provider never checks proves nothing on the exchange. The
-provider table records this per provider rather than sending it unconditionally, so a reader
-can see which providers are actually protected by it and which rest on `state` and the
-client secret alone. When GitHub adds PKCE the change is one flag.
-
-PKCE matters here even with a confidential client because the redirect URI is a public
-endpoint: an attacker who intercepts an authorization code cannot exchange it without the
-verifier, which never left this service.
-
-**`state`** is stored server-side with a ten minute TTL and spent exactly once, by a
-conditional delete. A cookie-based double submit would be the other option and is weaker in
-the way that matters: the callback arrives as a top-level cross-site navigation from the
-provider, so a `SameSite=Lax` cookie is sent but a `SameSite=Strict` one is not, and the
-state cookie therefore has to be readable on exactly the request an attacker would forge.
-A server-side row has no such trade-off, and it is the only place a PKCE verifier can live
-anyway.
-
-**`nonce`** is Google's, because Google returns an ID token and an ID token replayed from
-another session is the attack `nonce` exists to stop. It is generated with the state, stored
-on the state row, and compared against the `nonce` claim after signature verification.
-GitHub returns no ID token, so it has no nonce.
-
-## How the provider's answer is verified
-
-Google's ID token is a JWT signed by Google, and it is verified properly: the signature
-against Google's published JWKS, then `iss`, `aud`, `exp` and `nonce`. Verifying an ID token
-by decoding it without checking the signature is the classic OAuth mistake, and it turns the
-whole flow into "anybody who can reach the callback is anybody they say they are".
-
-GitHub has no ID token. Its access token is opaque, so identity comes from two authenticated
-calls: `GET /user` for the account, and `GET /user/emails` for the addresses, because the
-`email` on `/user` is the public profile email, which may be absent, may be unverified, and
-is chosen by the user. `/user/emails` is the only source that says `verified` and `primary`,
-and the verified-email branch below depends on that distinction being real.
-
-## Auto-link, and the one rule the whole design rests on
-
-Section 3.4 calls the email-match branch the dangerous one, and section 10's threat table
-lists "account takeover via OAuth" against exactly it. The locked decision for this
-milestone is the strict reading:
-
-> Auto-link an OAuth identity to an existing account **only** when both the provider email
-> and the account email are verified. Otherwise, refuse and require the account password:
-> the user signs in locally and links from their settings page.
-
-Both halves are load-bearing and they fail in different directions:
-
-- **Provider email unverified**: the provider is asserting an address the user typed and
-  nobody checked. Linking on it means registering a GitHub account with somebody else's
-  address takes over their account.
-- **Local account email unverified**: the local record's address was never proved either, so
-  matching a provider-verified address against it proves the provider owns the address and
-  says nothing about who owns the account. An attacker who registered locally with a
-  victim's address, unverified, would have that account handed the victim's real Google
-  identity, which is takeover in the other direction.
-
-When either side is unverified the callback answers `OAUTH_EMAIL_UNVERIFIED` (section 7.3
-lists that code) and nothing is written. There is no partial state to clean up: the state row
-is already spent, and the user starts again after signing in locally.
-
-**A provider identity with no matching local account is a registration**, which is the
-`create_user` hook, exactly as password registration is. `email_verified` is passed through
-from the provider, so a Google user who verified with Google does not then have to verify
-with the product.
-
-## Unlink refuses to leave an account with no way in
-
-Removing the last sign-in method locks a user out of their own account permanently, and the
-account is then unreachable by any support path this design has. So `unlink` counts what
-would remain: other OAuth links, a password credential, and passkeys. Only if something
-remains does it delete.
-
-The password is a `CredentialStore` lookup, which this module already has. Passkeys are M5's
-and are not knowable here, so they arrive through a hook: `has_other_sign_in_method`, added
-to `IdentityHooks` with a **default of `False`**, so every existing hooks class keeps
-type-checking and keeps working. `False` is the safe default in the one direction that
-matters: a product that has not implemented it can only ever be told "no extra methods",
-which makes `unlink` refuse more often than strictly necessary, never less. A default of
-`True` would let a product that forgot the hook delete its users' last credential.
+Synchronous and free of FastAPI; the routes live in `oauth_routes.py`. Auto-link attaches an
+identity to an existing account only when both emails are verified.
 """
 
 from __future__ import annotations
@@ -111,7 +18,7 @@ from urllib.parse import urlencode, urlsplit
 from webbpulse.dynamodb import now_iso, ttl_in
 from webbpulse.identity.storage import constant_time_equals, is_expired
 
-if TYPE_CHECKING:  # pragma: no cover - typing only
+if TYPE_CHECKING:  # pragma: no cover
     from collections.abc import Mapping
 
     from webbpulse.dynamodb import Repository
@@ -149,53 +56,25 @@ __all__ = [
 
 _log = logging.getLogger(__name__)
 
-#: Logical table names, as `webbpulse.dynamodb.table_name` expects them. Hyphenated to match
-#: the estate's naming, the same convention `storage.py` follows for its six.
 OAUTH_STATES_TABLE: Final = "oauth-states"
 OAUTH_LINKS_TABLE: Final = "oauth-links"
 
-#: The GSI on `oauth-links` that answers "every link for this user", which `list` and the
-#: last-method count in `unlink` both need.
-#:
-#: A GSI rather than a second store keyed on `user_id`, and the choice is worth recording.
-#: A second table would need both rows written and deleted in step, and DynamoDB gives no
-#: transaction across two tables without `TransactWriteItems`, which the `Repository` in this
-#: estate does not expose. Two rows that can disagree is exactly the state where a user has
-#: an orphaned link that `unlink` cannot find and `list` still shows. The GSI cannot
-#: disagree with its base table: DynamoDB maintains it. The price is that it is eventually
-#: consistent, which is why every read that must be exact goes to the base table by primary
-#: key and the index is used only where a slightly stale list is acceptable. The one place
-#: that is **not** acceptable is the last-method count in `unlink`, and that path re-reads
-#: the base table for each candidate before counting it. See `OAuthService.unlink`.
 OAUTH_LINK_USER_INDEX: Final = "user_id-index"
 
-#: Section 4.3: ten minutes. Long enough for a user to work through a provider's consent
-#: screen and an interstitial account chooser, short enough that an abandoned state is not
-#: sitting around to be guessed.
 OAUTH_STATE_TTL_SECONDS: Final = 600
 
-#: Provider names, matching `IdentitySettings.oauth_providers`.
 GOOGLE_PROVIDER: Final = "google"
 GITHUB_PROVIDER: Final = "github"
 
-#: What the state row records about why the flow was started. A callback cannot be replayed
-#: into the other meaning, which is section 3.4's reason for the field: a `link` callback
-#: carries an authenticated user id and a `login` one must never acquire it.
 type OAuthMode = Literal["login", "link"]
 
-#: The `amr` value for a login that came from a provider rather than from a password. Not an
-#: RFC 8176 registered value, for the same reason `AMR_RECOVERY` is not: RFC 8176 has no
-#: value for "federated through a specific provider", and reusing `pwd` would make a policy
-#: that asserts on `amr` unable to tell a password login from a Google one.
 AMR_OAUTH: Final = "oauth"
 
 
 class OAuthRejected(Exception):
     """An OAuth start, callback, link or unlink was refused.
 
-    Same shape as `LoginRejected` and `MfaRejected`, so the router renders all three
-    identically: a `message` the caller may show and an `error_code` the frontend branches
-    on. Section 7.3 lists `OAUTH_EMAIL_UNVERIFIED` as one the frontend must handle by name.
+    Same shape as `LoginRejected` and `MfaRejected` so the router renders all three alike.
     """
 
     def __init__(
@@ -205,23 +84,18 @@ class OAuthRejected(Exception):
         error_code: str = "OAUTH_FAILED",
         status_code: int = 400,
     ) -> None:
+        """Record the refusal message, its error code and the status to answer with."""
         super().__init__(message)
         self.message = message
         self.error_code = error_code
         self.status_code = status_code
 
 
-# ---------------------------------------------------------------------------
-# The HTTP seam
-# ---------------------------------------------------------------------------
-
-
 @dataclass(frozen=True, slots=True)
 class HttpResponse:
     """Just enough of a response for this module: the status and the parsed JSON body.
 
-    A structural minimum rather than a wrapper around `httpx.Response`, so a test can build
-    one directly and so nothing here depends on a client library's response type.
+    Deliberately not a wrapper around `httpx.Response`, so a test can build one directly.
     """
 
     status_code: int
@@ -229,14 +103,14 @@ class HttpResponse:
 
     @property
     def ok(self) -> bool:
+        """Whether the status is a 2xx."""
         return 200 <= self.status_code < 300
 
 
 class HttpClient(Protocol):
     """The two calls this module makes against a provider.
 
-    A Protocol rather than a class, so `HttpxClient` and a test double satisfy it without
-    inheritance, matching how `IdentityHooks` is defined.
+    A Protocol, so `HttpxClient` and a test double satisfy it without inheritance.
     """
 
     def post_form(
@@ -253,25 +127,17 @@ class HttpClient(Protocol):
 class HttpxClient:
     """`HttpClient` over `httpx`, built once and reused.
 
-    `httpx` rather than `urllib.request`, which is what `tests/test_identity_contract.py`
-    deliberately uses: that file is a read-only probe with no dependencies, and this is a
-    request path where connection reuse across a warm Lambda and a real timeout on every
-    call are both worth a dependency. The `oauth` extra declares it.
-
-    **A timeout on every call is the point.** `httpx`'s default is five seconds, and this
-    sets it explicitly anyway, because a provider that hangs would otherwise hold a Lambda
-    execution environment open until the function's own timeout and turn a provider incident
-    into an availability incident here.
-
-    Constructed lazily, so importing this module needs no `httpx` and a product that mounts
-    no OAuth routes does not install the extra.
+    Sets an explicit timeout on every call, and builds the client lazily so importing this
+    module needs no `httpx`.
     """
 
     def __init__(self, *, timeout: float = 10.0, client: Any = None) -> None:
+        """Hold the per-call timeout, and an already-built client when one is supplied."""
         self._timeout = timeout
         self._client = client
 
     def _require(self) -> Any:
+        """Build the `httpx` client on first use, and return it thereafter."""
         if self._client is None:
             import httpx
 
@@ -281,10 +147,12 @@ class HttpxClient:
     def post_form(
         self, url: str, *, data: Mapping[str, str], headers: Mapping[str, str]
     ) -> HttpResponse:
+        """Post an `application/x-www-form-urlencoded` body."""
         response = self._require().post(url, data=dict(data), headers=dict(headers))
         return _response_from(response)
 
     def get_json(self, url: str, *, headers: Mapping[str, str]) -> HttpResponse:
+        """Fetch a JSON document."""
         response = self._require().get(url, headers=dict(headers))
         return _response_from(response)
 
@@ -292,9 +160,7 @@ class HttpxClient:
 def _response_from(response: Any) -> HttpResponse:
     """Read a client library's response into this module's own shape.
 
-    A body that is not JSON becomes `None` rather than raising: a provider answering an
-    error page instead of a JSON error is a real condition, and the caller turns a missing
-    field into an `OAuthRejected` with a message that does not quote the provider's HTML.
+    A body that is not JSON becomes `None` rather than raising.
     """
     try:
         body = response.json()
@@ -303,56 +169,27 @@ def _response_from(response: Any) -> HttpResponse:
     return HttpResponse(status_code=int(response.status_code), json_body=body)
 
 
-# ---------------------------------------------------------------------------
-# Provider metadata
-# ---------------------------------------------------------------------------
-
-
 @dataclass(frozen=True, slots=True)
 class OAuthProviderConfig:
     """Everything that differs between one provider and the next, in one place.
 
-    A table rather than an `if provider == "google"` at each step. The flow is genuinely the
-    same for both; what differs is four URLs, a scope string and three booleans, and keeping
-    them here means adding a third provider is a new entry rather than a new branch in five
-    functions.
+    A table rather than a branch per step, so a third provider is a new entry.
     """
 
     name: str
     authorize_url: str
     token_url: str
-    #: What a sign-in button says. Fixed here rather than left to each frontend, because a
-    #: provider's name is the provider's to spell: "GitHub" has a capital H and "Google" is
-    #: not "google", and three frontends inventing their own casing is three chances to get
-    #: a third party's trademark wrong. Served by `/oauth/providers` so a client renders the
-    #: button from the response rather than from a hardcoded table it has to keep in step.
     display_name: str = ""
-    #: Where a `sub` and an email come from when there is no ID token. Empty for a provider
-    #: whose ID token carries both.
     userinfo_url: str = ""
-    #: GitHub's separate verified-addresses endpoint. Empty for a provider without one.
     emails_url: str = ""
-    #: The JWKS an ID token's signature is checked against. Empty for a provider that
-    #: returns no ID token.
     jwks_url: str = ""
-    #: The `iss` an ID token must carry. Google publishes two spellings and accepts either.
     id_token_issuers: tuple[str, ...] = ()
     scope: str = ""
-    #: Whether the provider honours PKCE. See the module docstring: sending a challenge to a
-    #: provider that ignores it proves nothing on the exchange.
     supports_pkce: bool = False
-    #: Whether the provider returns an OIDC ID token, and therefore takes a `nonce`.
     returns_id_token: bool = False
-    #: Extra fixed parameters on the authorization URL.
     extra_authorize_params: Mapping[str, str] = field(default_factory=dict)
 
 
-#: Google's endpoints are the ones its discovery document publishes. They are hardcoded
-#: rather than fetched from `https://accounts.google.com/.well-known/openid-configuration`
-#: at request time, deliberately: a discovery fetch on the login path adds a round trip to
-#: every sign-in and a third party outage to a flow that would otherwise still work from
-#: cache, and these four URLs have been stable for a decade. A rotation of Google's *keys* is
-#: handled, because the JWKS itself is fetched per verification.
 PROVIDERS: Final[Mapping[str, OAuthProviderConfig]] = {
     GOOGLE_PROVIDER: OAuthProviderConfig(
         name=GOOGLE_PROVIDER,
@@ -364,8 +201,6 @@ PROVIDERS: Final[Mapping[str, OAuthProviderConfig]] = {
         scope="openid email profile",
         supports_pkce=True,
         returns_id_token=True,
-        # `select_account` so a shared machine does not silently sign in whoever the browser
-        # last authenticated, which is a real account-mixing hazard rather than a nicety.
         extra_authorize_params={"prompt": "select_account"},
     ),
     GITHUB_PROVIDER: OAuthProviderConfig(
@@ -375,8 +210,6 @@ PROVIDERS: Final[Mapping[str, OAuthProviderConfig]] = {
         token_url="https://github.com/login/oauth/access_token",
         userinfo_url="https://api.github.com/user",
         emails_url="https://api.github.com/user/emails",
-        # `user:email` rather than `user`: the flow needs the addresses and nothing else, and
-        # the broader scope would grant profile write access this design never uses.
         scope="read:user user:email",
         supports_pkce=False,
         returns_id_token=False,
@@ -387,33 +220,17 @@ PROVIDERS: Final[Mapping[str, OAuthProviderConfig]] = {
 def provider_account_key(provider: str, subject: str) -> str:
     """The `oauth-links` partition key: `"<provider>#<subject>"`.
 
-    Section 4.2 fixes this spelling, and CarModPicker's existing `oauth_accounts` rows carry
-    the same one, so a migration is a copy rather than a transform.
-
-    The provider is part of the key because a subject is only unique within its provider:
-    Google and GitHub both hand out small numeric ids, and a bare subject would let a GitHub
-    account collide with a Google one and inherit its user.
+    The provider is part of the key because a subject is only unique within its provider.
     """
     return f"{provider}#{subject}"
-
-
-# ---------------------------------------------------------------------------
-# Records
-# ---------------------------------------------------------------------------
 
 
 @dataclass(frozen=True, slots=True)
 class OAuthStateRecord:
     """One in-flight authorization, written before the redirect and spent by the callback.
 
-    Holds the PKCE verifier, which is the one value that must never reach the browser, and
-    the `nonce` the ID token is checked against. `mode` and `user_id` together are what stop
-    a login callback being replayed as a link: a `login` row carries no user id, so there is
-    no account for a replay to attach to.
-
-    `return_to` is where the frontend is sent afterwards. It is validated against the
-    redirect allow-list **when it is stored**, not when it is used, so a rejected value never
-    reaches the table and a stored row is safe to redirect to without re-checking.
+    Holds the PKCE verifier and the nonce, which never reach the browser. `return_to` is
+    validated against the allow-list when it is stored, so a stored row is safe to use.
     """
 
     state: str
@@ -424,11 +241,7 @@ class OAuthStateRecord:
     pkce_verifier: str = ""
     nonce: str = ""
     return_to: str = ""
-    #: The authenticated subject that started a `link`. Empty for a `login`.
     user_id: str = ""
-    #: The exact `redirect_uri` sent to the provider. Stored because the token exchange must
-    #: send back a byte-identical value or the provider refuses it, and because a service
-    #: behind more than one host would otherwise recompute a different one on the callback.
     redirect_uri: str = ""
 
 
@@ -436,14 +249,7 @@ class OAuthStateRecord:
 class OAuthLinkRecord:
     """One provider identity attached to one local user.
 
-    The field names match CarModPicker's `oauth_accounts` rows so that migrating is a copy
-    with a renamed key attribute rather than a transform, and section 4.2's `oauth_links`
-    adds `provider_email`, `provider_email_verified` and `linked_at` to that shape.
-
-    **No provider tokens are stored.** Neither the access token nor the refresh token from
-    the provider is written down: this design consumes a provider as an identity source, and
-    it never calls a provider API on the user's behalf afterwards. Storing a token nobody
-    spends is a stored credential with no use, which is all cost.
+    No provider tokens are stored: a provider is consumed as an identity source only.
     """
 
     provider_subject: str
@@ -460,9 +266,8 @@ class OAuthLinkRecord:
 class OAuthIdentity:
     """What a provider said about the person who just authenticated.
 
-    Normalised across the two providers, so the linking rules read the same for both.
-    `email_verified` is the field the whole auto-link decision turns on, and it is `False`
-    unless the provider positively asserted otherwise.
+    Normalised across providers. `email_verified` is `False` unless the provider positively
+    asserted otherwise, and the auto-link decision turns on it.
     """
 
     provider: str
@@ -473,6 +278,7 @@ class OAuthIdentity:
 
     @property
     def account_key(self) -> str:
+        """The `oauth-links` partition key for this identity."""
         return provider_account_key(self.provider, self.subject)
 
 
@@ -484,17 +290,10 @@ class OAuthAuthorization:
     state: str
 
 
-# ---------------------------------------------------------------------------
-# Stores
-# ---------------------------------------------------------------------------
-
-
 class OAuthStateStore(ABC):
     """The `oauth-states` table: hash `state`, TTL `expires_at`, ten minutes.
 
-    Single use is enforced by `consume`, which must be one conditional operation. A `get`
-    followed by a `delete` would let two callbacks carrying the same state both pass the
-    read before either deleted, which is precisely the replay the state exists to stop.
+    Single use is enforced by `consume`, which must be one conditional operation.
     """
 
     @abstractmethod
@@ -505,26 +304,22 @@ class OAuthStateStore(ABC):
     def consume(self, state: str) -> OAuthStateRecord | None:
         """Atomically spend a state and return it, or `None` if unknown or expired.
 
-        Expiry is checked here as well as by the table's TTL, for the reason every store in
-        this package checks it: DynamoDB deletes on its own schedule and an expired row is
-        readable for days. TTL is storage reclamation and never an access control.
+        Expiry is checked here as well as by the table TTL, which is storage reclamation
+        rather than an access control.
         """
 
 
 class OAuthLinkStore(ABC):
     """The `oauth-links` table: hash `provider_subject`, GSI `user_id-index`, no TTL ever.
 
-    Never a TTL. A link is a sign-in method, and a sign-in method that expires on a schedule
-    locks a user out of an account they can still see, which is the same rule the M4 tables
-    follow and for the sharper version of the same reason.
+    Never a TTL: a sign-in method that expires on a schedule locks a user out.
     """
 
     @abstractmethod
     def get(self, provider_subject: str) -> OAuthLinkRecord | None:
         """The link for a `"<provider>#<subject>"` key, or `None`.
 
-        On the login path this must be a strongly consistent read of the base table: a user
-        who just linked and immediately signs in must not be told their identity is unknown.
+        Must be a strongly consistent read of the base table, since it gates a sign-in.
         """
 
     @abstractmethod
@@ -543,13 +338,8 @@ class OAuthLinkStore(ABC):
     def claim(self, record: OAuthLinkRecord) -> bool:
         """Write a link only if that provider identity is not already attached to somebody.
 
-        Conditional, and the condition is the security control rather than a nicety. Two
-        concurrent callbacks for the same provider identity must not both succeed, and only
-        the database can settle that; a read-then-write would let the second overwrite the
-        first and silently move a provider identity from one local account to another.
-
-        Returns `False` when the key already exists, which the caller reads as "already
-        linked" and answers without saying whose account it is attached to.
+        The condition is the security control: two concurrent callbacks for one identity
+        must not both succeed. Returns `False` when the key already exists.
         """
 
 
@@ -557,12 +347,15 @@ class InMemoryOAuthStateStore(OAuthStateStore):
     """Dict-backed `OAuthStateStore`, with the same single-use and expiry semantics."""
 
     def __init__(self) -> None:
+        """Start with an empty state table."""
         self._items: dict[str, OAuthStateRecord] = {}
 
     def put(self, record: OAuthStateRecord) -> None:
+        """Write a fresh state."""
         self._items[record.state] = record
 
     def consume(self, state: str) -> OAuthStateRecord | None:
+        """Spend a state, returning `None` when it is unknown or expired."""
         record = self._items.pop(state, None)
         if record is None or is_expired(record.expires_at):
             return None
@@ -573,21 +366,27 @@ class InMemoryOAuthLinkStore(OAuthLinkStore):
     """Dict-backed `OAuthLinkStore`, keyed as the table is."""
 
     def __init__(self) -> None:
+        """Start with an empty link table."""
         self._items: dict[str, OAuthLinkRecord] = {}
 
     def get(self, provider_subject: str) -> OAuthLinkRecord | None:
+        """The link for a provider-subject key, or `None`."""
         return self._items.get(provider_subject)
 
     def put(self, record: OAuthLinkRecord) -> None:
+        """Write or replace a link."""
         self._items[record.provider_subject] = record
 
     def list_for_user(self, user_id: str) -> list[OAuthLinkRecord]:
+        """Every link for a user."""
         return [record for record in self._items.values() if record.user_id == user_id]
 
     def delete(self, provider_subject: str) -> None:
+        """Remove a link, tolerating an absent one."""
         self._items.pop(provider_subject, None)
 
     def claim(self, record: OAuthLinkRecord) -> bool:
+        """Write a link only if that provider identity is not already attached."""
         if record.provider_subject in self._items:
             return False
         self._items[record.provider_subject] = record
@@ -597,14 +396,15 @@ class InMemoryOAuthLinkStore(OAuthLinkStore):
 class DynamoOAuthStateStore(OAuthStateStore):
     """`OAuthStateStore` over a `webbpulse.dynamodb.Repository`.
 
-    Takes the repository rather than building one, exactly as every other Dynamo store in
-    this package does, so the caller owns the table name, the prefix and the region.
+    Takes the repository rather than building one, so the caller owns the table name.
     """
 
     def __init__(self, repository: Repository) -> None:
+        """Hold the repository the state rows are read from and written to."""
         self._repo = repository
 
     def put(self, record: OAuthStateRecord) -> None:
+        """Write a fresh state row."""
         self._repo.put(
             {
                 "state": record.state,
@@ -623,10 +423,8 @@ class DynamoOAuthStateStore(OAuthStateStore):
     def consume(self, state: str) -> OAuthStateRecord | None:
         """Spend the row with a conditional delete that returns what it deleted.
 
-        `ReturnValues=ALL_OLD` on a `DeleteItem` is what makes this one operation rather
-        than two: the row is gone and its contents are in the response, so a second callback
-        carrying the same state finds nothing. Doing it as `get` then `delete` would let two
-        concurrent callbacks both read the verifier before either delete landed.
+        `ReturnValues=ALL_OLD` makes this one operation, so a second callback carrying the
+        same state finds nothing.
         """
         from botocore.exceptions import ClientError
 
@@ -645,8 +443,6 @@ class DynamoOAuthStateStore(OAuthStateStore):
         if not item:
             return None
         record = _state_from_item(item)
-        # Expired rows are deleted above and then refused here. Deleting an expired state is
-        # correct either way: it was single use and it is now spent.
         return None if is_expired(record.expires_at) else record
 
 
@@ -654,23 +450,22 @@ class DynamoOAuthLinkStore(OAuthLinkStore):
     """`OAuthLinkStore` over a `webbpulse.dynamodb.Repository`, with the `user_id-index` GSI."""
 
     def __init__(self, repository: Repository) -> None:
+        """Hold the repository the link rows are read from and written to."""
         self._repo = repository
 
     def get(self, provider_subject: str) -> OAuthLinkRecord | None:
-        # Consistent, because this read decides whether a sign-in succeeds and an eventually
-        # consistent miss reads as "we do not know you" to somebody who linked a moment ago.
+        """The link for a provider-subject key, read consistently from the base table."""
         item = self._repo.get({"provider_subject": provider_subject}, consistent=True)
         return _link_from_item(item) if item is not None else None
 
     def put(self, record: OAuthLinkRecord) -> None:
+        """Write or replace a link."""
         self._repo.put(_link_to_item(record))
 
     def list_for_user(self, user_id: str) -> list[OAuthLinkRecord]:
+        """Every link for a user, from the GSI, so it may be slightly stale."""
         from boto3.dynamodb.conditions import Key as KeyCondition
 
-        # No `consistent=True`: a GSI cannot be read consistently at all, which is the one
-        # real cost of choosing an index over a second table. Callers that need an exact
-        # answer re-read the base table per key. See `OAuthService.unlink`.
         return [
             _link_from_item(item)
             for item in self._repo.iter_query(
@@ -679,9 +474,11 @@ class DynamoOAuthLinkStore(OAuthLinkStore):
         ]
 
     def delete(self, provider_subject: str) -> None:
+        """Remove a link, tolerating an absent one."""
         self._repo.delete({"provider_subject": provider_subject})
 
     def claim(self, record: OAuthLinkRecord) -> bool:
+        """Conditionally write a link, returning `False` when the key already exists."""
         from boto3.dynamodb.conditions import Attr
         from botocore.exceptions import ClientError
 
@@ -698,6 +495,7 @@ class DynamoOAuthLinkStore(OAuthLinkStore):
 
 
 def _link_to_item(record: OAuthLinkRecord) -> dict[str, Any]:
+    """Render a link record as the item shape the table stores."""
     return {
         "provider_subject": record.provider_subject,
         "provider": record.provider,
@@ -711,12 +509,7 @@ def _link_to_item(record: OAuthLinkRecord) -> dict[str, Any]:
 
 
 def _state_from_item(item: Mapping[str, Any]) -> OAuthStateRecord:
-    """Read a state row defensively, as every mapper in this package does.
-
-    A row written by an older version of this module during a rolling deploy is a normal
-    condition rather than a corrupt one, and a `KeyError` on a field added last release would
-    turn that into a 500 on the callback path.
-    """
+    """Read a state row defensively, so a row written by an older version still loads."""
     mode = str(item.get("mode", "login"))
     return OAuthStateRecord(
         state=str(item["state"]),
@@ -733,6 +526,7 @@ def _state_from_item(item: Mapping[str, Any]) -> OAuthStateRecord:
 
 
 def _link_from_item(item: Mapping[str, Any]) -> OAuthLinkRecord:
+    """Read a link row into an `OAuthLinkRecord`."""
     return OAuthLinkRecord(
         provider_subject=str(item["provider_subject"]),
         provider=str(item.get("provider", "")),
@@ -745,55 +539,26 @@ def _link_from_item(item: Mapping[str, Any]) -> OAuthLinkRecord:
     )
 
 
-# ---------------------------------------------------------------------------
-# PKCE
-# ---------------------------------------------------------------------------
-
-
 def _b64url(raw: bytes) -> str:
     """base64url with no padding, which is what RFC 7636 and JWS both want."""
     return base64.urlsafe_b64encode(raw).rstrip(b"=").decode("ascii")
 
 
 def new_pkce_verifier() -> str:
-    """A fresh RFC 7636 code verifier: 43 to 128 characters from the unreserved set.
-
-    32 bytes base64url-encoded is 43 characters, which is the RFC's minimum length and
-    carries 256 bits. Longer buys nothing: the verifier is compared for equality, not
-    searched, so entropy beyond the point of unguessability is only bytes on the wire.
-    """
+    """A fresh RFC 7636 code verifier: 32 bytes base64url, the RFC's minimum length."""
     return _b64url(secrets.token_bytes(32))
 
 
 def pkce_challenge(verifier: str) -> str:
-    """The `S256` challenge for a verifier: base64url of its SHA-256.
-
-    `S256` and never `plain`. RFC 7636 permits `plain`, where the challenge *is* the
-    verifier, which protects against nothing at all if the authorization request can be
-    observed, and observing it is the threat the whole mechanism exists for.
-    """
+    """The `S256` challenge for a verifier: base64url of its SHA-256, never `plain`."""
     return _b64url(hashlib.sha256(verifier.encode("ascii")).digest())
-
-
-# ---------------------------------------------------------------------------
-# The service
-# ---------------------------------------------------------------------------
 
 
 class OAuthService:
     """Provider start, callback, link, list and unlink, with no FastAPI in sight.
 
-    Built once per execution environment from settings, hooks and the two stores, and holds
-    no request state. `oauth_routes.register_oauth_routes` is the only caller in this
-    package; a product may call it directly.
-
-    `client_secrets` is a mapping from provider name to that provider's client secret,
-    supplied by the composition root from `webbpulse.config.load_json_secret` under the keys
-    section 5.8 names, `google_client_secret` and `github_client_secret`. It is **not** a
-    settings field, for the reason `IdentitySettings` gives in its own docstring: a secret
-    that is a settings field is a secret that ends up in a `repr`, a validation error and a
-    log line. Nothing in this module logs the value, and every code path that fails with a
-    wrong secret reports the provider's status code rather than what was sent.
+    Built once per execution environment and holds no request state. `client_secrets` is
+    kept out of settings so a secret never reaches a `repr` or a log line.
     """
 
     def __init__(
@@ -807,6 +572,7 @@ class OAuthService:
         client_secrets: Mapping[str, str] | None = None,
         http_client: HttpClient | None = None,
     ) -> None:
+        """Hold the settings, hooks, stores, client secrets and HTTP client to use."""
         self._settings = settings
         self._hooks = hooks
         self._states = states
@@ -815,33 +581,18 @@ class OAuthService:
         self._secrets = dict(client_secrets or {})
         self._http = http_client if http_client is not None else HttpxClient()
 
-    # ---- provider and configuration -------------------------------------------------
-
     def enabled_providers(self) -> list[str]:
         """The providers this product has both switched on and given a client id.
 
-        Both halves matter. A provider listed in `oauth_providers` with an empty client id
-        is a misconfiguration whose symptom is a redirect to a provider error page, and it
-        is better for the route not to exist than for it to hand the user to Google with no
-        `client_id`.
+        This is what decides whether the routes mount at all.
         """
         return [name for name in self._settings.oauth_providers if self._client_id(name)]
 
     def available_providers(self) -> list[OAuthProviderConfig]:
         """The providers a sign-in button should actually be drawn for.
 
-        Stricter than `enabled_providers`, and the difference is the whole point of this
-        method. `enabled_providers` asks whether a provider has a client id, which is what
-        decides whether the *routes* mount. This asks whether the provider can complete a
-        sign-in, which additionally needs the client secret: without it the start route
-        redirects the user to the provider, the user consents, and the flow then dies at the
-        token exchange with a 503. A provider that will fail at the last step is worse than
-        one that is simply not offered, so it is not advertised here and, since 0.16.0,
-        `start` refuses it up front rather than mounting a doomed redirect.
-
-        Returned in the order `PROVIDERS` defines, Google then GitHub, rather than in the
-        order the settings list happens to be written in, so a frontend rendering the
-        buttons in response order gets the same layout in every environment.
+        Stricter than `enabled_providers`: a provider also needs a client secret to complete
+        a sign-in. Returned in the order `PROVIDERS` defines, so the layout is stable.
         """
         return [
             config
@@ -856,6 +607,7 @@ class OAuthService:
         return bool(self._secrets.get(provider, ""))
 
     def _provider(self, provider: str) -> OAuthProviderConfig:
+        """The config for an enabled provider, refusing an unknown or disabled one."""
         config = PROVIDERS.get(provider)
         if config is None or provider not in self.enabled_providers():
             raise OAuthRejected(
@@ -866,6 +618,7 @@ class OAuthService:
         return config
 
     def _client_id(self, provider: str) -> str:
+        """The configured client id for a provider, or an empty string."""
         if provider == GOOGLE_PROVIDER:
             return self._settings.google_client_id
         if provider == GITHUB_PROVIDER:
@@ -873,11 +626,13 @@ class OAuthService:
         return ""
 
     def _client_secret(self, provider: str) -> str:
+        """The client secret for a provider, refusing with a 503 when none is configured.
+
+        The refusal deliberately says nothing about how the service is configured; the
+        detail goes to the log line instead.
+        """
         secret = self._secrets.get(provider, "")
         if not secret:
-            # Deliberately not "the google_client_secret key is missing from the app secret",
-            # which is a true sentence that also tells an anonymous caller how this service
-            # is configured. The operator gets the detail in the log line below.
             _log.error(
                 "No OAuth client secret configured.",
                 extra={"event": "oauth.misconfigured", "provider": provider},
@@ -888,8 +643,6 @@ class OAuthService:
                 status_code=503,
             )
         return secret
-
-    # ---- start ----------------------------------------------------------------------
 
     def start(
         self,
@@ -902,24 +655,10 @@ class OAuthService:
     ) -> OAuthAuthorization:
         """Mint a state, write it, and build the URL the browser is redirected to.
 
-        The row is written **before** the URL is returned, for the reason
-        `MfaService.issue_challenge` writes its row first: a state the table does not know
-        cannot be spent, so a failed write is a sign-in the user retries rather than a
-        callback that arrives with nothing to check it against.
-
-        `redirect_uri` is checked against the allow-list here. An unvalidated redirect URI is
-        the open-redirect half of an OAuth flow, and checking it at the point it enters the
-        table means the callback can use the stored value without re-deriving trust.
+        The row is written first and `redirect_uri` is checked against the allow-list here,
+        so the callback can trust the stored value. A missing client secret refuses up front.
         """
         config = self._provider(provider)
-        # Refuse a provider whose secret is missing *here*, before the redirect, rather than
-        # letting it fail at the token exchange. New in 0.16.0. Until then a provider with a
-        # client id and no secret mounted, redirected the user to Google, collected their
-        # consent, and only then answered 503 on the way back, which spends a real person's
-        # attention on a configuration error and leaves an unusable button on the sign-in
-        # page. `_client_secret` raises `OAUTH_PROVIDER_UNAVAILABLE` with a 503 and logs the
-        # detail for the operator; the value itself is discarded, and the exchange reads it
-        # again later rather than carrying it through the state row.
         self._client_secret(provider)
         if mode == "link" and not user_id:
             raise OAuthRejected("Sign in first.", error_code="NOT_AUTHENTICATED", status_code=401)
@@ -972,11 +711,8 @@ class OAuthService:
     def _resolve_redirect_uri(self, requested: str) -> str:
         """The redirect URI to send, checked against the allow-list.
 
-        Empty means "the default", which is the issuer plus the callback path, and that is
-        the ordinary case: a product with one host never configures a list at all. A
-        non-empty value must appear in `oauth_redirect_uris` **exactly**, string equality and
-        not a prefix match, because a prefix match on `https://app.example.com` also admits
-        `https://app.example.com.attacker.test`.
+        Empty means the issuer plus the callback path. A non-empty value must appear in
+        `oauth_redirect_uris` exactly, by string equality and never a prefix match.
         """
         default = f"{self._settings.issuer}/oauth/callback"
         allowed = list(self._settings.oauth_redirect_uris)
@@ -993,20 +729,13 @@ class OAuthService:
     def _resolve_return_to(self, requested: str) -> str:
         """Where the frontend is sent after the callback, constrained to the frontend.
 
-        A `return_to` echoed back into a `Location` header with no check is an open redirect
-        that a phishing page reaches through this product's own domain, which is worth more
-        to an attacker than a domain they own. Two forms are accepted: a path, which is
-        resolved against `frontend_base_url`, and an absolute URL that is exactly under
-        `frontend_base_url`'s origin. Anything else falls back to the frontend root rather
-        than raising, because a bad `return_to` is a broken link and not an attack the user
-        should be shown an error for.
+        Accepts a path resolved against `frontend_base_url`, or an absolute URL on that same
+        origin. Anything else, a scheme-relative `//host` included, falls back to the root.
         """
         base = self._settings.frontend_base_url
         if not requested:
             return base
         if requested.startswith("/") and not requested.startswith("//"):
-            # `//host` is a scheme-relative URL and is a redirect off-site, so it is refused
-            # here alongside anything absolute that is not ours.
             return f"{base}{requested}"
         if base:
             base_parts = urlsplit(base)
@@ -1015,25 +744,11 @@ class OAuthService:
                 return requested
         return base
 
-    # ---- callback -------------------------------------------------------------------
-
     def consume_state(self, state: str, *, provider: str = "") -> OAuthStateRecord:
         """Spend a state exactly once, and return what it recorded.
 
-        The row is the authority on which provider the flow belongs to, which is why
-        `provider` is optional. The single shared callback route has no provider in its path
-        to pass, and that is the safer arrangement rather than a gap: the provider then comes
-        from a server-side, single-use row instead of from a path segment the caller writes.
-
-        A caller that *does* know the provider, such as a per-provider callback a product
-        mounts itself, passes it and gets the equality check. It is a constant-time
-        comparison for consistency with every other comparison in this package, though the
-        entropy here is in the state itself, which the store has already spent.
-
-        Every failure answers identically. Whether a state was unknown, expired, already
-        spent or belonged to a different provider is information about somebody else's
-        sign-in attempt, and distinguishing them would confirm to anyone guessing values that
-        a guess had found a real row.
+        The row is the authority on which provider the flow belongs to, so `provider` is
+        optional and only cross-checked when given. Every failure answers identically.
         """
         if not state:
             raise OAuthRejected(
@@ -1058,10 +773,8 @@ class OAuthService:
     ) -> OAuthIdentity:
         """Exchange the code and turn the provider's answer into an `OAuthIdentity`.
 
-        One method rather than two because the two providers diverge at exactly this point
-        and a caller should not have to know which branch it is on: Google's identity comes
-        out of a verified ID token in the token response, and GitHub's comes from two
-        authenticated calls made with the access token.
+        One method, so a caller need not know whether the identity comes from a verified ID
+        token or from authenticated userinfo calls.
         """
         config = self._provider(provider)
         token_body = self._token_body(provider, code=code, state_record=state_record)
@@ -1076,12 +789,7 @@ class OAuthService:
     def _token_body(
         self, provider: str, *, code: str, state_record: OAuthStateRecord
     ) -> Mapping[str, Any]:
-        """Trade the authorization code for the provider's token response.
-
-        Returns the whole body rather than just the access token, because Google's
-        `id_token` arrives in the same response and splitting the two would mean either two
-        return values or a second round trip for something already in hand.
-        """
+        """Trade the authorization code for the provider's whole token response body."""
         config = self._provider(provider)
         if not code:
             raise OAuthRejected(
@@ -1121,16 +829,8 @@ class OAuthService:
     def _signing_key_for(self, config: OAuthProviderConfig, id_token: str) -> Any:
         """Find the provider's public key for this token, fetching the JWKS ourselves.
 
-        `PyJWKClient` would do this in one line, but it fetches with `urllib.request` and no
-        timeout, which is the one thing `HttpxClient` exists to prevent: a provider that
-        accepts the connection and never answers would hold a Lambda execution environment
-        open until the function times out. Going through `self._http` puts the JWKS fetch
-        under the same timeout as the token exchange and the userinfo call, and puts it on
-        the same seam a test can mock.
-
-        The set is fetched per verification rather than cached. A cache would need an
-        invalidation path for the key rotation it exists to survive, and one extra HTTPS
-        call on a flow that already makes two is not where this endpoint's latency is.
+        Fetched through `self._http` so the call carries a timeout, and per verification so a
+        key rotation needs no invalidation. An unpublished `kid` is refused.
         """
         import jwt
 
@@ -1155,8 +855,6 @@ class OAuthService:
             if isinstance(entry, dict) and str(entry.get("kid", "")) == kid:
                 return jwt.PyJWK.from_dict(dict(entry)).key
 
-        # No matching `kid`. Refusing rather than trying every key: a token whose header
-        # names a key the provider does not publish is not a token the provider signed.
         raise OAuthRejected(
             "That sign-in could not be completed. Try again.",
             error_code="OAUTH_ID_TOKEN_INVALID",
@@ -1165,13 +863,10 @@ class OAuthService:
     def _identity_from_id_token(
         self, config: OAuthProviderConfig, id_token: str, *, nonce: str
     ) -> OAuthIdentity:
-        """Verify an OIDC ID token properly, then read the identity out of its claims.
+        """Verify an OIDC ID token, then read the identity out of its claims.
 
-        Properly means: the signature against the provider's published JWKS, then `iss`
-        against the provider's own issuers, `aud` against this product's client id, `exp`
-        against the clock, and `nonce` against the one this flow generated. Skipping any of
-        them turns the ID token into an unauthenticated assertion, and skipping the
-        signature turns it into one an attacker writes.
+        Checks the signature against the published JWKS, then `iss`, `aud`, `exp` and, after
+        the signature and never before, the `nonce` this flow generated.
         """
         import jwt
 
@@ -1201,8 +896,6 @@ class OAuthService:
                 error_code="OAUTH_ID_TOKEN_INVALID",
             ) from exc
 
-        # The nonce is checked after the signature, never before: comparing a claim from an
-        # unverified token is comparing whatever the caller wrote.
         presented = str(claims.get("nonce", ""))
         if nonce and not constant_time_equals(presented, nonce):
             _log.warning(
@@ -1218,9 +911,6 @@ class OAuthService:
             provider=config.name,
             subject=str(claims.get("sub", "")),
             email=str(claims.get("email", "")).strip().lower(),
-            # Google spells it as a real boolean in the ID token, and a string in some older
-            # responses. `is True` would refuse the string form and `bool()` would accept the
-            # string "false", so both spellings are handled explicitly.
             email_verified=_as_bool(claims.get("email_verified")),
             name=str(claims.get("name", "")),
         )
@@ -1228,13 +918,10 @@ class OAuthService:
     def _identity_from_userinfo(
         self, config: OAuthProviderConfig, access_token: str
     ) -> OAuthIdentity:
-        """GitHub's identity: the account from `/user`, the verified address from `/user/emails`.
+        """GitHub's identity: the account from `/user`, the address from `/user/emails`.
 
-        The two calls are both needed. `/user` gives the immutable numeric `id`, which is the
-        subject, and its `email` field is the **public profile** address: user-chosen, often
-        absent, and never marked verified. `/user/emails` is the only endpoint that says
-        which address GitHub has confirmed, and the auto-link rule depends on that being a
-        real assertion rather than a field a user typed.
+        Both calls are needed: `/user` gives the immutable subject, and only `/user/emails`
+        says which address GitHub has actually confirmed.
         """
         headers = {
             "Authorization": f"Bearer {access_token}",
@@ -1269,13 +956,8 @@ class OAuthService:
     ) -> tuple[str, bool]:
         """The verified primary address, or the best available with `verified` false.
 
-        Preference order: the verified primary, then any verified address, then the primary
-        whatever its state. The last case returns `verified=False`, which the linking rules
-        then refuse to auto-link on, so an unverified address is still usable for a fresh
-        registration and never for attaching to an existing account.
-
-        A failed call is not fatal. A GitHub account with no usable address is a registration
-        this product refuses, not a 500, and it is refused by the caller finding no email.
+        Prefers the verified primary, then any verified address, then the primary whatever
+        its state. A failed call yields an empty address rather than raising.
         """
         response = self._http.get_json(config.emails_url, headers=headers)
         entries = response.json_body if response.ok else None
@@ -1302,34 +984,16 @@ class OAuthService:
             return first_verified, True
         return primary_unverified, False
 
-    # ---- linking rules --------------------------------------------------------------
-
     def resolve_login(self, identity: OAuthIdentity) -> tuple[Mapping[str, Any], str]:
-        """Turn a provider identity into a local user, per section 3.4's three branches.
+        """Turn a provider identity into a local user, by link, email match or registration.
 
         Returns the user and how it was reached: `"linked"` for an existing link,
         `"auto_linked"` for the verified-email attach, `"registered"` for a new account.
-
-        The branches, in the order they are tried:
-
-        1. **A link already exists.** The ordinary case. The link's `user_id` is the account,
-           and nothing about the email is consulted at all: the provider identity was
-           attached deliberately at some earlier point and an address changing at the
-           provider does not move an account.
-        2. **No link, and the email matches a local account.** This is the dangerous branch.
-           It attaches only when **both** the provider email and the local account's email
-           are verified, per the locked decision in the module docstring. Otherwise it
-           refuses with `OAUTH_EMAIL_UNVERIFIED` and the user is told to sign in and link.
-        3. **No link and no match.** A registration through `create_user`, with
-           `email_verified` carried across from the provider.
         """
         existing = self._links.get(identity.account_key)
         if existing is not None:
             user = self._hooks.load_user_by_id(existing.user_id)
             if user is None:
-                # The link outlived the user, which a deletion that missed this table
-                # produces. Refusing and cleaning up is right: signing somebody in to an
-                # account that no longer exists is worse than asking them to start again.
                 self._links.delete(identity.account_key)
                 raise OAuthRejected(
                     "That account is no longer available.",
@@ -1351,9 +1015,6 @@ class OAuthService:
             self._require_auto_link_allowed(identity, matched)
             record = self._new_link(identity, _user_id(matched))
             if not self._links.claim(record):
-                # Another callback attached this identity between the `get` above and here.
-                # Refusing is correct: the winner may have attached it to a different
-                # account, and overwriting would silently move a provider identity.
                 raise OAuthRejected(
                     "That provider account is already linked.",
                     error_code="OAUTH_ALREADY_LINKED",
@@ -1373,12 +1034,10 @@ class OAuthService:
         return self._register(identity), "registered"
 
     def _require_auto_link_allowed(self, identity: OAuthIdentity, user: Mapping[str, Any]) -> None:
-        """Both sides verified, or nothing is attached. See the module docstring.
+        """Refuse the auto-link unless both the provider and the local email are verified.
 
-        The two failures deliberately answer with the same code and the same message. Telling
-        a caller *which* side was unverified tells them whether an account exists for that
-        address and whether it has confirmed its email, which is exactly the enumeration
-        section 5.4 closes on every other route.
+        Both failures answer with the same code and message, so neither confirms whether an
+        account exists for that address.
         """
         local_verified = bool(user.get("email_verified", False))
         if identity.email_verified and local_verified:
@@ -1402,12 +1061,8 @@ class OAuthService:
     def _register(self, identity: OAuthIdentity) -> Mapping[str, Any]:
         """Create a local account for a provider identity nobody has seen before.
 
-        `create_user` is the same hook password registration uses, so a product's own
-        username rules, required columns and defaults apply identically however an account
-        came to exist. `email_verified` is passed through from the provider rather than being
-        forced true: a GitHub user whose address is unverified gets an unverified local
-        account and the ordinary verification flow, which is the same position a password
-        registration starts from.
+        Goes through the same `create_user` hook password registration uses, and passes
+        `email_verified` through from the provider rather than forcing it true.
         """
         if not self._settings.registration_enabled:
             raise OAuthRejected(
@@ -1445,15 +1100,8 @@ class OAuthService:
     def link(self, identity: OAuthIdentity, *, user_id: str) -> OAuthLinkRecord:
         """Attach a provider identity to the authenticated account that asked for it.
 
-        This is the path the refused auto-link sends people to, and it needs no email check
-        at all: the user proved they hold this account by presenting a token for it, and they
-        proved they hold the provider account by completing the provider's own flow. The
-        email is recorded, not consulted.
-
-        Refuses when the identity is already attached, to this account or another, and says
-        the same thing either way. "You have already linked this" and "somebody else has"
-        are the same sentence on purpose: the second would confirm that a given provider
-        account has a local account here.
+        Needs no email check, since the caller proved they hold both accounts. An identity
+        already attached is refused with the same message whoever holds it.
         """
         existing = self._links.get(identity.account_key)
         if existing is not None:
@@ -1487,22 +1135,8 @@ class OAuthService:
     def unlink(self, *, user_id: str, provider: str) -> None:
         """Detach a provider, unless doing so would leave the account with no way in.
 
-        The count is the whole point of the method. Removing the last sign-in method is
-        permanent lockout: nobody can log in, so nobody can add a method back, and the
-        account is unreachable by any path this design has. So what would remain is counted
-        first, and only a non-empty answer permits the delete.
-
-        What counts as remaining:
-
-        - **Another OAuth link.** Read from the GSI and then **re-read from the base table**,
-          because the GSI is eventually consistent and a stale entry for a link that was just
-          removed would be counted as a remaining method. Over-counting here is the one
-          direction that loses the account, so it is the one the extra read buys out.
-        - **A password**, from the credential store this service was given. A product that
-          did not supply one gets `False`, which errs toward refusing.
-        - **A passkey or anything else**, through the `has_other_sign_in_method` hook, which
-          defaults to `False` so a hooks class written before M6 keeps working and can only
-          make this stricter.
+        What would remain is counted first: another OAuth link, a password, or anything the
+        `has_other_sign_in_method` hook reports. Only a non-empty answer permits the delete.
         """
         target = provider_account_key(provider, "")
         links = [
@@ -1535,12 +1169,14 @@ class OAuthService:
         )
 
     def _other_sign_in_methods(self, user_id: str, *, removing: set[str]) -> bool:
-        """Whether anything would still sign this user in after `removing` goes away."""
+        """Whether anything would still sign this user in after `removing` goes away.
+
+        Each GSI hit is re-read from the base table, since the index may be stale and
+        over-counting here is the direction that loses an account.
+        """
         for record in self._links.list_for_user(user_id):
             if record.provider_subject in removing:
                 continue
-            # The GSI is eventually consistent, so a link it still lists may already be gone.
-            # Confirm against the base table before counting it as a way in.
             confirmed = self._links.get(record.provider_subject)
             if confirmed is not None and confirmed.user_id == user_id:
                 return True
@@ -1554,9 +1190,8 @@ class OAuthService:
 
         return bool(self._hooks.has_other_sign_in_method(user_id))
 
-    # ---- helpers --------------------------------------------------------------------
-
     def _new_link(self, identity: OAuthIdentity, user_id: str) -> OAuthLinkRecord:
+        """Build a link record attaching this identity to a user, stamped with the time."""
         moment = now_iso()
         return OAuthLinkRecord(
             provider_subject=identity.account_key,
@@ -1572,9 +1207,7 @@ class OAuthService:
     def _touch(self, record: OAuthLinkRecord, identity: OAuthIdentity) -> None:
         """Record this login on the link, and refresh what the provider now says.
 
-        Best effort on purpose: a write failure here must not fail a sign-in that has already
-        succeeded in every way that matters. The value is an audit trail and a settings page
-        that shows the current address, neither of which is worth refusing a login for.
+        Best effort: a write failure here must not fail a sign-in that already succeeded.
         """
         try:
             self._links.put(
@@ -1597,12 +1230,7 @@ class OAuthService:
 
 
 def _as_bool(value: object) -> bool:
-    """Read a provider's boolean, which may be a real one or the string spelling of one.
-
-    Google has returned `email_verified` as both `true` and `"true"` over the years and
-    GitHub's `verified` is a real boolean. `bool("false")` is `True`, which is why this is a
-    function rather than a `bool()` call at each site.
-    """
+    """Read a provider's boolean, which may be a real one or the string spelling of one."""
     if isinstance(value, bool):
         return value
     if isinstance(value, str):
@@ -1611,6 +1239,7 @@ def _as_bool(value: object) -> bool:
 
 
 def _require_str(body: Mapping[str, Any], key: str, provider: str) -> str:
+    """Read a required non-empty string from a token response, refusing when it is absent."""
     value = body.get(key)
     if not isinstance(value, str) or not value:
         _log.warning(

@@ -1,12 +1,3 @@
-# Publish the package to CodeArtifact when a v* tag is pushed.
-#
-# The tag drives nothing except when this runs: the version that is published comes from
-# `src/webbpulse/_version.py` through hatchling. Tag `v0.1.0` after setting `__version__`
-# to `0.1.0` in the same commit, or the published version will not match the tag.
-#
-# The reusable workflow is idempotent. It looks the version up in CodeArtifact first and
-# skips with a notice rather than failing, so re-running an already released tag stays
-# green.
 name: Publish
 
 on:
@@ -19,21 +10,17 @@ permissions:
 
 jobs:
   publish:
+    name: Publish the package to CodeArtifact
     uses: WebbPulse/.github/.github/workflows/codeartifact-publish-python.yml@v1
-    # A called workflow can hold no more permission than the calling job grants, and the
-    # shared workflow needs id-token: write for the OIDC role assumption.
     permissions:
       contents: read
       id-token: write
     with:
       python-version: "3.13"
-      # pyproject.toml is at the repository root.
       working-directory: "."
       codeartifact-domain: webbpulse
       codeartifact-repository: python
       aws-region: us-west-2
-      # A GitHub Environment scopes the publish role and can require an approval before a
-      # release reaches the shared repository. Configure `publish` in repository settings.
       environment: publish
     secrets:
       role-to-assume: ${{ secrets.CODEARTIFACT_PUBLISH_ROLE_ARN }}

@@ -1,10 +1,7 @@
 """Tests for `webbpulse.metrics`.
 
-The assertions are largely about the exact shape of the `_aws` block, because CloudWatch
-parses that shape and reports nothing at all when it is wrong. There is no error surface
-for a malformed EMF document: the log line is ingested, the metric is silently not created,
-and the only symptom is an alarm that stays in INSUFFICIENT_DATA. So the document is
-pinned key by key here rather than smoke tested.
+The EMF document is pinned key by key, because a malformed `_aws` block has no error
+surface: the metric is silently not created and the alarm stays in INSUFFICIENT_DATA.
 """
 
 from __future__ import annotations
@@ -28,31 +25,31 @@ from webbpulse.metrics import (
 
 
 def _emitter(**kwargs: Any) -> tuple[MetricsEmitter, io.StringIO]:
+    """Build an emitter writing to an in-memory stream, and return both."""
     stream = io.StringIO()
     kwargs.setdefault("namespace", "WebbPulse/Test")
     return MetricsEmitter(stream=stream, **kwargs), stream
 
 
 def _lines(stream: io.StringIO) -> list[dict[str, Any]]:
+    """Parse every non-empty line written to the stream as JSON."""
     return [json.loads(line) for line in stream.getvalue().splitlines() if line]
 
 
-# --------------------------------------------------------------------------------------
-# Construction
-# --------------------------------------------------------------------------------------
-
-
 def test_a_namespace_is_required() -> None:
+    """An empty namespace is rejected at construction."""
     with pytest.raises(ValueError, match="namespace is required"):
         MetricsEmitter(namespace="")
 
 
 def test_a_blank_namespace_is_rejected() -> None:
+    """A whitespace only namespace is rejected at construction."""
     with pytest.raises(ValueError, match="namespace is required"):
         MetricsEmitter(namespace="   ")
 
 
 def test_dimensions_and_properties_can_be_passed_to_the_constructor() -> None:
+    """Constructor dimensions and properties reach the emitted document."""
     emitter, stream = _emitter(dimensions={"Environment": "staging"}, properties={"job_id": "abc"})
     emitter.put("Ingested", 1, "Count")
     emitter.flush()
@@ -61,12 +58,8 @@ def test_dimensions_and_properties_can_be_passed_to_the_constructor() -> None:
     assert payload["job_id"] == "abc"
 
 
-# --------------------------------------------------------------------------------------
-# The document shape
-# --------------------------------------------------------------------------------------
-
-
 def test_the_document_carries_the_aws_directive_cloudwatch_parses() -> None:
+    """The `_aws` block carries the timestamp, namespace, dimension set and metric list."""
     emitter, stream = _emitter(namespace="CarModPicker/Crawlers")
     emitter.set_dimensions(AdapterName="acme", Environment="staging", RunType="live")
     emitter.put("Ingested", 12, "Count")
@@ -82,6 +75,7 @@ def test_the_document_carries_the_aws_directive_cloudwatch_parses() -> None:
 
 
 def test_dimension_values_are_top_level_keys_so_they_stay_queryable() -> None:
+    """Each dimension value is also written as a top level key."""
     emitter, stream = _emitter()
     emitter.set_dimensions(AdapterName="acme", Environment="staging")
     emitter.put("Ingested", 1, "Count")
@@ -92,6 +86,7 @@ def test_dimension_values_are_top_level_keys_so_they_stay_queryable() -> None:
 
 
 def test_a_single_value_is_written_as_a_scalar() -> None:
+    """One `put` writes the value as a scalar, not a single element list."""
     emitter, stream = _emitter()
     emitter.put("Ingested", 12, "Count")
     emitter.flush()
@@ -100,6 +95,7 @@ def test_a_single_value_is_written_as_a_scalar() -> None:
 
 
 def test_repeated_puts_accumulate_into_one_array_rather_than_one_document_each() -> None:
+    """Repeated puts of one metric become an array in a single document."""
     emitter, stream = _emitter()
     emitter.put("Latency", 10, "Milliseconds")
     emitter.put("Latency", 20, "Milliseconds")
@@ -112,6 +108,7 @@ def test_repeated_puts_accumulate_into_one_array_rather_than_one_document_each()
 
 
 def test_the_unitless_default_omits_the_unit_key() -> None:
+    """A `put` with no unit omits the Unit key from the metric definition."""
     emitter, stream = _emitter()
     emitter.put("Ratio", 0.5)
     emitter.flush()
@@ -121,6 +118,7 @@ def test_the_unitless_default_omits_the_unit_key() -> None:
 
 
 def test_the_default_storage_resolution_is_omitted() -> None:
+    """StorageResolution is omitted unless it is asked for."""
     emitter, stream = _emitter()
     emitter.put("Ingested", 1, "Count")
     emitter.flush()
@@ -130,6 +128,7 @@ def test_the_default_storage_resolution_is_omitted() -> None:
 
 
 def test_high_resolution_is_written_when_asked_for() -> None:
+    """`storage_resolution=1` is written into the metric definition."""
     emitter, stream = _emitter()
     emitter.put("Ingested", 1, "Count", storage_resolution=1)
     emitter.flush()
@@ -139,6 +138,7 @@ def test_high_resolution_is_written_when_asked_for() -> None:
 
 
 def test_metric_names_are_sorted_so_the_document_is_deterministic() -> None:
+    """Metric definitions come out sorted by name."""
     emitter, stream = _emitter()
     emitter.put("Zebra", 1, "Count")
     emitter.put("Alpha", 2, "Count")
@@ -149,16 +149,16 @@ def test_metric_names_are_sorted_so_the_document_is_deterministic() -> None:
 
 
 def test_the_timestamp_defaults_to_now_in_milliseconds() -> None:
+    """With no timestamp given, the document carries epoch milliseconds, not seconds."""
     emitter, stream = _emitter()
     emitter.put("Ingested", 1, "Count")
     emitter.flush()
     (payload,) = _lines(stream)
-    # Milliseconds since the epoch is a 13 digit number for any date this decade. A
-    # seconds-valued timestamp would be 10 digits and CloudWatch would reject the document.
     assert 1_600_000_000_000 < payload["_aws"]["Timestamp"] < 4_000_000_000_000
 
 
 def test_the_document_is_one_line() -> None:
+    """A flush writes exactly one newline terminated line."""
     emitter, stream = _emitter()
     emitter.set_properties(note="a value")
     emitter.put("Ingested", 1, "Count")
@@ -167,6 +167,7 @@ def test_the_document_is_one_line() -> None:
 
 
 def test_document_builds_without_writing_anything() -> None:
+    """`document` returns the payload without writing to the stream."""
     emitter, stream = _emitter()
     emitter.put("Ingested", 1, "Count")
     document = emitter.document(timestamp_millis=1)
@@ -174,24 +175,22 @@ def test_document_builds_without_writing_anything() -> None:
     assert stream.getvalue() == ""
 
 
-# --------------------------------------------------------------------------------------
-# Validation
-# --------------------------------------------------------------------------------------
-
-
 def test_an_unknown_unit_is_rejected_at_the_call_site() -> None:
+    """`put` raises on a unit CloudWatch does not define."""
     emitter, _ = _emitter()
     with pytest.raises(ValueError, match="unit must be one of"):
         emitter.put("Ingested", 1, "Widgets")
 
 
 def test_every_documented_cloudwatch_unit_is_accepted() -> None:
+    """Every unit in `UNITS` is accepted by `put`."""
     emitter, _ = _emitter()
     for unit in sorted(UNITS):
         emitter.put("Metric", 1, unit)
 
 
 def test_too_many_dimensions_are_rejected() -> None:
+    """More than the EMF dimension ceiling is rejected."""
     emitter, _ = _emitter()
     too_many = {f"D{i}": str(i) for i in range(EMF_MAX_DIMENSIONS + 1)}
     with pytest.raises(ValueError, match="at most 9 dimensions"):
@@ -199,18 +198,21 @@ def test_too_many_dimensions_are_rejected() -> None:
 
 
 def test_the_dimension_ceiling_itself_is_allowed() -> None:
+    """Exactly the EMF dimension ceiling is accepted."""
     emitter, _ = _emitter()
     at_limit = {f"D{i}": str(i) for i in range(EMF_MAX_DIMENSIONS)}
     emitter.set_dimensions(**at_limit)
 
 
 def test_a_blank_dimension_value_is_rejected_before_it_voids_the_document() -> None:
+    """A blank dimension value raises and names the offending dimension."""
     emitter, _ = _emitter()
     with pytest.raises(ValueError, match="must not be blank: Environment"):
         emitter.set_dimensions(AdapterName="acme", Environment="")
 
 
 def test_a_non_string_dimension_value_is_coerced() -> None:
+    """A non-string dimension value is written as its string form."""
     emitter, stream = _emitter()
     emitter.set_dimensions(Shard=3)  # type: ignore[arg-type]
     emitter.put("Ingested", 1, "Count")
@@ -220,6 +222,7 @@ def test_a_non_string_dimension_value_is_coerced() -> None:
 
 
 def test_setters_return_self_so_calls_chain() -> None:
+    """`set_dimensions`, `set_properties` and `put` return the emitter, so calls chain."""
     emitter, stream = _emitter()
     emitter.set_dimensions(Environment="staging").set_properties(job="x").put(
         "Ingested", 1, "Count"
@@ -230,18 +233,15 @@ def test_setters_return_self_so_calls_chain() -> None:
     assert payload["job"] == "x"
 
 
-# --------------------------------------------------------------------------------------
-# Flush behaviour
-# --------------------------------------------------------------------------------------
-
-
 def test_a_flush_with_no_metrics_writes_nothing() -> None:
+    """A flush with nothing recorded returns None and writes nothing."""
     emitter, stream = _emitter()
     assert emitter.flush() is None
     assert stream.getvalue() == ""
 
 
 def test_a_flush_returns_the_line_it_wrote() -> None:
+    """A flush returns the JSON line it wrote."""
     emitter, _stream = _emitter()
     emitter.put("Ingested", 1, "Count")
     line = emitter.flush()
@@ -250,6 +250,7 @@ def test_a_flush_returns_the_line_it_wrote() -> None:
 
 
 def test_a_flush_clears_the_values_so_a_reused_emitter_does_not_double_report() -> None:
+    """A flush clears recorded values but keeps the dimensions for the next document."""
     emitter, stream = _emitter()
     emitter.set_dimensions(Environment="staging")
     emitter.put("Ingested", 1, "Count")
@@ -259,15 +260,19 @@ def test_a_flush_clears_the_values_so_a_reused_emitter_does_not_double_report() 
     first, second = _lines(stream)
     assert first["Ingested"] == 1.0
     assert second["Ingested"] == 2.0
-    # Dimensions survive a flush, which is what makes a per-iteration emit ergonomic.
     assert second["Environment"] == "staging"
 
 
 def test_the_stream_is_flushed_so_a_lambda_freeze_cannot_lose_the_line() -> None:
+    """The emitter flushes the stream once per written document."""
+
     class _CountingStream(io.StringIO):
+        """A stream that counts how many times it was flushed."""
+
         flushes = 0
 
         def flush(self) -> None:
+            """Count this flush instead of performing one."""
             type(self).flushes += 1
 
     stream = _CountingStream()
@@ -278,8 +283,7 @@ def test_the_stream_is_flushed_so_a_lambda_freeze_cannot_lose_the_line() -> None
 
 
 def test_stdout_is_resolved_at_flush_time(capsys: pytest.CaptureFixture[str]) -> None:
-    """No `stream` means `sys.stdout`, read when the flush happens rather than captured at
-    construction, which is what lets `capsys` and a Lambda log driver both see it."""
+    """With no `stream`, `sys.stdout` is read at flush time rather than at construction."""
     emitter = MetricsEmitter(namespace="WebbPulse/Test")
     emitter.put("Ingested", 5, "Count")
     emitter.flush()
@@ -290,8 +294,13 @@ def test_stdout_is_resolved_at_flush_time(capsys: pytest.CaptureFixture[str]) ->
 def test_a_stream_failure_is_logged_and_swallowed(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
+    """A stream that raises on write is logged as an error and does not propagate."""
+
     class _BrokenStream(io.StringIO):
+        """A stream that fails every write."""
+
         def write(self, s: str) -> int:
+            """Raise as a closed stream would."""
             raise OSError("stream is closed")
 
     emitter = MetricsEmitter(namespace="WebbPulse/Test", stream=_BrokenStream())
@@ -302,18 +311,23 @@ def test_a_stream_failure_is_logged_and_swallowed(
 
 
 def test_a_failed_flush_still_clears_the_values() -> None:
+    """A failed flush retains nothing, so the next flush is a no-op."""
+
     class _BrokenStream(io.StringIO):
+        """A stream that fails every write."""
+
         def write(self, s: str) -> int:
+            """Raise as a closed stream would."""
             raise OSError("stream is closed")
 
     emitter = MetricsEmitter(namespace="WebbPulse/Test", stream=_BrokenStream())
     emitter.put("Ingested", 1, "Count")
     emitter.flush()
-    # Nothing is retained, so the next flush is a no-op rather than a retry that fails again.
     assert emitter.flush() is None
 
 
 def test_an_unserialisable_property_falls_back_to_str_rather_than_losing_the_document() -> None:
+    """An unserialisable property is written as a string and the document still emits."""
     emitter, stream = _emitter()
     emitter.set_properties(when=object())
     emitter.put("Ingested", 1, "Count")
@@ -323,12 +337,8 @@ def test_an_unserialisable_property_falls_back_to_str_rather_than_losing_the_doc
     assert isinstance(payload["when"], str)
 
 
-# --------------------------------------------------------------------------------------
-# The disabled switch
-# --------------------------------------------------------------------------------------
-
-
 def test_disabled_writes_nothing() -> None:
+    """A disabled emitter records nothing and writes nothing on flush."""
     emitter, stream = _emitter(enabled=False)
     emitter.set_dimensions(Environment="local")
     emitter.put("Ingested", 1, "Count")
@@ -343,12 +353,8 @@ def test_disabled_still_validates_a_bad_unit() -> None:
         emitter.put("Ingested", 1, "Widgets")
 
 
-# --------------------------------------------------------------------------------------
-# The context manager
-# --------------------------------------------------------------------------------------
-
-
 def test_the_context_manager_flushes_on_exit() -> None:
+    """Used as a context manager, the emitter writes its document on exit and not before."""
     stream = io.StringIO()
     with MetricsEmitter(namespace="WebbPulse/Test", stream=stream) as emitter:
         emitter.put("Ingested", 1, "Count")
@@ -357,6 +363,7 @@ def test_the_context_manager_flushes_on_exit() -> None:
 
 
 def test_the_context_manager_flushes_what_it_had_when_the_body_raises() -> None:
+    """A raising body still flushes whatever was already recorded."""
     stream = io.StringIO()
     with (
         pytest.raises(RuntimeError),
@@ -368,17 +375,8 @@ def test_the_context_manager_flushes_what_it_had_when_the_body_raises() -> None:
     assert payload["Ingested"] == 1.0
 
 
-# --------------------------------------------------------------------------------------
-# emit
-# --------------------------------------------------------------------------------------
-
-
 def test_emit_writes_the_carmodpicker_crawler_document_unchanged() -> None:
-    """The metric names, units, dimension names and namespace CarModPicker emits today.
-
-    Any of these changing breaks the existing alarm, which filters on
-    `RunType=live`, so the whole shape is pinned rather than sampled.
-    """
+    """`emit` writes the crawler namespace, dimension names, metric names and units intact."""
     stream = io.StringIO()
     emit(
         namespace="CarModPicker/Crawlers",
@@ -408,6 +406,7 @@ def test_emit_writes_the_carmodpicker_crawler_document_unchanged() -> None:
 
 
 def test_emit_defaults_a_bare_number_to_count() -> None:
+    """A metric given as a bare number is emitted with the Count unit."""
     stream = io.StringIO()
     emit(namespace="WebbPulse/Test", metrics={"Ingested": 7}, stream=stream)
     (payload,) = _lines(stream)
@@ -416,6 +415,7 @@ def test_emit_defaults_a_bare_number_to_count() -> None:
 
 
 def test_emit_carries_properties_without_making_them_dimensions() -> None:
+    """Properties reach the document as keys but are not listed as dimensions."""
     stream = io.StringIO()
     emit(
         namespace="WebbPulse/Test",
@@ -431,11 +431,13 @@ def test_emit_carries_properties_without_making_them_dimensions() -> None:
 
 
 def test_emit_returns_none_when_there_are_no_metrics() -> None:
+    """`emit` with no metrics returns None."""
     stream = io.StringIO()
     assert emit(namespace="WebbPulse/Test", metrics={}, stream=stream) is None
 
 
 def test_emit_returns_none_when_disabled() -> None:
+    """`enabled=False` makes `emit` return None and write nothing."""
     stream = io.StringIO()
     assert (
         emit(
@@ -450,16 +452,13 @@ def test_emit_returns_none_when_disabled() -> None:
 
 
 def test_emit_writes_to_stdout_by_default(capsys: pytest.CaptureFixture[str]) -> None:
+    """With no stream, `emit` writes its document to stdout."""
     emit(namespace="WebbPulse/Test", metrics={"Ingested": 1})
     assert json.loads(capsys.readouterr().out.strip())["Ingested"] == 1.0
 
 
-# --------------------------------------------------------------------------------------
-# timed
-# --------------------------------------------------------------------------------------
-
-
 def test_timed_records_a_duration_in_milliseconds_by_default() -> None:
+    """`timed` records a non-negative duration with the Milliseconds unit."""
     emitter, stream = _emitter()
     with timed(emitter, "Elapsed"):
         pass
@@ -471,6 +470,7 @@ def test_timed_records_a_duration_in_milliseconds_by_default() -> None:
 
 
 def test_timed_accepts_seconds() -> None:
+    """`timed` records the duration with the Seconds unit when asked."""
     emitter, stream = _emitter()
     with timed(emitter, "ElapsedSeconds", unit="Seconds"):
         pass
@@ -481,6 +481,7 @@ def test_timed_accepts_seconds() -> None:
 
 
 def test_timed_accepts_microseconds() -> None:
+    """`timed` records the duration with the Microseconds unit when asked."""
     emitter, stream = _emitter()
     with timed(emitter, "Elapsed", unit="Microseconds"):
         pass
@@ -491,26 +492,20 @@ def test_timed_accepts_microseconds() -> None:
 
 
 def test_timed_rejects_a_unit_that_is_not_a_duration() -> None:
+    """A non-duration unit raises on entering the block rather than on the way out."""
     emitter, _ = _emitter()
-    # The unit is validated before the block is entered, so `timed` raises on the `with`
-    # line itself rather than on the way out. Constructing it without entering proves that.
     with pytest.raises(ValueError, match="timed unit must be a duration"):
         timed(emitter, "Elapsed", unit="Count").__enter__()
 
 
 def test_timed_records_the_duration_even_when_the_block_raises() -> None:
+    """A raising block still records its duration."""
     emitter, stream = _emitter()
     with pytest.raises(RuntimeError), timed(emitter, "Elapsed"):
         raise RuntimeError("boom")
     emitter.flush()
     (payload,) = _lines(stream)
     assert payload["Elapsed"] >= 0.0
-
-
-# --------------------------------------------------------------------------------------
-# `metrics_enabled_from_env`. CarModPicker's deleted module carried exactly this gate, so
-# these tests pin the behaviour it had rather than inventing a new policy.
-# --------------------------------------------------------------------------------------
 
 
 @pytest.fixture
@@ -522,11 +517,13 @@ def clean_env(monkeypatch: pytest.MonkeyPatch) -> None:
 
 @pytest.mark.parametrize("environment", DEFAULT_METRIC_ENVIRONMENTS)
 def test_metrics_are_live_in_the_deployed_environments(clean_env: None, environment: str) -> None:
+    """Each deployed environment in the default set enables metrics."""
     assert metrics_enabled_from_env(environment) is True
 
 
 @pytest.mark.parametrize("environment", ["development", "dev", "local", "preview", "test"])
 def test_metrics_are_silent_everywhere_else(clean_env: None, environment: str) -> None:
+    """An environment outside the default set leaves metrics off."""
     assert metrics_enabled_from_env(environment) is False
 
 
@@ -543,6 +540,7 @@ def test_the_testing_variable_wins_over_an_allowed_environment(
 def test_a_falsey_testing_variable_does_not_suppress_metrics(
     clean_env: None, monkeypatch: pytest.MonkeyPatch, value: str
 ) -> None:
+    """A falsey TESTING value leaves metrics enabled in an allowed environment."""
     monkeypatch.setenv("TESTING", value)
     assert metrics_enabled_from_env("production") is True
 
@@ -564,6 +562,7 @@ def test_an_unset_environment_is_silent_rather_than_live(clean_env: None) -> Non
 
 @pytest.mark.parametrize("environment", ["", "   "])
 def test_a_blank_environment_is_silent(clean_env: None, environment: str) -> None:
+    """A blank environment name leaves metrics off."""
     assert metrics_enabled_from_env(environment) is False
 
 
@@ -576,17 +575,20 @@ def test_the_environment_is_matched_case_insensitively_after_a_strip(
 
 
 def test_the_allowed_set_can_be_overridden(clean_env: None) -> None:
+    """An explicit `allowed` set replaces the default one."""
     assert metrics_enabled_from_env("preview", allowed=("preview",)) is True
     assert metrics_enabled_from_env("production", allowed=("preview",)) is False
 
 
 def test_the_allowed_set_is_normalised_too(clean_env: None) -> None:
+    """Entries in `allowed` are stripped and matched case insensitively."""
     assert metrics_enabled_from_env("preview", allowed=(" Preview ",)) is True
 
 
 def test_the_variable_names_can_be_overridden(
     clean_env: None, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    """`testing_var` and `environment_var` select which variables the gate reads."""
     monkeypatch.setenv("PYTEST_RUNNING", "true")
     monkeypatch.setenv("APP_ENV", "production")
     assert (

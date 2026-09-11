@@ -1,11 +1,7 @@
-"""Tests for the per-domain pytest matrix discovery.
+"""Tests for the per-domain pytest matrix discovery in `webbpulse.ci`.
 
-The contract these protect is a workflow contract rather than a library one: the reusable
-`python-ci.yml` parses this command's stdout with `fromJson`, so a change that makes the
-`domains` output anything other than a bare JSON array breaks every consumer's CI at once,
-and the failure appears as a matrix expansion error rather than as anything naming this
-module. That is why stdout shape is asserted here directly rather than only through the
-return values.
+The reusable `python-ci.yml` workflow parses this command's stdout with `fromJson`, so
+stdout shape is asserted directly rather than only through the return values.
 """
 
 from __future__ import annotations
@@ -28,7 +24,10 @@ def write_pyproject(directory: Path, body: str) -> Path:
 
 
 class TestLoadConfig:
+    """Tests for `load_config`."""
+
     def test_reads_domains_and_test_root(self, tmp_path: Path) -> None:
+        """`load_config` reads the test root and each domain's paths from pyproject."""
         write_pyproject(
             tmp_path,
             """
@@ -72,6 +71,7 @@ class TestLoadConfig:
         assert config.test_root == "tests"
 
     def test_missing_table_is_an_empty_config(self, tmp_path: Path) -> None:
+        """A pyproject without the ci table yields no domains."""
         write_pyproject(tmp_path, '[project]\nname = "thing"\n')
 
         assert load_config(tmp_path).domains == {}
@@ -103,6 +103,7 @@ class TestLoadConfig:
             load_config(tmp_path)
 
     def test_a_non_list_domain_is_rejected(self, tmp_path: Path) -> None:
+        """A domain mapped to a bare string is rejected as not a list of paths."""
         write_pyproject(
             tmp_path,
             """
@@ -116,7 +117,10 @@ class TestLoadConfig:
 
 
 class TestPytestArgs:
+    """Tests for `pytest_args_for`."""
+
     def test_a_domain_gets_its_own_paths(self) -> None:
+        """A named domain runs exactly the paths it claims."""
         config = CiConfig(test_root="tests", domains={"identity": ("tests/auth",)})
 
         assert pytest_args_for(config, "identity") == ("tests/auth",)
@@ -135,6 +139,7 @@ class TestPytestArgs:
         )
 
     def test_shared_with_no_domains_is_just_the_root(self) -> None:
+        """With no domains configured, the shared job runs the test root alone."""
         config = CiConfig(test_root="tests", domains={})
 
         assert pytest_args_for(config, SHARED_DOMAIN) == ("tests",)
@@ -152,6 +157,7 @@ class TestPytestArgs:
         )
 
     def test_an_unknown_domain_names_the_ones_that_exist(self) -> None:
+        """An unknown domain raises KeyError mentioning the configured domains."""
         config = CiConfig(test_root="tests", domains={"identity": ("tests/auth",)})
 
         with pytest.raises(KeyError, match="identity"):
@@ -159,6 +165,8 @@ class TestPytestArgs:
 
 
 class TestCommandLine:
+    """Tests for the `main` command line entrypoint."""
+
     def test_domains_prints_a_json_array(
         self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
     ) -> None:
@@ -179,6 +187,7 @@ class TestCommandLine:
     def test_domains_can_append_shared(
         self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
     ) -> None:
+        """`--include-shared` appends the shared job to the matrix."""
         write_pyproject(
             tmp_path,
             """
@@ -202,6 +211,7 @@ class TestCommandLine:
     def test_pytest_args_prints_shell_quoted_paths(
         self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
     ) -> None:
+        """`pytest-args` prints the domain's paths shell quoted, so spaces survive."""
         write_pyproject(
             tmp_path,
             """
@@ -218,6 +228,7 @@ class TestCommandLine:
     def test_pytest_args_for_shared(
         self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
     ) -> None:
+        """`pytest-args --domain shared` prints the root plus an --ignore per claimed path."""
         write_pyproject(
             tmp_path,
             """
@@ -237,6 +248,7 @@ class TestCommandLine:
     def test_an_unknown_domain_exits_two(
         self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
     ) -> None:
+        """An unknown domain exits 2 and names the problem on stderr."""
         write_pyproject(
             tmp_path,
             """
@@ -270,6 +282,7 @@ class TestRunsAsAModule:
     """The workflow invokes this as `python -m webbpulse.ci`, before test deps are installed."""
 
     def test_python_dash_m_prints_the_matrix(self, tmp_path: Path) -> None:
+        """`python -m webbpulse.ci domains` prints the matrix as JSON."""
         write_pyproject(
             tmp_path,
             """

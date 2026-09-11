@@ -1,33 +1,7 @@
 """Tests for the M4 identity work: TOTP, recovery codes, the MFA ticket, step-up and `amr`.
 
-Section 9.4 of `docs/identity-standard.md` sets the strategy, and four of its requirements
-shape this file in ways the M2 and M3 suites did not need:
-
-- **TOTP is checked against the RFC, not against itself.** RFC 6238 Appendix B publishes
-  code and timestamp pairs for a known seed. A generator tested only against its own
-  verifier passes while both are wrong in the same direction, and the user finds out when
-  their authenticator app disagrees. The vectors are the only test that can catch that.
-- **Single use is tested by using twice.** Every single-use thing here gets a test that
-  spends it and then spends it again: the TOTP step, the recovery code, the MFA ticket. A
-  test that only walks the happy path passes against an implementation with no replay
-  defence at all.
-- **The wire shape is asserted against the frontend's contract.** `@webbpulse/auth` 0.4.0
-  branches on `mfa_required` in a **200** body and posts `{mfa_ticket, code}` to
-  `/login/totp`. Those exact names and that exact status are asserted, because the failure
-  they guard against is a rename that type-checks perfectly and breaks every sign-in.
-- **The two token types are separated in both directions.** An MFA ticket must not be
-  accepted as an access token and an access token must not be accepted as a ticket. One
-  direction passing is not evidence for the other.
-
-The envelope is tested against **moto** as well as a hand fake. M1 decision 8 found moto
-unusable for KMS *asymmetric* signing, and the natural inference is that KMS is off limits
-for tests generally. That inference is wrong: moto 5.x implements symmetric
-`GenerateDataKey` and `Decrypt` faithfully, encryption context included, and rejects a
-tampered blob and a mismatched context the way KMS does. So the properties the design rests
-on are asserted against a real implementation rather than against a fake that could not have
-disagreed. The hand fake carries the rest, where moto's behaviour is not the point.
-
-The KMS signing fake is M2's, redefined here rather than imported: `tests/` is not a package.
+Covers the RFC 6238 vectors, single-use enforcement on every spendable secret, the KMS
+envelope against a hand fake and moto, and the login and MFA route contracts.
 """
 
 from __future__ import annotations
@@ -113,25 +87,15 @@ USER_ID = "user-0001"
 
 
 class FakeKms:
-    """Signing with a local private key plus a local stand-in for the two envelope calls.
-
-    One object, because `IdentityFlows` takes one `kms_client` and hands the same one to the
-    token service and the MFA service. That is the production shape too: one boto3 client
-    serves both key ids.
-
-    The envelope half wraps a data key by base64-ing it with its encryption context appended,
-    which is not encryption and is not pretending to be. What it does faithfully is the one
-    behaviour the design depends on: a `decrypt` under a context other than the one the key
-    was generated with fails. The moto test below covers the parts a fake cannot vouch for.
-    """
+    """Local signing plus a local stand-in for the two envelope calls, in one object."""
 
     def __init__(self, keys: dict[str, rsa.RSAPrivateKey]) -> None:
+        """Hold the signing keys and start an empty data key call log."""
         self._keys = keys
         self.data_key_calls: list[dict[str, Any]] = []
 
-    # ---- signing (M2's fake, unchanged) --------------------------------------------
-
     def get_public_key(self, *, KeyId: str) -> dict[str, Any]:
+        """Return the DER public key and signing metadata for a key id."""
         der = (
             self._keys[KeyId]
             .public_key()
@@ -151,16 +115,16 @@ class FakeKms:
     def sign(
         self, *, KeyId: str, Message: bytes, MessageType: str, SigningAlgorithm: str
     ) -> dict[str, Any]:
+        """Sign a prehashed message with the local private key for a key id."""
         signature = self._keys[KeyId].sign(
             Message, padding.PKCS1v15(), utils.Prehashed(hashes.SHA256())
         )
         return {"KeyId": KeyId, "Signature": signature, "SigningAlgorithm": SigningAlgorithm}
 
-    # ---- the envelope ----------------------------------------------------------------
-
     def generate_data_key(
         self, *, KeyId: str, NumberOfBytes: int, EncryptionContext: Mapping[str, str]
     ) -> dict[str, Any]:
+        """Record the request and return a random data key wrapped with its encryption context."""
         self.data_key_calls.append(
             {
                 "KeyId": KeyId,
@@ -177,44 +141,35 @@ class FakeKms:
     def decrypt(
         self, *, CiphertextBlob: bytes, EncryptionContext: Mapping[str, str]
     ) -> dict[str, Any]:
+        """Unwrap a data key, raising when the encryption context does not match."""
         try:
             encoded, context = CiphertextBlob.split(b"|", 1)
         except ValueError as exc:
             raise RuntimeError("InvalidCiphertextException") from exc
         if context != _context_bytes(EncryptionContext):
-            # What real KMS does when the context does not match, and the reason a
-            # ciphertext cannot be moved between users' rows.
             raise RuntimeError("InvalidCiphertextException")
         return {"KeyId": DATA_KEY, "Plaintext": base64.b64decode(encoded)}
 
 
 def _context_bytes(context: Mapping[str, str]) -> bytes:
+    """A stable byte encoding of an encryption context, for comparing contexts in the fake."""
     return repr(sorted(context.items())).encode("utf-8")
-
-
-# ---------------------------------------------------------------------------
-# Fixtures
-# ---------------------------------------------------------------------------
 
 
 @pytest.fixture(autouse=True)
 def cheap_bcrypt(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
-    """Pin bcrypt to its minimum cost for the whole module. M2's fixture, unchanged.
-
-    Wrapping the two functions rather than patching `security.DEFAULT_ROUNDS`. Since 0.12.1
-    patching the module attribute would work too, because the cost is read at call time; the
-    wrapper is kept because it also pins the cost for a caller that passes `rounds=`
-    explicitly, which a changed default does not.
-    """
+    """Pin bcrypt to its minimum cost for the whole module, so hashing does not dominate."""
     import webbpulse.security as security
 
     real_hash = security.hash_password
     real_needs = security.needs_rehash
 
     def cheap(password: str, *, rounds: int = 4) -> str:
+        """Hash a password at the pinned minimum cost."""
         return real_hash(password, rounds=rounds)
 
     def needs(hashed: str, *, rounds: int = 4) -> bool:
+        """Report whether a hash needs rehashing at the pinned minimum cost."""
         return real_needs(hashed, rounds=rounds)
 
     monkeypatch.setattr(security, "hash_password", cheap)
@@ -233,10 +188,12 @@ def module_key() -> rsa.RSAPrivateKey:
 
 @pytest.fixture
 def kms(module_key: rsa.RSAPrivateKey) -> FakeKms:
+    """A fake KMS client holding the module key under KEY_A."""
     return FakeKms({KEY_A: module_key})
 
 
 def make_settings(**overrides: Any) -> IdentitySettings:
+    """Identity settings for this suite, with a data key ARN and TOTP wired."""
     base: dict[str, Any] = {
         "environment": "test",
         "issuer": ISSUER,
@@ -256,6 +213,7 @@ class FakeHooks(BaseIdentityHooks):
     """A product's policy, in memory. M3's fake, unchanged."""
 
     def __init__(self, *, refuse: str = "") -> None:
+        """Start with no users and an empty call log."""
         self.users: dict[str, dict[str, Any]] = {}
         self.by_email: dict[str, str] = {}
         self.refuse = refuse
@@ -263,6 +221,7 @@ class FakeHooks(BaseIdentityHooks):
         self._next = 1
 
     def add(self, email: str, *, user_id: str = "", **attributes: Any) -> dict[str, Any]:
+        """Register a user in the fake store and return it."""
         identifier = user_id or f"user-{self._next:04d}"
         self._next += 1
         user = {"id": identifier, "email": email, **attributes}
@@ -271,37 +230,42 @@ class FakeHooks(BaseIdentityHooks):
         return user
 
     def load_user_by_id(self, user_id: str) -> Mapping[str, Any] | None:
+        """Return the user with this id, or None."""
         self.calls.append("load_user_by_id")
         return self.users.get(user_id)
 
     def load_user_by_email(self, email: str) -> Mapping[str, Any] | None:
+        """Return the user with this address, case insensitively, or None."""
         self.calls.append("load_user_by_email")
         identifier = self.by_email.get(email.lower())
         return self.users.get(identifier) if identifier else None
 
     def may_authenticate(self, user: Mapping[str, Any]) -> None:
+        """Refuse the login when the fake is configured to refuse."""
         self.calls.append("may_authenticate")
         if self.refuse:
             raise AuthenticationRefused(self.refuse, error_code="ACCOUNT_DISABLED")
 
     def claims_for(self, user: Mapping[str, Any]) -> Mapping[str, Any]:
+        """Return claims that try to set `amr` and `auth_time`, so the overwrite can be asserted."""
         self.calls.append("claims_for")
-        # Deliberately tries to set both. `_mint_access` must overwrite them: a hook that
-        # could forge `amr` could claim a factor the user never satisfied.
         return {"amr": ["forged"], "auth_time": 1}
 
     def create_user(self, *, email: str, attributes: Mapping[str, Any]) -> Mapping[str, Any]:
+        """Create and record a user from an address and attributes."""
         self.calls.append("create_user")
         return self.add(email, **dict(attributes))
 
 
 @pytest.fixture
 def hooks() -> FakeHooks:
+    """A fresh `FakeHooks` per test."""
     return FakeHooks()
 
 
 @pytest.fixture
 def stores() -> IdentityStores:
+    """In-memory stores for credentials, refresh and identity tokens, TOTP factors and recovery codes."""
     return IdentityStores(
         credentials=InMemoryCredentialStore(),
         refresh_tokens=InMemoryRefreshTokenStore(),
@@ -313,6 +277,7 @@ def stores() -> IdentityStores:
 
 @pytest.fixture
 def attempts() -> InMemoryLoginAttemptStore:
+    """An in-memory login attempt store."""
     return InMemoryLoginAttemptStore()
 
 
@@ -323,6 +288,7 @@ def flows(
     kms: FakeKms,
     attempts: InMemoryLoginAttemptStore,
 ) -> IdentityFlows:
+    """Identity flows wired to the fakes, with the KMS client supplied for the envelope."""
     settings = make_settings()
     return IdentityFlows(
         settings,
@@ -336,6 +302,7 @@ def flows(
 
 @pytest.fixture
 def mfa(flows: IdentityFlows) -> MfaService:
+    """The MFA service off the flows, asserted to be mounted by the fixtures."""
     service = flows.mfa
     assert service is not None, "the fixtures wire every M4 store, so MFA must be mounted"
     return service
@@ -348,6 +315,7 @@ def client(
     kms: FakeKms,
     attempts: InMemoryLoginAttemptStore,
 ) -> Iterator[TestClient]:
+    """A `TestClient` over an app mounting the identity router with the limiter off."""
     from webbpulse.http import register_error_handlers
 
     settings = make_settings()
@@ -368,6 +336,7 @@ def client(
 
 
 def prefix() -> str:
+    """The identity router path prefix for the suite's settings."""
     return identity_prefix(make_settings())
 
 
@@ -395,11 +364,7 @@ def seed_account(
 
 
 def enrol(mfa: MfaService, user_id: str = USER_ID) -> tuple[str, list[str]]:
-    """Enrol and activate a factor, returning the seed and the recovery codes.
-
-    Goes through the service rather than writing store rows directly, so a test that uses
-    this is also exercising the enrolment path it depends on.
-    """
+    """Enrol and activate a factor through the service, returning the seed and recovery codes."""
     enrolment = mfa.begin_enrolment(user_id, account_name=EMAIL)
     step = totp_module.current_step()
     codes = mfa.confirm_enrolment(user_id, totp_module.generate_code(enrolment.secret, step=step))
@@ -413,19 +378,7 @@ def code_now(seed: str, *, offset: int = 0) -> str:
 
 @contextmanager
 def clock_advanced(monkeypatch: pytest.MonkeyPatch, steps: int) -> Iterator[None]:
-    """Move the TOTP clock forward by whole time steps for the body of the block.
-
-    Needed because a second verification cannot simply reach for a code further ahead: the
-    window is one step either side of *now*, so the code two steps out is refused for being
-    outside the window rather than for being replayed, and a test written that way would be
-    asserting the wrong refusal. Advancing the clock is what really happens between two
-    verifications by the same user.
-
-    `time.time` is patched process-wide for the block, so token `iat` and `exp` move with
-    it too. That is the honest simulation of time passing, and it is why any assertion
-    inside the block has to be made against the advanced clock rather than against real
-    time.
-    """
+    """Move the TOTP clock forward by whole time steps for the body of the block."""
     real = time.time
     monkeypatch.setattr(time, "time", lambda: real() + steps * totp_module.TIME_STEP_SECONDS)
     try:
@@ -444,17 +397,8 @@ def claims_of(token: str) -> dict[str, Any]:
     return result
 
 
-# ---------------------------------------------------------------------------
-# TOTP against RFC 6238
-# ---------------------------------------------------------------------------
-
-#: The RFC 6238 Appendix B seed. The document gives it as the ASCII "12345678901234567890";
-#: base32 is the form a `otpauth://` URI carries and the form this module works in.
 RFC_SEED = base64.b32encode(b"12345678901234567890").decode("ascii").rstrip("=")
 
-#: Appendix B's SHA-1 rows: (unix time, the 8 digit code). The table publishes eight digits
-#: and this implementation emits six, so the assertion takes the last six, which is what
-#: truncating the same dynamic-truncation result to six digits gives.
 RFC_VECTORS = [
     (59, "94287082"),
     (1111111109, "07081804"),
@@ -467,32 +411,20 @@ RFC_VECTORS = [
 
 @pytest.mark.parametrize(("moment", "expected"), RFC_VECTORS)
 def test_the_generator_agrees_with_rfc_6238_appendix_b(moment: int, expected: str) -> None:
-    """The only test that can catch a generator and verifier that are wrong together.
-
-    Every other TOTP test here compares this implementation against itself, which passes
-    whatever the arithmetic does as long as it is consistent. These six rows come from the
-    RFC, so agreeing with them is agreeing with every authenticator app the user might have
-    installed. Getting this wrong ships a feature where enrolment succeeds and nothing the
-    user types is ever accepted.
-    """
+    """The generator reproduces the RFC 6238 Appendix B code for each published timestamp."""
     step = moment // totp_module.TIME_STEP_SECONDS
     assert totp_module.generate_code(RFC_SEED, step=step) == expected[-6:]
 
 
 def test_a_code_is_six_digits_including_its_leading_zeros() -> None:
-    """`07081804` truncates to `081804`, not to `81804`.
-
-    Formatting with `%d` rather than a zero-padded width is the classic bug here, and it only
-    shows up on the one code in ten that starts with a zero. A user hitting it sees a code
-    their app displays being refused with no pattern.
-    """
+    """A code starting with a zero keeps it: the result is zero padded to `CODE_DIGITS`."""
     step = 1111111109 // totp_module.TIME_STEP_SECONDS
     assert totp_module.generate_code(RFC_SEED, step=step) == "081804"
     assert len(totp_module.generate_code(RFC_SEED, step=step)) == totp_module.CODE_DIGITS
 
 
 def test_the_seed_is_long_enough_and_decodes_as_base32() -> None:
-    """RFC 4226 section 4 requires at least 128 bits and recommends 160."""
+    """A generated seed is unpadded upper-case base32 decoding to at least 128 bits."""
     seed = totp_module.generate_seed()
     assert seed == seed.upper()
     assert "=" not in seed
@@ -502,15 +434,12 @@ def test_the_seed_is_long_enough_and_decodes_as_base32() -> None:
 
 
 def test_two_seeds_are_never_the_same() -> None:
-    """A seed generated from anything but a CSPRNG is the whole factor gone."""
+    """Fifty generated seeds are all distinct, so the source is not a weak generator."""
     assert len({totp_module.generate_seed() for _ in range(50)}) == 50
 
 
 def test_a_seed_is_accepted_however_the_user_typed_it() -> None:
-    """Lower case, padding and the spaces some apps display between groups.
-
-    A user typing a seed by hand copies what is on screen, spaces included.
-    """
+    """Lower case, padding and grouped spaces all produce the same code as the canonical seed."""
     seed = totp_module.generate_seed()
     step = totp_module.current_step()
     expected = totp_module.generate_code(seed, step=step)
@@ -520,35 +449,20 @@ def test_a_seed_is_accepted_however_the_user_typed_it() -> None:
 
 
 def test_a_seed_that_is_not_base32_raises_rather_than_producing_a_code() -> None:
-    """Silently hashing garbage would give a code that is stably wrong forever."""
+    """A non-base32 seed raises `ValueError` rather than hashing garbage into a stable wrong code."""
     with pytest.raises(ValueError):
         totp_module.generate_code("not-valid-base32-1!", step=1)
 
 
-# ---------------------------------------------------------------------------
-# TOTP verification: the window and the replay refusal
-# ---------------------------------------------------------------------------
-
-
 def test_verification_accepts_the_current_step_and_returns_it() -> None:
-    """Returns the step rather than a bool because the caller must store the watermark.
-
-    A verifier returning `True` gives the caller nothing to record, and replay defence then
-    has to recompute which step matched, which is the sort of duplication that drifts.
-    """
+    """`verify_code` returns the matched step, which is the watermark the caller has to store."""
     seed = totp_module.generate_seed()
     step = totp_module.current_step()
     assert totp_module.verify_code(seed, totp_module.generate_code(seed, step=step)) == step
 
 
 def test_verification_accepts_one_step_either_side_and_not_two() -> None:
-    """Section 6.1 fixes the window at one step, which is thirty seconds each way.
-
-    Both sides, not just behind: a phone whose clock is a little fast produces the next
-    step's code, and refusing it would make the factor unusable for that user. Two steps
-    away is refused, because each extra step multiplies an attacker's chance against a
-    million-value space and the window is the only thing bounding that.
-    """
+    """The window is one step each way: offsets of one verify, offsets of two return None."""
     seed = totp_module.generate_seed()
     now = totp_module.current_step()
     for offset in (-1, 0, 1):
@@ -560,11 +474,7 @@ def test_verification_accepts_one_step_either_side_and_not_two() -> None:
 
 
 def test_a_step_at_or_below_the_watermark_is_refused() -> None:
-    """The replay refusal, at the level of the pure function.
-
-    Not `<`, but `<=`: the step just used is exactly the one an attacker who shoulder-surfed
-    the code would present, and it is still inside the window for another thirty seconds.
-    """
+    """A step equal to or below `last_used_step` is refused, so the code just used cannot replay."""
     seed = totp_module.generate_seed()
     now = totp_module.current_step()
     code = totp_module.generate_code(seed, step=now)
@@ -574,30 +484,21 @@ def test_a_step_at_or_below_the_watermark_is_refused() -> None:
 
 
 def test_a_wrong_code_of_the_right_shape_is_refused() -> None:
+    """A six digit code that is not the current one returns None."""
     seed = totp_module.generate_seed()
     wrong = "000000" if code_now(seed) != "000000" else "111111"
     assert totp_module.verify_code(seed, wrong) is None
 
 
 def test_codes_are_normalised_of_spaces_and_hyphens_only() -> None:
-    """Authenticator apps display `123 456`, and a user pastes what they see.
-
-    Only whitespace and hyphens, though: stripping anything else would mean a code with a
-    stray letter in it being silently reshaped into a valid one.
-    """
+    """`normalise_code` strips spaces and hyphens and leaves any other character alone."""
     assert totp_module.normalise_code(" 123 456 ") == "123456"
     assert totp_module.normalise_code("123-456") == "123456"
     assert totp_module.normalise_code("12a456") == "12a456"
 
 
 def test_the_provisioning_uri_is_a_uri_not_a_form_body() -> None:
-    """A space in the issuer must encode as `%20`, never as `+`.
-
-    `urlencode` defaults to form encoding, where a space becomes `+`. The Key URI format is
-    a URI, so a compliant parser reads that `+` literally and the user's authenticator lists
-    the account under a name with a plus sign in it. It is the sort of bug that never fails
-    a test written against the implementation's own parser.
-    """
+    """A space in the issuer encodes as `%20`, never as the form encoding `+`."""
     seed = totp_module.generate_seed()
     uri = totp_module.provisioning_uri(seed, account_name=EMAIL, issuer="WebbPulse Portfolio")
     assert "+" not in uri
@@ -605,11 +506,7 @@ def test_the_provisioning_uri_is_a_uri_not_a_form_body() -> None:
 
 
 def test_the_provisioning_uri_carries_the_issuer_in_both_places() -> None:
-    """The Key URI format puts the issuer in the label prefix *and* in a parameter.
-
-    Older apps read the prefix, newer ones read the parameter, and an app that reads both
-    warns when they disagree. Emitting only one is what makes an account show up unlabelled.
-    """
+    """The issuer appears in both the otpauth label prefix and the `issuer` parameter."""
     from urllib.parse import parse_qs, unquote, urlsplit
 
     seed = totp_module.generate_seed()
@@ -624,11 +521,7 @@ def test_the_provisioning_uri_carries_the_issuer_in_both_places() -> None:
 
 
 def test_the_provisioning_uri_omits_the_parameters_that_are_defaults() -> None:
-    """SHA-1, six digits and thirty seconds are what every app assumes.
-
-    Spelling them out is not merely redundant: several popular apps ignore `algorithm`
-    entirely, so a URI that names one implies a promise the apps do not keep.
-    """
+    """`algorithm`, `digits` and `period` are omitted, since every app assumes the defaults."""
     uri = totp_module.provisioning_uri(
         totp_module.generate_seed(), account_name=EMAIL, issuer="Example"
     )
@@ -638,11 +531,7 @@ def test_the_provisioning_uri_omits_the_parameters_that_are_defaults() -> None:
 
 
 def test_an_independent_implementation_agrees_with_this_one() -> None:
-    """Twenty random seeds through eight lines of RFC 4226 written from the spec.
-
-    The Appendix B vectors pin one seed. This pins the arithmetic across seeds, which is
-    where a masking or endianness mistake would show up on some inputs and not others.
-    """
+    """Twenty random seeds agree with RFC 4226 dynamic truncation written out from the spec."""
     for _ in range(20):
         seed = totp_module.generate_seed()
         step = totp_module.current_step()
@@ -653,23 +542,15 @@ def test_an_independent_implementation_agrees_with_this_one() -> None:
         assert totp_module.generate_code(seed, step=step) == f"{truncated % 1_000_000:06d}"
 
 
-# ---------------------------------------------------------------------------
-# The envelope: the hand fake, then moto
-# ---------------------------------------------------------------------------
-
-
 def test_a_sealed_seed_round_trips(kms: FakeKms) -> None:
+    """A sealed secret opens back to its plaintext for the same user."""
     cipher = EnvelopeCipher(DATA_KEY, kms)
     sealed = cipher.seal(b"the seed", user_id=USER_ID)
     assert cipher.open(sealed, user_id=USER_ID) == b"the seed"
 
 
 def test_the_sealed_fields_never_contain_the_plaintext(kms: FakeKms) -> None:
-    """The row is what a person with table read access sees.
-
-    Every field is asserted, not just the ciphertext: the failure this guards against is a
-    later change that keeps the plaintext around "for debugging" in a field nobody checks.
-    """
+    """No field of the stored item contains the seed, in any case."""
     cipher = EnvelopeCipher(DATA_KEY, kms)
     seed = totp_module.generate_seed()
     sealed = cipher.seal(seed.encode("ascii"), user_id=USER_ID)
@@ -679,11 +560,7 @@ def test_the_sealed_fields_never_contain_the_plaintext(kms: FakeKms) -> None:
 
 
 def test_a_ciphertext_moved_to_another_users_row_will_not_open(kms: FakeKms) -> None:
-    """The point of putting `user_id` in the encryption context.
-
-    Without it, somebody who can write the table copies the row of a user whose seed they
-    know onto the account they want, and the factor they now control passes.
-    """
+    """Opening under a different user id fails, because `user_id` is in the encryption context."""
     cipher = EnvelopeCipher(DATA_KEY, kms)
     sealed = cipher.seal(b"the seed", user_id=USER_ID)
     with pytest.raises(EnvelopeDecryptionFailed):
@@ -691,8 +568,7 @@ def test_a_ciphertext_moved_to_another_users_row_will_not_open(kms: FakeKms) -> 
 
 
 def test_a_ciphertext_from_another_purpose_will_not_open_as_a_seed(kms: FakeKms) -> None:
-    """The other half of the context. A later feature encrypting under the same key must not
-    produce values that can be dropped into the TOTP column."""
+    """A secret sealed under another purpose will not open as a TOTP seed."""
     cipher = EnvelopeCipher(DATA_KEY, kms)
     sealed = cipher.seal(b"something else", user_id=USER_ID, purpose="other")
     with pytest.raises(EnvelopeDecryptionFailed):
@@ -700,11 +576,7 @@ def test_a_ciphertext_from_another_purpose_will_not_open_as_a_seed(kms: FakeKms)
 
 
 def test_tampering_with_the_ciphertext_is_detected(kms: FakeKms) -> None:
-    """AES-GCM is authenticated, so this is a property of the mode rather than of the code.
-
-    Asserted anyway, because it stops being true the moment somebody swaps GCM for CTR to
-    "simplify" and the seed becomes malleable.
-    """
+    """A flipped ciphertext byte raises `EnvelopeDecryptionFailed`, as an authenticated mode must."""
     cipher = EnvelopeCipher(DATA_KEY, kms)
     sealed = cipher.seal(b"the seed", user_id=USER_ID)
     raw = bytearray(base64.b64decode(sealed.ciphertext))
@@ -719,11 +591,7 @@ def test_tampering_with_the_ciphertext_is_detected(kms: FakeKms) -> None:
 
 
 def test_every_seal_uses_a_fresh_data_key_and_a_fresh_nonce(kms: FakeKms) -> None:
-    """A reused GCM nonce under a reused key is a total break of confidentiality.
-
-    A data key per secret makes the pair impossible to repeat by construction, which is
-    exactly why the envelope is worth the extra call over `kms:Encrypt`.
-    """
+    """Ten seals of the same plaintext give ten distinct nonces, wrapped keys and ciphertexts."""
     cipher = EnvelopeCipher(DATA_KEY, kms)
     sealed = [cipher.seal(b"the seed", user_id=USER_ID) for _ in range(10)]
     assert len({item.nonce for item in sealed}) == 10
@@ -732,6 +600,7 @@ def test_every_seal_uses_a_fresh_data_key_and_a_fresh_nonce(kms: FakeKms) -> Non
 
 
 def test_the_data_key_request_asks_for_256_bits_under_the_configured_key(kms: FakeKms) -> None:
+    """The data key request names the configured key, 32 bytes, and the user's encryption context."""
     cipher = EnvelopeCipher(DATA_KEY, kms)
     cipher.seal(b"the seed", user_id=USER_ID)
     assert kms.data_key_calls == [
@@ -744,11 +613,7 @@ def test_the_data_key_request_asks_for_256_bits_under_the_configured_key(kms: Fa
 
 
 def test_a_half_written_row_reads_back_as_no_usable_factor() -> None:
-    """`None`, not a `KeyError` and not a partial object.
-
-    A row missing one of the three fields cannot be decrypted whatever the caller does. The
-    difference between `None` and a raise is a 401 on one user's login versus a 500.
-    """
+    """`SealedSecret.from_item` returns None for a row missing any of the three fields."""
     assert SealedSecret.from_item({}) is None
     assert SealedSecret.from_item({"secret_ciphertext": "x", "secret_nonce": "y"}) is None
     full = {"secret_ciphertext": "x", "secret_nonce": "y", "wrapped_data_key": "z"}
@@ -756,16 +621,7 @@ def test_a_half_written_row_reads_back_as_no_usable_factor() -> None:
 
 
 def test_the_envelope_works_against_moto() -> None:
-    """The one test that runs the envelope against a real KMS implementation.
-
-    M1 decision 8 found moto unusable for asymmetric signing, and it would be easy to
-    conclude KMS is off limits in tests entirely. It is not: moto 5.x implements symmetric
-    `GenerateDataKey` and `Decrypt` including encryption context, so the three properties
-    the design rests on can be asserted against something that was not written to agree.
-
-    A hand fake cannot tell us that a real client accepts these call shapes at all, and that
-    is the part this covers.
-    """
+    """A real KMS client under moto round trips a seal, and rejects a wrong context and a tampered key."""
     moto = pytest.importorskip("moto")
     boto3 = pytest.importorskip("boto3")
 
@@ -778,7 +634,6 @@ def test_the_envelope_works_against_moto() -> None:
         sealed = cipher.seal(seed.encode("ascii"), user_id=USER_ID)
         assert cipher.open(sealed, user_id=USER_ID).decode("ascii") == seed
 
-        # The context is enforced by KMS itself, not by anything in this package.
         with pytest.raises(EnvelopeDecryptionFailed):
             cipher.open(sealed, user_id="user-9999")
 
@@ -796,31 +651,17 @@ def test_the_envelope_works_against_moto() -> None:
 def test_the_cipher_names_the_missing_setting_rather_than_failing_deep(
     hooks: FakeHooks, stores: IdentityStores, kms: FakeKms
 ) -> None:
-    """An unset `data_key_arn` must fail with the setting's name in the message.
-
-    The alternative is a `ValueError` out of the middle of the cipher on the first enrolment
-    in production, and whoever is paged has to read three modules to learn which environment
-    variable is missing.
-    """
+    """An unset `data_key_arn` raises naming `IDENTITY_DATA_KEY_ARN` rather than failing inside the cipher."""
     settings = make_settings(data_key_arn="")
     service = MfaService(settings, stores, TokenService(settings, kms), kms_client=kms)
     with pytest.raises(ValueError, match="IDENTITY_DATA_KEY_ARN"):
         _ = service.cipher
 
 
-# ---------------------------------------------------------------------------
-# Enrolment
-# ---------------------------------------------------------------------------
-
-
 def test_enrolment_leaves_the_factor_inactive_until_a_code_confirms_it(
     mfa: MfaService, stores: IdentityStores
 ) -> None:
-    """The whole reason confirmation exists.
-
-    A factor active from the moment a QR code is drawn locks out every user who scans badly
-    or closes the tab, and the only way back is a support request.
-    """
+    """`begin_enrolment` writes an inactive factor, and `factors_for` reports none until confirmation."""
     mfa.begin_enrolment(USER_ID, account_name=EMAIL)
     factor = stores.require_totp_factors().get(USER_ID)
     assert factor is not None
@@ -831,6 +672,7 @@ def test_enrolment_leaves_the_factor_inactive_until_a_code_confirms_it(
 def test_confirming_with_a_correct_code_activates_and_issues_recovery_codes(
     mfa: MfaService, stores: IdentityStores
 ) -> None:
+    """A correct confirmation code activates the factor and issues the full set of recovery codes."""
     enrolment = mfa.begin_enrolment(USER_ID, account_name=EMAIL)
     codes = mfa.confirm_enrolment(USER_ID, code_now(enrolment.secret))
     assert mfa.factors_for(USER_ID) == [TOTP_FACTOR]
@@ -840,6 +682,7 @@ def test_confirming_with_a_correct_code_activates_and_issues_recovery_codes(
 
 
 def test_confirming_with_a_wrong_code_leaves_the_factor_inactive(mfa: MfaService) -> None:
+    """A wrong confirmation code raises `MfaRejected` and leaves the factor inactive."""
     mfa.begin_enrolment(USER_ID, account_name=EMAIL)
     with pytest.raises(MfaRejected):
         mfa.confirm_enrolment(USER_ID, "000000")
@@ -847,11 +690,7 @@ def test_confirming_with_a_wrong_code_leaves_the_factor_inactive(mfa: MfaService
 
 
 def test_the_confirming_code_cannot_then_be_replayed_as_a_login_code(mfa: MfaService) -> None:
-    """Activation records the step it was confirmed at.
-
-    Without that, the code the user typed to finish enrolment is still valid for the rest of
-    its thirty second window, and anyone who watched them type it can use it.
-    """
+    """Activation records its step, so the confirming code cannot then satisfy a login challenge."""
     enrolment = mfa.begin_enrolment(USER_ID, account_name=EMAIL)
     code = code_now(enrolment.secret)
     mfa.confirm_enrolment(USER_ID, code)
@@ -860,11 +699,7 @@ def test_the_confirming_code_cannot_then_be_replayed_as_a_login_code(mfa: MfaSer
 
 
 def test_enrolling_again_over_an_active_factor_is_refused(mfa: MfaService) -> None:
-    """409, not a silent replacement.
-
-    Overwriting a working authenticator with an unconfirmed seed is how a user ends up with
-    a factor they cannot satisfy. Replacing one means disabling and enrolling again.
-    """
+    """Enrolling over an active factor is a 409 `TOTP_ALREADY_ENABLED`, not a silent replacement."""
     enrol(mfa)
     with pytest.raises(MfaRejected) as caught:
         mfa.begin_enrolment(USER_ID, account_name=EMAIL)
@@ -873,11 +708,7 @@ def test_enrolling_again_over_an_active_factor_is_refused(mfa: MfaService) -> No
 
 
 def test_enrolling_again_over_a_pending_factor_issues_a_new_seed(mfa: MfaService) -> None:
-    """A user who lost the first QR code before confirming just starts again.
-
-    The seed is never redisplayed, so the only thing `begin_enrolment` can do for them is
-    issue a fresh one, and the old pending row must not survive to be confirmed later.
-    """
+    """A second enrolment over a pending one issues a new seed and retires the old pending row."""
     first = mfa.begin_enrolment(USER_ID, account_name=EMAIL)
     second = mfa.begin_enrolment(USER_ID, account_name=EMAIL)
     assert first.secret != second.secret
@@ -888,6 +719,7 @@ def test_enrolling_again_over_a_pending_factor_issues_a_new_seed(mfa: MfaService
 
 
 def test_confirming_with_no_pending_enrolment_is_refused(mfa: MfaService) -> None:
+    """Confirming with nothing pending is refused as `NO_PENDING_ENROLMENT`."""
     with pytest.raises(MfaRejected) as caught:
         mfa.confirm_enrolment(USER_ID, "123456")
     assert caught.value.error_code == "NO_PENDING_ENROLMENT"
@@ -896,11 +728,7 @@ def test_confirming_with_no_pending_enrolment_is_refused(mfa: MfaService) -> Non
 def test_disabling_removes_the_factor_and_every_recovery_code(
     mfa: MfaService, stores: IdentityStores
 ) -> None:
-    """Both, always.
-
-    Recovery codes left behind after TOTP is disabled are live credentials satisfying a
-    factor the user believes is gone, and nothing in the UI would ever show them again.
-    """
+    """Disabling removes the factor row and every recovery code, leaving no live credential."""
     _, codes = enrol(mfa)
     mfa.disable_totp(USER_ID)
     assert mfa.factors_for(USER_ID) == []
@@ -910,17 +738,8 @@ def test_disabling_removes_the_factor_and_every_recovery_code(
         mfa.verify_challenge(USER_ID, codes[0])
 
 
-# ---------------------------------------------------------------------------
-# Verification through the service
-# ---------------------------------------------------------------------------
-
-
 def test_a_totp_code_is_accepted_once_and_then_refused(mfa: MfaService) -> None:
-    """The replay refusal at the level a route actually reaches.
-
-    The pure function has its own test; this one proves the watermark is written, which is
-    the half that is easy to leave out.
-    """
+    """A TOTP code verifies as `otp` once, then is refused, proving the watermark is written."""
     seed, _ = enrol(mfa)
     code = code_now(seed, offset=1)
     assert mfa.verify_challenge(USER_ID, code) == AMR_OTP
@@ -929,6 +748,7 @@ def test_a_totp_code_is_accepted_once_and_then_refused(mfa: MfaService) -> None:
 
 
 def test_a_recovery_code_is_accepted_once_and_then_refused(mfa: MfaService) -> None:
+    """A recovery code verifies as `recovery` once and is refused the second time."""
     _, codes = enrol(mfa)
     assert mfa.verify_challenge(USER_ID, codes[0]) == AMR_RECOVERY
     with pytest.raises(MfaRejected):
@@ -936,6 +756,7 @@ def test_a_recovery_code_is_accepted_once_and_then_refused(mfa: MfaService) -> N
 
 
 def test_spending_one_recovery_code_leaves_the_others_alone(mfa: MfaService) -> None:
+    """Spending one recovery code decrements the count by one and leaves the rest usable."""
     _, codes = enrol(mfa)
     mfa.verify_challenge(USER_ID, codes[0])
     assert mfa.remaining_recovery_codes(USER_ID) == RECOVERY_CODE_COUNT - 1
@@ -943,21 +764,14 @@ def test_spending_one_recovery_code_leaves_the_others_alone(mfa: MfaService) -> 
 
 
 def test_a_recovery_code_is_accepted_however_it_was_typed(mfa: MfaService) -> None:
-    """Read off paper, so hyphens and case must not matter.
-
-    Base32 has no lower case and no 0, 1 or 8, so folding case introduces no ambiguity.
-    """
+    """A recovery code typed without hyphens and in lower case still verifies."""
     _, codes = enrol(mfa)
     typed = codes[0].replace("-", "").lower()
     assert mfa.verify_challenge(USER_ID, typed) == AMR_RECOVERY
 
 
 def test_recovery_codes_are_stored_hashed(mfa: MfaService, stores: IdentityStores) -> None:
-    """A code is only ever compared, so the store holds the weakest thing that supports that.
-
-    The seed is the opposite case and is sealed rather than hashed, because verification
-    needs it back. Two secrets, two storage choices, for one reason each.
-    """
+    """The store holds only `hash_recovery_code` digests, never the code or its normalised form."""
     _, codes = enrol(mfa)
     stored = list(stores.require_recovery_codes().list_for_user(USER_ID))
     hashes_stored = {record.code_hash for record in stored}
@@ -968,16 +782,13 @@ def test_recovery_codes_are_stored_hashed(mfa: MfaService, stores: IdentityStore
 
 
 def test_the_stored_hash_is_of_the_normalised_code() -> None:
-    """Otherwise the same code typed with and without hyphens hashes differently."""
+    """The same code hashes identically whether typed with hyphens, spaces, or neither."""
     assert hash_recovery_code("abcde-fghij") == hash_recovery_code("ABCDEFGHIJ")
     assert hash_recovery_code("abcde fghij") == hash_recovery_code("ABCDEFGHIJ")
 
 
 def test_regenerating_invalidates_the_previous_set(mfa: MfaService) -> None:
-    """The entire reason a user regenerates is that the old printout is no longer trusted.
-
-    A new set that leaves the old one working has not done the thing the user asked for.
-    """
+    """Regenerating issues a disjoint set and stops every old code from verifying."""
     _, old = enrol(mfa)
     fresh = mfa.regenerate_recovery_codes(USER_ID)
     assert len(fresh.codes) == RECOVERY_CODE_COUNT
@@ -988,6 +799,7 @@ def test_regenerating_invalidates_the_previous_set(mfa: MfaService) -> None:
 
 
 def test_one_users_codes_do_not_work_for_another(mfa: MfaService, hooks: FakeHooks) -> None:
+    """Neither a recovery code nor a TOTP code from one user verifies for another."""
     hooks.add("other@example.com", user_id="user-0002")
     seed, codes = enrol(mfa)
     enrol(mfa, "user-0002")
@@ -998,18 +810,13 @@ def test_one_users_codes_do_not_work_for_another(mfa: MfaService, hooks: FakeHoo
 
 
 def test_a_user_with_no_factor_is_refused_rather_than_waved_through(mfa: MfaService) -> None:
-    """The failure mode where "no factor configured" reads as "nothing to check"."""
+    """A user with no factor is refused rather than treated as having nothing to check."""
     with pytest.raises(MfaRejected):
         mfa.verify_challenge(USER_ID, "123456")
 
 
 def test_every_refusal_carries_the_same_message(mfa: MfaService) -> None:
-    """Enumeration resistance: a caller must not learn *why* a code failed.
-
-    Wrong code, replayed code, unknown user and no factor all answer identically. A distinct
-    message for "you have no TOTP factor" tells an attacker which accounts to target with
-    something else.
-    """
+    """Wrong code, replayed code, unknown user and no factor all refuse with one message, code and status."""
     seed, codes = enrol(mfa)
     spent = code_now(seed, offset=1)
     mfa.verify_challenge(USER_ID, spent)
@@ -1032,11 +839,7 @@ def test_every_refusal_carries_the_same_message(mfa: MfaService) -> None:
 def test_a_seed_that_cannot_be_decrypted_is_an_ordinary_refusal(
     mfa: MfaService, stores: IdentityStores
 ) -> None:
-    """A key policy change is not something the user can act on.
-
-    It is logged as the fault it is, but the caller sees the same 401 as a wrong code: an
-    attacker should not learn that the key stopped working either.
-    """
+    """An undecryptable seed surfaces as the ordinary 401, not as a distinguishable failure."""
     enrol(mfa)
     store = stores.require_totp_factors()
     factor = store.get(USER_ID)
@@ -1056,17 +859,8 @@ def test_a_seed_that_cannot_be_decrypted_is_an_ordinary_refusal(
     assert caught.value.status_code == 401
 
 
-# ---------------------------------------------------------------------------
-# The MFA ticket
-# ---------------------------------------------------------------------------
-
-
 def test_a_ticket_is_not_an_access_token(mfa: MfaService, kms: FakeKms) -> None:
-    """Three separations, and the audience is the one that matters at the gateway.
-
-    An API Gateway JWT authorizer configured for the API's audience must refuse a ticket, or
-    the first leg of login hands out something that opens every route behind it.
-    """
+    """An MFA ticket has the MFA type and audience, carries no `sid`, and fails access token verification."""
     settings = make_settings()
     tokens = TokenService(settings, kms)
     challenge = mfa.issue_challenge(USER_ID, factors=[TOTP_FACTOR])
@@ -1082,11 +876,7 @@ def test_a_ticket_is_not_an_access_token(mfa: MfaService, kms: FakeKms) -> None:
 def test_an_access_token_is_not_a_ticket(
     flows: IdentityFlows, hooks: FakeHooks, stores: IdentityStores, kms: FakeKms
 ) -> None:
-    """The other direction, which does not follow from the first.
-
-    A ticket verifier that only checked the signature would accept every access token the
-    issuer ever minted, and any of them would complete somebody's second login leg.
-    """
+    """An access token has the access type and fails MFA ticket verification."""
     seed_account(hooks, stores)
     result = flows.login(email=EMAIL, password=PASSWORD)
     tokens = TokenService(make_settings(), kms)
@@ -1096,11 +886,7 @@ def test_an_access_token_is_not_a_ticket(
 
 
 def test_a_ticket_is_short_lived(mfa: MfaService) -> None:
-    """Five minutes, per the settings default. It is the gap between two legs of one login.
-
-    An access token's lifetime would be wrong here: nothing is happening in between except
-    a user reading six digits off a screen.
-    """
+    """An MFA ticket lives five minutes, the gap between two legs of one login."""
     challenge = mfa.issue_challenge(USER_ID, factors=[TOTP_FACTOR])
     claims = claims_of(challenge.ticket)
     assert claims["exp"] - claims["iat"] == 300
@@ -1109,11 +895,7 @@ def test_a_ticket_is_short_lived(mfa: MfaService) -> None:
 def test_a_ticket_is_recorded_before_it_is_returned(
     mfa: MfaService, stores: IdentityStores
 ) -> None:
-    """The safe failure direction.
-
-    A ticket with no row cannot be spent, so a failed write costs a login the user retries.
-    A row written after the return would mean a window where the ticket works twice.
-    """
+    """The ticket's row is in the identity token store by the time the ticket is returned."""
     from webbpulse.identity import hash_token
 
     challenge = mfa.issue_challenge(USER_ID, factors=[TOTP_FACTOR])
@@ -1125,6 +907,7 @@ def test_a_ticket_is_recorded_before_it_is_returned(
 
 
 def test_a_ticket_is_spent_by_its_first_use(mfa: MfaService) -> None:
+    """A ticket consumes once, and the second attempt is `MFA_TICKET_INVALID`."""
     challenge = mfa.issue_challenge(USER_ID, factors=[TOTP_FACTOR])
     assert mfa.consume_ticket(challenge.ticket) == USER_ID
     with pytest.raises(MfaRejected) as caught:
@@ -1133,16 +916,13 @@ def test_a_ticket_is_spent_by_its_first_use(mfa: MfaService) -> None:
 
 
 def test_a_forged_ticket_is_refused(mfa: MfaService) -> None:
+    """A string that is not a token is refused rather than accepted."""
     with pytest.raises(MfaRejected):
         mfa.consume_ticket("not.a.token")
 
 
 def test_the_challenge_body_matches_what_the_frontend_reads(mfa: MfaService) -> None:
-    """`@webbpulse/auth` 0.4.0 branches on exactly these three keys.
-
-    Asserted as an exact set rather than key by key: an extra key is how a frontend that
-    switches on the body shape starts taking a branch nobody intended.
-    """
+    """The challenge body is exactly `mfa_required`, `mfa_ticket` and `factors`, with no extra keys."""
     challenge = mfa.issue_challenge(USER_ID, factors=[TOTP_FACTOR])
     body = challenge.as_body()
     assert set(body) == {"mfa_required", "mfa_ticket", "factors"}
@@ -1151,15 +931,10 @@ def test_the_challenge_body_matches_what_the_frontend_reads(mfa: MfaService) -> 
     assert body["mfa_ticket"] == challenge.ticket
 
 
-# ---------------------------------------------------------------------------
-# Login: the two legs
-# ---------------------------------------------------------------------------
-
-
 def test_login_without_a_factor_still_issues_tokens_directly(
     flows: IdentityFlows, hooks: FakeHooks, stores: IdentityStores
 ) -> None:
-    """M2's behaviour, unchanged for every user who has not enrolled."""
+    """A user with no factor still gets an access and refresh token straight from `login`."""
     seed_account(hooks, stores)
     result = flows.login(email=EMAIL, password=PASSWORD)
     assert result.access_token
@@ -1169,11 +944,7 @@ def test_login_without_a_factor_still_issues_tokens_directly(
 def test_login_with_a_factor_raises_the_challenge_instead_of_issuing_tokens(
     flows: IdentityFlows, mfa: MfaService, hooks: FakeHooks, stores: IdentityStores
 ) -> None:
-    """Raised rather than returned, so a product that has not handled MFA fails loudly.
-
-    A second success shape returned from `login` would be silently ignored by every existing
-    caller, and those callers would hand out sessions to users who never satisfied a factor.
-    """
+    """A user with an active factor makes `login` raise `MfaChallengeRequired` rather than return tokens."""
     seed_account(hooks, stores)
     enrol(mfa)
     with pytest.raises(MfaChallengeRequired) as caught:
@@ -1184,8 +955,7 @@ def test_login_with_a_factor_raises_the_challenge_instead_of_issuing_tokens(
 def test_a_pending_enrolment_does_not_challenge_a_login(
     flows: IdentityFlows, mfa: MfaService, hooks: FakeHooks, stores: IdentityStores
 ) -> None:
-    """A factor the user never confirmed cannot be satisfied, so challenging on it locks
-    them out with no way through."""
+    """An unconfirmed factor does not challenge a login, so a half-finished enrolment is not a lockout."""
     seed_account(hooks, stores)
     mfa.begin_enrolment(USER_ID, account_name=EMAIL)
     assert flows.login(email=EMAIL, password=PASSWORD).access_token
@@ -1194,25 +964,20 @@ def test_a_pending_enrolment_does_not_challenge_a_login(
 def test_a_wrong_password_is_refused_before_any_ticket_is_minted(
     flows: IdentityFlows, mfa: MfaService, hooks: FakeHooks, stores: IdentityStores
 ) -> None:
-    """Ordering, and it is the ordering that matters.
-
-    A ticket minted before the password check is a ticket anybody can get for any account,
-    and the second leg would then be the only thing standing between them and a session.
-    """
+    """A wrong password is refused before any MFA ticket row is written."""
     from webbpulse.identity.flows import LoginRejected
 
     seed_account(hooks, stores)
     enrol(mfa)
     with pytest.raises(LoginRejected):
         flows.login(email=EMAIL, password="wrong password entirely")
-    # `revoke_for_user` reports how many rows it removed, which is the only count the store
-    # ABC exposes. Zero here means no ticket was ever written.
     assert stores.require_identity_tokens().revoke_for_user(USER_ID, "mfa_ticket") == 0
 
 
 def test_completing_the_second_leg_issues_the_session(
     flows: IdentityFlows, mfa: MfaService, hooks: FakeHooks, stores: IdentityStores
 ) -> None:
+    """Completing the ticket with a valid code issues the session for the right subject."""
     seed_account(hooks, stores)
     seed, _ = enrol(mfa)
     with pytest.raises(MfaChallengeRequired) as caught:
@@ -1228,7 +993,7 @@ def test_completing_the_second_leg_issues_the_session(
 def test_a_recovery_code_completes_the_second_leg(
     flows: IdentityFlows, mfa: MfaService, hooks: FakeHooks, stores: IdentityStores
 ) -> None:
-    """One route takes both kinds, so a user who lost their phone is not locked out."""
+    """A recovery code completes the second leg and claims `recovery` in `amr`."""
     seed_account(hooks, stores)
     _, codes = enrol(mfa)
     with pytest.raises(MfaChallengeRequired) as caught:
@@ -1240,12 +1005,7 @@ def test_a_recovery_code_completes_the_second_leg(
 def test_the_ticket_is_spent_even_when_the_code_is_wrong(
     flows: IdentityFlows, mfa: MfaService, hooks: FakeHooks, stores: IdentityStores
 ) -> None:
-    """Deliberate, and the stricter choice.
-
-    A ticket that survives a wrong code is a ticket a thief can grind codes against. Spending
-    it first means a user who mistypes signs in again, which costs them a password entry and
-    costs an attacker the whole attempt.
-    """
+    """A wrong code still spends the ticket, so the next attempt is `MFA_TICKET_INVALID`."""
     seed_account(hooks, stores)
     seed, _ = enrol(mfa)
     with pytest.raises(MfaChallengeRequired) as caught:
@@ -1262,11 +1022,7 @@ def test_the_ticket_is_spent_even_when_the_code_is_wrong(
 def test_one_users_ticket_cannot_be_completed_with_another_users_code(
     flows: IdentityFlows, mfa: MfaService, hooks: FakeHooks, stores: IdentityStores
 ) -> None:
-    """The ticket binds the second leg to the login it came from.
-
-    Without that binding, anybody holding their own valid code could complete a ticket
-    issued for somebody else's password.
-    """
+    """A ticket is bound to its user: another user's valid code will not complete it."""
     seed_account(hooks, stores)
     seed_account(hooks, stores, email="other@example.com", user_id="user-0002")
     enrol(mfa)
@@ -1281,23 +1037,15 @@ def test_one_users_ticket_cannot_be_completed_with_another_users_code(
 
 
 def test_completing_with_no_ticket_is_refused(flows: IdentityFlows) -> None:
+    """Completing with an empty ticket is refused."""
     with pytest.raises(MfaRejected):
         flows.complete_mfa(ticket="", code="123456")
-
-
-# ---------------------------------------------------------------------------
-# `amr` and `auth_time`
-# ---------------------------------------------------------------------------
 
 
 def test_a_password_only_login_claims_pwd_alone(
     flows: IdentityFlows, hooks: FakeHooks, stores: IdentityStores
 ) -> None:
-    """No `mfa` value, because one factor is not multi-factor.
-
-    A route asserting on `amr` containing `mfa` is asserting on exactly this distinction, so
-    claiming it for a single factor would make the assertion meaningless.
-    """
+    """A single-factor login claims `pwd` alone and never `mfa`."""
     seed_account(hooks, stores)
     claims = claims_of(flows.login(email=EMAIL, password=PASSWORD).access_token)
     assert claims["amr"] == [AMR_PASSWORD]
@@ -1307,7 +1055,7 @@ def test_a_password_only_login_claims_pwd_alone(
 def test_a_two_leg_login_claims_the_factors_and_mfa(
     flows: IdentityFlows, mfa: MfaService, hooks: FakeHooks, stores: IdentityStores
 ) -> None:
-    """RFC 8176 values, and `mfa` appended because more than one method was used."""
+    """A two-leg login claims `pwd`, `otp` and `mfa`."""
     seed_account(hooks, stores)
     seed, _ = enrol(mfa)
     with pytest.raises(MfaChallengeRequired) as caught:
@@ -1322,12 +1070,7 @@ def test_a_two_leg_login_claims_the_factors_and_mfa(
 def test_recovery_is_not_claimed_as_an_rfc_8176_factor(
     flows: IdentityFlows, mfa: MfaService, hooks: FakeHooks, stores: IdentityStores
 ) -> None:
-    """`recovery` is deliberately not `otp`.
-
-    A recovery code is a bearer secret off a printout, not a possession factor, and a route
-    that requires a real second factor for something sensitive has to be able to tell them
-    apart. Claiming `otp` for a recovery code would make that impossible.
-    """
+    """A recovery code claims `recovery` and never `otp`, so the two stay distinguishable."""
     seed_account(hooks, stores)
     _, codes = enrol(mfa)
     with pytest.raises(MfaChallengeRequired) as caught:
@@ -1342,12 +1085,7 @@ def test_recovery_is_not_claimed_as_an_rfc_8176_factor(
 def test_a_hook_cannot_forge_amr_or_auth_time(
     flows: IdentityFlows, hooks: FakeHooks, stores: IdentityStores
 ) -> None:
-    """`claims_for` returns both here, and neither survives.
-
-    The claims are applied after the hook, not merged with it. A product hook that could set
-    `amr` could assert a factor its user never satisfied, and every step-up check downstream
-    would believe it.
-    """
+    """`amr` and `auth_time` from the product hook are overwritten, not merged."""
     seed_account(hooks, stores)
     claims = claims_of(flows.login(email=EMAIL, password=PASSWORD).access_token)
     assert claims["amr"] == [AMR_PASSWORD]
@@ -1357,14 +1095,10 @@ def test_a_hook_cannot_forge_amr_or_auth_time(
 def test_auth_time_is_present_and_recent_on_a_login(
     flows: IdentityFlows, hooks: FakeHooks, stores: IdentityStores
 ) -> None:
+    """A login's `auth_time` is present and within a few seconds of now."""
     seed_account(hooks, stores)
     claims = claims_of(flows.login(email=EMAIL, password=PASSWORD).access_token)
     assert abs(int(claims["auth_time"]) - int(time.time())) < 5
-
-
-# ---------------------------------------------------------------------------
-# Step-up
-# ---------------------------------------------------------------------------
 
 
 def test_step_up_returns_a_fresher_auth_time_without_a_new_session(
@@ -1374,12 +1108,7 @@ def test_step_up_returns_a_fresher_auth_time_without_a_new_session(
     stores: IdentityStores,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """The `auth_time` moves, the session does not.
-
-    Section 2.6 asserts on freshness rather than on a boolean precisely so that "recently"
-    is expressible. A new refresh family here would log the user out of nothing and rotate a
-    cookie that never moved.
-    """
+    """Step-up refreshes `auth_time` and claims `otp` while keeping the session and issuing no refresh token."""
     seed_account(hooks, stores)
     seed, _ = enrol(mfa)
     with pytest.raises(MfaChallengeRequired) as caught:
@@ -1395,9 +1124,6 @@ def test_step_up_returns_a_fresher_auth_time_without_a_new_session(
     assert claims["sid"] == session
     assert stepped.refresh_token == ""
     assert stepped.family_id == session
-    # Compared against the advanced clock, and asserted to have actually moved. Comparing
-    # against real time would pass on an implementation that never refreshed `auth_time`
-    # at all, which is the one thing this test exists to rule out.
     assert abs(int(claims["auth_time"]) - expected) < 5
     assert int(claims["auth_time"]) > first_auth_time
     assert AMR_OTP in claims["amr"]
@@ -1406,6 +1132,7 @@ def test_step_up_returns_a_fresher_auth_time_without_a_new_session(
 def test_step_up_with_a_wrong_code_is_refused(
     flows: IdentityFlows, mfa: MfaService, hooks: FakeHooks, stores: IdentityStores
 ) -> None:
+    """Step-up with a wrong code is refused."""
     seed_account(hooks, stores)
     enrol(mfa)
     with pytest.raises(MfaRejected):
@@ -1413,6 +1140,7 @@ def test_step_up_with_a_wrong_code_is_refused(
 
 
 def test_step_up_for_an_unknown_user_is_refused(flows: IdentityFlows) -> None:
+    """Step-up for a user with no factor is refused."""
     with pytest.raises(MfaRejected):
         flows.step_up(user_id="user-9999", session_id="session-1", code="123456")
 
@@ -1420,26 +1148,19 @@ def test_step_up_for_an_unknown_user_is_refused(flows: IdentityFlows) -> None:
 def test_step_up_spends_the_code_it_used(
     flows: IdentityFlows, mfa: MfaService, hooks: FakeHooks, stores: IdentityStores
 ) -> None:
-    """Same replay refusal as login. A step-up code is not a lesser code."""
+    """A step-up code is spent by its use and cannot be presented again."""
     seed_account(hooks, stores)
     seed, _ = enrol(mfa)
     code = code_now(seed, offset=1)
     flows.step_up(user_id=USER_ID, session_id="session-1", code=code)
     with pytest.raises(MfaRejected):
         flows.step_up(user_id=USER_ID, session_id="session-1", code=code)
-    # And still refused a moment later, while the code is inside the window but behind the
-    # watermark. This is the case a naive "is it the current code" check would let through.
     with pytest.raises(MfaRejected):
         flows.step_up(user_id=USER_ID, session_id="session-1", code=code)
 
 
-# ---------------------------------------------------------------------------
-# The stores
-# ---------------------------------------------------------------------------
-
-
 def test_a_factor_activates_exactly_once() -> None:
-    """`activate` returning `False` the second time is what makes the route's 409 correct."""
+    """`activate` returns True the first time and False after, which is what makes the route's 409 correct."""
     store = InMemoryTotpFactorStore()
     store.put(
         TotpFactorRecord(
@@ -1455,8 +1176,7 @@ def test_a_factor_activates_exactly_once() -> None:
 
 
 def test_the_step_watermark_only_moves_forward() -> None:
-    """The conditional write, which on DynamoDB is what makes two concurrent presentations
-    of the same code resolve to one acceptance."""
+    """`record_use` accepts only a step above the watermark, so a repeat or an earlier step fails."""
     store = InMemoryTotpFactorStore()
     store.put(
         TotpFactorRecord(
@@ -1475,6 +1195,7 @@ def test_the_step_watermark_only_moves_forward() -> None:
 
 
 def test_a_recovery_code_consumes_exactly_once() -> None:
+    """`consume` returns True once for a stored hash and False afterwards."""
     store = InMemoryRecoveryCodeStore()
     digest = hash_recovery_code("ABCDE-FGHIJ")
     store.put_many(
@@ -1485,11 +1206,13 @@ def test_a_recovery_code_consumes_exactly_once() -> None:
 
 
 def test_consuming_an_unknown_code_reports_failure_rather_than_raising() -> None:
+    """Consuming a hash that was never stored returns False rather than raising."""
     store = InMemoryRecoveryCodeStore()
     assert store.consume(USER_ID, hash_recovery_code("NOPE")) is False
 
 
 def test_recovery_codes_are_scoped_to_their_user() -> None:
+    """A stored code hash consumes only for the user it was written for."""
     store = InMemoryRecoveryCodeStore()
     digest = hash_recovery_code("ABCDE-FGHIJ")
     store.put_many(
@@ -1500,6 +1223,7 @@ def test_recovery_codes_are_scoped_to_their_user() -> None:
 
 
 def test_deleting_a_users_codes_leaves_another_users_alone() -> None:
+    """`delete_for_user` empties one user's codes and leaves another user's usable."""
     store = InMemoryRecoveryCodeStore()
     created = "2026-09-10T00:00:00Z"
     mine = hash_recovery_code("MINE-CODE")
@@ -1511,17 +1235,8 @@ def test_deleting_a_users_codes_leaves_another_users_alone() -> None:
     assert store.consume("user-0002", theirs) is True
 
 
-# ---------------------------------------------------------------------------
-# The routes
-# ---------------------------------------------------------------------------
-
-
 def router_paths(**kwargs: Any) -> set[str]:
-    """The paths one built router declares.
-
-    Read off the router rather than off an app, the way the M2 and M3 suites do: an app's
-    `routes` list holds the include wrapper rather than the routes themselves.
-    """
+    """The paths one built router declares, read off the router rather than off an app."""
     router = build_identity_router(make_settings(), limiter_enabled=False, **kwargs)
     return {route.path for route in router.routes}  # type: ignore[attr-defined]
 
@@ -1529,6 +1244,7 @@ def router_paths(**kwargs: Any) -> set[str]:
 def test_the_mfa_routes_are_declared(
     hooks: FakeHooks, stores: IdentityStores, kms: FakeKms
 ) -> None:
+    """All six MFA routes are declared when the stores and the KMS client are wired."""
     paths = router_paths(hooks=hooks, stores=stores, kms_client=kms)
     for path in (
         LOGIN_TOTP_PATH,
@@ -1544,12 +1260,7 @@ def test_the_mfa_routes_are_declared(
 def test_the_mfa_routes_are_absent_when_the_stores_are_not_wired(
     hooks: FakeHooks, kms: FakeKms
 ) -> None:
-    """Section 6.1 makes TOTP a capability, and a capability that cannot be switched off is
-    not one.
-
-    A route answering 503 because the product never created the tables is worse than a route
-    that does not exist: it appears in the OpenAPI document as something a caller can use.
-    """
+    """Without the TOTP and recovery stores the MFA routes are absent, while login remains."""
     paths = router_paths(
         hooks=hooks,
         stores=IdentityStores(
@@ -1566,6 +1277,7 @@ def test_the_mfa_routes_are_absent_when_the_stores_are_not_wired(
 def test_the_mfa_routes_are_absent_when_totp_is_disabled(
     hooks: FakeHooks, stores: IdentityStores, kms: FakeKms
 ) -> None:
+    """With `totp_enabled=False` the MFA routes are absent, while login remains."""
     router = build_identity_router(
         make_settings(totp_enabled=False),
         hooks,
@@ -1581,12 +1293,7 @@ def test_the_mfa_routes_are_absent_when_totp_is_disabled(
 def test_login_answers_200_with_the_challenge_not_401(
     client: TestClient, hooks: FakeHooks, stores: IdentityStores, kms: FakeKms
 ) -> None:
-    """The single most load-bearing assertion in this file.
-
-    `@webbpulse/auth` 0.4.0 branches on the body of a **successful** response. A 401 here,
-    however sensible it looks, sends every MFA user down the frontend's error path and there
-    is no way for them to sign in. Nothing was refused: the password was correct.
-    """
+    """A challenged login is a 200 carrying the challenge body, with no access token and no cookie."""
     seed_account(hooks, stores)
     settings = make_settings()
     service = MfaService(settings, stores, TokenService(settings, kms), kms_client=kms)
@@ -1605,11 +1312,7 @@ def test_login_answers_200_with_the_challenge_not_401(
 def test_the_second_leg_reads_the_field_names_the_frontend_sends(
     client: TestClient, hooks: FakeHooks, stores: IdentityStores, kms: FakeKms
 ) -> None:
-    """`mfa_ticket`, not `ticket`. That is what `AuthClient.completeTotp` posts.
-
-    A rename here type-checks perfectly on both sides and breaks every sign-in, which is
-    exactly the class of failure a test on the wire names exists to catch.
-    """
+    """The second leg accepts `mfa_ticket` and `code`, and sets the refresh cookie on success."""
     seed_account(hooks, stores)
     settings = make_settings()
     service = MfaService(settings, stores, TokenService(settings, kms), kms_client=kms)
@@ -1631,7 +1334,7 @@ def test_the_second_leg_reads_the_field_names_the_frontend_sends(
 def test_the_second_leg_refuses_a_wrong_code_in_the_shared_envelope(
     client: TestClient, hooks: FakeHooks, stores: IdentityStores, kms: FakeKms
 ) -> None:
-    """One envelope for every refusal, so the frontend has one error shape to read."""
+    """A wrong code on the second leg is a 401 `INVALID_MFA_CODE` in the shared envelope."""
     seed_account(hooks, stores)
     settings = make_settings()
     service = MfaService(settings, stores, TokenService(settings, kms), kms_client=kms)
@@ -1647,11 +1350,7 @@ def test_the_second_leg_refuses_a_wrong_code_in_the_shared_envelope(
 
 
 def test_the_enrolment_routes_refuse_an_unauthenticated_caller(client: TestClient) -> None:
-    """The subject comes from verified claims, never from the body.
-
-    A user id in the body is how anybody enrols a factor on anybody's account, or disables
-    one on an account they are locking somebody out of.
-    """
+    """All three enrolment routes answer 401 `NOT_AUTHENTICATED` without a bearer token."""
     for path in (TOTP_ENROL_PATH, TOTP_DISABLE_PATH, RECOVERY_CODES_PATH):
         response = client.post(f"{prefix()}{path}", json={})
         assert response.status_code == 401, path
@@ -1661,11 +1360,7 @@ def test_the_enrolment_routes_refuse_an_unauthenticated_caller(client: TestClien
 def test_the_enrolment_round_trip_over_http(
     client: TestClient, hooks: FakeHooks, stores: IdentityStores
 ) -> None:
-    """Enrol, activate, sign out, and sign in again through the challenge.
-
-    End to end over the routes rather than through the service, because the wiring between
-    them is where a subject read from the wrong place would show up.
-    """
+    """Enrol, activate, then sign in again through the challenge, entirely over the routes."""
     seed_account(hooks, stores)
     login = client.post(f"{prefix()}{LOGIN_PATH}", json={"email": EMAIL, "password": PASSWORD})
     access = login.json()["access_token"]
@@ -1696,11 +1391,7 @@ def test_the_enrolment_round_trip_over_http(
 def test_the_enrolment_route_returns_the_seed_exactly_once(
     client: TestClient, hooks: FakeHooks, stores: IdentityStores
 ) -> None:
-    """There is no route that reads a seed back.
-
-    A user who loses it before confirming enrols again and gets a new one. A read-back route
-    would turn every stolen access token into a copy of the user's second factor.
-    """
+    """Enrolling twice returns two different seeds: there is no route that reads a seed back."""
     seed_account(hooks, stores)
     login = client.post(f"{prefix()}{LOGIN_PATH}", json={"email": EMAIL, "password": PASSWORD})
     auth = {"Authorization": f"Bearer {login.json()['access_token']}"}
@@ -1716,11 +1407,7 @@ def test_regenerating_over_http_replaces_the_set(
     kms: FakeKms,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """The clock is advanced because the login two lines up already spent its own step.
-
-    Presenting the same code again would be refused by the replay watermark rather than
-    accepted, which is the point of the watermark and not a fault in this route.
-    """
+    """The recovery codes route returns a full disjoint set, replacing the old one."""
     seed_account(hooks, stores)
     settings = make_settings()
     service = MfaService(settings, stores, TokenService(settings, kms), kms_client=kms)
@@ -1750,7 +1437,7 @@ def test_step_up_over_http_does_not_rotate_the_refresh_cookie(
     kms: FakeKms,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """No `Set-Cookie` at all. Step-up starts no family, so there is nothing to write."""
+    """The step-up route sets no cookie at all and returns a token claiming `otp`."""
     seed_account(hooks, stores)
     settings = make_settings()
     service = MfaService(settings, stores, TokenService(settings, kms), kms_client=kms)
@@ -1773,32 +1460,14 @@ def test_step_up_over_http_does_not_rotate_the_refresh_cookie(
 
 
 def test_the_verify_limit_matches_section_5_1() -> None:
-    """Ten attempts per fifteen minutes.
-
-    The limit is the other half of the replay defence: a million-value code space is only
-    out of reach while the number of guesses is bounded, and this is the bound.
-    """
+    """The MFA verify limit is ten attempts per fifteen minutes."""
     assert TOTP_VERIFY_LIMIT == (10, 900)
-
-
-# ---------------------------------------------------------------------------
-# Re-authentication on the two destructive MFA routes
-# ---------------------------------------------------------------------------
-#
-# `totp/disable` and `recovery-codes` each take a `code` as of 0.13.0. Both are destructive
-# to the second factor, so a bearer access token alone must not be enough to call either:
-# an access token is short-lived but it is still a bearer secret, and one that has been
-# stolen would otherwise switch off the very control that bounds what the theft is worth.
-#
-# The tests below assert the property in both directions. A correct code works, of either
-# kind, and a recovery code spent here is spent for good. A wrong code refuses **and leaves
-# the factor standing**, which is the assertion that actually matters: a route that deleted
-# first and verified afterwards would pass a test that only checked the status code.
 
 
 def test_disabling_requires_a_code_and_a_correct_one_works(
     flows: IdentityFlows, mfa: MfaService, hooks: FakeHooks, stores: IdentityStores
 ) -> None:
+    """A correct TOTP code disables the factor and clears every recovery code."""
     seed_account(hooks, stores)
     seed, _ = enrol(mfa)
     flows.disable_totp(user_id=USER_ID, code=code_now(seed, offset=1))
@@ -1809,27 +1478,18 @@ def test_disabling_requires_a_code_and_a_correct_one_works(
 def test_a_recovery_code_disables_and_is_spent_doing_it(
     flows: IdentityFlows, mfa: MfaService, hooks: FakeHooks, stores: IdentityStores
 ) -> None:
-    """One route takes both kinds, as login does, and the recovery code is consumed.
-
-    A recovery code that survived its use here would be a code an attacker could present
-    again, which is the whole reason single use exists.
-    """
+    """A recovery code also disables the factor, and the whole set goes with it."""
     seed_account(hooks, stores)
     _, codes = enrol(mfa)
     flows.disable_totp(user_id=USER_ID, code=codes[0])
     assert stores.require_totp_factors().get(USER_ID) is None
-    # Every code is gone, the spent one included: disabling removes the whole set.
     assert list(stores.require_recovery_codes().list_for_user(USER_ID)) == []
 
 
 def test_a_wrong_code_refuses_the_disable_and_leaves_the_factor_standing(
     flows: IdentityFlows, mfa: MfaService, hooks: FakeHooks, stores: IdentityStores
 ) -> None:
-    """The assertion that matters. Verification has to happen before the delete.
-
-    A route that deleted first and verified afterwards would still return 401 here and would
-    still have destroyed the user's second factor.
-    """
+    """A wrong code is a 401 and leaves the factor active with every recovery code intact."""
     seed_account(hooks, stores)
     enrol(mfa)
     with pytest.raises(MfaRejected) as caught:
@@ -1845,14 +1505,7 @@ def test_a_wrong_code_refuses_the_disable_and_leaves_the_factor_standing(
 def test_a_reauthentication_code_cannot_be_replayed(
     flows: IdentityFlows, mfa: MfaService, hooks: FakeHooks, stores: IdentityStores
 ) -> None:
-    """The same watermark `step_up` and `login/totp` rely on, reached through the same call.
-
-    Shown on `regenerate` rather than on `disable`, because disabling removes the factor and
-    a second attempt would then be refused for having nothing enrolled: a different refusal
-    wearing the same message, which would pass against an implementation with no replay
-    defence at all. `regenerate` leaves the factor in place, so the second refusal here can
-    only be the watermark.
-    """
+    """A code used to authorise a regenerate cannot authorise a second one."""
     seed_account(hooks, stores)
     seed, _ = enrol(mfa)
     code = code_now(seed, offset=1)
@@ -1865,6 +1518,7 @@ def test_a_reauthentication_code_cannot_be_replayed(
 def test_regenerating_requires_a_code_and_a_correct_one_replaces_the_set(
     flows: IdentityFlows, mfa: MfaService, hooks: FakeHooks, stores: IdentityStores
 ) -> None:
+    """A correct code replaces the recovery set with a full disjoint one."""
     seed_account(hooks, stores)
     seed, old = enrol(mfa)
     fresh = flows.regenerate_recovery_codes(user_id=USER_ID, code=code_now(seed, offset=1))
@@ -1876,8 +1530,7 @@ def test_regenerating_requires_a_code_and_a_correct_one_replaces_the_set(
 def test_a_recovery_code_can_authorise_its_own_replacement(
     flows: IdentityFlows, mfa: MfaService, hooks: FakeHooks, stores: IdentityStores
 ) -> None:
-    """The user who lost their phone still has a way to rotate a printout they no longer
-    trust, and the code they used does not survive into the new set."""
+    """A recovery code can authorise a regenerate, and does not survive into the new set."""
     seed_account(hooks, stores)
     _, old = enrol(mfa)
     fresh = flows.regenerate_recovery_codes(user_id=USER_ID, code=old[0])
@@ -1888,11 +1541,7 @@ def test_a_recovery_code_can_authorise_its_own_replacement(
 def test_a_wrong_code_refuses_the_regenerate_and_keeps_every_existing_code(
     flows: IdentityFlows, mfa: MfaService, hooks: FakeHooks, stores: IdentityStores
 ) -> None:
-    """All or nothing, and the "nothing" half.
-
-    `regenerate_recovery_codes` deletes the old set before writing the new one, so a refused
-    attempt that reached it would leave the user holding no codes at all.
-    """
+    """A refused regenerate leaves the old set intact and still usable."""
     seed_account(hooks, stores)
     _, old = enrol(mfa)
     with pytest.raises(MfaRejected) as caught:
@@ -1900,18 +1549,13 @@ def test_a_wrong_code_refuses_the_regenerate_and_keeps_every_existing_code(
     assert caught.value.error_code == "INVALID_MFA_CODE"
 
     assert mfa.remaining_recovery_codes(USER_ID) == RECOVERY_CODE_COUNT
-    # Not merely the right count: the codes the user is actually holding still work.
     assert mfa.verify_challenge(USER_ID, old[0]) == AMR_RECOVERY
 
 
 def test_neither_route_can_be_used_against_a_user_with_no_factor(
     flows: IdentityFlows, hooks: FakeHooks, stores: IdentityStores
 ) -> None:
-    """A user with nothing enrolled has no code to present, so both refuse.
-
-    Refusing rather than waving through is what stops "no factor" being an easier path than
-    "a factor I cannot satisfy".
-    """
+    """Disable and regenerate both refuse for a user with nothing enrolled."""
     seed_account(hooks, stores)
     with pytest.raises(MfaRejected):
         flows.disable_totp(user_id=USER_ID, code="000000")
@@ -1920,6 +1564,7 @@ def test_neither_route_can_be_used_against_a_user_with_no_factor(
 
 
 def test_neither_route_works_for_an_unknown_user(flows: IdentityFlows) -> None:
+    """Disable and regenerate both refuse for an unknown user."""
     with pytest.raises(MfaRejected):
         flows.disable_totp(user_id="user-9999", code="123456")
     with pytest.raises(MfaRejected):
@@ -1929,11 +1574,7 @@ def test_neither_route_works_for_an_unknown_user(flows: IdentityFlows) -> None:
 def test_one_users_code_cannot_disable_anothers_factor(
     flows: IdentityFlows, mfa: MfaService, hooks: FakeHooks, stores: IdentityStores
 ) -> None:
-    """The subject comes from the verified claims, and the code has to match that subject.
-
-    Without this, anybody holding a valid code of their own could disable somebody else's
-    factor by pointing the call at their user id.
-    """
+    """Another user's valid code cannot disable this user's factor, which stays active."""
     seed_account(hooks, stores)
     seed_account(hooks, stores, email="other@example.com", user_id="user-0002")
     enrol(mfa)
@@ -1943,9 +1584,6 @@ def test_one_users_code_cannot_disable_anothers_factor(
         flows.disable_totp(user_id=USER_ID, code=code_now(other_seed, offset=1))
     factor = stores.require_totp_factors().get(USER_ID)
     assert factor is not None and factor.is_active
-
-
-# ---- the same two routes over HTTP -------------------------------------------------
 
 
 def _signed_in(client: TestClient, seed: str) -> dict[str, str]:
@@ -1965,6 +1603,7 @@ def test_disabling_over_http_needs_the_code(
     kms: FakeKms,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    """The disable route with a correct code answers 200 and removes the factor."""
     seed_account(hooks, stores)
     settings = make_settings()
     service = MfaService(settings, stores, TokenService(settings, kms), kms_client=kms)
@@ -1983,11 +1622,7 @@ def test_disabling_over_http_needs_the_code(
 def test_a_bearer_token_alone_no_longer_disables_the_factor(
     client: TestClient, hooks: FakeHooks, stores: IdentityStores, kms: FakeKms
 ) -> None:
-    """The whole point of 0.13.0, asserted on the wire.
-
-    Before it, this exact request switched off the user's second factor. A stolen access
-    token is the threat, and the factor is what limits what the theft is worth.
-    """
+    """A disable with no code is a 422 and leaves the factor active."""
     seed_account(hooks, stores)
     settings = make_settings()
     service = MfaService(settings, stores, TokenService(settings, kms), kms_client=kms)
@@ -2004,6 +1639,7 @@ def test_a_bearer_token_alone_no_longer_disables_the_factor(
 def test_a_bearer_token_alone_no_longer_regenerates_the_codes(
     client: TestClient, hooks: FakeHooks, stores: IdentityStores, kms: FakeKms
 ) -> None:
+    """A regenerate with no code is a 422 and leaves the existing codes usable."""
     seed_account(hooks, stores)
     settings = make_settings()
     service = MfaService(settings, stores, TokenService(settings, kms), kms_client=kms)
@@ -2013,7 +1649,6 @@ def test_a_bearer_token_alone_no_longer_regenerates_the_codes(
     response = client.post(f"{prefix()}{RECOVERY_CODES_PATH}", headers=auth, json={})
     assert response.status_code == 422
     assert response.json()["error_code"] == "VALIDATION_ERROR"
-    # The codes the user is holding are untouched, not merely un-returned.
     assert service.verify_challenge(USER_ID, old[0]) == AMR_RECOVERY
 
 
@@ -2021,12 +1656,7 @@ def test_a_bearer_token_alone_no_longer_regenerates_the_codes(
 def test_a_blank_code_is_a_validation_error_not_a_wrong_code(
     client: TestClient, hooks: FakeHooks, stores: IdentityStores, kms: FakeKms, path: str
 ) -> None:
-    """A client bug is reported as a client bug.
-
-    Answering `INVALID_MFA_CODE` to an empty string would show the user "that code is not
-    valid" for a field they were never asked to fill in, and would spend an attempt against
-    the rate limit while doing it.
-    """
+    """A whitespace-only code is a 422 `VALIDATION_ERROR`, not a wrong-code refusal."""
     seed_account(hooks, stores)
     settings = make_settings()
     service = MfaService(settings, stores, TokenService(settings, kms), kms_client=kms)
@@ -2042,11 +1672,7 @@ def test_a_blank_code_is_a_validation_error_not_a_wrong_code(
 def test_a_wrong_code_over_http_is_the_shared_mfa_envelope(
     client: TestClient, hooks: FakeHooks, stores: IdentityStores, kms: FakeKms, path: str
 ) -> None:
-    """The same status and the same `error_code` `login/totp` answers with.
-
-    One envelope for every MFA refusal in the product, so the frontend has one error shape
-    to read whichever route produced it.
-    """
+    """Both routes refuse a wrong code with the same 401 `INVALID_MFA_CODE` as `login/totp`."""
     seed_account(hooks, stores)
     settings = make_settings()
     service = MfaService(settings, stores, TokenService(settings, kms), kms_client=kms)
@@ -2059,11 +1685,7 @@ def test_a_wrong_code_over_http_is_the_shared_mfa_envelope(
 
 
 def test_the_missing_body_is_refused_before_the_code_is_read(client: TestClient) -> None:
-    """An unauthenticated caller gets 401, not 422, on both routes.
-
-    Authentication is checked first, so the routes do not become an oracle for whether a
-    body shape is right to somebody who cannot call them at all.
-    """
+    """Both routes answer 401 to an unauthenticated caller, never 422, so they are not an oracle."""
     for path in (TOTP_DISABLE_PATH, RECOVERY_CODES_PATH):
         response = client.post(f"{prefix()}{path}", json={"code": "123456"})
         assert response.status_code == 401, path
@@ -2073,14 +1695,7 @@ def test_the_missing_body_is_refused_before_the_code_is_read(client: TestClient)
 def test_both_routes_carry_the_same_number_of_limits_as_the_second_leg(
     hooks: FakeHooks, stores: IdentityStores, kms: FakeKms
 ) -> None:
-    """Counted against the same `mfa-verify` limit as `login/totp`.
-
-    A million-value code space is only out of reach while the number of guesses is bounded,
-    and these two routes now accept the same codes, so they have to share the same bound.
-    Asserted by comparing the dependency count against `login/totp` rather than by driving
-    the limiter, which needs a DynamoDB table: the failure this guards against is a route
-    declared with no limit at all, and that shows up as a count of zero.
-    """
+    """Disable and regenerate declare the same single rate limit dependency as `login/totp`."""
     router = build_identity_router(make_settings(), hooks, stores, kms_client=kms)
     counts = {
         route.path: len(route.dependencies)  # type: ignore[attr-defined]
@@ -2095,8 +1710,7 @@ def test_both_routes_carry_the_same_number_of_limits_as_the_second_leg(
 def test_the_two_routes_have_no_limit_when_the_limiter_is_off(
     hooks: FakeHooks, stores: IdentityStores, kms: FakeKms
 ) -> None:
-    """`limiter_enabled=False` is what the fixtures use, so the check above is meaningful
-    only if the limits really are absent in that mode."""
+    """With the limiter off both routes declare no dependencies, which is the mode the fixtures use."""
     router = build_identity_router(
         make_settings(), hooks, stores, kms_client=kms, limiter_enabled=False
     )

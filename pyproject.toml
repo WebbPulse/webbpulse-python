@@ -17,20 +17,14 @@ classifiers = [
   "Typing :: Typed",
 ]
 dynamic = ["version"]
-
-# The base install carries nothing that is not needed by every consumer.
-# Everything else is an extra, so a service installs only the surface it uses.
 dependencies = [
   "pydantic>=2.9,<3",
   "pydantic-settings>=2.6,<3",
 ]
 
 [project.optional-dependencies]
-# webbpulse.config secret loading, webbpulse.dynamodb and webbpulse.ratelimit.
 dynamodb = ["boto3>=1.35", "botocore>=1.35"]
-# webbpulse.http, webbpulse.ratelimit dependencies and webbpulse.lambda_entry.
 fastapi = ["fastapi>=0.115", "starlette>=0.40", "uvicorn>=0.32"]
-# webbpulse.otel.
 otel = [
   "opentelemetry-api>=1.30",
   "opentelemetry-sdk>=1.30",
@@ -38,41 +32,11 @@ otel = [
   "opentelemetry-instrumentation-fastapi>=0.51b0",
   "opentelemetry-instrumentation-botocore>=0.51b0",
 ]
-# SigV4 signing for the CloudWatch X-Ray OTLP endpoint, which rejects unsigned requests
-# with a 403. Only the exporter class is used; the distro's configurator and its
-# `opentelemetry-instrument` entry point are deliberately not, so this is additive to
-# `otel` rather than a replacement for it. Needs botocore, which `dynamodb` also brings.
 aws-otel = ["aws-opentelemetry-distro>=0.10", "botocore>=1.35"]
-# webbpulse.security. PyJWT rather than python-jose, which is effectively unmaintained and
-# validates less by default; an HS256 token is interchangeable between the two, so a
-# service switching libraries invalidates no existing session. bcrypt is unpinned across
-# the 4/5 boundary on purpose: the module truncates to 72 bytes itself, which is the only
-# behaviour that differs between those majors.
 security = ["PyJWT>=2.10,<3", "bcrypt>=4.1"]
-# webbpulse.testing. Starlette 1.x TestClient is built on httpx2 and warns (and under
-# `-W error` fails) when only the 0.x httpx is importable, so httpx2 is what is pinned.
 testing = ["moto[dynamodb,secretsmanager]>=5", "pytest>=8", "httpx2>=2"]
-# webbpulse.identity. `PyJWT[crypto]` rather than bare PyJWT: the JWK is built from the DER
-# SubjectPublicKeyInfo that kms:GetPublicKey returns, and `cryptography` is what parses it.
-# boto3 is not here on purpose. The module takes a KMS client rather than constructing one,
-# so a consumer that already has the `dynamodb` extra brings its own and one that does not
-# is not made to install boto3 to serve a JWKS.
 identity = ["PyJWT[crypto]>=2.9", "fastapi>=0.115"]
-# webbpulse.identity.oauth. The only outbound HTTP this package makes is the provider token
-# exchange and userinfo calls in M6, and `httpx` is what makes them: it gives a real
-# per-request timeout, which matters because a provider that hangs would otherwise hold a
-# Lambda execution environment open until the function's own timeout and turn a provider
-# incident into an availability incident here. Declared separately from `identity` so a
-# product that mounts no OAuth routes does not install it, and separately from `testing`,
-# whose `httpx2` is there for Starlette's TestClient rather than for this.
 oauth = ["httpx>=0.27"]
-
-# webbpulse.identity.passkeys. Separate from `identity` because WebAuthn is a capability a
-# product turns on rather than part of the base slice, and because py_webauthn pulls in a
-# CBOR and an ASN.1 stack that a deployment doing password login only has no use for.
-# `webbpulse.identity.passkeys` imports it lazily inside its methods, so this extra is
-# needed only where `passkeys_enabled` is true and the two M5 tables exist. Capped below 3
-# because the 2.x line is where `verify_registration_response`'s keyword signature is fixed.
 passkeys = ["webauthn>=2.7,<3"]
 
 [project.urls]
@@ -86,8 +50,6 @@ dev = [
   "botocore-stubs",
   "mypy>=1.13",
   "pytest-cov>=6",
-  # The reusable python-ci workflow runs pytest with `-n auto` by default, which is
-  # an unrecognized argument rather than a no-op when xdist is absent.
   "pytest-xdist>=3",
   "ruff>=0.8",
 ]
@@ -108,25 +70,21 @@ src = ["src", "tests"]
 
 [tool.ruff.lint]
 select = [
-  "E",   # pycodestyle
-  "F",   # pyflakes
-  "I",   # isort
-  "B",   # bugbear
-  "UP",  # pyupgrade
-  "SIM", # flake8-simplify
-  "TID", # flake8-tidy-imports
+  "E",
+  "F",
+  "I",
+  "B",
+  "UP",
+  "SIM",
+  "TID",
   "RUF",
 ]
 ignore = [
-  # A boolean positional argument is fine on the small helpers here.
   "B008",
 ]
 
 [tool.ruff.lint.per-file-ignores]
-# Tests reach into private helpers and shadow builtins freely.
 "tests/*" = ["E501"]
-# The module docstring carries a copy-pasteable Dockerfile. Wrapping the CodeArtifact
-# index URL or the COPY --from line would break the snippet for anyone who pastes it.
 "src/webbpulse/lambda_entry.py" = ["E501"]
 
 [tool.ruff.lint.isort]
@@ -136,31 +94,22 @@ known-first-party = ["webbpulse"]
 python_version = "3.13"
 strict = true
 files = ["src/webbpulse", "tests"]
-# Optional extras are absent in a minimal install, and mypy should not fail on that.
 ignore_missing_imports = false
 warn_unused_ignores = true
 enable_error_code = ["ignore-without-code", "redundant-expr", "truthy-bool"]
 
 [[tool.mypy.overrides]]
-# moto ships no stubs.
 module = ["moto.*"]
 ignore_missing_imports = true
 
 [[tool.mypy.overrides]]
-# aws-opentelemetry-distro ships no stubs, and it is an optional extra that is absent from a
-# minimal install anyway, so its import is guarded at runtime.
 module = ["amazon.*"]
 ignore_missing_imports = true
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 addopts = "-q --strict-markers --strict-config"
-# Warnings are errors, so a deprecation in this package's own code fails the suite
-# rather than scrolling past. The exemptions below are third-party and narrowly
-# targeted: each names the emitting module, so the same warning raised from
-# webbpulse code would still fail.
 filterwarnings = [
   "error",
-  # Starlette's own testclient module touches the deprecated anyio.abc alias at import.
   "ignore:The anyio.abc.BlockingPortal alias is deprecated:DeprecationWarning:starlette.testclient",
 ]

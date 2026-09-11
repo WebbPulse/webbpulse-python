@@ -1,43 +1,7 @@
 """The flows: register, login, change password, verification, reset, refresh, logout.
 
-Section 2.1 splits routers from services and says the services hold "the flow logic, no
-FastAPI imports". This module is that layer. It imports no web framework, so every decision
-below is reachable from a plain unit test with no client, no app and no transport, which is
-what makes the negative paths cheap enough to write exhaustively.
-
-`router.py` is the thin part: it parses a body, calls one method here, and renders the
-result. Anything that decides *whether* something is allowed lives here.
-
-M2 added the password and session flows; M3 adds email verification and password reset on
-top of them, so the register path now mails a link and the reset path revokes every session.
-
-## The rules that shape every method
-
-**Enumeration resistance is structural, not a message.** Section 5.4 requires that a login
-against an unknown address and a login with the wrong password be indistinguishable. Both
-answer 401 with the identical body, and both spend one bcrypt verification, the real one
-against the stored hash or the dummy one from `passwords.equalise_password_timing`. This is
-why `login` has no early return for "no such user": the shape of the function is the
-control.
-
-The same rule shapes the two request-a-link flows differently: they return `None` on every
-path rather than answering identically by convention. `request_password_reset` and
-`request_verification` have no return value a caller could branch on and raise nothing that
-distinguishes a known address from an unknown one, so a router cannot render the two cases
-differently even by mistake.
-
-**Register never says the email is taken.** It returns the same 200 either way, and mails
-the existing address to say somebody tried, which is section 5.4's resolution: the form
-leaks nothing and the person who owns the address still finds out.
-
-**Refusals from a hook are laundered into the same 401.** `may_authenticate` raising is the
-product saying no: a disabled account, an unverified email. Its message is passed through
-because a product writes it knowing what it discloses, but the login path still spends its
-bcrypt round first, so a disabled account is not detectable by timing either.
-
-**Every failure is recorded, and recording never fails the request.** Login attempts go to
-the `login-attempts` table and to the structured log. A DynamoDB write that fails must not
-turn a correct login into a 500, so the write is best-effort and the log line is not.
+The service layer behind `router.py`, holding every decision about whether something is
+allowed. Imports no web framework, so each path is reachable from a plain unit test.
 """
 
 from __future__ import annotations
@@ -73,7 +37,7 @@ from webbpulse.identity.passwords import (
 )
 from webbpulse.identity.sessions import SessionService
 
-if TYPE_CHECKING:  # pragma: no cover - typing only
+if TYPE_CHECKING:  # pragma: no cover
     from collections.abc import Mapping, Sequence
 
     from webbpulse.identity.email import EmailMessage, EmailSender
@@ -96,15 +60,10 @@ __all__ = [
 
 _log = logging.getLogger(__name__)
 
-#: The one message every failed login returns, whatever actually went wrong. Section 5.4.
-#: A single constant rather than a literal at each `raise`, because the control is that the
-#: strings are identical and two literals drift.
 INVALID_CREDENTIALS_MESSAGE: Final = "Invalid email or password."
 
-#: The `credential_type` range key for a bcrypt password in the `credentials` table.
 PASSWORD_CREDENTIAL_TYPE: Final = "password"
 
-#: What `on_user_created` is told about a registration through this flow.
 REGISTRATION_VIA: Final = "password"
 
 
@@ -112,8 +71,7 @@ class LoginRejected(Exception):
     """A login, registration or password change was refused.
 
     Carries the message the caller renders and an `error_code` the frontend branches on,
-    matching `AuthenticationRefused` and `PasswordRejected` so the router renders all three
-    identically.
+    matching `AuthenticationRefused` and `PasswordRejected`.
     """
 
     def __init__(
@@ -123,6 +81,7 @@ class LoginRejected(Exception):
         error_code: str = "INVALID_CREDENTIALS",
         status_code: int = 401,
     ) -> None:
+        """Record the message, error code and status the router will render."""
         super().__init__(message)
         self.message = message
         self.error_code = error_code
@@ -132,17 +91,12 @@ class LoginRejected(Exception):
 class RateLimited(LoginRejected):
     """Progressive lockout is in effect for this account. Section 5.1.
 
-    Distinct from a `webbpulse.ratelimit` refusal, which protects the service and is applied
-    by a route dependency before this module is reached. This one protects one account
-    against guessing and is decided here, because it depends on that account's own history.
-
-    Answers 429 with `Retry-After`, and the message deliberately does not confirm that the
-    account exists: a locked-out response for an address that has failed five times is
-    itself weak evidence, which section 5.4 records as a residual leak of the same kind as
-    the rate limit boundary.
+    Protects one account against guessing, unlike a `webbpulse.ratelimit` refusal, which
+    protects the service. Answers 429 with `Retry-After`.
     """
 
     def __init__(self, retry_after: int) -> None:
+        """Build the 429 refusal, carrying the seconds until the lockout decays."""
         super().__init__(
             "Too many failed attempts. Try again shortly.",
             error_code="TOO_MANY_ATTEMPTS",
@@ -154,16 +108,12 @@ class RateLimited(LoginRejected):
 class MfaChallengeRequired(Exception):
     """The password was correct and a second factor is enrolled.
 
-    Raised rather than returned because `login` otherwise has two success shapes, and every
-    caller would have to remember to check which one it got. An exception cannot be ignored
-    by accident, so a product that has not handled MFA gets a loud failure rather than
-    quietly handing out a session to a user who never satisfied their factor.
-
-    This is not a `LoginRejected`: nothing was refused, and it answers **200** carrying the
-    challenge, which is the shape `@webbpulse/auth` branches on.
+    Raised rather than returned so a product that has not handled MFA gets a loud failure.
+    Not a `LoginRejected`: nothing was refused, and it answers 200 carrying the challenge.
     """
 
     def __init__(self, challenge: MfaChallenge) -> None:
+        """Carry the challenge the router renders as an `mfa_required` body."""
         super().__init__("Multi-factor authentication is required.")
         self.challenge = challenge
 
@@ -172,9 +122,8 @@ class MfaChallengeRequired(Exception):
 class AuthResult:
     """A successful authentication: the access token and the refresh cookie to set.
 
-    `refresh_token` is the plaintext, and it exists only to be written into a `Set-Cookie`.
-    Nothing stores it, nothing logs it. The router is the only caller, and it puts the value
-    straight into the cookie.
+    `refresh_token` is the plaintext and exists only to be written into a `Set-Cookie`.
+    Nothing stores it and nothing logs it.
     """
 
     access_token: str
@@ -182,19 +131,14 @@ class AuthResult:
     user: Mapping[str, Any]
     refresh_token: str
     family_id: str
-    #: Extra body fields a flow wants returned, such as `user_id` on a registration.
     extra: Mapping[str, Any] = field(default_factory=dict)
 
 
 class IdentityFlows:
-    """The M2 flow logic for one product.
+    """The flow logic for one product.
 
-    Built once per execution environment from settings, hooks, stores and a `TokenService`.
-    Holds no request state, so it is safe to share, and every method takes the request's IP
-    and user agent explicitly rather than reaching for a request object it cannot see.
-
-    `now` is a parameter on the paths where time is part of the behaviour, so lockout decay
-    and refresh expiry are testable without sleeping.
+    Built once per execution environment and holds no request state, so every method takes
+    the request's IP and user agent explicitly. `now` is a parameter where time is behaviour.
     """
 
     def __init__(
@@ -208,6 +152,11 @@ class IdentityFlows:
         email_sender: EmailSender | None = None,
         kms_client: Any = None,
     ) -> None:
+        """Wire the flows to their settings, hooks, stores and token service.
+
+        The MFA, passkey and link services are built only when their stores and settings are
+        present, so an unconfigured capability is absent rather than broken.
+        """
         self._settings = settings
         self._hooks = hooks
         self._stores = stores
@@ -221,9 +170,6 @@ class IdentityFlows:
 
             self._links = LinkService(settings, stores.identity_tokens)
 
-        # MFA needs both M4 tables and the ticket store. A product that has not created them
-        # gets `None` and M2's behaviour, rather than an import-time failure: section 6.1
-        # makes TOTP a capability, and a capability that cannot be switched off is not one.
         self.mfa: MfaService | None = None
         if (
             settings.totp_enabled
@@ -233,9 +179,6 @@ class IdentityFlows:
         ):
             self.mfa = MfaService(settings, stores, tokens, kms_client=kms_client)
 
-        # Passkeys gate the same way M3 and M4 do: both M5 tables present and the capability
-        # switched on, or `None` and no passkey routes. The import is deferred to here so
-        # the `webauthn` extra is only needed by a product that actually turned passkeys on.
         self.passkeys: PasskeyService | None = None
         if (
             settings.passkeys_enabled
@@ -255,14 +198,10 @@ class IdentityFlows:
     def email_enabled(self) -> bool:
         """Whether the email flows can run: a sender and an `identity-tokens` store.
 
-        The router asks this rather than re-deriving the condition, so the routes that
-        mount and the flows that work are decided by one expression. A flow method called
-        without them raises rather than silently doing nothing, because "we sent you an
-        email" answered by a service that cannot send email is the worst of the outcomes.
+        The router asks this rather than re-deriving the condition, so the routes that mount
+        and the flows that work are decided by one expression.
         """
         return self._links is not None and self._email is not None
-
-    # ---- registration --------------------------------------------------------------
 
     def register(
         self,
@@ -275,20 +214,8 @@ class IdentityFlows:
     ) -> AuthResult | None:
         """Create an account and sign it in, or pretend to when the email is taken.
 
-        Returns an `AuthResult` for a genuine new account. Returns **`None`** when the
-        address already exists, which the router renders as the same 200 a real registration
-        gets. That is section 5.4's requirement: the signup form must leak nothing, so the
-        two cases have to be indistinguishable from outside.
-
-        Returning `None` rather than raising is deliberate. An exception would tempt a
-        caller into rendering something different, and the whole control is that it cannot.
-
-        Password policy runs **before** the existence check, so a password that violates the
-        policy is rejected for a taken address too. That is not a leak: the answer depends
-        only on the password the caller just supplied, never on the address.
-
-        Raises `LoginRejected` when registration is disabled, and `PasswordRejected` when the
-        password fails section 5.6's policy.
+        Returns `None` when the address already exists, which the router renders as the same
+        200 a real registration gets. Raises `LoginRejected` when registration is disabled.
         """
         if not self._settings.registration_enabled:
             raise LoginRejected(
@@ -315,9 +242,6 @@ class IdentityFlows:
 
         existing = self._hooks.load_user_by_email(normalised_email)
         if existing is not None:
-            # Section 5.4: 200, and the existing address is told somebody tried. Spend a
-            # bcrypt round anyway, so the taken and free paths cost the same and the
-            # non-disclosure holds against a clock as well as against a reader.
             equalise_password_timing(checked)
             self._send_registration_notice(existing, normalised_email)
             _log.info(
@@ -352,15 +276,6 @@ class IdentityFlows:
         )
         self._hooks.on_user_created(user, REGISTRATION_VIA)
 
-        # Section 2.6: verification is requested on register as well as on demand. Sent
-        # before the refusal below, so the user who is about to be told to check their mail
-        # has something waiting there.
-        #
-        # Best effort, and deliberately so: a failed SES call must not roll back an account
-        # that has already been created and whose credential has already been written. The
-        # user asks for another link through the resend route, which exists for exactly
-        # this. The alternative, failing the registration, leaves a real account behind a
-        # 500 and a user who cannot register again because the address is now taken.
         self._send_verification(user_id, normalised_email, best_effort=True)
 
         _log.info(
@@ -369,10 +284,6 @@ class IdentityFlows:
         )
 
         if self._settings.email_verification_required:
-            # The account exists but must not have a session until the address is confirmed.
-            # Refusing here rather than issuing a token is the honest reading of the
-            # setting: a product that requires verification does not want an unverified
-            # session, and `may_authenticate` would refuse the next login anyway.
             raise LoginRejected(
                 "Check your email to confirm your address before signing in.",
                 error_code="EMAIL_VERIFICATION_REQUIRED",
@@ -380,8 +291,6 @@ class IdentityFlows:
             )
 
         return self._issue(user, ip=ip, user_agent=user_agent, extra={"user_id": user_id})
-
-    # ---- login ---------------------------------------------------------------------
 
     def login(
         self,
@@ -394,18 +303,8 @@ class IdentityFlows:
     ) -> AuthResult:
         """Authenticate an email and password, or raise the one indistinguishable refusal.
 
-        The order of operations is the security control, so it is worth reading as a whole:
-
-        1. **Lockout check** first, from the attempt history. A locked account never reaches
-           bcrypt, which is what stops the lockout itself becoming a work amplifier.
-        2. **Load the user**, which may be `None`.
-        3. **Verify**, against the stored hash when there is one and against the dummy hash
-           when there is not. There is no branch that skips this step.
-        4. **Ask the product** whether this user may authenticate.
-        5. **Record** the attempt, success or failure.
-
-        Every refusal from steps 2, 3 and 4 raises the same `LoginRejected` with the same
-        message, so no caller can render them differently even by accident.
+        Checks lockout, loads the user, always verifies against a real or dummy hash, asks the
+        product, then records the attempt. Every refusal raises the same `LoginRejected`.
         """
         moment = now or datetime.now(UTC)
         if not self._settings.passwords_enabled:
@@ -428,8 +327,6 @@ class IdentityFlows:
             raise RateLimited(state.retry_after_seconds(now=moment))
 
         user = self._hooks.load_user_by_email(normalised_email) if normalised_email else None
-        # `presented` is normalised the same way the stored hash was produced, or a password
-        # containing a composed character stops verifying the day normalisation lands.
         presented = normalise_password(password)
 
         credential = None
@@ -439,16 +336,11 @@ class IdentityFlows:
             )
 
         if user is None or credential is None or not credential.secret:
-            # No early return above this line, deliberately. Section 5.3: both paths cost
-            # one bcrypt verification, so "no such account" and "wrong password" have the
-            # same timing shape as well as the same body.
             equalise_password_timing(presented)
             self._fail(identity, ip=ip, user_agent=user_agent, reason="unknown_or_no_credential")
 
         from webbpulse.security import needs_rehash, verify_password
 
-        # `user` and `credential` are non-None here: `_fail` is `NoReturn`, so the branch
-        # above cannot fall through.
         if not verify_password(presented, credential.secret):
             self._fail(
                 identity,
@@ -461,8 +353,6 @@ class IdentityFlows:
         try:
             self._hooks.may_authenticate(user)
         except AuthenticationRefused as refused:
-            # The product said no: disabled, unverified, whatever its policy is. The bcrypt
-            # round is already spent, so this refusal costs the same as a wrong password.
             self._fail(
                 identity,
                 ip=ip,
@@ -474,8 +364,6 @@ class IdentityFlows:
             )
 
         if needs_rehash(credential.secret):
-            # Section 5.6: upgrade the cost factor on login, which is the only moment the
-            # plaintext is available to rehash with.
             from webbpulse.identity.storage import CredentialRecord
             from webbpulse.security import hash_password
 
@@ -501,10 +389,6 @@ class IdentityFlows:
             },
         )
 
-        # The password is proved. If a second factor is enrolled, this is where the flow
-        # stops: a challenge, not a session. The attempt is recorded as a success above
-        # because the password *was* correct, and the lockout counter is about passwords.
-        # An MFA failure is rate limited separately, per section 5.1.
         challenge = self._challenge_for(user)
         if challenge is not None:
             raise MfaChallengeRequired(challenge)
@@ -521,28 +405,8 @@ class IdentityFlows:
     ) -> AuthResult:
         """Issue the same token pair a password login gets, for a completed OAuth callback.
 
-        M6's callback needs exactly what `login` produces once the password is proved, and
-        it must not produce anything different: an OAuth session and a password session are
-        the same session, with the same refresh family, the same rotation and the same
-        cookie. Anything else would mean two session models to reason about and two places
-        to fix a session bug.
-
-        **MFA is honoured here, exactly as it is for a password.** A provider proving who
-        somebody is does not prove they hold the second factor, and a product that enrolled
-        TOTP did so to require it on sign-in, not to require it on some sign-ins. So this
-        raises `MfaChallengeRequired` on an account with a factor enrolled, and the router
-        answers the same `mfa_required` body the password path answers. Skipping it would
-        make "add Google to your account" a way to turn MFA off.
-
-        `amr` records the provider itself rather than a generic federated value, because a
-        policy that wants to say "this action needs a Google session" cannot express that
-        against a value shared with GitHub. `AMR_OAUTH` sits alongside it so a policy that
-        only cares that it was federated has one value to check.
-
-        `may_authenticate` is consulted for the same reason `login` consults it: a disabled
-        or deleted account must not become reachable through a second front door. A product
-        that suspends a user and finds them signing in through Google would rightly call
-        that a bug in this method.
+        MFA is honoured exactly as it is for a password, and `may_authenticate` is consulted,
+        so a second front door cannot reach a disabled account. `amr` records the provider.
         """
         from webbpulse.identity.oauth import AMR_OAUTH
 
@@ -563,7 +427,7 @@ class IdentityFlows:
         """The challenge this user must answer, or `None` to issue tokens directly.
 
         Returns `None` when MFA is not configured at all, so a product that never wired the
-        stores gets M2's behaviour unchanged rather than an exception on every login.
+        stores keeps its previous behaviour.
         """
         if self.mfa is None:
             return None
@@ -583,21 +447,14 @@ class IdentityFlows:
     ) -> AuthResult:
         """The second leg of login: spend a ticket, satisfy a factor, issue the session.
 
-        The ticket is consumed **before** the code is checked, so a ticket is spent by one
-        attempt whatever the outcome. That is deliberate and it is the stricter choice: it
-        means a stolen ticket cannot be used to grind codes, and a user who mistypes starts
-        the login again rather than retrying against a ticket an attacker also holds.
-
-        The rate limit on this route is the other half of that. Ten attempts per fifteen
-        minutes per user, per section 5.1, applied by the router.
+        The ticket is consumed before the code is checked, so a stolen ticket cannot be used
+        to grind codes.
         """
         service = self._require_mfa()
         user_id = service.consume_ticket(ticket)
 
         user = self._hooks.load_user_by_id(user_id)
         if user is None:
-            # The ticket verified, so this is a user deleted between the two legs rather
-            # than an attack. Same refusal either way.
             raise MfaRejected(
                 "That sign-in attempt has expired. Start again.",
                 error_code="MFA_TICKET_INVALID",
@@ -619,14 +476,8 @@ class IdentityFlows:
     ) -> AuthResult:
         """Re-authenticate inside an existing session, returning a fresher access token.
 
-        No new refresh family and no cookie change: the session is not new. What changes is
-        `auth_time`, which becomes now, and `amr`, which gains the factor just satisfied.
-        A sensitive route then asserts on both, per section 2.6, rather than on a boolean
-        that could not express "recently".
-
-        The returned `AuthResult` carries an empty `refresh_token` and the caller's existing
-        `family_id`, because there is nothing new to set and the caller must not be tempted
-        to rotate the cookie on a step-up.
+        No new refresh family and no cookie change: what changes is `auth_time` and `amr`.
+        The result carries an empty `refresh_token` and the caller's existing `family_id`.
         """
         service = self._require_mfa()
         user = self._hooks.load_user_by_id(user_id)
@@ -655,23 +506,8 @@ class IdentityFlows:
     def disable_totp(self, *, user_id: str, code: str) -> None:
         """Remove the factor and every recovery code, after proving possession of the factor.
 
-        The code is required and is checked **before** anything is deleted. A bearer access
-        token alone is not enough: an access token is short-lived but it is still a bearer
-        secret, and one that has been stolen would otherwise be able to turn off the very
-        control that limits what the theft is worth. Requiring the factor means the attacker
-        has to hold the second factor as well, which is the thing they were trying to get
-        around.
-
-        Verification goes through `MfaService.verify_challenge`, the same call
-        `complete_mfa` and `step_up` make, so a TOTP code and a recovery code are both
-        accepted, the constant-time comparison and the replay watermark are the ones already
-        tested, and a wrong code raises the same `MfaRejected` carrying `INVALID_MFA_CODE`.
-        A second verification path here would be a second place for the replay defence to be
-        subtly wrong.
-
-        A recovery code presented here is **spent**, exactly as it is on login. That is a
-        harmless-looking asymmetry only until you notice the alternative: a recovery code
-        that survives its use is a code an attacker can present again.
+        The code is checked before anything is deleted, so a stolen access token alone cannot
+        turn off the control that bounds its value. A recovery code presented here is spent.
         """
         service = self._require_mfa()
         user = self._hooks.load_user_by_id(user_id)
@@ -688,15 +524,8 @@ class IdentityFlows:
     def regenerate_recovery_codes(self, *, user_id: str, code: str) -> RecoveryCodeSet:
         """Replace every recovery code, after proving possession of the factor.
 
-        Same reasoning as `disable_totp` and the same verification call. Regenerating is
-        destructive in its own way: it invalidates every code the user is holding, so a
-        stolen access token that could do it unaided could strand the legitimate user
-        without a way back in the moment they lose their phone.
-
-        Verification happens **before** the old set is deleted, so a refused attempt leaves
-        the user's existing codes intact. `MfaService.regenerate_recovery_codes` keeps its
-        own all-or-nothing property: it deletes the old set and writes the new one, and the
-        plaintext it returns is the set that was written.
+        Verification happens before the old set is deleted, so a refused attempt leaves the
+        user's existing codes intact.
         """
         service = self._require_mfa()
         user = self._hooks.load_user_by_id(user_id)
@@ -712,6 +541,7 @@ class IdentityFlows:
         return codes
 
     def _require_mfa(self) -> MfaService:
+        """The MFA service, or a 503 saying it is not configured."""
         service = self.mfa
         if service is None:
             raise MfaRejected(
@@ -720,8 +550,6 @@ class IdentityFlows:
                 status_code=503,
             )
         return service
-
-    # ---- change password -----------------------------------------------------------
 
     def change_password(
         self,
@@ -734,22 +562,8 @@ class IdentityFlows:
     ) -> int:
         """Change a signed-in user's password and revoke their other sessions.
 
-        Requires the current password even though the caller already holds a valid access
-        token. A token proves the session, not the person at the keyboard, and re-proving
-        the password is what stops a stolen access token being upgraded into permanent
-        control of the account.
-
-        Revokes every family the caller can identify, because section 2.6 says a password
-        change calls sign-out-everywhere: a change made in response to a suspected
-        compromise is worthless if the attacker's session survives it.
-
-        `keep_family_id` names the caller's own family, which is spared so that changing a
-        password does not sign the user out of the tab they did it in. Passing nothing
-        revokes everything including the caller's, which is the stricter behaviour and the
-        right default for a reset rather than a change.
-
-        Returns the number of refresh records revoked. Raises `LoginRejected` when the
-        current password is wrong and `PasswordRejected` when the new one fails the policy.
+        Requires the current password, because a token proves the session and not the person.
+        `keep_family_id` spares the caller's own family. Returns the number of records revoked.
         """
         credential = self._stores.require_credentials().get(user_id, PASSWORD_CREDENTIAL_TYPE)
         presented = normalise_password(current_password)
@@ -795,28 +609,11 @@ class IdentityFlows:
         self._send_password_changed(user_id)
         return revoked
 
-    # ---- email verification --------------------------------------------------------
-
     def request_verification(self, email: str, *, ip: str = "") -> None:
         """Send a verification link to an address, on demand. Always succeeds.
 
-        Section 5.4 puts "verification resend" in the table of endpoints that answer
-        identically whether or not the address exists, and this returns `None` on every
-        path for that reason. An unknown address, an address whose account is already
-        verified, and an address that gets a link are the same outcome from outside.
-
-        An **already verified** address gets no second link, and that is not a leak: from
-        outside it is indistinguishable from an unknown address, which is the property
-        section 5.4 asks for. It matters because a verification link is a credential, and
-        minting one for an account that no longer needs it widens the window in which a
-        mailbox compromise is an account compromise for no gain.
-
-        The work is deliberately similar on both paths. Both look the address up, and the
-        one that finds a user writes a row and calls SES. That difference is measurable in
-        principle, and section 5.4 already records the residual: rate limit counters are per
-        address, so a determined attacker infers existence from a 429 boundary whatever this
-        function does. Equalising an SES round trip would mean sending mail to nobody, which
-        is worse than the leak it closes.
+        Returns `None` on every path, so an unknown address, an already verified one and one
+        that gets a link are the same outcome from outside.
         """
         self._require_email()
         normalised = _normalise_email(email)
@@ -840,15 +637,8 @@ class IdentityFlows:
     def confirm_verification(self, token: str, *, ip: str = "") -> str:
         """Consume a verification link and mark the address verified. Returns the user id.
 
-        Raises `ConfirmationFailed` for an unknown, expired, already used or wrong-purpose
-        token, all with the same message. Unlike the request side, this endpoint does not
-        answer identically on every path: the caller holds a token they were mailed, so
-        telling them it did not work is the whole point of the endpoint, and it discloses
-        nothing about anybody else's address.
-
-        The hook is called **after** the link is consumed, so a link cannot be spent twice
-        by racing the hook. The cost is that a hook that raises leaves the link spent, which
-        the hook's own docstring names.
+        Raises `ConfirmationFailed` for an unknown, expired, used or wrong-purpose token, all
+        with the same message. The hook runs after the link is consumed.
         """
         links = self._require_links()
         from webbpulse.identity.verification import ConfirmationFailed
@@ -866,21 +656,11 @@ class IdentityFlows:
         )
         return record.user_id
 
-    # ---- password reset ------------------------------------------------------------
-
     def request_password_reset(self, email: str, *, ip: str = "") -> None:
         """Send a reset link. Always succeeds, whatever the address is.
 
-        Section 5.4: "reset request" answers 200 always, with "If that address has an
-        account, a link is on its way." Returning `None` on every path is how that is
-        enforced here rather than left to a router: there is no return value a caller could
-        branch on even by accident, and no exception distinguishing the two cases.
-
-        Same shape as `request_verification`, and the same recorded residual about timing.
-        The one difference is that a reset link is issued regardless of whether the address
-        is verified: a user who never confirmed their address and has forgotten their
-        password still needs the remedy, and holding the reset link back until they verify
-        would need the verification link they also cannot get.
+        Returns `None` on every path, so no caller can branch on whether the address exists.
+        A link is issued whether or not the address is verified.
         """
         self._require_email()
         normalised = _normalise_email(email)
@@ -919,27 +699,8 @@ class IdentityFlows:
     ) -> str:
         """Consume a reset link, set a new password, and end every session. Returns the id.
 
-        The revocation is not optional and is not a courtesy. Section 2.6: "Password reset
-        additionally revokes every refresh family for that user on success, because a reset
-        is the remedy for a compromise and leaving old sessions alive defeats it." Unlike
-        `change_password`, **nothing is kept**: a reset is performed by somebody who may not
-        be signed in at all, and there is no session to spare that is known to be the
-        owner's rather than the attacker's.
-
-        The order is: consume the link, then check the policy, then write, then revoke. The
-        policy check after the consume is deliberate. Checking first would let a caller with
-        a valid link probe the password policy without spending it, which is harmless, but
-        it would also let a typo in the new password burn nothing while a policy violation
-        burns nothing either, and then a user who fails the policy twice still holds a live
-        link they can present a third time. Consuming first makes the link genuinely single
-        use, and the price is that a rejected password costs a new link.
-
-        `family_ids` is the same seam `logout_all` uses, and for the same reason:
-        `refresh-tokens` carries no user index by design, so a DynamoDB-backed store cannot
-        enumerate a user's families without a scan. Passing them is the cheap exact path;
-        passing none falls through to the store, which raises rather than silently revoking
-        nothing. **Raising is correct here.** A reset that reports success while leaving the
-        attacker's session alive is the one outcome this flow exists to prevent.
+        Nothing is kept, unlike `change_password`: a reset is the remedy for a compromise.
+        The link is consumed before the policy is checked, which makes it genuinely single use.
         """
         links = self._require_links()
         from webbpulse.identity.verification import ConfirmationFailed
@@ -970,17 +731,9 @@ class IdentityFlows:
 
         revoked = self._revoke_families(record.user_id, family_ids=family_ids)
 
-        # A reset proves control of the mailbox, which is the same thing a verification link
-        # proves. Marking the address verified here saves a user who never confirmed their
-        # address from being locked out by `may_authenticate` immediately after successfully
-        # resetting the password they were told to reset.
         try:
             self._hooks.mark_email_verified(record.user_id)
         except Exception:
-            # Deliberately broad, and deliberately swallowed. A product may not implement
-            # the hook at all, and the reset itself has already succeeded: the password is
-            # written and every family is revoked. Failing here would tell the user their
-            # reset did not work when it did.
             _log.info(
                 "Password reset did not mark the address verified.",
                 extra={"event": "password.reset_completed", "user_id": record.user_id},
@@ -998,8 +751,6 @@ class IdentityFlows:
         )
         return record.user_id
 
-    # ---- sessions ------------------------------------------------------------------
-
     def refresh(
         self,
         presented: str,
@@ -1010,16 +761,8 @@ class IdentityFlows:
     ) -> AuthResult:
         """Rotate a refresh token and mint a new access token.
 
-        Delegates the state machine to `SessionService.rotate` and turns its outcome into
-        either an `AuthResult` or the one 401. Every refusal is the same 401 whatever the
-        outcome was: the difference between an expired token and a detected reuse is an
-        alarm for an operator, not information for whoever presented the token.
-
-        Re-reads the user through `load_user_by_id` and re-runs `may_authenticate` on every
-        rotation. That is the only revocation the design has: section 2.6 states plainly
-        that a logout cannot invalidate an already-issued access token, so an account
-        disabled mid-session stops being able to *renew*, and the ten-minute access token is
-        the bound on how long the old one keeps working.
+        Every refusal is the same 401, whatever the outcome. Re-reads the user and re-runs
+        `may_authenticate` on each rotation, which is the only revocation the design has.
         """
         if not presented:
             raise LoginRejected("Your session has ended. Sign in again.", error_code="NO_SESSION")
@@ -1040,8 +783,6 @@ class IdentityFlows:
 
         user = self._hooks.load_user_by_id(result.issued.user_id)
         if user is None:
-            # The family outlived the account. Revoke rather than leave a live family
-            # pointing at a user that no longer exists.
             self._sessions.revoke_family(result.issued.family_id)
             raise LoginRejected("Your session has ended. Sign in again.", error_code="NO_SESSION")
 
@@ -1082,9 +823,8 @@ class IdentityFlows:
     def logout(self, presented: str, *, ip: str = "") -> int:
         """Revoke the family the presented cookie belongs to. Always succeeds.
 
-        Tolerant of an unknown, expired or already-revoked token, because the caller's
-        intent is to end up signed out and answering 401 to that is both unhelpful and a
-        signal about whether the cookie they hold is live.
+        Tolerant of an unknown, expired or already-revoked token, because the caller's intent
+        is to end up signed out.
         """
         if not presented:
             return 0
@@ -1119,9 +859,8 @@ class IdentityFlows:
         )
         return revoked
 
-    # ---- internals: email ----------------------------------------------------------
-
     def _require_email(self) -> None:
+        """Raise a 503 unless a sender and an `identity-tokens` store are both present."""
         if not self.email_enabled:
             raise LoginRejected(
                 "This service is not configured to send email, so this flow is not available.",
@@ -1130,22 +869,20 @@ class IdentityFlows:
             )
 
     def _require_links(self) -> LinkService:
+        """The link service, after checking email is configured."""
         self._require_email()
-        assert self._links is not None  # narrowed by _require_email
+        assert self._links is not None
         return self._links
 
     def _send(self, message: EmailMessage, *, best_effort: bool) -> None:
         """Send one rendered message.
 
-        `best_effort` is the whole difference between the paths that tolerate a send failure
-        and the paths that report one. Registration tolerates it, because the account exists
-        and a resend route exists to try again; a deliberate resend does not, because
-        answering 200 to "send me another link" and sending nothing leaves the user waiting
-        for mail that will never arrive.
+        `best_effort` separates the paths that tolerate a send failure from the paths that
+        report one: a deliberate resend must not answer 200 having sent nothing.
         """
         from webbpulse.identity.email import EmailSendFailed
 
-        assert self._email is not None  # callers check `email_enabled` first
+        assert self._email is not None
         try:
             self._email.send(message)
         except EmailSendFailed:
@@ -1162,9 +899,8 @@ class IdentityFlows:
     def _send_verification(self, user_id: str, email: str, *, best_effort: bool) -> None:
         """Issue a verification link and mail it, when email is configured.
 
-        Silently does nothing when it is not, and only on the `best_effort` path. A product
-        that mounts no email sender still registers accounts, and this is the one place that
-        tolerance lives: every route that promises an email checks `email_enabled` first.
+        Silently does nothing when it is not, and only on the `best_effort` path, so a product
+        with no email sender still registers accounts.
         """
         if not self.email_enabled:
             if not best_effort:
@@ -1188,14 +924,14 @@ class IdentityFlows:
     def _send_registration_notice(self, user: Mapping[str, Any], email: str) -> None:
         """Section 5.4's notice to an address somebody tried to register again.
 
-        Always best effort. The caller has already decided to answer 200, and a send failure
-        here must not turn the non-disclosure into a 500 that discloses by its own existence.
+        Always best effort: a send failure must not turn the non-disclosure into a 500 that
+        discloses by its own existence.
         """
         if not self.email_enabled:
             return
         from webbpulse.identity.email import render_registration_notice
 
-        del user  # The notice names no attribute of the account, deliberately.
+        del user
         self._send(
             render_registration_notice(
                 self._settings,
@@ -1208,18 +944,14 @@ class IdentityFlows:
     def _send_password_changed(self, user_id: str) -> None:
         """Tell a user their password changed. Always best effort.
 
-        A notification, not a control: the password is already changed by the time this
-        runs, and failing the request because a notice did not send would undo nothing.
-        Needs the address, which lives on the product's user record, so a hook that cannot
-        load the user simply means no notice.
+        A notification, not a control: the password is already changed, so failing the request
+        would undo nothing. No address on the user record means no notice.
         """
         if not self.email_enabled:
             return
         try:
             user = self._hooks.load_user_by_id(user_id)
         except Exception:
-            # A notice must not fail the flow that sent it. The password has already
-            # changed by the time this runs.
             return
         address = str((user or {}).get("email", "")).strip()
         if not address:
@@ -1235,15 +967,11 @@ class IdentityFlows:
             best_effort=True,
         )
 
-    # ---- passkeys ------------------------------------------------------------------
-
     def _require_passkeys(self) -> PasskeyService:
         """The passkey service, or a refusal naming the reason it is absent.
 
-        The counterpart of `_require_mfa`. A 501 rather than a 500: the deployment has not
-        created the two M5 tables or has `passkeys_enabled` false, which is a configuration
-        state and not a fault, and the router does not mount these routes in that case
-        anyway. Reaching it means somebody called the flow directly.
+        A 501 rather than a 500: the tables are absent or `passkeys_enabled` is false, which
+        is a configuration state and not a fault.
         """
         if self.passkeys is None:
             raise LoginRejected(
@@ -1256,9 +984,8 @@ class IdentityFlows:
     def begin_passkey_registration(self, *, user_id: str) -> RegistrationChallenge:
         """Options for enrolling a new passkey on an already-authenticated account.
 
-        The caller is authenticated, so the user is loaded rather than guessed, and
-        `may_authenticate` is consulted: a product that has disabled an account should not
-        let that account grow new credentials while the token in hand is still valid.
+        `may_authenticate` is consulted, so a disabled account cannot grow new credentials
+        while a valid token is still in hand.
         """
         service = self._require_passkeys()
         user = self._hooks.load_user_by_id(user_id)
@@ -1294,13 +1021,8 @@ class IdentityFlows:
     def begin_passkey_login(self, *, email: str = "") -> RegistrationChallenge:
         """Options for signing in with a passkey.
 
-        Refused outright unless `passkeys_passwordless` is on, because these options are the
-        entire passwordless entry point: with them off, a passkey is a second factor and an
-        enrolment credential, and there is no route into an account that starts here.
-
-        An unknown or absent address produces a discoverable-credential challenge with no
-        `allowCredentials`, which is what a genuine discoverable request looks like. Section
-        5.4 again: this route must not become an account oracle that needs no password.
+        Refused unless `passkeys_passwordless` is on. An unknown or absent address produces a
+        discoverable-credential challenge, so this route is not an account oracle.
         """
         service = self._require_passkeys()
         if not self._settings.passkeys_passwordless:
@@ -1314,7 +1036,7 @@ class IdentityFlows:
         if normalised:
             try:
                 user = self._hooks.load_user_by_email(normalised)
-            except Exception:  # pragma: no cover - defensive, hook failures
+            except Exception:  # pragma: no cover
                 user = None
             if user is not None:
                 user_id = _user_id(user)
@@ -1330,20 +1052,8 @@ class IdentityFlows:
     ) -> AuthResult:
         """The passwordless login leg: verify an assertion, issue the same token pair.
 
-        Identical output to `login`, deliberately. A passkey session is a session: same
-        refresh family, same cookie, same access token lifetime. The only difference is
-        `amr`, and that difference is the point.
-
-        **A user-verified passkey is not challenged for TOTP.** `_challenge_for` is not
-        consulted on this path, because the assertion already carried two factors and asking
-        for a third would be a policy this package has no business inventing. A passkey that
-        reports no user verification is one factor, so the MFA challenge still applies to it
-        exactly as it applies to a password. See `passkeys.amr_for`.
-
-        Lockout is not applied here and the attempt is not recorded against the email
-        counter. There is nothing to grind: an assertion is either signed by the credential's
-        private key or it is not, and a wrong guess costs an attacker a challenge rather than
-        a step towards one. The route is rate limited all the same.
+        Identical output to `login` but for `amr`. A user-verified passkey is not challenged
+        for TOTP; one reporting no user verification still is. Lockout does not apply.
         """
         service = self._require_passkeys()
         if not self._settings.passkeys_passwordless:
@@ -1356,20 +1066,13 @@ class IdentityFlows:
 
         user = self._hooks.load_user_by_id(result.user_id)
         if user is None:
-            # The assertion verified, so this is a credential outliving its user rather than
-            # an attack. Same refusal as any other passkey failure.
             from webbpulse.identity.passkeys import PasskeyRejected
 
             raise PasskeyRejected()
 
-        # The product still gets its say. A disabled account with a working passkey must not
-        # sign in, and `may_authenticate` is where a product expresses that.
         self._hooks.may_authenticate(user)
 
         if not result.user_verified and self.mfa is not None:
-            # One factor only, so the second-factor policy applies exactly as it does to a
-            # password. The challenge is raised the same way `login` raises it, so a caller
-            # already handling `MfaChallengeRequired` needs no new branch.
             challenge = self._challenge_for(user)
             if challenge is not None:
                 raise MfaChallengeRequired(challenge)
@@ -1404,18 +1107,13 @@ class IdentityFlows:
     def delete_passkey(self, *, user_id: str, credential_id: str) -> None:
         """Remove one of the caller's own passkeys, unless it is the only way in.
 
-        "Has a password" is read from the `credentials` store, which is where this package's
-        own password lives, so no new hook is needed and `IdentityHooks` is unchanged by M5.
-        A product with some other sign-in method the package cannot see still has
-        `may_authenticate` and can refuse the delete in front of the route.
+        "Has a password" is read from the `credentials` store, so M5 needed no new hook.
         """
         service = self._require_passkeys()
         credential = self._stores.require_credentials().get(user_id, PASSWORD_CREDENTIAL_TYPE)
         service.delete_passkey(
             user_id, credential_id, has_password=credential is not None and bool(credential.secret)
         )
-
-    # ---- internals -----------------------------------------------------------------
 
     def _issue(
         self,
@@ -1449,14 +1147,8 @@ class IdentityFlows:
     ) -> str:
         """The single place an access token is minted, and so the single place `amr` is set.
 
-        `amr` and `auth_time` are applied **after** `claims_for`, so a product hook cannot
-        overwrite them. That matters more than it looks: a hook that returned `amr: ["mfa"]`
-        for every user would silently satisfy every step-up check in the estate.
-
-        `mfa` is added alongside the specific factor whenever more than one method was used,
-        per RFC 8176, which defines it as "multiple-factor authentication". A route asserting
-        on `amr` can then require `mfa` without enumerating every factor that might satisfy
-        it, and can still require `otp` specifically when only a live authenticator will do.
+        `amr` and `auth_time` are applied after `claims_for`, so a product hook cannot
+        overwrite them. `mfa` is added alongside the specific factor when more than one was used.
         """
         methods = list(dict.fromkeys(amr))
         if len(methods) > 1 and AMR_MFA not in methods:
@@ -1464,9 +1156,6 @@ class IdentityFlows:
         claims = dict(self._hooks.claims_for(user))
         claims["amr"] = methods
         claims["auth_time"] = int(time.time()) if auth_time is None else auth_time
-        # `mint_access_token` drops any registered claim a hook returns, so a hook cannot
-        # forge an issuer or extend a lifetime. `amr` and `auth_time` are not registered
-        # claims in that set, which is why they are set here rather than passed through.
         return self._tokens.mint_access_token(
             _user_id(user),
             claims=claims,
@@ -1480,25 +1169,21 @@ class IdentityFlows:
         keep_family_id: str = "",
         family_ids: list[str] | None = None,
     ) -> int:
+        """Revoke a user's families, using `family_ids` when the caller supplied them."""
         if family_ids is not None:
             targets = [family for family in family_ids if family]
             return self._sessions.revoke_all_for_user(
                 user_id, family_ids=targets, except_family_id=keep_family_id
             )
-        # No family list, so fall through to the store. Exact where the store can be, and
-        # raising where it cannot be without scanning a production table. See
-        # `SessionService.revoke_all_for_user`.
         return self._sessions.revoke_all_for_user(user_id, except_family_id=keep_family_id)
 
     def _lockout_state(self, identity: str, *, now: datetime) -> LockoutState:
+        """The lockout state for an identity, or an empty one when attempts are unreadable."""
         if self._attempts is None:
-            # No attempt store configured, so there is no history to lock on. Permitting is
-            # the right failure direction: lockout is a hardening measure, and a product
-            # that has not wired the table should still be able to sign its users in.
             return LockoutState(failures=0)
         try:
             recent = self._attempts.recent(identity)
-        except Exception:  # pragma: no cover - defensive, storage failures
+        except Exception:  # pragma: no cover
             _log.warning(
                 "Could not read login attempts; proceeding without lockout.",
                 extra={"event": "login.lockout_read_failed"},
@@ -1515,15 +1200,10 @@ class IdentityFlows:
         ip: str = "",
         user_agent: str = "",
     ) -> None:
-        """Write one attempt row, best effort.
-
-        Never raises. A failure to write the audit row must not turn a correct login into a
-        500, and the structured log line has already carried the same event to CloudWatch,
-        which section 5.7 requires precisely so the record survives a table problem.
+        """Write one attempt row, best effort. Never raises.
 
         Written under both the email key and the IP key, which is what makes section 5.2's
-        anomaly query possible: one email failing from many addresses, or many emails
-        failing from one, are both a `Query` rather than a scan.
+        anomaly query a `Query` rather than a scan.
         """
         if self._attempts is None:
             return
@@ -1540,7 +1220,7 @@ class IdentityFlows:
                         user_agent=_device_class(user_agent),
                     )
                 )
-            except Exception:  # pragma: no cover - defensive, storage failures
+            except Exception:  # pragma: no cover
                 _log.warning(
                     "Could not record a login attempt.",
                     extra={"event": "login.attempt_write_failed", "outcome": outcome},
@@ -1559,12 +1239,8 @@ class IdentityFlows:
     ) -> NoReturn:
         """Record a failed login and raise. Never returns.
 
-        `NoReturn` rather than `None` so the type checker narrows after each call site: the
-        code following `if user is None: self._fail(...)` genuinely has a non-None user, and
-        saying so here is what keeps that from needing an assertion.
-
-        `reason` reaches the log and never the response, which is the whole point: an
-        operator can tell an unknown address from a wrong password, and the caller cannot.
+        `NoReturn` so the type checker narrows after each call site. `reason` reaches the log
+        and never the response.
         """
         self._record(identity, "failure", user_id=user_id, ip=ip, user_agent=user_agent)
         _log.info(
@@ -1583,9 +1259,8 @@ class IdentityFlows:
 def _normalise_email(email: str) -> str:
     """Lower case and strip. The form every lookup and every attempt key uses.
 
-    Email local parts are case sensitive by RFC, and every mail provider in practice ignores
-    that. Matching case-insensitively is what users expect, and it must be done identically
-    at registration and at login or an account becomes unreachable.
+    Must be done identically at registration and at login, or an account becomes
+    unreachable.
     """
     return email.strip().lower()
 
@@ -1609,24 +1284,17 @@ def _user_id(user: Mapping[str, Any]) -> str:
 def _is_verified(user: Mapping[str, Any]) -> bool:
     """Whether the product's user record already says this address is confirmed.
 
-    `email_verified` is the column section 4.2 names on the `users` table, and it is the
-    column `mark_email_verified` sets. Reading it here is the read half of that same seam.
-
-    Absent means **not** verified, which is the safe reading: a product whose user records
-    predate the column, or which spells it something else, gets a second verification link
-    it did not strictly need. The other reading would silently refuse to send a link to an
-    account that genuinely needs one, and a user with no way to verify has no way to sign
-    in either.
+    Absent means not verified, which is the safe reading: the cost is a redundant link,
+    where the other reading would strand a user who genuinely needs one.
     """
     return bool(user.get("email_verified", False))
 
 
 def _device_class(user_agent: str) -> str:
-    """A coarse class, never a fingerprint. Section 4.2 and section 5.7.
+    """A coarse device class, never a fingerprint. Section 4.2 and section 5.7.
 
-    Enough to make an audit line readable and to notice that a session moved from a phone to
-    a server, and deliberately not enough to identify a browser. A full user-agent string in
-    a table with a thirty day TTL is tracking data with no purpose this design has.
+    Enough to make an audit line readable, and deliberately not enough to identify a
+    browser.
     """
     if not user_agent:
         return "unknown"

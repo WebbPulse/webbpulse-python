@@ -1,104 +1,7 @@
-"""`build_identity_router`: the router a product mounts into its identity Lambda.
+"""The identity router a product mounts into its identity Lambda.
 
-Always mounts the three anonymous documents, plus the two discovery routes:
-
-    GET <prefix>/.well-known/openid-configuration
-    GET <prefix>/.well-known/jwks.json
-    GET <prefix>/health
-    GET <prefix>/oauth/providers
-    GET <prefix>/passkeys/availability
-
-and, when the product supplies `hooks` **and** a `stores` carrying the credential and
-refresh stores, the M2 password and session flows:
-
-    POST <prefix>/register
-    POST <prefix>/login
-    POST <prefix>/password
-    POST <prefix>/refresh
-    POST <prefix>/logout
-    POST <prefix>/logout-all
-
-and, when TOTP is enabled and the two M4 stores are supplied, the MFA routes:
-
-    POST <prefix>/login/totp        second leg of login, anonymous, holds an MFA ticket
-    POST <prefix>/totp/enrol        behind the authorizer
-    POST <prefix>/totp/activate     behind the authorizer
-    POST <prefix>/totp/disable      behind the authorizer, and takes a `code`
-    POST <prefix>/recovery-codes    behind the authorizer, and takes a `code`
-    POST <prefix>/step-up           behind the authorizer
-
-`login/totp` must stay **outside** the authorizer: it carries an MFA ticket whose audience
-is `<issuer>/mfa`, which the gateway's authorizer is not configured with, so putting it
-behind the authorizer rejects the second leg of every MFA login before it runs.
-
-`totp/disable` and `recovery-codes` require `{"code": "..."}` in the body as well as the
-bearer token, and it is checked by the same path `login/totp` uses. Both are destructive to
-the second factor, so the bearer token alone must not be enough: a stolen access token would
-otherwise be able to switch off the control that bounds what stealing it is worth. **This
-changed in 0.13.0**, where both routes took no body at all.
-
-Passkeys and OAuth are M5 and M6, per section 9.1 of `docs/identity-standard.md`.
-
-`oauth/providers` and `passkeys/availability` are the exception to all of the above
-conditionality. Both are unconditional, `oauth/providers` from 0.16.0 and
-`passkeys/availability` from 0.17.0, and each answers the negative case in a deployment that
-has no OAuth and no passkeys configured at all, so a frontend gets one authoritative answer
-in every environment rather than a 404 it has to interpret. The other five OAuth routes and
-the seven passkey routes stay conditional. See `register_oauth_provider_discovery` and
-`register_passkey_availability` for the rest of that reasoning.
-
-## Where `<prefix>` comes from, and why you mount with no prefix of your own
-
-`<prefix>` is the issuer's path: `/api/auth` for the standard's
-`https://<host>/api/auth`, and empty for an issuer with no path, which gives origin paths.
-The router places itself there, so **mount it with no prefix**.
-
-It is the issuer's path because that is where API Gateway and the advertised `jwks_uri`
-look. The gateway builds the discovery URL as `issuer + "/.well-known/openid-configuration"`
-at `CreateAuthorizer` time, and `settings.jwks_uri` advertises the JWKS the same way.
-Neither URL is ours to choose once the issuer is set, so the routes go where they point.
-
-0.9.0 served the documents at the origin regardless of the issuer's path, which was wrong
-for the standard's own issuer and is fixed here. See `identity_prefix`.
-
-## Why the flows mount conditionally
-
-A product that runs a JWKS-only function, which is how 0.9.0 shipped, passes no hooks and no
-stores. Mounting a login route for it would declare an endpoint that answers 500 on its
-first request, because the very first thing it does is call a hook that raises
-`HookNotImplemented`. A route that cannot work should not exist: an unmountable flow is a
-configuration error worth failing at composition, not at 3am.
-
-So the rule is explicit and checkable: **flows appear exactly when the collaborators they
-need are present.** `build_identity_router(settings, kms_client=kms)` is still the three
-document routes and nothing else.
-
-## Why these routes must be anonymous
-
-API Gateway fetches both `.well-known` documents **itself**, from outside any browser
-session, holding no cookies and presenting no token. Any authorizer or access gate in front
-of either one means the JWT authorizer cannot retrieve the signing key, and then every
-authorized route in the product fails closed. Section 2.5 names this as the single most
-likely way to get the deployment wrong, and it is worth repeating at the place where the
-routes are actually declared: **do not put these behind the staging access gate.**
-
-## Caching
-
-Both documents get an explicit `Cache-Control`. The gateway refetches the JWKS on its own
-interval and the discovery document at authorizer creation, and both are on the anonymous
-hot path, so an unclaimed cache policy means every fetch is a Lambda invocation.
-
-The two get different lifetimes, and the asymmetry is the point:
-
-- **Discovery is `max-age=3600`.** It is a pure function of the issuer and changes only when
-  the issuer does, which is never in the life of a deployment.
-- **JWKS is `max-age=300`.** Short, because this is the document rotation moves through. A
-  long cache here is what turns rotation step 3 into an outage: a verifier holding a
-  ten-hour-old JWKS has not seen the new key and rejects every token signed with it. Five
-  minutes bounds that window while still absorbing the fetch volume.
-
-Neither carries `no-store`. Neither contains a secret: a JWKS is public key material by
-definition, and treating it as sensitive would be cargo cult.
+Mounts the discovery, JWKS and health documents unconditionally, plus the password,
+session, email, MFA, passkey and OAuth flows when their collaborators are supplied.
 """
 
 from __future__ import annotations
@@ -109,7 +12,7 @@ from urllib.parse import urlsplit
 from webbpulse.identity.storage import IdentityStores
 from webbpulse.identity.tokens import DISCOVERY_PATH, JWKS_PATH
 
-if TYPE_CHECKING:  # pragma: no cover - typing only
+if TYPE_CHECKING:  # pragma: no cover
     from collections.abc import Callable, Mapping
 
     from fastapi import APIRouter, Request
@@ -154,21 +57,12 @@ __all__ = [
     "identity_prefix",
 ]
 
-#: One hour. The discovery document changes only when the issuer changes.
 DISCOVERY_CACHE_CONTROL = "public, max-age=3600"
 
-#: Five minutes. Short enough that a rotation propagates inside one step's deploy window.
 JWKS_CACHE_CONTROL = "public, max-age=300"
 
-#: Matches `webbpulse.http.health_router`, so an identity Lambda answers the same probe
-#: path as every other service in the estate.
 HEALTH_PATH = "/health"
 
-#: Flow route suffixes, relative to the issuer path the router mounts under.
-#:
-#: Suffixes rather than absolute paths, because the prefix is not knowable here: it comes
-#: from `settings.issuer`, and a product is free to issue from an origin or from a path.
-#: `identity_prefix()` computes it and `build_identity_router` joins the two.
 REGISTER_PATH = "/register"
 LOGIN_PATH = "/login"
 PASSWORD_PATH = "/password"
@@ -176,15 +70,11 @@ REFRESH_PATH = "/refresh"
 LOGOUT_PATH = "/logout"
 LOGOUT_ALL_PATH = "/logout-all"
 
-#: M3's four email routes. All four are anonymous: the link is the credential, which is
-#: what section 2.3's route table says about `verify-email` and `reset/*`.
 VERIFY_REQUEST_PATH = "/verify-email"
 VERIFY_CONFIRM_PATH = "/verify-email/confirm"
 RESET_REQUEST_PATH = "/reset"
 RESET_CONFIRM_PATH = "/reset/confirm"
 
-#: M4. `LOGIN_TOTP_PATH` is the second leg of login and carries an MFA ticket rather than an
-#: access token, so it must stay outside the authorizer. The rest sit behind it.
 LOGIN_TOTP_PATH = "/login/totp"
 TOTP_ENROL_PATH = "/totp/enrol"
 TOTP_ACTIVATE_PATH = "/totp/activate"
@@ -192,51 +82,23 @@ TOTP_DISABLE_PATH = "/totp/disable"
 RECOVERY_CODES_PATH = "/recovery-codes"
 STEP_UP_PATH = "/step-up"
 
-#: Section 5.4's exact wording for the reset request. It is a true sentence in both cases,
-#: which is what makes it usable as the single answer: it does not claim an email was sent.
 RESET_REQUESTED_MESSAGE: Final = "If that address has an account, a link is on its way."
 
-#: Section 5.1's limits, as (limit, window seconds). Named here rather than inline so the
-#: table in the standard and the code can be diffed against each other by eye.
 LOGIN_IP_LIMIT: Final = (20, 900)
 LOGIN_EMAIL_LIMIT: Final = (10, 900)
 REFRESH_IP_LIMIT: Final = (120, 900)
 REGISTER_IP_LIMIT: Final = (5, 3600)
 
-#: Section 5.1's email limits. Reset request is limited by **both** address and IP, which
-#: the table gives as 3/hour and 10/hour; verification resend is given per address only, and
-#: gets the same per-IP ceiling here because the two routes are the same shape and an
-#: unlimited per-IP resend is a free mail relay pointed at whoever's addresses an attacker
-#: has. That addition is recorded in the M3 decisions.
 RESET_EMAIL_LIMIT: Final = (3, 3600)
 RESET_IP_LIMIT: Final = (10, 3600)
 VERIFY_EMAIL_LIMIT: Final = (3, 3600)
 VERIFY_IP_LIMIT: Final = (10, 3600)
 
-#: Section 5.1: ten TOTP verifications per fifteen minutes. This is the control that makes a
-#: six digit code acceptable at all, so it is per user rather than per IP: an attacker with
-#: many addresses guessing one account is exactly the case it exists to stop.
 TOTP_VERIFY_LIMIT: Final = (10, 900)
-#: Enrolment is per IP and looser: it mints a seed rather than guessing one.
 TOTP_ENROL_IP_LIMIT: Final = (10, 3600)
 
-#: `Sec-Fetch-Site` values a state-changing cookie route accepts. Section 5.5's first CSRF
-#: supplement: the header is sent by every current major browser and cannot be set by page
-#: JavaScript, so a cross-site value is a forged request. A **missing** header is allowed,
-#: because a non-browser client legitimately sends none and refusing those would break every
-#: integration test and curl invocation.
 ALLOWED_FETCH_SITES: Final = frozenset({"same-origin", "same-site", "none"})
 
-#: `fastapi.Request`, bound into this module's globals at first use.
-#:
-#: Every route below annotates a parameter `request: _FastAPIRequest`. Under
-#: `from __future__ import annotations` an annotation is a **string**, and FastAPI resolves a
-#: route's annotations against the defining module's namespace. A `Request` imported inside
-#: a function is not in that namespace, so FastAPI could not tell the parameter was the
-#: request object and treated it as a required query parameter, answering 422 to every call.
-#: `webbpulse.ratelimit` hit the identical problem and solved it the identical way, and the
-#: shape of that bug (a whole router answering 422 with no error anywhere) is unpleasant
-#: enough to be worth solving the same way twice rather than inventing a second idiom.
 _FastAPIRequest: Any = None
 
 
@@ -252,26 +114,8 @@ def _bind_fastapi_request() -> None:
 def identity_prefix(settings: IdentitySettings) -> str:
     """The path every identity route mounts under, taken from the issuer.
 
-    Returns the issuer's path with any trailing slash removed, so
-    `https://host/api/auth` gives `/api/auth` and `https://host` gives `""`. Joining a
-    suffix onto the result is always well formed: an empty prefix leaves the suffix's own
-    leading slash to do the work.
-
-    **Derived rather than configured, because the issuer already decides it.** API Gateway
-    builds the discovery URL as `issuer + "/.well-known/openid-configuration"` at
-    `CreateAuthorizer` time, and `settings.jwks_uri` advertises the JWKS the same way. Those
-    two URLs are not ours to choose once the issuer is set, so the routes have to be where
-    they point. A second setting for the mount path would be a second source of truth for
-    one fact, and the failure it invites is silent: the documents serve 200 at a path
-    nothing fetches, while the gateway gets a 404 and every authorized route in the product
-    fails closed.
-
-    This is a behaviour change from 0.9.0, which served the documents at the origin whatever
-    the issuer's path was. That was wrong for the standard's own `https://<host>/api/auth`
-    issuer, and the Portfolio pilot hit it: a test that followed the served `jwks_uri` found
-    a 404, and the workaround was to mount the router under a hand-written prefix. Deriving
-    the prefix here makes that workaround unnecessary, and makes the doubled
-    `/api/auth/api/auth` it would now produce impossible.
+    Returns the issuer's path with any trailing slash removed, so `https://host/api/auth`
+    gives `/api/auth` and `https://host` gives an empty string.
     """
     return urlsplit(settings.issuer).path.rstrip("/")
 
@@ -292,45 +136,8 @@ def build_identity_router(
 ) -> APIRouter:
     """The identity router for a product, mounted with no prefix.
 
-    `settings` is an `IdentitySettings`. Pass `hooks` and a `stores` holding the credential
-    and refresh stores to get the M2 flows as well as the three documents; omit either and
-    only the documents mount. See the module docstring for why that is conditional.
-
-    `attempts` is the `login-attempts` store backing progressive lockout. Omit it and the
-    flows still work, with lockout disabled: it is a hardening measure, and a product that
-    has not created the table should still be able to sign its users in.
-
-    `limiter_enabled` turns off the `webbpulse.ratelimit` dependencies. It exists for tests
-    and for a local run with no DynamoDB, and production leaves it `True`. The limiter fails
-    open on its own when the table is unreachable (section 5.1), so this flag is about not
-    building the dependency at all rather than about tolerating a failure.
-
-    `tokens` is a `TokenService`. Pass one to share a single instance, and its JWK cache,
-    with the rest of the service. Omit it and one is built from `settings` and `kms_client`,
-    which is the ordinary case.
-
-    `oauth_client_secrets` maps a provider name to its client secret, for M6. Supply it from
-    `webbpulse.config.load_json_secret` at composition time, reading the `google_client_secret`
-    and `github_client_secret` keys of the product's single app secret. It is an argument
-    rather than an `IdentitySettings` field on purpose, and that is the same rule the settings
-    module states for itself: a secret that is a settings field is a secret that appears in a
-    `repr`, in a pydantic validation error and in whatever log line prints the settings
-    object. Omit it and the OAuth routes still mount but answer 503, because the token
-    exchange cannot be made without it.
-
-    `service` and `version` are what `/health` reports, matching the arguments
-    `webbpulse.http.health_router` takes for the same purpose.
-
-    **Mount this with no prefix**, even in a service whose other routers sit under
-    `/api/v1`. The router places itself under the issuer's path, because that is where API
-    Gateway and the advertised `jwks_uri` look for it: the gateway builds the discovery URL
-    as `issuer + "/.well-known/openid-configuration"`, and `settings.jwks_uri` advertises
-    the JWKS the same way. For the standard's `https://<host>/api/auth` issuer every route
-    lands under `/api/auth`; for an issuer with no path they land at the origin. Adding a
-    prefix of your own puts the documents where nothing will look for them, or doubles the
-    issuer path if you mount under it by hand.
-
-    Every route here is anonymous, deliberately. See the module docstring.
+    The discovery, JWKS, health, OAuth provider and passkey availability routes always
+    mount; the flows mount only when their hooks and stores are supplied.
     """
     from fastapi import APIRouter
     from fastapi.responses import JSONResponse
@@ -347,51 +154,29 @@ def build_identity_router(
 
     resolved_stores = stores if stores is not None else IdentityStores()
 
-    # Every route hangs off the issuer's path. See `identity_prefix` for why this is derived
-    # rather than configured, and the docstring above for why the caller adds no prefix.
     prefix = identity_prefix(settings)
 
     router = APIRouter(tags=["identity"])
 
-    # Each returns an explicit `JSONResponse` rather than taking a `response: Response`
-    # parameter and mutating its headers. Under `from __future__ import annotations` that
-    # parameter's annotation is the *string* "Response", and FastAPI, unable to resolve it
-    # to the class from this function's local import, treats it as a required query
-    # parameter and answers 422 to every request. Returning the response sidesteps the
-    # resolution problem entirely.
-
     @router.get(f"{prefix}{DISCOVERY_PATH}", include_in_schema=False)
     async def discovery_document() -> JSONResponse:
+        """Serve the OpenID discovery document with its long cache header."""
         return JSONResponse(tokens.discovery(), headers={"Cache-Control": DISCOVERY_CACHE_CONTROL})
 
     @router.get(f"{prefix}{JWKS_PATH}", include_in_schema=False)
     async def jwks_document() -> JSONResponse:
+        """Serve the JWKS with its short cache header, sized for key rotation."""
         return JSONResponse(tokens.jwks(), headers={"Cache-Control": JWKS_CACHE_CONTROL})
 
     @router.get(f"{prefix}{HEALTH_PATH}", include_in_schema=False)
     async def health() -> dict[str, Any]:
-        # Shape matches `webbpulse.http.health_router` so one probe configuration works
-        # across every service. Deliberately does not call KMS: a health check that depends
-        # on a downstream turns a KMS blip into an unhealthy target and a restart loop,
-        # and the JWKS route already fails loudly if KMS is genuinely unreachable.
+        """Report service health, matching `webbpulse.http.health_router`'s shape."""
         return {
             "status": "healthy",
             "service": service,
             "version": version,
         }
 
-    # M6's provider discovery, new in 0.16.0, and the one OAuth route that is unconditional.
-    #
-    # Mounted here rather than inside `_mount_flows` because it must exist in *every*
-    # deployment, including one that mounts no flows at all: a JWKS-only function, a product
-    # with no OAuth stores, a product that configured no provider. The frontend then has one
-    # authoritative answer everywhere instead of a 404 it has to interpret, which is the
-    # ambiguous signal the route exists to replace. See `register_oauth_provider_discovery`.
-    #
-    # The service is built only when both stores are present, because `OAuthService` requires
-    # them. When they are absent the route still mounts and answers `{"providers": []}`,
-    # which is the truth: a product with nowhere to write a state row cannot complete an
-    # OAuth sign-in whatever its client ids say.
     _mount_oauth_discovery(
         router,
         prefix=prefix,
@@ -401,16 +186,6 @@ def build_identity_router(
         oauth_client_secrets=oauth_client_secrets,
     )
 
-    # M5's availability route, new in 0.17.0, and the one passkey route that is
-    # unconditional. Mounted here for the reason the OAuth discovery route is: the frontend
-    # needs one authoritative answer in every deployment, including one that mounts no flows
-    # at all, rather than a 404 it has to interpret.
-    #
-    # It takes settings and nothing else. There is no service to build and no store to reach,
-    # because the answer is two configuration booleans, which is exactly what makes it safe
-    # to mount unconditionally and cheap enough to leave unlimited. See
-    # `register_passkey_availability` for why a frontend probing `login/passkey/options`
-    # instead is wrong twice over.
     from webbpulse.identity.passkey_routes import register_passkey_availability
 
     register_passkey_availability(router, prefix=prefix, settings=settings)
@@ -444,20 +219,8 @@ def _mount_oauth_discovery(
 ) -> None:
     """Mount `GET <prefix>/oauth/providers`, with a service behind it where one can exist.
 
-    Split out of `build_identity_router` so the "can a service be built" question is asked in
-    one place and reads as one thought, rather than as four lines of `and` in the middle of a
-    function that is otherwise about mounting documents.
-
-    The route mounts either way. What varies is whether it can answer anything but an empty
-    list, and that needs the same collaborators the flow routes need: an `OAuthService` takes
-    both OAuth stores and a hooks object. When any of them is missing the route mounts with
-    no service, which is not a degraded answer but the correct one: a deployment with no
-    state table cannot complete an OAuth sign-in no matter which client ids it holds, so
-    advertising a provider would be advertising a button that cannot work.
-
-    `credentials` is passed through where present, matching `_mount_flows`, so a service
-    built here is the same object shape as the one built there and neither can drift into
-    answering differently about the same configuration.
+    The route mounts either way; without both OAuth stores and hooks it answers an empty
+    provider list.
     """
     from webbpulse.identity.oauth_routes import register_oauth_provider_discovery
 
@@ -491,17 +254,10 @@ def _mount_flows(
     kms_client: Any = None,
     oauth_client_secrets: Mapping[str, str] | None = None,
 ) -> None:
-    """Add the six M2 flow routes, and M3's four email routes, to an already-built router.
+    """Add the M2 flow routes, and M3's four email routes, to an already-built router.
 
-    Split out of `build_identity_router` because that function is otherwise readable in one
-    screen and this half is three times its length. The split is also the seam M3 to M6 will
-    extend: each later milestone adds its own `_mount_*` rather than growing one function
-    past the point anybody reads it.
-
-    Every route returns an explicit `JSONResponse`, for the same reason the document routes
-    do. Under `from __future__ import annotations` a `response: Response` parameter is the
-    unresolvable string `"Response"`, which FastAPI treats as a required query parameter and
-    answers 422 to. Returning the response and calling `set_cookie` on it sidesteps that.
+    Also mounts the MFA, OAuth and passkey routes when their collaborators are present.
+    Every route returns an explicit `JSONResponse`.
     """
     from fastapi import Body, Depends
     from fastapi.responses import JSONResponse
@@ -514,7 +270,6 @@ def _mount_flows(
     )
     from webbpulse.identity.passwords import PasswordRejected
 
-    # Must happen before the first `@router.post` below. See `_FastAPIRequest`.
     _bind_fastapi_request()
 
     flows = IdentityFlows(
@@ -551,21 +306,17 @@ def _mount_flows(
     def set_refresh_cookie(response: JSONResponse, token: str) -> JSONResponse:
         """Attach the refresh cookie with section 5.5's attributes.
 
-        `httponly` is what keeps JavaScript from reading it, `secure` keeps it off plain
-        HTTP, `samesite=lax` is the primary CSRF defence and is available only because both
-        products serve frontend and API under one registrable domain, and `path` keeps it
-        off every other domain's routes so the catalog function can never log it.
+        `httponly`, `secure`, `samesite=lax` and a scoped `path` are what keep the token
+        out of JavaScript, off plain HTTP and off other routes.
         """
         response.set_cookie(settings.cookie_name, token, **settings.cookie_kwargs())
         return response
 
     def clear_refresh_cookie(response: JSONResponse) -> JSONResponse:
-        """Delete the cookie, with the same attributes it was set with.
+        """Delete the refresh cookie, with the same attributes it was set with.
 
-        `path` and `domain` must match the `Set-Cookie` that created it or the browser
-        treats the deletion as a different cookie and leaves the original in place, which
-        would leave a revoked token sitting in the browser to be sent on every subsequent
-        request.
+        `path` and `domain` must match the `Set-Cookie` that created it, or the browser
+        treats the deletion as a different cookie and leaves the original in place.
         """
         kwargs = settings.cookie_kwargs()
         domain = kwargs.get("domain")
@@ -594,6 +345,7 @@ def _mount_flows(
         )
 
     def policy_rejected(request: Request, exc: PasswordRejected) -> JSONResponse:
+        """Render a password policy refusal as a 422 in the shared error envelope."""
         from webbpulse.http import error_body
 
         return JSONResponse(
@@ -611,8 +363,7 @@ def _mount_flows(
         """The success envelope for an authentication.
 
         `access_token` and `expires_in` only, plus whatever the flow added. The refresh
-        token is **never** in the body: it goes in the cookie, and putting it here as well
-        would hand it to any script that can read a fetch response, defeating `httponly`.
+        token is never in the body: it goes in the cookie.
         """
         return {
             "access_token": result.access_token,
@@ -628,6 +379,7 @@ def _mount_flows(
     async def register(
         request: _FastAPIRequest, payload: dict[str, Any] = Body(...)
     ) -> JSONResponse:
+        """Register an account, returning tokens unless the address already has one."""
         ip, user_agent = context(request)
         try:
             result = await run_sync(
@@ -645,10 +397,6 @@ def _mount_flows(
             return rejected(request, exc)
 
         if result is None:
-            # The address already has an account. Section 5.4: the same 200 a real
-            # registration gets, with no token, because there is no session to start. The
-            # SPA shows "check your email either way", which is true in both branches once
-            # M3 sends the notice to the existing address.
             return JSONResponse({"registered": True}, status_code=200)
 
         return set_refresh_cookie(
@@ -664,6 +412,7 @@ def _mount_flows(
         ),
     )
     async def login(request: _FastAPIRequest, payload: dict[str, Any] = Body(...)) -> JSONResponse:
+        """Sign in with a password, or answer an MFA challenge when one is required."""
         ip, user_agent = context(request)
         try:
             result = await run_sync(
@@ -675,9 +424,6 @@ def _mount_flows(
                 )
             )
         except MfaChallengeRequired as challenge:
-            # 200, not 401. Nothing was refused: the password was right and the flow is
-            # half done. `@webbpulse/auth` branches on `mfa_required` in the body, so an
-            # error status here would be read as a failed login by every existing client.
             return JSONResponse(challenge.challenge.as_body())
         except LoginRejected as exc:
             return rejected(request, exc)
@@ -687,9 +433,7 @@ def _mount_flows(
     async def change_password(
         request: _FastAPIRequest, payload: dict[str, Any] = Body(...)
     ) -> JSONResponse:
-        # Behind the gateway's JWT authorizer per section 2.3, so the caller is already
-        # authenticated and the subject comes from the verified claims rather than the body.
-        # Reading it from the body would let anybody change anybody's password.
+        """Change the caller's password, taking the subject from the verified claims."""
         subject = _subject_from_request(request, tokens)
         if not subject:
             return rejected(
@@ -722,12 +466,8 @@ def _mount_flows(
         dependencies=limits(("refresh", REFRESH_IP_LIMIT, "ip")),
     )
     async def refresh(request: _FastAPIRequest) -> JSONResponse:
+        """Exchange the refresh cookie for a new access token and a rotated cookie."""
         if not _fetch_site_allowed(request):
-            # The cookie is deliberately **not** cleared here, unlike every other refusal on
-            # this route. A cross-site refusal means the request was forged, so the session
-            # it names is the victim's and is perfectly good. Clearing it would let any
-            # attacker page sign a victim out by causing one refused request, turning the
-            # CSRF defence into the denial of service it was meant to prevent.
             return rejected(
                 request,
                 LoginRejected(
@@ -741,14 +481,12 @@ def _mount_flows(
         try:
             result = await run_sync(lambda: flows.refresh(presented, ip=ip, user_agent=user_agent))
         except LoginRejected as exc:
-            # The cookie is cleared on every refusal, whatever the cause. A token that has
-            # just been refused will never work again, so leaving it in the browser only
-            # guarantees the next request repeats the failure.
             return clear_refresh_cookie(rejected(request, exc))
         return set_refresh_cookie(JSONResponse(success_body(result)), result.refresh_token)
 
     @router.post(f"{prefix}{LOGOUT_PATH}")
     async def logout(request: _FastAPIRequest) -> JSONResponse:
+        """End the presented session and clear the refresh cookie. Always succeeds."""
         if not _fetch_site_allowed(request):
             return rejected(
                 request,
@@ -761,13 +499,11 @@ def _mount_flows(
         ip, _ = context(request)
         presented = request.cookies.get(settings.cookie_name, "")
         await run_sync(lambda: flows.logout(presented, ip=ip))
-        # Always 200. Logout is idempotent and the caller's intent is to end up signed out,
-        # so an unknown or expired cookie is a success, not an error. Telling the caller
-        # their cookie was already dead is also a signal they should not get.
         return clear_refresh_cookie(JSONResponse({"signed_out": True}))
 
     @router.post(f"{prefix}{LOGOUT_ALL_PATH}")
     async def logout_all(request: _FastAPIRequest) -> JSONResponse:
+        """Revoke every session for the caller and clear the refresh cookie."""
         subject = _subject_from_request(request, tokens)
         if not subject:
             return rejected(
@@ -782,9 +518,6 @@ def _mount_flows(
         await run_sync(lambda: flows.logout_all(subject, ip=ip))
         return clear_refresh_cookie(JSONResponse({"signed_out": True}))
 
-    # Before the email early-return below, deliberately. MFA needs no sender: a product can
-    # run TOTP with no email configured at all, and mounting these after that `return` meant
-    # the second leg of login silently did not exist for exactly those products.
     if flows.mfa is not None:
         _mount_mfa(
             router,
@@ -798,10 +531,6 @@ def _mount_flows(
             set_refresh_cookie=set_refresh_cookie,
         )
 
-    # M6. Mounted when the product has both OAuth stores and at least one provider carrying
-    # a client id, for the same reason MFA is conditional: a route that can only answer 503
-    # is worse than a route that does not exist. Placed before the email early-return
-    # below, because OAuth needs no email sender at all.
     if stores.oauth_states is not None and stores.oauth_links is not None:
         from webbpulse.identity.oauth import OAuthService
         from webbpulse.identity.oauth_routes import register_oauth_routes
@@ -829,9 +558,6 @@ def _mount_flows(
                 set_refresh_cookie=set_refresh_cookie,
             )
 
-    # Before the email early-return too, and for the identical reason: passkeys need no
-    # sender, and mounting them after that `return` would mean a product running passwordless
-    # sign-in with no email configured had no passkey routes at all.
     if flows.passkeys is not None:
         from webbpulse.identity.passkey_routes import register_passkey_routes
 
@@ -848,21 +574,15 @@ def _mount_flows(
         )
 
     if not flows.email_enabled:
-        # No sender, or no `identity-tokens` store. The four routes below all promise the
-        # caller an email or spend a token, so declaring them here would mean four endpoints
-        # that answer 503 to their first request. Same rule the flow routes themselves
-        # follow: a route that cannot work should not exist.
         return
 
     from webbpulse.identity.verification import ConfirmationFailed
 
     def link_refused(request: Request, exc: ConfirmationFailed) -> JSONResponse:
-        """Render a refused link.
+        """Render a refused verification or reset link.
 
-        `exc.message` is the one message every refusal carries, and `exc.reason` is never
-        rendered: whether a token was unknown, expired or already spent is information about
-        somebody else's link, and telling a caller who guessed a value that it was "already
-        used" confirms the guess found a real token.
+        `exc.reason` is never rendered: whether a token was unknown, expired or already
+        spent is information about somebody else's link.
         """
         from webbpulse.http import error_body
 
@@ -881,23 +601,19 @@ def _mount_flows(
     async def request_verification(
         request: _FastAPIRequest, payload: dict[str, Any] = Body(...)
     ) -> JSONResponse:
+        """Send a verification link, answering the same 200 whatever the address is."""
         ip, _ = context(request)
         try:
             await run_sync(lambda: flows.request_verification(str(payload.get("email", "")), ip=ip))
         except LoginRejected as exc:
             return rejected(request, exc)
-        # Section 5.4: 200 always, with a body that commits to nothing. The same response
-        # for an unknown address, an already verified one and one that just got a link.
         return JSONResponse({"sent": True})
 
     @router.post(f"{prefix}{VERIFY_CONFIRM_PATH}")
     async def confirm_verification(
         request: _FastAPIRequest, payload: dict[str, Any] = Body(...)
     ) -> JSONResponse:
-        # Anonymous, and a POST rather than the GET section 2.3's table sketches. The link
-        # in the email points at the frontend, which collects nothing for verification and
-        # calls this. A GET that consumes the token would be spent by the first mail scanner
-        # that follows the link to check it for malware, before the user ever clicks.
+        """Spend a verification token and mark the address verified."""
         ip, _ = context(request)
         try:
             user_id = await run_sync(
@@ -919,6 +635,7 @@ def _mount_flows(
     async def request_password_reset(
         request: _FastAPIRequest, payload: dict[str, Any] = Body(...)
     ) -> JSONResponse:
+        """Send a password reset link, answering the same 200 whatever the address is."""
         ip, _ = context(request)
         try:
             await run_sync(
@@ -926,14 +643,13 @@ def _mount_flows(
             )
         except LoginRejected as exc:
             return rejected(request, exc)
-        # Section 5.4's exact wording, which is a message that is true either way rather
-        # than one that pretends something happened.
         return JSONResponse({"sent": True, "detail": RESET_REQUESTED_MESSAGE})
 
     @router.post(f"{prefix}{RESET_CONFIRM_PATH}")
     async def confirm_password_reset(
         request: _FastAPIRequest, payload: dict[str, Any] = Body(...)
     ) -> JSONResponse:
+        """Spend a reset token, set the new password and clear the refresh cookie."""
         ip, _ = context(request)
         try:
             await run_sync(
@@ -950,9 +666,6 @@ def _mount_flows(
             return policy_rejected(request, exc)
         except LoginRejected as exc:
             return rejected(request, exc)
-        # The refresh cookie is cleared, because the reset revoked every family including
-        # whichever one this browser held. Leaving it would send a dead token on every
-        # subsequent request until it expired.
         return clear_refresh_cookie(JSONResponse({"reset": True}))
 
 
@@ -970,25 +683,8 @@ def _mount_mfa(
 ) -> None:
     """Add M4's six MFA routes, given the closures `_mount_flows` already built.
 
-    Called from inside `_mount_flows` rather than from `build_identity_router` because it
-    needs those closures: the cookie writer, the error renderer and the rate limit builder
-    are all bound to settings that only exist there. Passing them in keeps one definition of
-    each, so an MFA route and a login route cannot render the same refusal differently.
-
-    Mounted only when `flows.mfa` is present, which needs both M4 tables and TOTP enabled.
-    Section 6.1 makes TOTP a capability, and a route that answers 503 because the product
-    never created the tables is worse than a route that does not exist.
-
-    ## Which of these sit behind the authorizer
-
-    `login/totp` does **not**: it carries an MFA ticket, and the ticket's audience is
-    `<issuer>/mfa`, which the gateway's authorizer is not configured with. Putting it behind
-    the authorizer means the second leg of every MFA login is rejected before it runs.
-
-    The other five do. They all act on an already-authenticated user, and each reads the
-    subject from the verified claims rather than from the body, for the reason
-    `change_password` does: a user id in the body lets anybody enrol a factor on anybody's
-    account.
+    `login/totp` stays outside the gateway authorizer because it carries an MFA ticket
+    audienced to `<issuer>/mfa`; the other five sit behind it.
     """
     from fastapi import Body
     from fastapi.responses import JSONResponse
@@ -1006,6 +702,7 @@ def _mount_mfa(
         )
 
     def require_subject(request: Request) -> str:
+        """The verified subject of the request, or a `LoginRejected` when there is none."""
         subject = _subject_from_request(request, tokens)
         if not subject:
             raise LoginRejected("Sign in first.", error_code="NOT_AUTHENTICATED", status_code=401)
@@ -1018,8 +715,7 @@ def _mount_mfa(
     async def complete_totp_login(
         request: _FastAPIRequest, payload: dict[str, Any] = Body(...)
     ) -> JSONResponse:
-        # The body field is `mfa_ticket`, not `ticket`: that is what `AuthClient.completeTotp`
-        # sends, and matching it is what lets the frontend work unchanged.
+        """Complete the second leg of an MFA login using a ticket and a code."""
         ip, user_agent = context(request)
         try:
             result = await run_sync(
@@ -1041,6 +737,7 @@ def _mount_mfa(
         dependencies=limits(("totp-enrol", TOTP_ENROL_IP_LIMIT, "ip")),
     )
     async def enrol_totp(request: _FastAPIRequest) -> JSONResponse:
+        """Begin TOTP enrolment, returning the seed and provisioning URI exactly once."""
         try:
             subject = require_subject(request)
         except LoginRejected as exc:
@@ -1054,8 +751,6 @@ def _mount_mfa(
             )
         except MfaRejected as exc:
             return mfa_refused(request, exc)
-        # The seed is returned in plaintext exactly once, here. There is no route that reads
-        # it back: a user who loses it before confirming enrols again.
         return JSONResponse(
             {
                 "secret": enrolment.secret,
@@ -1070,6 +765,7 @@ def _mount_mfa(
     async def activate_totp(
         request: _FastAPIRequest, payload: dict[str, Any] = Body(...)
     ) -> JSONResponse:
+        """Activate TOTP with a code, returning the recovery codes exactly once."""
         try:
             subject = require_subject(request)
         except LoginRejected as exc:
@@ -1080,8 +776,6 @@ def _mount_mfa(
             )
         except MfaRejected as exc:
             return mfa_refused(request, exc)
-        # The recovery codes are returned exactly once, with the activation that created
-        # them. Regenerating is the only way to see a set again.
         return JSONResponse({"activated": True, "recovery_codes": codes.codes})
 
     @router.post(
@@ -1091,6 +785,7 @@ def _mount_mfa(
     async def disable_totp(
         request: _FastAPIRequest, payload: dict[str, Any] = Body(...)
     ) -> JSONResponse:
+        """Turn TOTP off, requiring a current code as well as the bearer token."""
         try:
             subject = require_subject(request)
         except LoginRejected as exc:
@@ -1109,6 +804,7 @@ def _mount_mfa(
     async def regenerate_recovery_codes(
         request: _FastAPIRequest, payload: dict[str, Any] = Body(...)
     ) -> JSONResponse:
+        """Issue a fresh set of recovery codes, requiring a current code."""
         try:
             subject = require_subject(request)
         except LoginRejected as exc:
@@ -1129,6 +825,7 @@ def _mount_mfa(
     async def step_up(
         request: _FastAPIRequest, payload: dict[str, Any] = Body(...)
     ) -> JSONResponse:
+        """Re-assert the second factor, returning a stepped-up access token and no cookie."""
         try:
             subject = require_subject(request)
         except LoginRejected as exc:
@@ -1143,27 +840,14 @@ def _mount_mfa(
             )
         except MfaRejected as exc:
             return mfa_refused(request, exc)
-        # No cookie. Step-up does not start a family, so there is nothing new to set, and
-        # rewriting the cookie here would rotate a refresh token that never moved.
         return JSONResponse(success_body(result))
 
 
 def _required_code(payload: Mapping[str, Any]) -> str:
     """The `code` field of a re-authentication body, or a 422 saying it is missing.
 
-    Raised as a `RequestValidationError` rather than returned as an `MfaRejected`, so that a
-    client which forgot the field is told it forgot the field. Answering `INVALID_MFA_CODE`
-    to a missing body would be indistinguishable from a wrong code, and the frontend would
-    show the user "that code is not valid" for a bug that never asked them for one. The
-    shared 422 handler in `webbpulse.http` renders it in the same envelope with
-    `VALIDATION_ERROR`.
-
-    A blank or whitespace-only string is the same case as an absent one. It cannot be a real
-    code, and treating it as a wrong code would spend an attempt against the rate limit for
-    what is a client bug.
-
-    This is deliberately not the enumeration concern the code checks are: the field's
-    presence says nothing about the account, only about the request.
+    Raised as a `RequestValidationError` so a client that omitted the field is told so
+    rather than being told its code was wrong. A blank string is the same case.
     """
     from fastapi.exceptions import RequestValidationError
 
@@ -1184,11 +868,8 @@ def _required_code(payload: Mapping[str, Any]) -> str:
 def _string_list(value: object) -> list[str] | None:
     """A JSON array of strings from a request body, or `None`.
 
-    `None` and a list mean different things to `confirm_password_reset`: `None` falls
-    through to the store, which raises on DynamoDB rather than silently revoking nothing,
-    and a list is revoked exactly. An empty list therefore has to stay an empty list rather
-    than becoming `None`, or a caller that genuinely knows there are no other families
-    would trip the raise.
+    `None` and an empty list mean different things to `confirm_password_reset`: `None`
+    falls through to the store, an empty list revokes exactly nothing.
     """
     if value is None:
         return None
@@ -1200,11 +881,8 @@ def _string_list(value: object) -> list[str] | None:
 async def run_sync[T](work: Callable[[], T]) -> T:
     """Run blocking work off the event loop.
 
-    Every flow method is synchronous: bcrypt burns CPU for the better part of a hundred
-    milliseconds and boto3 blocks on a socket. Calling either directly from an `async def`
-    route stalls the whole worker for that time, so a login would serialise every other
-    request the process is serving. Starlette's threadpool is what a plain `def` route would
-    have been given anyway.
+    Every flow method is synchronous, and bcrypt and boto3 would otherwise stall the
+    worker for the whole call. Uses Starlette's threadpool.
     """
     from starlette.concurrency import run_in_threadpool
 
@@ -1212,22 +890,10 @@ async def run_sync[T](work: Callable[[], T]) -> T:
 
 
 async def _email_key_fn(request: _FastAPIRequest) -> str:
-    """Rate limit key for the per-email login limit. Section 5.1.
+    """Rate limit key for the per-email login limit, falling back to the IP.
 
-    Limiting login by both IP and email matters: by IP alone a distributed attacker walks
-    past it, and by email alone one attacker can lock out a known user, which is why both
-    limits exist rather than either one.
-
-    Reads the request body to find the address. `request.body()` caches on the request, so
-    reading it in a dependency does not consume the stream the route handler later parses:
-    Starlette returns the same buffered bytes to both. Doing this any other way, such as
-    pulling the email from a query parameter, would put a credential-adjacent value in an
-    access log.
-
-    Falls back to the IP whenever there is no parseable address, so a malformed body is
-    still limited rather than being an unlimited hole in the per-email ceiling. The
-    namespaces differ between the two limits, so an IP fallback here does not consume the
-    per-IP budget the other dependency is counting.
+    Reads the buffered request body, which does not consume the stream the route handler
+    later parses. A malformed body is limited by IP under a different namespace.
     """
     import json
 
@@ -1246,47 +912,36 @@ def _samesite(value: str) -> Literal["lax", "strict", "none"]:
     """Narrow a configured `samesite` to the three values Starlette accepts.
 
     `IdentitySettings` already validates the value, so the fallback is unreachable in
-    practice. It exists so that `delete_cookie` is called with a literal the type checker
-    can see, rather than with an ignore comment standing where a check should be.
+    practice and exists to give the type checker a literal.
     """
     return value if value in {"lax", "strict", "none"} else "lax"  # type: ignore[return-value]
 
 
 def _fetch_site_allowed(request: Request) -> bool:
-    """Section 5.5's first CSRF supplement.
+    """Whether `Sec-Fetch-Site` allows this state-changing cookie request.
 
-    `Sec-Fetch-Site` is set by the browser and cannot be set by page JavaScript, so a value
-    of `cross-site` on a state-changing cookie route is a forged request whatever the cookie
-    says. A missing header is allowed: non-browser clients send none, and refusing those
-    would break every server-to-server caller and every curl invocation for no security
-    gain, since an attacker's page cannot suppress the header a browser adds.
+    A `cross-site` value is a forged request, because page JavaScript cannot set the
+    header. A missing header is allowed, since non-browser clients send none.
     """
     value = request.headers.get("sec-fetch-site", "")
     return not value or value.lower() in ALLOWED_FETCH_SITES
 
 
 def _subject_from_request(request: Request, tokens: TokenService) -> str:
+    """The `sub` claim of the calling request, or an empty string."""
     return _claims_from_request(request, tokens).get("sub", "")
 
 
 def _session_from_request(request: Request, tokens: TokenService) -> str:
+    """The `sid` session claim of the calling request, or an empty string."""
     return _claims_from_request(request, tokens).get("sid", "")
 
 
 def _claims_from_request(request: Request, tokens: TokenService) -> dict[str, str]:
     """Verified claims for a route the gateway's JWT authorizer sits in front of.
 
-    Two sources, in order:
-
-    1. **The authorizer context**, which API Gateway puts in the Lambda event and the Web
-       Adapter forwards as a header. Preferred, because the gateway has already verified the
-       signature and this code re-verifying it would be duplicated work on the hot path.
-    2. **The `Authorization` header**, verified here through `TokenService`. This is the
-       local and test path, and the path for a deployment that has not put the authorizer in
-       front of the flow routes.
-
-    Returns an empty mapping rather than raising when there is nothing valid, and the caller
-    turns that into a 401. Never trusts an unverified claim from either source.
+    Prefers the authorizer context header the gateway has already verified, and falls
+    back to verifying the bearer token locally. Empty mapping means not authenticated.
     """
     import json
 
@@ -1298,8 +953,6 @@ def _claims_from_request(request: Request, tokens: TokenService) -> dict[str, st
         except (KeyError, TypeError, ValueError):
             claims = None
         if isinstance(claims, dict):
-            # The gateway presents every claim as a string, `exp` included. It has already
-            # verified the signature, so these are trusted.
             return {str(k): str(v) for k, v in claims.items()}
 
     authorization = request.headers.get("authorization", "")
@@ -1309,7 +962,5 @@ def _claims_from_request(request: Request, tokens: TokenService) -> dict[str, st
     try:
         verified = tokens.verify_access_token(token)
     except Exception:
-        # Any verification failure is simply "not authenticated". The specific reason is not
-        # something to tell the caller, and the token service has already logged it.
         return {}
     return {str(k): str(v) for k, v in verified.items()}

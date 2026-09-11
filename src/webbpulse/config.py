@@ -1,21 +1,7 @@
 """Settings base and the Secrets Manager JSON secret loader.
 
-Two things live here, and they are deliberately separate.
-
-`BaseServiceSettings` is the pydantic-settings base every service subclasses. It carries
-only the fields that are genuinely common to every WebbPulse service: which environment
-this is, what to log at, what the service is called, and where its shared secret lives.
-Anything domain specific belongs in the subclass.
-
-`load_json_secret` reads one Secrets Manager secret whose value is a JSON object and
-returns it as a dict. It is cached per ARN for the life of the process, which on Lambda
-means once per execution environment rather than once per invoke.
-
-**Nothing in this module reads AWS at import time.** `load_json_secret` is a function, not
-a module-level call, and the boto3 client it uses is created on first use. Importing this
-module inside a Lambda handler must not cost a network round trip, because an import that
-calls Secrets Manager turns every cold start into a synchronous dependency on another
-service and fails the whole function when that service is slow.
+`BaseServiceSettings` is the pydantic-settings base every service subclasses, and
+`load_json_secret` reads one JSON secret, cached per ARN. Neither reads AWS at import time.
 """
 
 from __future__ import annotations
@@ -28,7 +14,7 @@ from typing import TYPE_CHECKING, Any, Literal
 from pydantic import Field, field_validator
 from pydantic_settings import BaseSettings, PydanticBaseSettingsSource, SettingsConfigDict
 
-if TYPE_CHECKING:  # pragma: no cover - typing only
+if TYPE_CHECKING:  # pragma: no cover
     from mypy_boto3_secretsmanager.client import SecretsManagerClient
 
 __all__ = [
@@ -42,19 +28,13 @@ __all__ = [
 
 Environment = Literal["local", "test", "staging", "production"]
 
-# The environment variable holding the ARN of the one JSON secret per service per
-# environment. The name matches what the Portfolio and CarModPicker Terraform already sets.
 APP_SECRETS_ARN_ENV = "APP_SECRETS_ARN"
 
 _LOG_LEVELS = frozenset({"CRITICAL", "ERROR", "WARNING", "INFO", "DEBUG", "NOTSET"})
 
 
 class SecretNotJsonObjectError(ValueError):
-    """Raised when a secret's value is not a JSON object.
-
-    A secret holding a bare string or a JSON array cannot be merged into settings, and
-    failing loudly here beats a confusing `AttributeError` three frames later.
-    """
+    """Raised when a secret's value is not a JSON object and so cannot become settings."""
 
 
 def split_csv(value: str) -> list[str]:
@@ -65,35 +45,32 @@ def split_csv(value: str) -> list[str]:
 class _CsvOrJsonEnvSource(PydanticBaseSettingsSource):
     """Wrap a settings source so list fields accept CSV as well as JSON.
 
-    Only the decoding of a complex value is overridden. Everything else, including which
-    variables a field matches and how they are cased, is delegated to the wrapped source, so
-    this stays correct as pydantic-settings changes.
+    Only the decoding of a complex value is overridden; everything else is delegated to the
+    wrapped source.
     """
 
     def __init__(self, wrapped: PydanticBaseSettingsSource) -> None:
+        """Wrap `wrapped`, capturing its real JSON decoder before any rebinding."""
         self._wrapped = wrapped
-        # Bound before any rebinding, so the JSON fallback below always reaches the real
-        # decoder rather than the override that is temporarily installed in __call__.
         self._decode_json = wrapped.decode_complex_value
         super().__init__(wrapped.settings_cls)
 
     def decode_complex_value(self, field_name: str, field: Any, value: Any) -> Any:
+        """Decode a complex value, treating a non-JSON-looking string as CSV."""
         if isinstance(value, str):
             stripped = value.strip()
             if not stripped:
                 return []
-            # Anything that looks like JSON is left to the real decoder, so a genuine
-            # JSON list or object still parses and still reports its own errors.
             if not stripped.startswith(("[", "{", '"')):
                 return split_csv(stripped)
         return self._decode_json(field_name, field, value)
 
     def get_field_value(self, field: Any, field_name: str) -> tuple[Any, str, bool]:
+        """Delegate field lookup to the wrapped source."""
         return self._wrapped.get_field_value(field, field_name)
 
     def __call__(self) -> dict[str, Any]:
-        # Re-bind the wrapped source's decoder to this one for the duration of the call,
-        # since the source decodes internally rather than through the caller.
+        """Run the wrapped source with this decoder installed on it for the call."""
         self._wrapped.decode_complex_value = self.decode_complex_value  # type: ignore[method-assign]
         try:
             return self._wrapped()
@@ -104,23 +81,14 @@ class _CsvOrJsonEnvSource(PydanticBaseSettingsSource):
 class BaseServiceSettings(BaseSettings):
     """Base settings for a WebbPulse service.
 
-    Subclass it and add the service's own fields::
-
-        class Settings(BaseServiceSettings):
-            table_prefix: str = "webbpulse-staging"
-            google_client_id: str = ""
-
-    Reading settings is the subclass's job, not this module's: instantiate the subclass
-    behind an `lru_cache` in the service so construction happens on first use rather than
-    at import.
+    Subclass it, add the service's own fields, and instantiate the subclass behind an
+    `lru_cache` so construction happens on first use rather than at import.
     """
 
     model_config = SettingsConfigDict(
         env_file=".env",
         env_file_encoding="utf-8",
         extra="ignore",
-        # Environment variables are conventionally upper case; pydantic-settings matches
-        # case insensitively by default, and this keeps that explicit.
         case_sensitive=False,
     )
 
@@ -172,17 +140,10 @@ class BaseServiceSettings(BaseSettings):
         dotenv_settings: PydanticBaseSettingsSource,
         file_secret_settings: PydanticBaseSettingsSource,
     ) -> tuple[PydanticBaseSettingsSource, ...]:
-        """Parse list-valued environment variables as CSV as well as JSON.
+        """Parse list-valued environment and dotenv variables as CSV as well as JSON.
 
-        pydantic-settings treats any complex-typed field (a `list`, here) as JSON and calls
-        `json.loads` on the raw environment value *inside the source*, before any
-        `mode="before"` field validator runs. So a plain `CORS_ALLOW_ORIGINS=https://a,
-        https://b`, which is exactly what a Terraform-rendered environment variable looks
-        like, raises `SettingsError` from the source and never reaches a validator. Fixing
-        it therefore has to happen at the source layer, not with a validator.
-
-        `_CsvOrJsonEnvSource` below keeps JSON working and adds the bare comma-separated
-        form; the dotenv source is wrapped too, since a `.env` file has the same problem.
+        The source decodes complex values before any validator runs, so the CSV form has to
+        be handled at the source layer.
         """
         return (
             init_settings,
@@ -210,12 +171,8 @@ class BaseServiceSettings(BaseSettings):
 
 @lru_cache(maxsize=1)
 def _secrets_client(region_name: str | None) -> SecretsManagerClient:
-    """Create the Secrets Manager client once per process.
-
-    Separate from `load_json_secret` so the cache on that function keys on the ARN alone
-    and this one keys on the region, and so tests can clear either independently.
-    """
-    import boto3  # Imported lazily: the base install has no boto3.
+    """Create the Secrets Manager client once per process, keyed on region."""
+    import boto3
 
     client: SecretsManagerClient = boto3.client("secretsmanager", region_name=region_name)
     return client
@@ -225,19 +182,12 @@ def _secrets_client(region_name: str | None) -> SecretsManagerClient:
 def load_json_secret(arn: str, region_name: str | None = None) -> dict[str, Any]:
     """Fetch one Secrets Manager secret and parse its value as a JSON object.
 
-    Cached per `(arn, region_name)` for the life of the process. On Lambda that is once per
-    execution environment, so a warm invoke never calls Secrets Manager. The cache holds
-    decrypted secret material in memory, which is the same exposure as an environment
-    variable and considerably better than fetching on every request.
-
-    Raises `SecretNotJsonObjectError` if the secret is not a JSON object, and lets
-    botocore's own `ClientError` propagate for a missing secret or a denied read. Both are
-    unrecoverable at startup and should fail the invoke rather than be swallowed.
+    Cached per `(arn, region_name)` for the life of the process. Raises
+    `SecretNotJsonObjectError` when the value is not a JSON object.
     """
     response = _secrets_client(region_name).get_secret_value(SecretId=arn)
     raw = response.get("SecretString")
     if raw is None:
-        # A binary secret is a configuration mistake for an application secret.
         raise SecretNotJsonObjectError(f"Secret {arn} holds binary data, not a JSON object.")
 
     try:

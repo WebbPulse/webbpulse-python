@@ -1,8 +1,7 @@
 """Tests for `webbpulse.logging`.
 
-The assertions here are mostly about the exact key names, because those are what CloudWatch
-and the `api-alarms` metric filter select on. A rename that looks harmless breaks alarming
-silently, so the names are pinned by test.
+The exact key names are pinned by test because CloudWatch and the `api-alarms` metric
+filter select on them, so a rename would break alarming silently.
 """
 
 from __future__ import annotations
@@ -25,12 +24,11 @@ from webbpulse.logging import (
     get_logger,
 )
 
-# RFC 3339 with milliseconds and a Z suffix. Lambda requires this exact shape to parse the
-# timestamp; anything else makes it stamp its own time and force the level to INFO.
 _RFC3339 = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$")
 
 
 def _record(**kwargs: Any) -> logging.LogRecord:
+    """Build a plain INFO log record, overriding any field by keyword."""
     defaults: dict[str, Any] = {
         "name": "app.api",
         "level": logging.INFO,
@@ -45,11 +43,13 @@ def _record(**kwargs: Any) -> logging.LogRecord:
 
 
 def _format(record: logging.LogRecord, **formatter_kwargs: Any) -> dict[str, Any]:
+    """Format a record with `JsonFormatter` and return the parsed payload."""
     parsed: dict[str, Any] = json.loads(JsonFormatter(**formatter_kwargs).format(record))
     return parsed
 
 
 def test_the_output_is_one_json_object_per_line() -> None:
+    """A formatted record is a single line of JSON, so it stays one CloudWatch event."""
     line = JsonFormatter().format(_record())
     assert "\n" not in line, "a multi-line log record becomes several CloudWatch events"
     assert json.loads(line)["message"] == "hello"
@@ -61,17 +61,19 @@ def test_level_is_a_top_level_key() -> None:
 
 
 def test_timestamp_is_rfc3339_with_a_z_suffix() -> None:
+    """The timestamp is RFC 3339 with milliseconds and a Z suffix, and it parses."""
     payload = _format(_record())
     assert _RFC3339.match(payload["timestamp"]), payload["timestamp"]
-    # Also assert it actually parses, so the regex cannot pass on a nonsense date.
     datetime.fromisoformat(payload["timestamp"].replace("Z", "+00:00"))
 
 
 def test_the_logger_name_is_carried() -> None:
+    """The record's logger name is emitted under the `logger` key."""
     assert _format(_record(name="app.posts"))["logger"] == "app.posts"
 
 
 def test_service_and_environment_are_added_when_given() -> None:
+    """`service` and `environment` given to the formatter appear on every record."""
     payload = _format(_record(), service="posts", environment="staging")
     assert payload["service"] == "posts"
     assert payload["environment"] == "staging"
@@ -95,6 +97,7 @@ def test_reserved_logrecord_attributes_are_not_emitted() -> None:
 
 
 def test_exceptions_use_lambdas_own_key_names() -> None:
+    """An exception is emitted as errorType, errorMessage and a stackTrace list."""
     try:
         raise ValueError("boom")
     except ValueError:
@@ -112,7 +115,10 @@ def test_an_unserialisable_value_does_not_lose_the_line() -> None:
     """Losing a log line to a TypeError is always worse than losing exact typing in it."""
 
     class Opaque:
+        """A value with no JSON representation but a usable string form."""
+
         def __str__(self) -> str:
+            """Return the string the formatter should fall back to."""
             return "opaque-value"
 
     record = _record()
@@ -121,6 +127,7 @@ def test_an_unserialisable_value_does_not_lose_the_line() -> None:
 
 
 def test_message_formatting_arguments_are_applied() -> None:
+    """Percent-style arguments on the record are interpolated into `message`."""
     assert _format(_record(msg="hello %s", args=("world",)))["message"] == "hello world"
 
 
@@ -162,6 +169,7 @@ def test_botocore_is_held_at_warning() -> None:
 
 
 def test_configured_logging_emits_parseable_json(capsys: pytest.CaptureFixture[str]) -> None:
+    """A configured logger emits JSON carrying the level, message, extras and service."""
     configure_logging(level="INFO", service="posts", environment="staging", force=True)
     get_logger("app.posts").info("served", extra={"path": "/api/v1/posts"})
 
@@ -173,6 +181,7 @@ def test_configured_logging_emits_parseable_json(capsys: pytest.CaptureFixture[s
 
 
 def test_trace_ids_are_merged_when_a_span_is_recording() -> None:
+    """Inside a recording span, the record carries 32 and 16 character hex trace ids."""
     from opentelemetry import trace
     from opentelemetry.sdk.trace import TracerProvider
 
@@ -196,13 +205,8 @@ def test_trace_ids_are_absent_outside_a_span() -> None:
     assert "span_id" not in payload
 
 
-# --------------------------------------------------------------------------------------
-# The 0.8.0 escape hatches. CarModPicker kept a local wrapper module because neither of
-# these existed. The first assertion in each pair is that the default did not move.
-# --------------------------------------------------------------------------------------
-
-
 def test_the_default_stream_is_still_stdout(capsys: pytest.CaptureFixture[str]) -> None:
+    """With no `stream`, log lines go to stdout and nothing reaches stderr."""
     configure_logging(level="INFO", force=True)
     get_logger("app.api").info("served")
 
@@ -214,11 +218,7 @@ def test_the_default_stream_is_still_stdout(capsys: pytest.CaptureFixture[str]) 
 def test_stream_routes_every_handler_the_function_installs(
     capsys: pytest.CaptureFixture[str],
 ) -> None:
-    """Two CMP commands write data on stdout and are diffed byte for byte.
-
-    A single log line leaking onto stdout breaks that comparison, so the assertion is that
-    stdout is *empty*, not merely that stderr has the line.
-    """
+    """`stream=` routes every installed handler, leaving stdout completely empty."""
     configure_logging(level="INFO", force=True, stream=sys.stderr)
     get_logger("app.api").info("served")
     get_logger("uvicorn.access").warning("slow")
@@ -247,6 +247,7 @@ def test_stream_is_read_at_call_time_not_at_import() -> None:
 def test_the_default_formatter_is_json_and_unchanged(
     capsys: pytest.CaptureFixture[str],
 ) -> None:
+    """The default formatter is `JsonFormatter` and it still carries service and environment."""
     configure_logging(level="INFO", service="posts", environment="staging", force=True)
     handler = logging.getLogger().handlers[0]
     assert isinstance(handler.formatter, JsonFormatter)
@@ -258,6 +259,7 @@ def test_the_default_formatter_is_json_and_unchanged(
 
 
 def test_the_text_formatter_is_one_readable_line(capsys: pytest.CaptureFixture[str]) -> None:
+    """`formatter="text"` emits one readable, non-JSON line per record."""
     configure_logging(level="INFO", formatter="text", force=True)
     get_logger("app.api").warning("served")
 
@@ -271,6 +273,7 @@ def test_the_text_formatter_is_one_readable_line(capsys: pytest.CaptureFixture[s
 def test_the_text_formatter_still_renders_a_traceback(
     capsys: pytest.CaptureFixture[str],
 ) -> None:
+    """The text formatter still renders the exception type and its traceback."""
     configure_logging(level="INFO", formatter="text", force=True)
     try:
         raise RuntimeError("boom")
@@ -307,6 +310,7 @@ def test_a_formatter_instance_is_installed_as_given(
 
 
 def test_an_unknown_formatter_selector_is_rejected() -> None:
+    """An unrecognised formatter selector raises naming the accepted values."""
     with pytest.raises(ValueError, match=re.escape("'json', 'text' or a logging.Formatter")):
         configure_logging(formatter="logfmt", force=True)  # type: ignore[arg-type]
 
@@ -325,5 +329,6 @@ def test_a_bad_formatter_leaves_the_previous_configuration_in_place(
 
 
 def test_the_text_formatter_accepts_a_format_string() -> None:
+    """`TextFormatter` uses its default layout, or a format string when given one."""
     assert TextFormatter().format(_record()).endswith("INFO     app.api hello")
     assert TextFormatter("%(message)s").format(_record()) == "hello"

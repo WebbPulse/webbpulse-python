@@ -1,64 +1,7 @@
 """Sending the two emails identity owns: a verification link and a reset link.
 
-Section 2.1 of `docs/identity-standard.md` puts `services/mail.py` beside the other flow
-services, and section 5.8 grants the identity function `ses:SendEmail` on the identity and
-the configuration set. This module is that service, split in the same two-part shape every
-storage class in this package already has: an abstract sender with a real implementation
-and an in-memory one.
-
-## The seam, and why it is an ABC rather than only a Protocol
-
-`EmailSender` is an ABC with one method. `SesV2EmailSender` is the deployed implementation
-and `RecordingEmailSender` is the one every test uses, and the choice between them is a
-constructor argument rather than a patch of `boto3.client`.
-
-`IdentityHooks` is a Protocol because a product implements it and the package must not make
-a product inherit from it. This is the opposite direction: the package supplies both
-implementations, a product supplies none, and a third implementation is an unusual thing to
-write rather than the normal case. An ABC makes the one method obligatory at class
-definition rather than at the first send, which is where an unimplemented sender would
-otherwise be discovered.
-
-## No templating dependency, deliberately
-
-Two emails, each about fifteen lines. Jinja2 would be a new runtime dependency in the
-`identity` extra, a template directory to package, and a second place a product would then
-want to override. `string.Template` is in the standard library, and `$name` substitution is
-all these bodies need.
-
-The consequence is that **escaping is this module's job**, and it is done at the one place
-it can be got right: `_render_html` escapes every substitution value with `html.escape`
-before substituting, and the plain text part substitutes raw because there is nothing to
-escape into. A product name of `Bob & Co` renders as `Bob &amp; Co` in the HTML part and
-as `Bob & Co` in the text part, which is correct in both.
-
-The link itself is **not** escaped as a URL: it is built by this package from a token this
-package generated, so it carries base64url characters and nothing else. It is still
-`html.escape`d in the HTML part, because `&` in a query string is exactly the character
-that would otherwise truncate an `href`.
-
-## Both parts, always
-
-Every message carries a text part and an HTML part. Text alone renders badly in clients
-that expect HTML, and HTML alone is the shape spam filters score worst and the shape a
-plain text client cannot read at all. Building both costs one extra `Template` and removes
-a class of deliverability problem worth more than that.
-
-## The copy
-
-Written to the house style: no em dashes, and the product name comes from settings rather
-than being hardcoded, because two products mount this and neither is named in the package.
-The link is stated as a URL in the text part rather than hidden behind link text, so a
-reader can see where it goes before following it, which is the habit an identity email
-should encourage rather than train out.
-
-## What is not here
-
-**No bounce or complaint handling.** The configuration set is a settings field and SES
-publishes events to it, but reacting to a bounce is a product's decision about its own user
-record and belongs behind a hook it has not needed yet. **No retry.** A `SendEmail` failure
-raises `EmailSendFailed`, and each flow decides whether that fails the request: verification
-on register does not, a resend does.
+An abstract sender with an SES v2 implementation and a recording one. Bodies are rendered
+with `string.Template`, so escaping the HTML part is this module's own job.
 """
 
 from __future__ import annotations
@@ -70,7 +13,7 @@ from dataclasses import dataclass, field
 from string import Template
 from typing import TYPE_CHECKING, Any, Final, Protocol
 
-if TYPE_CHECKING:  # pragma: no cover - typing only
+if TYPE_CHECKING:  # pragma: no cover
     from webbpulse.identity.settings import IdentitySettings
 
 __all__ = [
@@ -88,8 +31,6 @@ __all__ = [
 
 _log = logging.getLogger(__name__)
 
-#: The character set every part is sent as. SES takes the charset per part, and every body
-#: this module builds is a Python `str`, so there is exactly one right answer.
 CHARSET: Final = "UTF-8"
 
 
@@ -97,9 +38,7 @@ class EmailSendFailed(Exception):
     """SES refused a message, or the client raised on the way to it.
 
     A distinct type rather than the underlying `ClientError`, so a flow can decide what a
-    send failure means without importing botocore. The flows differ: a verification email
-    that fails during registration is logged and the account still exists, while a
-    deliberate resend answers the caller.
+    send failure means without importing botocore.
     """
 
 
@@ -107,43 +46,36 @@ class EmailSendFailed(Exception):
 class EmailMessage:
     """One rendered message, ready for any sender.
 
-    Rendered before a sender is chosen, so the template tests never construct a client and
-    the sender tests never render a template. `to` is a single address: identity never
-    sends to more than one recipient, and a list would invite a caller to try.
+    Rendered before a sender is chosen. `to` is a single address: identity never sends to
+    more than one recipient.
     """
 
     to: str
     subject: str
     text: str
     html: str
-    #: Tags SES attaches to the event stream when a configuration set is configured.
-    #: `purpose` is what makes a bounce rate on verification separable from one on reset.
     tags: dict[str, str] = field(default_factory=dict)
 
 
 class EmailSender(ABC):
-    """Send one message. The whole seam.
+    """Send one message: the whole seam.
 
-    One method, because identity sends one message at a time and every batching question
-    belongs to a product's own notification path rather than to a verification link.
+    One method, because identity sends one message at a time and batching belongs to a
+    product's own notification path.
     """
 
     @abstractmethod
     def send(self, message: EmailMessage) -> str:
-        """Send it and return a provider message id.
+        """Send one message and return a provider message id.
 
-        Raises `EmailSendFailed` when the provider refuses. The id is for the log line and
-        for correlating with an SES event, and no caller stores it.
+        Raises `EmailSendFailed` when the provider refuses. The id is for the log line only.
         """
 
 
 class SesV2Client(Protocol):
     """The one SES v2 call this module makes, as a structural type.
 
-    Typed here rather than imported from `boto3-stubs`, for the same reason
-    `webbpulse.identity.tokens.KmsClient` is: the `identity` extra deliberately does not
-    depend on boto3, so that a product serving a JWKS is not made to install it. A
-    `boto3.client("sesv2")` satisfies this, and so does a fake in a test.
+    A protocol rather than a boto3 import, so the `identity` extra does not depend on boto3.
     """
 
     def send_email(self, **kwargs: Any) -> Any: ...
@@ -152,19 +84,8 @@ class SesV2Client(Protocol):
 class SesV2EmailSender(EmailSender):
     """`EmailSender` over SES v2 `SendEmail`.
 
-    Takes a client rather than building one, matching `TokenService` and every storage class
-    here: the module makes no AWS call at import, and a caller that already has a session
-    reuses it.
-
-    **v2 rather than v1.** The v1 `SendEmail` is the older API and its account-level
-    resources are the ones AWS documents as legacy. The v2 shape is also the one that takes
-    `EmailTags` inline, which is what makes a bounce rate on verification separable from one
-    on reset without a second configuration set.
-
-    `ses_configuration_set` is optional in settings and omitted from the call when unset. A
-    configuration set that does not exist is a hard failure on every send, so defaulting to
-    a name would break a product that had not created one, and passing an empty string is
-    not the same as omitting the key.
+    Takes a client rather than building one, so no AWS call happens at import. The
+    configuration set is omitted from the call when unset, since a missing one fails a send.
     """
 
     def __init__(
@@ -174,6 +95,7 @@ class SesV2EmailSender(EmailSender):
         from_address: str,
         configuration_set: str | None = None,
     ) -> None:
+        """Bind the sender to a client, a verified from address and an optional config set."""
         if not from_address:
             raise ValueError(
                 "SesV2EmailSender needs a from_address. It is `IdentitySettings.email_from`, "
@@ -185,7 +107,7 @@ class SesV2EmailSender(EmailSender):
 
     @classmethod
     def from_settings(cls, settings: IdentitySettings, client: SesV2Client) -> SesV2EmailSender:
-        """Build one from the settings fields section 6.1 already specifies for it."""
+        """Build one from the settings fields that already name the address and config set."""
         return cls(
             client,
             from_address=settings.email_from,
@@ -193,6 +115,7 @@ class SesV2EmailSender(EmailSender):
         )
 
     def send(self, message: EmailMessage) -> str:
+        """Send one message through SES v2 and return its `MessageId`."""
         request: dict[str, Any] = {
             "FromEmailAddress": self._from,
             "Destination": {"ToAddresses": [message.to]},
@@ -216,18 +139,11 @@ class SesV2EmailSender(EmailSender):
         try:
             response = self._client.send_email(**request)
         except Exception as exc:
-            # Deliberately broad. botocore raises `ClientError` for a refusal, but also
-            # `EndpointConnectionError`, `ParamValidationError` and a handful of others, and
-            # every one of them means the same thing to a caller: the mail did not go. This
-            # module does not depend on botocore, so it cannot name those types anyway.
             raise EmailSendFailed(f"SES refused the message: {exc}") from exc
 
         message_id = str(response.get("MessageId", "")) if isinstance(response, dict) else ""
         _log.info(
             "Identity email sent.",
-            # No recipient address and no link. Section 5.7: an audit line carries the user
-            # and the outcome, and an address in a log is the personal data a log should not
-            # accumulate for thirty days.
             extra={
                 "event": "email.sent",
                 "purpose": message.tags.get("purpose", "unknown"),
@@ -240,45 +156,33 @@ class SesV2EmailSender(EmailSender):
 class RecordingEmailSender(EmailSender):
     """An `EmailSender` that keeps every message in a list instead of sending it.
 
-    The test double, and also the right sender for a local run with no SES identity: the
-    link is in `sent[-1].text` and a software engineer working on the flow can paste it into
-    a browser without a mailbox.
-
-    Deliberately keeps the whole `EmailMessage` rather than a summary. A test that asserts
-    the link is in the body, or that the subject names the product, needs the rendered
-    thing, and a double that stored only "one email went to this address" would push every
-    such test back into rendering the template itself.
+    The test double, and the right sender for a local run with no SES identity: the link is
+    in `sent[-1].text`. Keeps the whole `EmailMessage` so a test can assert on the body.
     """
 
     def __init__(self, *, fail: bool = False) -> None:
+        """Start with no recorded messages; `fail` makes every send raise."""
         self.sent: list[EmailMessage] = []
-        #: Set to make every send raise, for testing the paths that tolerate a failure.
         self.fail = fail
 
     def send(self, message: EmailMessage) -> str:
+        """Record the message and return a synthetic id, or raise when configured to fail."""
         if self.fail:
             raise EmailSendFailed("RecordingEmailSender is configured to fail.")
         self.sent.append(message)
         return f"recorded-{len(self.sent)}"
 
     def last_for(self, address: str) -> EmailMessage | None:
-        """The most recent message to one address, or `None`."""
+        """Return the most recent message sent to one address, or `None`."""
         for message in reversed(self.sent):
             if message.to == address:
                 return message
         return None
 
     def clear(self) -> None:
+        """Discard every recorded message."""
         self.sent.clear()
 
-
-# ---------------------------------------------------------------------------
-# Templates
-# ---------------------------------------------------------------------------
-#
-# `string.Template` rather than an f-string, so the body reads as a document with holes in
-# it rather than as an expression. `safe_substitute` is not used anywhere: a missing key
-# should raise here, in a test, rather than mail a customer a body containing `$link`.
 
 _VERIFICATION_TEXT = Template(
     """Confirm your email address
@@ -333,10 +237,6 @@ nobody can use this link without opening your mailbox.</p>
 """
 )
 
-# Section 5.4: registration against a taken address answers 200 and mails the existing
-# address instead of telling the form the address is taken. This is that message, and it is
-# what makes the non-disclosure honest rather than merely silent: the person who owns the
-# address finds out somebody tried.
 _REGISTRATION_NOTICE_TEXT = Template(
     """Someone tried to create an account with your address
 
@@ -407,7 +307,7 @@ $logo$body<p style="color: #666; font-size: 13px;">$product_name</p>
 def render_verification(
     settings: IdentitySettings, *, to: str, link: str, expiry: str
 ) -> EmailMessage:
-    """The email verification message. Section 2.6 and section 5.4."""
+    """Render the email verification message."""
     return _render(
         settings,
         to=to,
@@ -423,7 +323,7 @@ def render_verification(
 def render_password_reset(
     settings: IdentitySettings, *, to: str, link: str, expiry: str
 ) -> EmailMessage:
-    """The password reset message. Section 2.6."""
+    """Render the password reset message."""
     return _render(
         settings,
         to=to,
@@ -437,10 +337,9 @@ def render_password_reset(
 
 
 def render_registration_notice(settings: IdentitySettings, *, to: str, link: str) -> EmailMessage:
-    """The notice section 5.4 sends to an address somebody tried to register again.
+    """Render the notice sent to an address somebody tried to register again.
 
-    Carries a reset link rather than a verification link, because the account already
-    exists and the plausible innocent explanation is a person who forgot they had one.
+    Carries a reset link rather than a verification link, because the account already exists.
     """
     return _render(
         settings,
@@ -455,11 +354,10 @@ def render_registration_notice(settings: IdentitySettings, *, to: str, link: str
 
 
 def render_password_changed(settings: IdentitySettings, *, to: str, link: str) -> EmailMessage:
-    """The notice sent after a password is changed or reset.
+    """Render the notice sent after a password is changed or reset.
 
-    Not required by the standard, and included because a change notification is the one
-    signal a user has that a takeover happened: an attacker who changes a password locks
-    the owner out silently otherwise. The link is the reset link, which is the remedy.
+    A change notification is the one signal a user has that a takeover happened, and the link
+    is the reset link, which is the remedy.
     """
     return _render(
         settings,
@@ -486,11 +384,8 @@ def _render(
 ) -> EmailMessage:
     """Render both parts of one message.
 
-    The two parts substitute the **same** values through different escaping: the text part
-    takes them raw, because plain text has no markup to escape into, and the HTML part takes
-    them through `html.escape`. Doing it in one function is what keeps the two from
-    drifting, and doing it here rather than in each caller is what keeps a new template from
-    forgetting the escape.
+    Both parts substitute the same values, the text part raw and the HTML part through
+    `html.escape`, in one place so a new template cannot forget the escape.
     """
     values = {
         "product_name": settings.product_name or "your account",
