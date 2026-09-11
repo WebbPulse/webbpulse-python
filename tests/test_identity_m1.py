@@ -510,7 +510,9 @@ def build_app(kms: MultiKeyFakeKms, **kwargs: Any) -> Any:
 
 
 def test_router_exposes_exactly_the_intended_routes(kms: MultiKeyFakeKms) -> None:
-    """M1 mounts three routes. A flow route appearing here is a milestone leaking early.
+    """M1's three routes, plus the two unconditional discovery routes that came later.
+
+    A flow route appearing here is a milestone leaking early.
 
     The paths carry the issuer's own path, `/api/auth` for this suite's `ISSUER`, because
     that is where API Gateway fetches discovery and where the advertised `jwks_uri` points.
@@ -535,6 +537,9 @@ def test_router_exposes_exactly_the_intended_routes(kms: MultiKeyFakeKms) -> Non
         # Unconditional from 0.16.0, even with no OAuth configured at all: the frontend
         # gets one authoritative answer in every deployment instead of a 404 to interpret.
         f"{prefix}/oauth/providers",
+        # Unconditional from 0.17.0, for the same reason, and answering
+        # `{"enabled": false, "passwordless": false}` where passkeys are off.
+        f"{prefix}/passkeys/availability",
     }
 
 

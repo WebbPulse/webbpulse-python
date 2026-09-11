@@ -1150,6 +1150,7 @@ def test_the_documents_alone_mount_without_hooks_or_stores(kms: FakeKms) -> None
         "/api/auth/.well-known/jwks.json",
         "/api/auth/health",
         "/api/auth/oauth/providers",
+        "/api/auth/passkeys/availability",
     }
 
 
@@ -1163,6 +1164,7 @@ def test_the_flows_mount_when_hooks_and_stores_are_supplied(
         "/api/auth/.well-known/jwks.json",
         "/api/auth/health",
         "/api/auth/oauth/providers",
+        "/api/auth/passkeys/availability",
         "/api/auth/register",
         "/api/auth/login",
         "/api/auth/password",
@@ -1188,6 +1190,7 @@ def test_an_origin_issuer_mounts_every_route_at_the_origin(
         "/.well-known/jwks.json",
         "/health",
         "/oauth/providers",
+        "/passkeys/availability",
         "/register",
         "/login",
         "/password",

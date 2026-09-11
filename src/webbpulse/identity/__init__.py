@@ -186,6 +186,11 @@ from webbpulse.identity.oauth_routes import (
     register_oauth_provider_discovery,
     register_oauth_routes,
 )
+from webbpulse.identity.passkey_routes import (
+    PASSKEY_AVAILABILITY_CACHE_CONTROL,
+    PASSKEY_AVAILABILITY_PATH,
+    register_passkey_availability,
+)
 from webbpulse.identity.passkeys import (
     AMR_PASSKEY,
     AMR_PIN,
@@ -378,6 +383,8 @@ __all__ = [
     "OAUTH_STATES_TABLE",
     "OAUTH_STATE_TTL_SECONDS",
     "PASSKEYS_TABLE",
+    "PASSKEY_AVAILABILITY_CACHE_CONTROL",
+    "PASSKEY_AVAILABILITY_PATH",
     "PASSKEY_CREDENTIAL_INDEX",
     "PASSWORD_CREDENTIAL_TYPE",
     "PASSWORD_PATH",
@@ -540,6 +547,7 @@ __all__ = [
     "read_authorizer_claims",
     "register_oauth_provider_discovery",
     "register_oauth_routes",
+    "register_passkey_availability",
     "render_password_changed",
     "render_password_reset",
     "render_registration_notice",

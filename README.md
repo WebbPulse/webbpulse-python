@@ -1093,6 +1093,7 @@ gateway builds the discovery URL as `issuer + "/.well-known/openid-configuration
 | `POST /api/auth/oauth/{provider}/link` | Starts a link for the authenticated account, returning the URL |
 | `GET /api/auth/oauth/links` | The providers attached to this account, for a settings page |
 | `DELETE /api/auth/oauth/{provider}/link` | Detaches a provider, unless it is the last way in |
+| `GET /api/auth/passkeys/availability` | Whether passkeys and passwordless sign-in are on, anonymous |
 | `POST /api/auth/passkeys/register/options` | WebAuthn registration options for the authenticated caller |
 | `POST /api/auth/passkeys/register/verify` | Verifies the attestation and stores the credential |
 | `POST /api/auth/login/passkey/options` | WebAuthn authentication options, anonymous |
@@ -1118,6 +1119,14 @@ The seven passkey routes need `passkeys_enabled` plus a passkey store and a WebA
 challenge store, and they mount independently of both: a product can run passwordless
 sign-in with no email and no TOTP. A route that cannot do its job should not exist to be
 called.
+
+**Two routes are the deliberate exception.** `GET /oauth/providers`, from 0.16.0, and
+`GET /passkeys/availability`, from 0.17.0, mount in **every** deployment, including the
+documents-only one, answering `{"providers": []}` and
+`{"enabled": false, "passwordless": false}` where the feature is off. Both exist so a
+frontend gets one authoritative answer everywhere rather than a 404 it has to interpret, and
+a 404 is indistinguishable from a routing mistake or an older version of this package. Each
+is anonymous, touches no store, and carries `Cache-Control: public, max-age=300`.
 
 **Login answers 200 with a challenge when a factor is enrolled.** The first leg returns
 `{"mfa_required": true, "mfa_ticket": "...", "factors": ["totp"]}` rather than tokens, and
@@ -1200,6 +1209,30 @@ disarm the check for that credential forever, since every later assertion would 
 variable, because an empty origin list makes the origin check vacuous and that check is the
 whole of what makes a passkey phishing resistant. `rp_id` is the registrable domain, hashed
 into every credential and immutable for that credential's life.
+
+**Ask `GET /api/auth/passkeys/availability` whether to draw the passkey button.** New in
+0.17.0, anonymous, cheap and cached for five minutes, and it answers:
+
+```json
+{"enabled": true, "passwordless": true}
+```
+
+`enabled` is `passkeys_enabled`: the deployment registers and verifies passkeys, so an
+account settings page should offer to add one. `passwordless` is additionally
+`passkeys_passwordless`: a passkey is a way *into* an account, so a sign-in page should offer
+the button. `passwordless` is never `true` while `enabled` is `false`, so a client can read
+it alone.
+
+**Do not infer availability by probing `login/passkey/options`.** That was the pre-0.17.0
+workaround and it is wrong twice. It spends that route's rate limit budget, 30 per 15 minutes
+per IP, on sign-in *page loads* rather than on sign-ins, so a user who reloads the page
+enough times is refused the passkey sign-in they then attempt. And the probe is not a read:
+it writes a WebAuthn challenge row per call, so every sign-in page load in the estate leaves
+a row in the challenge table to expire, which is a storage cost paid to answer a question
+about configuration. Caching the probe's result in the browser only defers both costs: the
+first load of every session still pays them in full. The availability route mounts in
+**every** deployment, so `{"enabled": false, "passwordless": false}` is a real answer and
+never a 404 to interpret.
 
 **`POST /login/passkey/options` answers any input, including an unknown address.** It returns
 a challenge and an empty `allowCredentials`, which is byte-identical to a genuine

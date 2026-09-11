@@ -5,6 +5,82 @@ Notable changes to the `webbpulse` package. The version here is the one in
 
 This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## 0.17.0
+
+Identity M5 follow-up: a public passkey availability route, so a frontend can ask whether
+passkeys are offered instead of probing a route that costs something to call.
+
+WebbPulse-Portfolio probes `POST /api/auth/login/passkey/options` on sign-in page load to
+find out, and that is wrong twice over. It spends that route's rate limit budget, 30 per 15
+minutes per IP, on sign-in *page loads* rather than on sign-ins, so a user who reloads the
+page enough times is refused the passkey sign-in they then attempt. And the probe is not a
+read: `begin_passkey_login` writes a WebAuthn challenge row per call, so every sign-in page
+load in the estate leaves a row in the challenge table to expire, which is a storage cost
+paid to answer a question about configuration. WebbPulse-Portfolio PR 182 added a
+`sessionStorage` cache as a stopgap and asked for this route. A cache in one frontend is not
+a fix: the first load of every session still pays both costs, and every other consumer pays
+them in full.
+
+### Added
+
+- **`GET <prefix>/passkeys/availability`**, anonymous, answering
+  `{"enabled": <bool>, "passwordless": <bool>}` from the `passkeys_enabled` and
+  `passkeys_passwordless` settings. Carries `Cache-Control: public, max-age=300`, the same
+  number `oauth/providers` and the JWKS carry and for the same reason: whether passkeys are
+  on changes only when a deploy changes it, which is rare but is exactly the moment somebody
+  is watching for the button to appear.
+
+  `enabled` says the deployment registers and verifies passkeys at all, so an account
+  settings page should offer to add one. `passwordless` says a passkey is a way *into* an
+  account, so a sign-in page should offer the button, and it is the distinction
+  `begin_passkey_login` already enforces.
+
+  **`passwordless` is `false` whenever `enabled` is `false`.** `passkeys_passwordless`
+  defaults to `True` and nothing else reads it against `passkeys_enabled`, so a deployment
+  with passkeys switched off still holds `passwordless=True` and means nothing by it.
+  Reporting that pair would tell a frontend to draw a "Sign in with a passkey" button
+  against login routes that do not exist. The gate is in the route, so the two can never
+  disagree and a client can read `passwordless` alone.
+
+  The answer comes from settings rather than from whether the stores were supplied. A
+  deployment with the capability on but no passkey table is a configuration error an operator
+  has to fix, and reporting `enabled: false` for it would hide that error behind a frontend
+  that quietly stops offering passkeys.
+
+  **The route mounts in every deployment**, including one with passkeys switched off and the
+  documents-only one that has no hooks and no stores at all, where it answers
+  `{"enabled": false, "passwordless": false}` and `{"enabled": true, "passwordless": true}`
+  respectively. It is the one passkey route that is unconditional, and the deliberate
+  exception to the rule the other seven follow. Those do not mount when they cannot work,
+  because a route that can only answer 503 is worse than an absent one; this one can always
+  work, and its answer when passkeys are off is the correct answer rather than a degraded
+  one. A route that were absent would answer 404, and a 404 is exactly the ambiguous signal
+  this route exists to replace: indistinguishable from a routing mistake, a gateway
+  misconfiguration, or an older version of this package.
+
+  It consumes no rate limit budget and writes nothing. The response is two booleans derived
+  from configuration, it holds nothing about any user, it touches no store and makes no call.
+  Rate limiting it would mean a DynamoDB write per sign-in page load to protect a handler
+  that reads two attributes, which is the cost the route was added to remove.
+
+  It is tagged `identity` and `passkeys` in the OpenAPI document, and is deliberately
+  annotated `-> Any` with `response_model=None` rather than `-> JSONResponse`, for the reason
+  `oauth_providers` gives: under `from __future__ import annotations` the latter is an
+  unresolvable string that FastAPI hands pydantic as a response model, which makes
+  `app.openapi()` raise for the whole app. Every other route in `passkey_routes.py` carries
+  that annotation; this one mounts everywhere, so it must not be what takes `/docs` away from
+  a product that has no passkeys at all.
+
+- **`register_passkey_availability`**, exported from `webbpulse.identity`, along with
+  `PASSKEY_AVAILABILITY_PATH` and `PASSKEY_AVAILABILITY_CACHE_CONTROL`. This is the first
+  time `webbpulse.identity.passkey_routes` exports anything through the package root.
+
+### Changed
+
+- **Nothing behavioural.** The seven passkey routes, their rate limits, their bodies and
+  their gating are untouched, and so is every other route. A deployment that upgrades gains
+  one anonymous `GET` and changes in no other way.
+
 ## 0.16.0
 
 Identity M6 follow-up: a public OAuth provider discovery route, so a frontend can ask which
