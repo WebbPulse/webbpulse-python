@@ -18,6 +18,7 @@ from webbpulse.ratelimit import (
 
 
 def _decision(**overrides: Any) -> RateLimitDecision:
+    """Build an allowed decision, overriding any field by keyword."""
     defaults: dict[str, Any] = {
         "allowed": True,
         "limit": 100,
@@ -28,10 +29,8 @@ def _decision(**overrides: Any) -> RateLimitDecision:
     return RateLimitDecision(**{**defaults, **overrides})
 
 
-# ---- headers ---------------------------------------------------------------------
-
-
 def test_rate_limit_headers_emit_the_structured_fields() -> None:
+    """The RateLimit and RateLimit-Policy structured fields carry r, t, q and w."""
     headers = rate_limit_headers(_decision())
 
     assert headers["RateLimit"] == '"default";r=50;t=30'
@@ -39,6 +38,7 @@ def test_rate_limit_headers_emit_the_structured_fields() -> None:
 
 
 def test_rate_limit_headers_emit_the_x_prefixed_trio() -> None:
+    """The X-RateLimit limit, remaining and reset headers are emitted too."""
     headers = rate_limit_headers(_decision())
 
     assert headers["X-RateLimit-Limit"] == "100"
@@ -47,6 +47,7 @@ def test_rate_limit_headers_emit_the_x_prefixed_trio() -> None:
 
 
 def test_rate_limit_headers_use_the_policy_name() -> None:
+    """`policy_name` names the policy in both structured fields."""
     headers = rate_limit_headers(_decision(), policy_name="login")
 
     assert headers["RateLimit"] == '"login";r=50;t=30'
@@ -54,8 +55,7 @@ def test_rate_limit_headers_use_the_policy_name() -> None:
 
 
 def test_rate_limit_headers_clamp_remaining_at_zero() -> None:
-    # The counter keeps climbing past the limit on rejected requests, so `remaining` goes
-    # negative internally. A negative `r` is not a valid structured field value.
+    """A negative remaining is clamped to zero, which a structured field requires."""
     headers = rate_limit_headers(_decision(allowed=False, remaining=-5))
 
     assert headers["RateLimit"] == '"default";r=0;t=30', "r must be clamped, never negative"
@@ -63,10 +63,8 @@ def test_rate_limit_headers_clamp_remaining_at_zero() -> None:
 
 
 def test_rate_limit_decision_repr_is_readable() -> None:
+    """`repr(RateLimitDecision)` includes the `allowed` flag."""
     assert "allowed=True" in repr(_decision())
-
-
-# ---- the limiter -----------------------------------------------------------------
 
 
 @pytest.fixture
@@ -77,6 +75,7 @@ def limiter(rate_limit_table: Any) -> RateLimiter:
 
 
 def test_check_allows_up_to_the_limit_and_denies_the_next(limiter: RateLimiter) -> None:
+    """`check` allows requests up to the limit and denies the one after it."""
     decisions = [
         limiter.check("198.51.100.1", limit=3, window_seconds=60, now=1_000.0) for _ in range(4)
     ]
@@ -88,6 +87,7 @@ def test_check_allows_up_to_the_limit_and_denies_the_next(limiter: RateLimiter) 
 
 
 def test_check_decrements_remaining(limiter: RateLimiter) -> None:
+    """`remaining` counts down to zero and clamps there."""
     remaining = [
         limiter.check("198.51.100.2", limit=3, window_seconds=60, now=1_000.0).remaining
         for _ in range(4)
@@ -97,8 +97,7 @@ def test_check_decrements_remaining(limiter: RateLimiter) -> None:
 
 
 def test_a_rejected_request_still_increments_the_counter(limiter: RateLimiter) -> None:
-    # This is what stops a caller sitting at exactly the limit by continuing to send
-    # requests that are refused: the window has to drain, not just stop growing.
+    """A rejected request still counts, so the window has to drain rather than stop growing."""
     for _ in range(5):
         limiter.check("198.51.100.3", limit=2, window_seconds=60, now=1_000.0)
 
@@ -108,6 +107,7 @@ def test_a_rejected_request_still_increments_the_counter(limiter: RateLimiter) -
 
 
 def test_two_identities_are_independent_counters(limiter: RateLimiter) -> None:
+    """Two identities keep separate counters."""
     for _ in range(3):
         limiter.check("198.51.100.4", limit=3, window_seconds=60, now=1_000.0)
 
@@ -117,6 +117,7 @@ def test_two_identities_are_independent_counters(limiter: RateLimiter) -> None:
 
 
 def test_two_namespaces_are_independent_counters(rate_limit_table: Any) -> None:
+    """Two namespaces keep separate counters for the same identity."""
     assert rate_limit_table is not None
     login = RateLimiter(namespace="login", prefix="", region_name="us-west-2")
     search = RateLimiter(namespace="search", prefix="", region_name="us-west-2")
@@ -130,15 +131,7 @@ def test_two_namespaces_are_independent_counters(rate_limit_table: Any) -> None:
 
 
 def test_the_fixed_window_rolls_over(limiter: RateLimiter) -> None:
-    """A new window is a new key, so the counter starts again rather than being reset.
-
-    moto does not expire TTL items and neither does DynamoDB promptly, so the rollover is
-    asserted through the window key changing and the old item surviving, never through an
-    expired item having disappeared.
-
-    The window containing t=1000 with a 60 second window is floor(1000/60)*60 = 960, so it
-    spans 960..1020. t=1010 is inside it and t=1100 (window 1080..1140) is not.
-    """
+    """A new window is a new key, so the counter starts again and the old item survives."""
     for _ in range(3):
         limiter.check("198.51.100.7", limit=3, window_seconds=60, now=1_000.0)
 
@@ -150,19 +143,17 @@ def test_the_fixed_window_rolls_over(limiter: RateLimiter) -> None:
     assert rolled.allowed is True, "a new window must start a fresh counter"
     assert rolled.remaining == 2, "the count must reset to 1 in the new window"
 
-    # The old window's item is untouched, which is what makes the rollover a new key, and
-    # it holds 4 because a rejected request still counts against its window.
     old = limiter.get({"pk": "default#198.51.100.7#960"})
     assert old is not None
     assert int(old["count"]) == 4
 
-    # The new window is a genuinely separate item rather than the old one mutated.
     fresh = limiter.get({"pk": "default#198.51.100.7#1080"})
     assert fresh is not None
     assert int(fresh["count"]) == 1
 
 
 def test_reset_after_counts_down_within_the_window(limiter: RateLimiter) -> None:
+    """`reset_after` reports the seconds left in the current window."""
     early = limiter.check("198.51.100.8", limit=10, window_seconds=60, now=1_000.0)
     late = limiter.check("198.51.100.8", limit=10, window_seconds=60, now=1_015.0)
 
@@ -172,23 +163,25 @@ def test_reset_after_counts_down_within_the_window(limiter: RateLimiter) -> None
 
 
 def test_check_writes_a_ttl_in_epoch_seconds(limiter: RateLimiter) -> None:
+    """The item's TTL is the window end plus a 60 second grace buffer, in epoch seconds."""
     limiter.check("198.51.100.9", limit=10, window_seconds=60, now=1_000.0)
 
     item = limiter.get({"pk": "default#198.51.100.9#960"})
     assert item is not None
-    # window_end (1020) plus the 60 second grace buffer.
     assert int(item["expires_at"]) == 1080
 
 
 def test_check_fails_open_and_logs_a_warning(
     limiter: RateLimiter, caplog: pytest.LogCaptureFixture, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    """A DynamoDB error fails open and logs one WARNING carrying `rate_limit_failed_open`."""
     error = ClientError(
         {"Error": {"Code": "ProvisionedThroughputExceededException", "Message": "slow down"}},
         "UpdateItem",
     )
 
     def explode(*args: Any, **kwargs: Any) -> Any:
+        """Raise the prepared ClientError in place of the DynamoDB call."""
         raise error
 
     monkeypatch.setattr(limiter, "update", explode)
@@ -211,7 +204,10 @@ def test_check_fails_open_and_logs_a_warning(
 def test_check_fails_open_on_a_non_botocore_error(
     limiter: RateLimiter, caplog: pytest.LogCaptureFixture, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    """Any exception from the DynamoDB call fails open, not only a botocore one."""
+
     def explode(*args: Any, **kwargs: Any) -> Any:
+        """Raise a non-botocore error in place of the DynamoDB call."""
         raise RuntimeError("anything at all")
 
     monkeypatch.setattr(limiter, "update", explode)
@@ -224,8 +220,7 @@ def test_check_fails_open_on_a_non_botocore_error(
 
 
 def test_missing_table_fails_open(caplog: pytest.LogCaptureFixture, dynamodb_resource: Any) -> None:
-    # No `rate_limit_table` fixture here, so the table genuinely does not exist. This is the
-    # realistic outage shape, and the limiter must still let the request through.
+    """With no rate limit table at all, the limiter still lets the request through."""
     assert dynamodb_resource is not None
     limiter = RateLimiter(prefix="", region_name="us-west-2")
 
@@ -236,21 +231,21 @@ def test_missing_table_fails_open(caplog: pytest.LogCaptureFixture, dynamodb_res
     assert decision.failed_open is True
 
 
-# ---- the FastAPI dependency ------------------------------------------------------
-
-
 def _app(limiter: RateLimiter, *, limit: int = 2, namespace: str = "default") -> FastAPI:
+    """Build an app with one route guarded by the rate limit dependency."""
     app = FastAPI()
     dependency = rate_limit(limit=limit, window_seconds=60, namespace=namespace, limiter=limiter)
 
     @app.get("/limited")
     async def limited(decision: Any = Depends(dependency)) -> dict[str, Any]:
+        """Report the remaining quota from the dependency's decision."""
         return {"remaining": decision.remaining}
 
     return app
 
 
 def test_dependency_allows_then_returns_429(limiter: RateLimiter, test_client: Any) -> None:
+    """The dependency serves requests up to the limit and then answers 429."""
     client = test_client(_app(limiter), source_ip="198.51.100.20")
 
     first = client.get("/limited")
@@ -266,6 +261,7 @@ def test_dependency_allows_then_returns_429(limiter: RateLimiter, test_client: A
 def test_the_429_carries_retry_after_and_the_ratelimit_header(
     limiter: RateLimiter, test_client: Any
 ) -> None:
+    """A 429 carries Retry-After in delta seconds plus the rate limit headers."""
     client = test_client(_app(limiter, namespace="login"), source_ip="198.51.100.21")
     for _ in range(2):
         client.get("/limited")
@@ -285,7 +281,7 @@ def test_the_429_carries_retry_after_and_the_ratelimit_header(
 def test_the_dependency_identifies_callers_by_source_ip(
     limiter: RateLimiter, test_client: Any
 ) -> None:
-    # Two clients differ only by the API Gateway source IP, so they must not share a bucket.
+    """Callers differing only by source IP get separate counters."""
     app = _app(limiter)
     first = test_client(app, source_ip="198.51.100.22")
     second = test_client(app, source_ip="198.51.100.23")
@@ -299,14 +295,13 @@ def test_the_dependency_identifies_callers_by_source_ip(
 def test_the_dependency_exposes_headers_on_a_successful_response(
     limiter: RateLimiter, test_client: Any
 ) -> None:
+    """The dependency stashes the rate limit headers on `request.state` for a middleware."""
     app = FastAPI()
     dependency = rate_limit(limit=5, window_seconds=60, limiter=limiter)
 
     @app.get("/state")
     async def state(request: Request, decision: Any = Depends(dependency)) -> dict[str, Any]:
-        # The dependency stashes the headers on request.state for a middleware to attach.
-        # `request` must be annotated as Request, not Any: FastAPI decides a parameter is
-        # the request object from its annotation, and Any makes it a query parameter.
+        """Report the headers the dependency stashed on the request state."""
         return dict(request.state.rate_limit_headers)
 
     client = test_client(app, source_ip="198.51.100.24")
@@ -319,6 +314,7 @@ def test_the_dependency_exposes_headers_on_a_successful_response(
 def test_the_dependency_accepts_a_custom_key_function(
     limiter: RateLimiter, test_client: Any
 ) -> None:
+    """A custom key function gives each key its own counter."""
     app = FastAPI()
     dependency = rate_limit(
         lambda request: request.headers.get("x-tenant", "anonymous"),
@@ -330,6 +326,7 @@ def test_the_dependency_accepts_a_custom_key_function(
 
     @app.get("/tenant")
     async def tenant(decision: Any = Depends(dependency)) -> dict[str, bool]:
+        """Answer once the rate limit dependency has allowed the request."""
         return {"ok": True}
 
     client = test_client(app, source_ip="198.51.100.25")
@@ -344,14 +341,11 @@ def test_the_dependency_accepts_a_custom_key_function(
 def test_the_dependency_accepts_an_async_key_function(
     limiter: RateLimiter, test_client: Any
 ) -> None:
-    """An async key function is awaited rather than counted as a coroutine object.
-
-    Without the await, every request would key on a distinct `<coroutine object ...>`
-    repr, so each caller would get a fresh counter and the limit would never bite.
-    """
+    """An async key function is awaited, so callers key on the string and not a coroutine."""
     app = FastAPI()
 
     async def key_fn(request: Request) -> str:
+        """Key the limiter on the tenant header."""
         return request.headers.get("x-tenant", "anonymous")
 
     dependency = rate_limit(
@@ -360,6 +354,7 @@ def test_the_dependency_accepts_an_async_key_function(
 
     @app.get("/tenant")
     async def tenant(decision: Any = Depends(dependency)) -> dict[str, bool]:
+        """Answer once the rate limit dependency has allowed the request."""
         return {"ok": True}
 
     client = test_client(app, source_ip="198.51.100.26")
@@ -374,12 +369,7 @@ def test_the_dependency_accepts_an_async_key_function(
 def test_the_dependency_does_not_block_the_event_loop(
     limiter: RateLimiter, test_client: Any
 ) -> None:
-    """The blocking boto3 call must be offloaded, not run on the event loop thread.
-
-    `check` is synchronous socket I/O. Run inline in an `async def` dependency it would
-    stall every other request the worker is serving, which on a Lambda under load is a
-    latency bug that only appears in production.
-    """
+    """The blocking `check` call runs in a worker thread, not on the thread running the route."""
     import threading
 
     loop_thread = threading.get_ident()
@@ -387,6 +377,7 @@ def test_the_dependency_does_not_block_the_event_loop(
     original = limiter.check
 
     def record(*args: Any, **kwargs: Any) -> Any:
+        """Record the thread `check` runs on, then delegate to the real method."""
         seen["thread"] = threading.get_ident()
         return original(*args, **kwargs)
 
@@ -395,6 +386,7 @@ def test_the_dependency_does_not_block_the_event_loop(
 
     @app.get("/offloaded")
     async def offloaded(decision: Any = Depends(dependency)) -> dict[str, int]:
+        """Record the thread the route handler runs on."""
         seen["route"] = threading.get_ident()
         return {"ok": 1}
 

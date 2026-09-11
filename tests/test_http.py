@@ -1,9 +1,7 @@
 """Tests for `webbpulse.http`.
 
-The `client_ip` cases carry most of the weight. The previous per-app implementation read a
-scope key Mangum set and the Web Adapter does not, so on migration it stopped matching and
-fell through to a spoofable header without anything failing. These tests pin both the
-supported shapes and the refusal to trust `X-Forwarded-For`.
+The `client_ip` cases carry most of the weight: they pin the API Gateway payload shapes the
+resolver supports and its refusal to trust `X-Forwarded-For`.
 """
 
 from __future__ import annotations
@@ -43,6 +41,7 @@ from webbpulse.logging import configure_logging
 def _request(
     headers: dict[str, str] | None = None, client: tuple[str, int] | None = None
 ) -> Request:
+    """Build a bare Starlette request with the given headers and optional peer address."""
     raw = [(k.lower().encode(), v.encode()) for k, v in (headers or {}).items()]
     scope: dict[str, Any] = {"type": "http", "method": "GET", "path": "/", "headers": raw}
     if client is not None:
@@ -51,10 +50,12 @@ def _request(
 
 
 def _context_header(context: dict[str, Any]) -> dict[str, str]:
+    """Render a request context dict as the header the Web Adapter passes through."""
     return {REQUEST_CONTEXT_HEADER: json.dumps(context)}
 
 
 def test_client_ip_reads_the_http_api_v2_shape() -> None:
+    """Payload format 2.0 puts the source IP under `http`."""
     request = _request(_context_header({"http": {"sourceIp": "203.0.113.7"}}))
     assert client_ip(request) == "203.0.113.7"
 
@@ -66,6 +67,7 @@ def test_client_ip_reads_the_rest_api_v1_shape() -> None:
 
 
 def test_client_ip_prefers_v2_when_both_are_present() -> None:
+    """The 2.0 shape wins when a context carries both."""
     request = _request(
         _context_header(
             {"http": {"sourceIp": "203.0.113.7"}, "identity": {"sourceIp": "198.51.100.9"}}
@@ -83,21 +85,25 @@ def test_client_ip_never_trusts_x_forwarded_for() -> None:
 
 
 def test_client_ip_ignores_x_forwarded_for_even_with_no_request_context() -> None:
+    """With no request context, the peer address is used and the header is ignored."""
     request = _request({"X-Forwarded-For": "10.0.0.1"}, client=("127.0.0.1", 5000))
     assert client_ip(request) == "127.0.0.1", "the peer address, never the spoofable header"
 
 
 def test_client_ip_falls_back_to_the_peer_for_local_development() -> None:
+    """With no request context at all, the peer address stands in for local runs."""
     request = _request(client=("127.0.0.1", 5000))
     assert client_ip(request) == "127.0.0.1"
 
 
 def test_client_ip_can_refuse_the_local_fallback() -> None:
+    """`local_fallback=False` reports `unknown` rather than the peer address."""
     request = _request(client=("127.0.0.1", 5000))
     assert client_ip(request, local_fallback=False) == "unknown"
 
 
 def test_client_ip_is_unknown_with_nothing_to_go_on() -> None:
+    """With neither a context nor a peer, the result is `unknown`."""
     assert client_ip(_request()) == "unknown"
 
 
@@ -112,6 +118,7 @@ def test_client_ip_survives_a_malformed_context_header() -> None:
     [{"http": {}}, {"identity": {}}, {"http": {"sourceIp": ""}}, {"http": "not-an-object"}],
 )
 def test_client_ip_handles_a_context_without_a_usable_source_ip(context: dict[str, Any]) -> None:
+    """A context missing a usable source IP degrades to the peer address."""
     request = _request(_context_header(context), client=("127.0.0.1", 5000))
     assert client_ip(request) == "127.0.0.1"
 
@@ -128,12 +135,14 @@ def test_health_route_is_always_two_hundred() -> None:
 
 
 def test_a_request_id_is_minted_and_echoed() -> None:
+    """Every response carries a request id header, minted when none arrives."""
     client = TestClient(create_app())
     response = client.get("/health")
     assert response.headers[REQUEST_ID_HEADER]
 
 
 def test_an_inbound_request_id_is_honoured() -> None:
+    """An inbound request id header is echoed back unchanged."""
     client = TestClient(create_app())
     response = client.get("/health", headers={REQUEST_ID_HEADER: "edge-abc"})
     assert response.headers[REQUEST_ID_HEADER] == "edge-abc"
@@ -147,10 +156,12 @@ def test_an_oversized_request_id_is_truncated() -> None:
 
 
 def test_the_request_id_is_available_as_a_dependency() -> None:
+    """`request_id` reads the same id the middleware bound, inside a handler."""
     router = APIRouter()
 
     @router.get("/whoami")
     async def whoami(request: Request) -> dict[str, str]:
+        """Report the request id the middleware resolved."""
         return {"rid": request_id(request)}
 
     client = TestClient(create_app([router]))
@@ -159,10 +170,12 @@ def test_the_request_id_is_available_as_a_dependency() -> None:
 
 
 def test_http_exceptions_render_the_error_envelope() -> None:
+    """An `HTTPException` renders the shared error envelope, not Starlette's shape."""
     router = APIRouter()
 
     @router.get("/missing")
     async def missing() -> None:
+        """Raise a 404 with a caller visible detail."""
         raise HTTPException(status_code=404, detail="No such post.")
 
     client = TestClient(create_app([router]))
@@ -181,6 +194,7 @@ def test_validation_errors_do_not_echo_the_offending_value() -> None:
 
     @router.get("/items")
     async def items(count: int) -> dict[str, int]:
+        """Echo the validated query parameter."""
         return {"count": count}
 
     client = TestClient(create_app([router]))
@@ -193,10 +207,12 @@ def test_validation_errors_do_not_echo_the_offending_value() -> None:
 
 
 def test_an_unhandled_exception_becomes_a_generic_five_hundred() -> None:
+    """An unhandled exception becomes a generic 500 with no internal detail."""
     router = APIRouter()
 
     @router.get("/boom")
     async def boom() -> None:
+        """Raise an exception whose message carries a secret."""
         raise RuntimeError("connection string postgres://user:hunter2@host/db")
 
     client = TestClient(create_app([router]), raise_server_exceptions=False)
@@ -209,6 +225,7 @@ def test_an_unhandled_exception_becomes_a_generic_five_hundred() -> None:
 
 
 def test_cors_headers_are_applied_for_a_listed_origin() -> None:
+    """A listed origin gets the CORS allow origin and credentials headers."""
     app = create_app(cors_allow_origins=["https://webbpulse.com"])
     client = TestClient(app)
     response = client.get("/health", headers={"Origin": "https://webbpulse.com"})
@@ -222,6 +239,7 @@ def test_cors_headers_are_present_on_an_error_response() -> None:
 
     @router.get("/missing")
     async def missing() -> None:
+        """Raise a 404 so the error path can be checked for CORS headers."""
         raise HTTPException(status_code=404, detail="Gone.")
 
     app = create_app([router], cors_allow_origins=["https://webbpulse.com"])
@@ -237,6 +255,7 @@ def test_wildcard_origins_with_credentials_are_rejected() -> None:
 
 
 def test_settings_supply_the_cors_configuration() -> None:
+    """`BaseServiceSettings` supplies the CORS origins when no list is passed."""
     from webbpulse.config import BaseServiceSettings
 
     settings = BaseServiceSettings(cors_allow_origins=["https://a.example"])
@@ -246,10 +265,12 @@ def test_settings_supply_the_cors_configuration() -> None:
 
 
 def test_routers_can_be_mounted_under_a_prefix() -> None:
+    """`router_prefix` mounts the supplied routers under that path."""
     router = APIRouter()
 
     @router.get("/posts")
     async def posts() -> list[str]:
+        """Return a trivial list so the prefixed path can be requested."""
         return ["a"]
 
     client = TestClient(create_app([router], router_prefix="/api/v1"))
@@ -257,10 +278,12 @@ def test_routers_can_be_mounted_under_a_prefix() -> None:
 
 
 def _domain_app(name: str) -> FastAPI:
+    """Build a one route app that names itself, for the mounting tests."""
     router = APIRouter()
 
     @router.get("/")
     async def index() -> dict[str, str]:
+        """Report which domain app served the request."""
         return {"domain": name}
 
     return create_app([router], service_name=name)
@@ -279,10 +302,12 @@ def test_mount_all_serves_every_domain_from_one_app() -> None:
 
 
 def test_a_mounted_app_keeps_its_own_error_handlers() -> None:
+    """A mounted app keeps its own handlers rather than the parent's."""
     router = APIRouter()
 
     @router.get("/boom")
     async def boom() -> None:
+        """Raise a domain specific 418."""
         raise HTTPException(status_code=418, detail="Domain specific.")
 
     parent = mount_all({"/api/v1/posts": create_app([router])})
@@ -292,21 +317,18 @@ def test_a_mounted_app_keeps_its_own_error_handlers() -> None:
 
 
 def test_mount_all_rejects_a_relative_mount_path() -> None:
+    """A mount path that does not start with a slash is rejected."""
     with pytest.raises(ValueError, match="must start with"):
         mount_all({"api/v1/posts": _domain_app("posts")})
 
 
 def test_a_deliberate_five_hundred_does_not_echo_its_detail() -> None:
-    """A 5xx detail goes to the log, never to the caller.
-
-    `raise HTTPException(500, f"could not read {table}")` is a normal thing to write, and
-    echoing it hands an attacker internals for free. The request id joins the response to
-    the log line that does carry the detail.
-    """
+    """A 5xx detail goes to the log, never to the caller."""
     router = APIRouter()
 
     @router.get("/boom")
     async def boom() -> None:
+        """Raise a 500 whose detail names an internal resource."""
         raise HTTPException(status_code=500, detail="connection to webbpulse-prod-posts failed")
 
     client = TestClient(create_app([router]), raise_server_exceptions=False)
@@ -324,6 +346,7 @@ def test_a_four_hundred_still_carries_its_detail() -> None:
 
     @router.get("/nope")
     async def nope() -> None:
+        """Raise a 404 with a detail written for the caller."""
         raise HTTPException(status_code=404, detail="No such post.")
 
     client = TestClient(create_app([router]), raise_server_exceptions=False)
@@ -345,18 +368,13 @@ def test_cors_exposes_the_rate_limit_headers() -> None:
         assert header in exposed, f"{header} is emitted, so it must be exposed too"
 
 
-# ---- the 0.3.0 envelope options ------------------------------------------------------
-#
-# The whole point of these being options is that a 0.2.0 caller is unaffected, so the
-# first test here pins the default body exactly rather than field by field.
-
-
 def test_the_default_envelope_is_byte_identical_to_0_2_0() -> None:
     """Portfolio reads this body. Adding a key by default would be a breaking change."""
     router = APIRouter()
 
     @router.get("/missing")
     async def missing() -> None:
+        """Raise a 404 so the default envelope keys can be compared."""
         raise HTTPException(status_code=404, detail="No such post.")
 
     response = TestClient(create_app([router])).get("/missing")
@@ -367,14 +385,17 @@ def test_the_default_envelope_is_byte_identical_to_0_2_0() -> None:
 
 
 def test_error_codes_add_a_stable_code_per_status() -> None:
+    """`error_codes=True` adds a stable code derived from the status."""
     router = APIRouter()
 
     @router.get("/missing")
     async def missing() -> None:
+        """Raise a 404."""
         raise HTTPException(status_code=404, detail="No such post.")
 
     @router.get("/conflict")
     async def conflict() -> None:
+        """Raise a 409."""
         raise HTTPException(status_code=409, detail="Already exists.")
 
     client = TestClient(create_app([router], error_codes=True))
@@ -383,10 +404,12 @@ def test_error_codes_add_a_stable_code_per_status() -> None:
 
 
 def test_the_four_base_fields_survive_every_option() -> None:
+    """The four base envelope fields are present whatever the options say."""
     router = APIRouter()
 
     @router.get("/missing")
     async def missing() -> None:
+        """Raise a 404 so the base fields can be checked."""
         raise HTTPException(status_code=404, detail="No such post.")
 
     app = create_app([router], error_codes=True, validation_details=True)
@@ -401,6 +424,7 @@ def test_a_route_can_override_the_error_code_at_the_raise_site() -> None:
 
     @router.get("/missing")
     async def missing() -> None:
+        """Raise a 404 whose dict detail names its own error code."""
         raise HTTPException(
             status_code=404,
             detail={"message": "No such post.", "error_code": "POST_NOT_FOUND"},
@@ -412,10 +436,12 @@ def test_a_route_can_override_the_error_code_at_the_raise_site() -> None:
 
 
 def test_a_dict_detail_without_a_message_does_not_leak_the_dict() -> None:
+    """A dict detail without a message renders the default text, not the dict."""
     router = APIRouter()
 
     @router.get("/weird")
     async def weird() -> None:
+        """Raise a 400 whose dict detail carries only internal keys."""
         raise HTTPException(status_code=400, detail={"internal": "table=webbpulse-prod"})
 
     body = TestClient(create_app([router])).get("/weird").json()
@@ -424,10 +450,12 @@ def test_a_dict_detail_without_a_message_does_not_leak_the_dict() -> None:
 
 
 def test_validation_details_add_the_flat_field_shape() -> None:
+    """`validation_details=True` adds the flat per field `details` list."""
     router = APIRouter()
 
     @router.get("/items")
     async def items(count: int) -> dict[str, int]:
+        """Echo the validated query parameter."""
         return {"count": count}
 
     app = create_app([router], validation_details=True)
@@ -447,6 +475,7 @@ def test_validation_details_never_echo_the_offending_value() -> None:
 
     @router.get("/items")
     async def items(count: int) -> dict[str, int]:
+        """Echo the validated query parameter."""
         return {"count": count}
 
     app = create_app([router], validation_details=True, error_codes=True)
@@ -458,6 +487,7 @@ def test_validation_details_never_echo_the_offending_value() -> None:
 
 
 def test_error_body_omits_the_optional_fields_when_unset() -> None:
+    """`error_body` omits `error_code` and `details` when they are not supplied."""
     request = _request()
     assert set(error_body(500, "Boom.", request)) == {
         "success",
@@ -468,6 +498,7 @@ def test_error_body_omits_the_optional_fields_when_unset() -> None:
 
 
 def test_error_body_includes_the_optional_fields_when_set() -> None:
+    """`error_body` includes `error_code` and `details` when they are supplied."""
     request = _request()
     body = error_body(409, "Conflict.", request, error_code="CONFLICT", details={"a": 1})
     assert body["error_code"] == "CONFLICT"
@@ -475,13 +506,8 @@ def test_error_body_includes_the_optional_fields_when_set() -> None:
     assert body["success"] is False and body["status"] == 409
 
 
-# ---- raw routing errors --------------------------------------------------------------
-#
-# CarModPicker leaked Starlette's own {"detail": "Not Found"} for an unmatched route,
-# which is a different shape from every handled error in the same API.
-
-
 def test_an_unmatched_route_renders_the_envelope() -> None:
+    """An unmatched route renders the envelope instead of Starlette's `detail` body."""
     response = TestClient(create_app()).get("/no-such-path")
 
     assert response.status_code == 404
@@ -494,10 +520,12 @@ def test_an_unmatched_route_renders_the_envelope() -> None:
 
 
 def test_a_wrong_method_renders_the_envelope() -> None:
+    """A wrong method renders the envelope instead of Starlette's `detail` body."""
     router = APIRouter()
 
     @router.get("/thing")
     async def thing() -> dict[str, bool]:
+        """Return a trivial body for the GET the test does not make."""
         return {"ok": True}
 
     response = TestClient(create_app([router])).post("/thing")
@@ -509,15 +537,9 @@ def test_a_wrong_method_renders_the_envelope() -> None:
 
 
 def test_routing_errors_carry_an_error_code_when_enabled() -> None:
+    """Routing errors carry an error code when `error_codes=True`."""
     client = TestClient(create_app(error_codes=True))
     assert client.get("/no-such-path").json()["error_code"] == "NOT_FOUND"
-
-
-# ---- DynamoDB handlers ---------------------------------------------------------------
-#
-# Opt in, because installing them imports botocore and the base install has no boto3.
-# The mapping is the part worth pinning: a failed condition is a 409 and not a 500, and
-# throttling is a retryable 503 and not a 500, or a client is told not to bother retrying.
 
 
 def _client_error(code: str, **extra: Any) -> ClientError:
@@ -527,10 +549,12 @@ def _client_error(code: str, **extra: Any) -> ClientError:
 
 
 def _dynamodb_app(raises: ClientError, **kwargs: Any) -> TestClient:
+    """Build a client for an app with the DynamoDB handlers whose one route raises."""
     router = APIRouter()
 
     @router.get("/write")
     async def write() -> None:
+        """Raise the ClientError under test."""
         raise raises
 
     app = create_app([router], dynamodb_handlers=True, **kwargs)
@@ -557,6 +581,7 @@ def test_a_failed_condition_is_a_conflict_not_a_server_error() -> None:
     ],
 )
 def test_throttling_is_a_retryable_503_with_retry_after(code: str) -> None:
+    """Each throttling error code becomes a 503 carrying `Retry-After`."""
     response = _dynamodb_app(_client_error(code)).get("/write")
 
     assert response.status_code == 503
@@ -575,6 +600,7 @@ def test_a_missing_table_is_a_five_hundred_and_tells_the_caller_nothing() -> Non
 
 
 def test_a_missing_table_logs_at_error(caplog: pytest.LogCaptureFixture) -> None:
+    """A missing table is logged at error level."""
     with caplog.at_level(logging.ERROR, logger="webbpulse.http"):
         _dynamodb_app(_client_error("ResourceNotFoundException")).get("/write")
 
@@ -582,6 +608,7 @@ def test_a_missing_table_logs_at_error(caplog: pytest.LogCaptureFixture) -> None
 
 
 def test_a_cancelled_transaction_with_a_failed_condition_is_a_conflict() -> None:
+    """A cancelled transaction with a failed condition reason is a 409."""
     error = _client_error(
         "TransactionCanceledException",
         CancellationReasons=[{"Code": "None"}, {"Code": "ConditionalCheckFailed"}],
@@ -603,12 +630,14 @@ def test_a_cancelled_transaction_without_a_failed_condition_is_a_five_hundred() 
 
 
 def test_a_cancelled_transaction_with_no_reasons_is_a_five_hundred() -> None:
+    """A cancelled transaction reporting no reasons is a 500."""
     response = _dynamodb_app(_client_error("TransactionCanceledException")).get("/write")
 
     assert response.status_code == 500
 
 
 def test_an_unrecognised_client_error_is_a_generic_five_hundred() -> None:
+    """An unrecognised DynamoDB error code is a generic 500."""
     error = _client_error("ValidationException")
     response = _dynamodb_app(error).get("/write")
 
@@ -617,6 +646,7 @@ def test_an_unrecognised_client_error_is_a_generic_five_hundred() -> None:
 
 
 def test_dynamodb_errors_carry_an_error_code_when_enabled() -> None:
+    """DynamoDB errors carry an error code when `error_codes=True`."""
     client = _dynamodb_app(_client_error("ConditionalCheckFailedException"), error_codes=True)
     assert client.get("/write").json()["error_code"] == "CONFLICT"
 
@@ -638,6 +668,7 @@ def test_install_dynamodb_handlers_can_be_called_on_its_own() -> None:
 
     @router.get("/write")
     async def write() -> None:
+        """Raise a failed condition error."""
         raise _client_error("ConditionalCheckFailedException")
 
     app = create_app([router])
@@ -653,17 +684,11 @@ def test_the_dynamodb_handlers_are_absent_unless_requested() -> None:
 
     @router.get("/write")
     async def write() -> None:
+        """Raise a failed condition error."""
         raise _client_error("ConditionalCheckFailedException")
 
     response = TestClient(create_app([router]), raise_server_exceptions=False).get("/write")
     assert response.status_code == 500, "no 409 mapping without dynamodb_handlers=True"
-
-
-# ---- Caller-supplied exception map ------------------------------------------------------
-#
-# The case the botocore branches cannot reach. A repository layer that translates a
-# conditional check failure into its own class means no `ClientError` ever reaches the
-# handler, so before this the consumer kept thin handlers of its own around `error_body`.
 
 
 class ItemNotFound(Exception):
@@ -671,11 +696,11 @@ class ItemNotFound(Exception):
 
 
 class ConditionFailed(Exception):
-    pass
+    """Stand-in for a consumer's own failed condition exception."""
 
 
 class TransactionCanceled(Exception):
-    pass
+    """Stand-in for a consumer's own cancelled transaction exception."""
 
 
 _ADOPTION_MAP: dict[type[BaseException], int | ErrorSpec] = {
@@ -686,10 +711,12 @@ _ADOPTION_MAP: dict[type[BaseException], int | ErrorSpec] = {
 
 
 def _mapped_app(raises: BaseException, **kwargs: Any) -> TestClient:
+    """Build a client for an app whose one route raises the given exception."""
     router = APIRouter()
 
     @router.get("/work")
     async def work() -> None:
+        """Raise the exception under test."""
         raise raises
 
     app = create_app([router], **kwargs)
@@ -710,6 +737,7 @@ def test_a_mapped_exception_renders_the_envelope_at_its_status() -> None:
 
 @pytest.mark.parametrize("exc", [ConditionFailed(), TransactionCanceled()])
 def test_the_conflict_entries_are_four_oh_nines(exc: BaseException) -> None:
+    """Both conflict entries in the adoption map render as 409."""
     response = _mapped_app(exc, exception_map=_ADOPTION_MAP).get("/work")
     assert response.status_code == 409
 
@@ -724,6 +752,7 @@ def test_a_mapped_conflict_reads_exactly_like_the_botocore_one() -> None:
 
 
 def test_the_internal_exception_message_never_reaches_the_caller() -> None:
+    """A mapped exception's own message never reaches the response body."""
     response = _mapped_app(ItemNotFound("pk=USER#42 sk=SECRET"), exception_map=_ADOPTION_MAP).get(
         "/work"
     )
@@ -731,11 +760,13 @@ def test_the_internal_exception_message_never_reaches_the_caller() -> None:
 
 
 def test_a_mapped_status_carries_its_default_message() -> None:
+    """A bare status entry renders the default message for that status."""
     response = _mapped_app(ItemNotFound(), exception_map={ItemNotFound: 404}).get("/work")
     assert response.json()["message"] == "The requested resource was not found."
 
 
 def test_an_error_spec_sets_the_message_and_the_code() -> None:
+    """An `ErrorSpec` sets both the message and the error code."""
     spec = ErrorSpec(404, message="No such post.", error_code="POST_NOT_FOUND")
     response = _mapped_app(
         ItemNotFound(), exception_map={ItemNotFound: spec}, error_codes=True
@@ -755,6 +786,7 @@ def test_an_error_spec_code_is_still_suppressed_without_error_codes() -> None:
 
 
 def test_a_mapped_status_gets_the_per_status_code_when_enabled() -> None:
+    """A mapped status gets the per status error code when `error_codes=True`."""
     response = _mapped_app(
         ConditionFailed(), exception_map={ConditionFailed: 409}, error_codes=True
     ).get("/work")
@@ -762,6 +794,7 @@ def test_a_mapped_status_gets_the_per_status_code_when_enabled() -> None:
 
 
 def test_an_unlisted_status_falls_back_to_a_generic_code() -> None:
+    """A status with no wording of its own falls back to the generic code and message."""
     response = _mapped_app(ItemNotFound(), exception_map={ItemNotFound: 418}, error_codes=True).get(
         "/work"
     )
@@ -772,6 +805,7 @@ def test_an_unlisted_status_falls_back_to_a_generic_code() -> None:
 
 
 def test_a_spec_can_ask_for_retry_after() -> None:
+    """An `ErrorSpec` can set the `Retry-After` header."""
     spec = ErrorSpec(503, retry_after=5)
     response = _mapped_app(ConditionFailed(), exception_map={ConditionFailed: spec}).get("/work")
 
@@ -807,6 +841,7 @@ def test_a_mapped_five_hundred_is_generic_and_logs_at_error(
 def test_a_mapped_four_xx_logs_at_warning_with_the_request_id(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
+    """A mapped 4xx logs at warning level with the request id and exception type."""
     with caplog.at_level(logging.WARNING, logger="webbpulse.http"):
         response = _mapped_app(ItemNotFound(), exception_map=_ADOPTION_MAP).get(
             "/work", headers={REQUEST_ID_HEADER: "map-me"}
@@ -819,16 +854,20 @@ def test_a_mapped_four_xx_logs_at_warning_with_the_request_id(
 
 
 def test_a_subclass_uses_its_own_entry_rather_than_the_base_one() -> None:
+    """A subclass with its own map entry uses that entry, not the base one."""
+
     class Missing(ItemNotFound):
-        pass
+        """A subclass of the mapped repository exception."""
 
     response = _mapped_app(Missing(), exception_map={ItemNotFound: 404, Missing: 410}).get("/work")
     assert response.status_code == 410
 
 
 def test_a_subclass_without_its_own_entry_falls_back_to_the_base() -> None:
+    """A subclass with no entry of its own falls back to the base class entry."""
+
     class Missing(ItemNotFound):
-        pass
+        """A subclass of the mapped repository exception."""
 
     response = _mapped_app(Missing(), exception_map={ItemNotFound: 404}).get("/work")
     assert response.status_code == 404, "Starlette walks the MRO"
@@ -840,10 +879,12 @@ def test_the_map_works_alongside_the_botocore_handlers() -> None:
 
     @router.get("/aws")
     async def aws() -> None:
+        """Raise a botocore error handled by the DynamoDB branch."""
         raise _client_error("ConditionalCheckFailedException")
 
     @router.get("/own")
     async def own() -> None:
+        """Raise a consumer exception handled by the map."""
         raise ItemNotFound()
 
     app = create_app([router], dynamodb_handlers=True, exception_map=_ADOPTION_MAP)
@@ -859,6 +900,7 @@ def test_the_map_needs_no_botocore_import() -> None:
 
     @router.get("/own")
     async def own() -> None:
+        """Raise a consumer exception handled by the map."""
         raise ItemNotFound()
 
     app = FastAPI()
@@ -875,6 +917,7 @@ def test_install_dynamodb_handlers_takes_the_map_directly() -> None:
 
     @router.get("/own")
     async def own() -> None:
+        """Raise a consumer exception handled by the map."""
         raise ConditionFailed()
 
     app = create_app([router])
@@ -892,6 +935,7 @@ def test_an_unmapped_exception_is_still_a_plain_five_hundred() -> None:
 
 
 def test_an_exception_outside_the_map_is_unaffected_by_it() -> None:
+    """An exception absent from the map is still a plain 500 with no detail."""
     response = _mapped_app(RuntimeError("boom"), exception_map=_ADOPTION_MAP).get("/work")
 
     assert response.status_code == 500
@@ -905,32 +949,28 @@ def test_a_non_exception_key_is_rejected_when_the_app_is_built() -> None:
 
 
 def test_a_nonsense_value_is_rejected_when_the_app_is_built() -> None:
+    """A map value that is neither an int nor an `ErrorSpec` is rejected at build time."""
     with pytest.raises(TypeError, match="int status or an ErrorSpec"):
         create_app([], exception_map={ItemNotFound: "404"})  # type: ignore[dict-item]
 
 
 def test_an_impossible_status_is_rejected_when_the_app_is_built() -> None:
+    """A map value outside the valid HTTP status range is rejected at build time."""
     with pytest.raises(ValueError, match="valid HTTP status"):
         create_app([], exception_map={ItemNotFound: 42})
 
 
 def test_an_empty_map_installs_nothing_and_raises_nothing() -> None:
+    """An empty map installs nothing and behaves like no map at all."""
     response = _mapped_app(ItemNotFound(), exception_map={}).get("/work")
     assert response.status_code == 500, "an empty map is the same as no map"
-
-
-# --------------------------------------------------------------------------------------
-# The sync dependency trap: `set_user_id` in a `def` dependency binds a context that
-# Starlette's threadpool discards, so the handler and every log line after it see `"-"`.
-# WebbPulse-Portfolio shipped that shape to production. These tests demonstrate the failure
-# and then the fix, end to end, by parsing the JSON that `JsonFormatter` actually emitted.
-# --------------------------------------------------------------------------------------
 
 
 class _User:
     """The minimal shape of a service's user object: something with an `id`."""
 
     def __init__(self, user_id: str) -> None:
+        """Store the user id."""
         self.id = user_id
 
 
@@ -940,11 +980,10 @@ def _resolve_user() -> _User:
 
 
 def _user_id_app(current_user: Any) -> FastAPI:
-    """An app whose one route logs, and reports the `user_id` the handler itself can see.
+    """Build an app whose one route logs and reports the `user_id` the handler can see.
 
-    Two readings, because they can disagree and the disagreement is the whole point. The
-    response body is what the handler sees at the moment it runs; the emitted log line is
-    what `JsonFormatter` merged in, which is what actually reaches CloudWatch.
+    The response body is what the handler sees, and the emitted log line is what
+    `JsonFormatter` merged in, so the two readings can be compared.
     """
     from webbpulse.log_context import user_id_var
 
@@ -952,6 +991,7 @@ def _user_id_app(current_user: Any) -> FastAPI:
 
     @router.get("/me")
     async def me(user: Any = Depends(current_user)) -> dict[str, str]:
+        """Log, then report the bound and resolved user ids."""
         logging.getLogger("app.me").info("served")
         return {"handler_user_id": user_id_var.get(), "resolved_id": user.id}
 
@@ -961,7 +1001,6 @@ def _user_id_app(current_user: Any) -> FastAPI:
 def _call_and_read_log(app: FastAPI, capsys: pytest.CaptureFixture[str]) -> tuple[Any, Any]:
     """Drive `/me` with logging configured, returning the body and the parsed log line."""
     configure_logging(level="INFO", force=True)
-    # Discard anything `configure_logging` or the client setup wrote before the request.
     capsys.readouterr()
 
     body = TestClient(app).get("/me").json()
@@ -979,24 +1018,18 @@ def _call_and_read_log(app: FastAPI, capsys: pytest.CaptureFixture[str]) -> tupl
 def test_set_user_id_in_a_sync_dependency_never_reaches_the_handler_or_the_log(
     capsys: pytest.CaptureFixture[str],
 ) -> None:
-    """The trap itself. Nothing raises; `user_id` is simply still the `"-"` placeholder.
-
-    This is the production shape Portfolio shipped: a `def` dependency calling
-    `set_user_id`. Starlette runs it through `anyio.to_thread.run_sync`, which copies the
-    context into a worker thread, and the copy dies when the call returns.
-    """
+    """`set_user_id` in a `def` dependency leaves the placeholder, silently."""
     from webbpulse.log_context import UNSET, set_user_id
 
     def current_user() -> _User:
+        """Resolve the user and bind its id from a `def` dependency."""
         user = _resolve_user()
-        set_user_id(user.id)  # Binds a context that is about to be thrown away.
+        set_user_id(user.id)
         return user
 
     body, log_line = _call_and_read_log(_user_id_app(current_user), capsys)
 
-    # The dependency ran and resolved the right user, which is why this is silent.
     assert body["resolved_id"] == "u-42"
-    # And yet neither the handler nor the log line ever saw the id.
     assert body["handler_user_id"] == UNSET
     assert "user_id" not in log_line, (
         "if this key appears, the threadpool context copy now propagates and the "
@@ -1021,6 +1054,7 @@ def test_an_async_dependency_that_awaits_bind_user_id_works_too(
     """The hand-rolled form of the same fix, for a service that wants its own wrapper."""
 
     async def current_user() -> _User:
+        """Resolve the user and bind its id by awaiting `bind_user_id`."""
         user = _resolve_user()
         await bind_user_id(user.id)
         return user
@@ -1036,6 +1070,7 @@ def test_bind_user_id_returns_the_cleaned_value() -> None:
     from webbpulse.log_context import user_id_var
 
     async def run() -> str:
+        """Bind a value that needs cleaning and return what `bind_user_id` gave back."""
         return await bind_user_id(" 42\nx ")
 
     token = user_id_var.set("-")
@@ -1053,6 +1088,7 @@ def test_user_id_dependency_passes_the_resolved_object_through_unchanged() -> No
 
     @router.get("/same")
     async def same(user: Any = Depends(dependency)) -> dict[str, bool]:
+        """Report whether the injected object is the very object the resolver returned."""
         return {"identical": user is sentinel}
 
     assert TestClient(create_app([router], instrument=False)).get("/same").json() == {
@@ -1061,13 +1097,17 @@ def test_user_id_dependency_passes_the_resolved_object_through_unchanged() -> No
 
 
 def test_user_id_dependency_wraps_an_async_resolver_too() -> None:
+    """`user_id_dependency` wraps an `async` resolver as well as a `def` one."""
+
     async def current_user() -> _User:
+        """Resolve a user asynchronously."""
         return _User("u-9")
 
     router = APIRouter()
 
     @router.get("/me")
     async def me(user: Any = Depends(user_id_dependency(current_user))) -> dict[str, str]:
+        """Report the bound user id."""
         from webbpulse.log_context import user_id_var
 
         return {"user_id": user_id_var.get()}
@@ -1079,12 +1119,14 @@ def test_user_id_dependency_keeps_the_wrapped_dependencys_own_dependencies() -> 
     """FastAPI resolves the wrapped callable normally, so its signature still works."""
 
     def current_user(request: Request) -> _User:
+        """Resolve a user from a request header, so the wrapper must keep the signature."""
         return _User(request.headers["x-test-user"])
 
     router = APIRouter()
 
     @router.get("/me")
     async def me(user: Any = Depends(user_id_dependency(current_user))) -> dict[str, str]:
+        """Report the bound user id."""
         from webbpulse.log_context import user_id_var
 
         return {"user_id": user_id_var.get()}
@@ -1103,6 +1145,7 @@ def test_user_id_dependency_binds_nothing_when_the_resolver_returns_none() -> No
 
     @router.get("/me")
     async def me(user: Any = Depends(user_id_dependency(lambda: None))) -> dict[str, Any]:
+        """Report the bound user id and whether the resolver returned `None`."""
         from webbpulse.log_context import user_id_var
 
         return {"user_id": user_id_var.get(), "user_is_none": user is None}
@@ -1116,12 +1159,13 @@ def test_user_id_dependency_binds_nothing_when_the_attribute_is_missing() -> Non
     from webbpulse.log_context import UNSET
 
     class _NoId:
-        pass
+        """A resolved object with no id attribute."""
 
     router = APIRouter()
 
     @router.get("/me")
     async def me(user: Any = Depends(user_id_dependency(_NoId))) -> dict[str, str]:
+        """Report the bound user id."""
         from webbpulse.log_context import user_id_var
 
         return {"user_id": user_id_var.get()}
@@ -1130,7 +1174,11 @@ def test_user_id_dependency_binds_nothing_when_the_attribute_is_missing() -> Non
 
 
 def test_user_id_dependency_honours_a_custom_attribute_name() -> None:
+    """`attribute` names which attribute of the resolved object carries the id."""
+
     class _Principal:
+        """A resolved object whose id lives under `sub`."""
+
         sub = "sub-123"
 
     router = APIRouter()
@@ -1139,6 +1187,7 @@ def test_user_id_dependency_honours_a_custom_attribute_name() -> None:
     async def me(
         user: Any = Depends(user_id_dependency(_Principal, attribute="sub")),
     ) -> dict[str, str]:
+        """Report the bound user id."""
         from webbpulse.log_context import user_id_var
 
         return {"user_id": user_id_var.get()}
@@ -1157,6 +1206,7 @@ def test_user_id_dependency_honours_an_extract_callable() -> None:
 
     @router.get("/me")
     async def me(user: Any = Depends(dependency)) -> dict[str, str]:
+        """Report the bound user id."""
         from webbpulse.log_context import user_id_var
 
         return {"user_id": user_id_var.get()}
@@ -1173,4 +1223,5 @@ def test_user_id_dependency_takes_the_wrapped_callables_name() -> None:
 
 
 def test_user_id_dependency_carries_the_wrapped_callables_docstring() -> None:
+    """The wrapper carries the wrapped callable's docstring."""
     assert user_id_dependency(_resolve_user).__doc__ == inspect.getdoc(_resolve_user)

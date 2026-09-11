@@ -1,29 +1,7 @@
 """Tests for the M3 identity flows: email verification, password reset, and the SES sender.
 
-Section 9.4 of `docs/identity-standard.md` sets the strategy. Three of its requirements do
-most of the shaping here, and they are different requirements from the ones that shaped the
-M2 suite:
-
-- **The link state machine gets a test per state.** Unknown, expired, already consumed,
-  wrong purpose, consumed concurrently, and the happy path. Six states, six tests, named
-  after the states, because the failure a loose test misses is two states collapsing into
-  one and a spent link quietly becoming reusable.
-- **Enumeration resistance is tested as an equality.** Both request routes are compared
-  against each other for an address that exists and one that does not, byte for byte
-  including headers, rather than each being checked against a literal. A test asserting
-  that both say `{"sent": true}` still passes when one of them also sets a header the other
-  does not.
-- **The escaping is tested with a value that would break out.** A product name containing
-  markup is rendered into both parts, and the assertion is that the HTML part contains the
-  escaped form and not the raw one, while the text part contains the raw form. Testing that
-  the HTML "looks right" with a benign value tests nothing.
-
-The SES sender is tested against **moto**, unlike M1's KMS work. moto 5.x implements
-`sesv2:SendEmail` faithfully enough to assert the request shape, which M1 decision 8 found
-was not true of KMS asymmetric signing. Where moto's behaviour is not the point, the
-recording sender stands in, and one test uses a raising fake to prove the failure wrapping.
-
-The KMS fake is M2's, redefined here rather than imported: `tests/` is not a package.
+Covers the link state machine, enumeration-resistant request routes, template escaping, and
+the SES v2 sender against both hand fakes and moto.
 """
 
 from __future__ import annotations
@@ -76,7 +54,7 @@ from webbpulse.identity.flows import (
 )
 from webbpulse.identity.storage import CredentialRecord
 
-if TYPE_CHECKING:  # pragma: no cover - typing only
+if TYPE_CHECKING:  # pragma: no cover
     from collections.abc import Iterator, Mapping
 
 cryptography = pytest.importorskip("cryptography")
@@ -100,16 +78,14 @@ USER_ID = "user-0001"
 
 
 class FakeKms:
-    """A KMS client signing for real with a local private key. M2's fake, unchanged.
-
-    Redefined rather than imported because `tests/` is not a package, and cross-importing
-    between test modules couples two suites that should change independently.
-    """
+    """A KMS client signing for real with a local private key. M2's fake, unchanged."""
 
     def __init__(self, keys: dict[str, rsa.RSAPrivateKey]) -> None:
+        """Hold the key id to private key mapping the fake signs with."""
         self._keys = keys
 
     def get_public_key(self, *, KeyId: str) -> dict[str, Any]:
+        """Return the DER public key and signing metadata for a key id."""
         der = (
             self._keys[KeyId]
             .public_key()
@@ -129,35 +105,27 @@ class FakeKms:
     def sign(
         self, *, KeyId: str, Message: bytes, MessageType: str, SigningAlgorithm: str
     ) -> dict[str, Any]:
+        """Sign a prehashed message with the local private key for a key id."""
         signature = self._keys[KeyId].sign(
             Message, padding.PKCS1v15(), utils.Prehashed(hashes.SHA256())
         )
         return {"KeyId": KeyId, "Signature": signature, "SigningAlgorithm": SigningAlgorithm}
 
 
-# ---------------------------------------------------------------------------
-# Fixtures
-# ---------------------------------------------------------------------------
-
-
 @pytest.fixture(autouse=True)
 def cheap_bcrypt(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
-    """Pin bcrypt to its minimum cost for the whole module. M2's fixture, unchanged.
-
-    Wrapping the two functions rather than patching `security.DEFAULT_ROUNDS`. Since 0.12.1
-    patching the module attribute would work too, because the cost is read at call time; the
-    wrapper is kept because it also pins the cost for a caller that passes `rounds=`
-    explicitly, which a changed default does not.
-    """
+    """Pin bcrypt to its minimum cost for the whole module, so hashing does not dominate."""
     import webbpulse.security as security
 
     real_hash = security.hash_password
     real_needs = security.needs_rehash
 
     def cheap(password: str, *, rounds: int = 4) -> str:
+        """Hash a password at the pinned minimum cost."""
         return real_hash(password, rounds=rounds)
 
     def needs(hashed: str, *, rounds: int = 4) -> bool:
+        """Report whether a hash needs rehashing at the pinned minimum cost."""
         return real_needs(hashed, rounds=rounds)
 
     monkeypatch.setattr(security, "hash_password", cheap)
@@ -176,17 +144,17 @@ def module_key() -> rsa.RSAPrivateKey:
 
 @pytest.fixture
 def kms(module_key: rsa.RSAPrivateKey) -> FakeKms:
+    """A fake KMS client holding the module key under KEY_A."""
     return FakeKms({KEY_A: module_key})
 
 
 def make_settings(**overrides: Any) -> IdentitySettings:
+    """Identity settings for this suite, with email verification off unless overridden."""
     base: dict[str, Any] = {
         "environment": "test",
         "issuer": ISSUER,
         "audience": AUDIENCE,
         "signing_key_arns": [KEY_A],
-        # Off by default here for the same reason M2 turns it off: most tests in this file
-        # want a session out of `register`. The tests that are about the refusal turn it on.
         "email_verification_required": False,
         "frontend_base_url": FRONTEND,
         "email_from": "no-reply@example.com",
@@ -198,14 +166,10 @@ def make_settings(**overrides: Any) -> IdentitySettings:
 
 
 class FakeHooks(BaseIdentityHooks):
-    """A product's policy, in memory. M2's fake plus `mark_email_verified`.
-
-    `verified` records every id the flow marked, which is what makes the ordering assertion
-    in the confirmation tests possible: the hook must be called after the link is consumed,
-    and a mock would let a test pass while the order was wrong.
-    """
+    """A product's policy, in memory. M2's fake plus `mark_email_verified`."""
 
     def __init__(self, *, refuse: str = "", verify_raises: bool = False) -> None:
+        """Start with no users and empty call and verification logs."""
         self.users: dict[str, dict[str, Any]] = {}
         self.by_email: dict[str, str] = {}
         self.refuse = refuse
@@ -215,6 +179,7 @@ class FakeHooks(BaseIdentityHooks):
         self._next = 1
 
     def add(self, email: str, *, user_id: str = "", **attributes: Any) -> dict[str, Any]:
+        """Register a user in the fake store and return it."""
         identifier = user_id or f"user-{self._next:04d}"
         self._next += 1
         user = {"id": identifier, "email": email, **attributes}
@@ -223,31 +188,38 @@ class FakeHooks(BaseIdentityHooks):
         return user
 
     def load_user_by_id(self, user_id: str) -> Mapping[str, Any] | None:
+        """Return the user with this id, or None."""
         self.calls.append("load_user_by_id")
         return self.users.get(user_id)
 
     def load_user_by_email(self, email: str) -> Mapping[str, Any] | None:
+        """Return the user with this address, case insensitively, or None."""
         self.calls.append("load_user_by_email")
         identifier = self.by_email.get(email.lower())
         return self.users.get(identifier) if identifier else None
 
     def may_authenticate(self, user: Mapping[str, Any]) -> None:
+        """Refuse the login when the fake is configured to refuse."""
         self.calls.append("may_authenticate")
         if self.refuse:
             raise AuthenticationRefused(self.refuse, error_code="ACCOUNT_DISABLED")
 
     def claims_for(self, user: Mapping[str, Any]) -> Mapping[str, Any]:
+        """Return no extra claims."""
         self.calls.append("claims_for")
         return {}
 
     def create_user(self, *, email: str, attributes: Mapping[str, Any]) -> Mapping[str, Any]:
+        """Create and record a user from an address and attributes."""
         self.calls.append("create_user")
         return self.add(email, **dict(attributes))
 
     def on_user_created(self, user: Mapping[str, Any], via: str) -> None:
+        """Record that the creation hook ran."""
         self.calls.append("on_user_created")
 
     def mark_email_verified(self, user_id: str) -> None:
+        """Record the verified id, or raise when the fake is set to fail."""
         self.calls.append("mark_email_verified")
         if self.verify_raises:
             raise RuntimeError("the product's users table refused the write")
@@ -259,11 +231,13 @@ class FakeHooks(BaseIdentityHooks):
 
 @pytest.fixture
 def hooks() -> FakeHooks:
+    """A fresh `FakeHooks` per test."""
     return FakeHooks()
 
 
 @pytest.fixture
 def stores() -> IdentityStores:
+    """In-memory credential, refresh token and identity token stores."""
     return IdentityStores(
         credentials=InMemoryCredentialStore(),
         refresh_tokens=InMemoryRefreshTokenStore(),
@@ -273,21 +247,25 @@ def stores() -> IdentityStores:
 
 @pytest.fixture
 def attempts() -> InMemoryLoginAttemptStore:
+    """An in-memory login attempt store."""
     return InMemoryLoginAttemptStore()
 
 
 @pytest.fixture
 def sender() -> RecordingEmailSender:
+    """A recording email sender that keeps every message instead of sending it."""
     return RecordingEmailSender()
 
 
 @pytest.fixture
 def settings() -> IdentitySettings:
+    """The default identity settings for this suite."""
     return make_settings()
 
 
 @pytest.fixture
 def links(settings: IdentitySettings, stores: IdentityStores) -> LinkService:
+    """A `LinkService` over the suite's settings and identity token store."""
     return LinkService(settings, stores.require_identity_tokens())
 
 
@@ -299,6 +277,7 @@ def flows(
     attempts: InMemoryLoginAttemptStore,
     sender: RecordingEmailSender,
 ) -> IdentityFlows:
+    """Identity flows wired to the fakes, with the recording email sender attached."""
     settings = make_settings()
     return IdentityFlows(
         settings,
@@ -334,12 +313,7 @@ def seed_account(
 
 
 def token_from(sender: RecordingEmailSender, address: str = EMAIL) -> str:
-    """The token out of the most recent link mailed to an address.
-
-    Read out of the email rather than returned by the flow on purpose. The flow methods
-    return `None` precisely so a caller cannot get at the token, and a test that reached
-    around that would be testing a path no route can take.
-    """
+    """The token out of the most recent link mailed to an address, read from the message body."""
     message = sender.last_for(address)
     assert message is not None, f"no message was sent to {address}"
     from urllib.parse import parse_qs, urlsplit
@@ -351,13 +325,8 @@ def token_from(sender: RecordingEmailSender, address: str = EMAIL) -> str:
     raise AssertionError("the message body carried no link")
 
 
-# ---------------------------------------------------------------------------
-# Templates: escaping, both parts, and the copy rules
-# ---------------------------------------------------------------------------
-
-
 def test_every_message_carries_both_a_text_and_an_html_part(settings: IdentitySettings) -> None:
-    """A text-only message looks like spam and an HTML-only one is unreadable in mutt."""
+    """Every rendered message has a non-empty text part, an HTML part, a subject and a purpose tag."""
     messages = [
         render_verification(settings, to=EMAIL, link="https://x/y?token=t", expiry="24 hours"),
         render_password_reset(settings, to=EMAIL, link="https://x/y?token=t", expiry="1 hour"),
@@ -373,25 +342,18 @@ def test_every_message_carries_both_a_text_and_an_html_part(settings: IdentitySe
 
 
 def test_markup_in_a_setting_is_escaped_in_the_html_part_and_raw_in_the_text() -> None:
-    """The escaping is the point, so it is tested with a value that would break out.
-
-    A product name is operator-supplied rather than attacker-supplied, so this is defence in
-    depth rather than a live hole. It is worth having because the templates are the one
-    place in the package that concatenates configuration into markup, and the next value to
-    go through `_render` may not be operator-supplied.
-    """
+    """A product name containing markup is escaped in the HTML part and left raw in the text part."""
     hostile = 'Example<script>alert("x")</script>'
     settings = make_settings(product_name=hostile)
     message = render_verification(settings, to=EMAIL, link="https://x/y", expiry="24 hours")
 
     assert "<script>" not in message.html
     assert "&lt;script&gt;" in message.html
-    # Plain text has no markup to escape into, so the raw value belongs there.
     assert "<script>" in message.text
 
 
 def test_a_link_with_query_characters_survives_both_parts(settings: IdentitySettings) -> None:
-    """`?token=` is an ampersand away from being mangled, and the token is the credential."""
+    """A link with a query string survives raw in the text part and ampersand-escaped in the HTML."""
     link = "https://staging.example.com/verify-email?token=abc&next=%2Fdash"
     message = render_verification(settings, to=EMAIL, link=link, expiry="24 hours")
 
@@ -401,6 +363,7 @@ def test_a_link_with_query_characters_survives_both_parts(settings: IdentitySett
 
 
 def test_the_logo_is_included_only_when_it_is_configured() -> None:
+    """The HTML part carries an `img` tag only when `logo_url` is set."""
     with_logo = make_settings(logo_url="https://cdn.example.com/logo.png")
     without = make_settings()
 
@@ -413,11 +376,7 @@ def test_the_logo_is_included_only_when_it_is_configured() -> None:
 
 
 def test_no_message_uses_an_em_dash_or_the_word_developer(settings: IdentitySettings) -> None:
-    """The house copy rules, asserted rather than remembered.
-
-    Cheap to check and easy to reintroduce: the next person to add a template writes the
-    dash without thinking about it, and nothing else in the suite would notice.
-    """
+    """No subject, text or HTML part contains an em dash or the word developer."""
     messages = [
         render_verification(settings, to=EMAIL, link="https://x", expiry="24 hours"),
         render_password_reset(settings, to=EMAIL, link="https://x", expiry="1 hour"),
@@ -431,7 +390,7 @@ def test_no_message_uses_an_em_dash_or_the_word_developer(settings: IdentitySett
 
 
 def test_a_template_with_a_missing_value_raises_rather_than_mailing_a_dollar_sign() -> None:
-    """`substitute`, not `safe_substitute`. The failure belongs in a test, not a mailbox."""
+    """`_render` raises `KeyError` on a missing placeholder rather than mailing the raw template."""
     from string import Template
 
     from webbpulse.identity.email import _render
@@ -450,7 +409,7 @@ def test_a_template_with_a_missing_value_raises_rather_than_mailing_a_dollar_sig
 
 
 def test_each_message_carries_a_distinct_purpose_tag(settings: IdentitySettings) -> None:
-    """The tag is what makes a bounce rate on reset separable from one on verification."""
+    """The four templates carry four distinct purpose tags."""
     purposes = {
         render_verification(settings, to=EMAIL, link="https://x", expiry="1 hour").tags["purpose"],
         render_password_reset(settings, to=EMAIL, link="https://x", expiry="1 hour").tags[
@@ -462,20 +421,11 @@ def test_each_message_carries_a_distinct_purpose_tag(settings: IdentitySettings)
     assert len(purposes) == 4
 
 
-# ---------------------------------------------------------------------------
-# The SES v2 sender
-# ---------------------------------------------------------------------------
-
-
 class RaisingSesClient:
-    """A client that refuses every send, the way botocore does for an unverified identity.
-
-    Raises a plain `RuntimeError` rather than a `ClientError` on purpose: the sender catches
-    `Exception` because it does not depend on botocore, and a test that raised `ClientError`
-    would not prove that.
-    """
+    """A client that refuses every send, the way botocore does for an unverified identity."""
 
     def send_email(self, **kwargs: Any) -> Any:
+        """Raise a plain `RuntimeError` for every send."""
         raise RuntimeError("MessageRejected: Email address is not verified.")
 
 
@@ -483,14 +433,17 @@ class CapturingSesClient:
     """Records the request instead of sending it. For asserting the request shape."""
 
     def __init__(self) -> None:
+        """Start with no recorded requests."""
         self.requests: list[dict[str, Any]] = []
 
     def send_email(self, **kwargs: Any) -> Any:
+        """Record the request and return a fixed message id."""
         self.requests.append(kwargs)
         return {"MessageId": "0100000000000000-aaaa-bbbb-cccc-000000"}
 
 
 def test_the_ses_sender_builds_a_simple_content_with_both_parts() -> None:
+    """The SES request carries the from address, destination, subject and both body parts as UTF-8."""
     client = CapturingSesClient()
     sender = SesV2EmailSender(client, from_address="no-reply@example.com")
     message = EmailMessage(to=EMAIL, subject="Subject", text="text body", html="<p>html body</p>")
@@ -509,8 +462,7 @@ def test_the_ses_sender_builds_a_simple_content_with_both_parts() -> None:
 
 
 def test_the_configuration_set_key_is_omitted_when_it_is_unset() -> None:
-    """Omitted, not empty. SES rejects a send naming a configuration set that does not exist,
-    and an empty string is a name that does not exist rather than an absence."""
+    """`ConfigurationSetName` is absent, not empty, when unset or set to an empty string."""
     client = CapturingSesClient()
     SesV2EmailSender(client, from_address="a@b.c").send(
         EmailMessage(to=EMAIL, subject="s", text="t", html="<p>h</p>")
@@ -525,6 +477,7 @@ def test_the_configuration_set_key_is_omitted_when_it_is_unset() -> None:
 
 
 def test_the_configuration_set_is_sent_when_it_is_configured() -> None:
+    """`ConfigurationSetName` is sent when the sender is built with a configuration set."""
     client = CapturingSesClient()
     SesV2EmailSender(client, from_address="a@b.c", configuration_set="identity-events").send(
         EmailMessage(to=EMAIL, subject="s", text="t", html="<p>h</p>")
@@ -533,6 +486,7 @@ def test_the_configuration_set_is_sent_when_it_is_configured() -> None:
 
 
 def test_tags_become_email_tags_and_are_omitted_when_there_are_none() -> None:
+    """Message tags become `EmailTags`, and the key is omitted when there are none."""
     client = CapturingSesClient()
     sender = SesV2EmailSender(client, from_address="a@b.c")
 
@@ -548,6 +502,7 @@ def test_tags_become_email_tags_and_are_omitted_when_there_are_none() -> None:
 
 
 def test_from_settings_reads_the_two_fields_section_6_1_specifies() -> None:
+    """`from_settings` reads `email_from` and `ses_configuration_set` into the request."""
     settings = make_settings(
         email_from="sender@example.com", ses_configuration_set="identity-events"
     )
@@ -560,26 +515,20 @@ def test_from_settings_reads_the_two_fields_section_6_1_specifies() -> None:
 
 
 def test_an_empty_from_address_is_refused_at_construction() -> None:
-    """SES would refuse it on every send. Failing at construction fails at deploy instead."""
+    """An empty from address raises `ValueError` at construction rather than on every send."""
     with pytest.raises(ValueError, match="from_address"):
         SesV2EmailSender(CapturingSesClient(), from_address="")
 
 
 def test_any_client_exception_becomes_email_send_failed() -> None:
-    """One type for the caller, because every underlying failure means the same thing."""
+    """Any exception from the client surfaces as `EmailSendFailed`."""
     sender = SesV2EmailSender(RaisingSesClient(), from_address="a@b.c")
     with pytest.raises(EmailSendFailed):
         sender.send(EmailMessage(to=EMAIL, subject="s", text="t", html="<p>h</p>"))
 
 
 def test_the_ses_sender_works_against_moto() -> None:
-    """The one test that exercises a real SES v2 implementation rather than a hand fake.
-
-    moto 5.x implements `sesv2:SendEmail`, which M1 decision 8 found was **not** true of KMS
-    asymmetric signing. The hand fakes above assert the request shape; this asserts that a
-    real client with a real serialiser accepts that shape at all, which is the part a hand
-    fake cannot tell us.
-    """
+    """A real sesv2 client under moto accepts the request shape the sender builds."""
     moto = pytest.importorskip("moto")
     boto3 = pytest.importorskip("boto3")
 
@@ -597,6 +546,7 @@ def test_the_ses_sender_works_against_moto() -> None:
 
 
 def test_the_recording_sender_records_and_can_be_made_to_fail() -> None:
+    """The recording sender tracks sends per address, clears, and raises when built with `fail=True`."""
     sender = RecordingEmailSender()
     assert sender.last_for(EMAIL) is None
 
@@ -617,13 +567,8 @@ def test_the_recording_sender_records_and_can_be_made_to_fail() -> None:
         failing.send(EmailMessage(to=EMAIL, subject="s", text="t", html="<p>h</p>"))
 
 
-# ---------------------------------------------------------------------------
-# The link primitive: issue, and the confirmation state machine
-# ---------------------------------------------------------------------------
-
-
 def test_issuing_a_link_stores_only_the_hash(links: LinkService, stores: IdentityStores) -> None:
-    """The token in the email is never at rest. A database dump must not be a set of links."""
+    """Issuing stores the token hash, never the token itself, against the user and purpose."""
     issued = links.issue(USER_ID, "verify_email")
 
     store = stores.require_identity_tokens()
@@ -636,11 +581,13 @@ def test_issuing_a_link_stores_only_the_hash(links: LinkService, stores: Identit
 
 
 def test_the_two_purposes_get_the_two_ttls_section_4_3_specifies(links: LinkService) -> None:
+    """Verification links live 24 hours and reset links 1 hour."""
     assert links.ttl_for("verify_email") == timedelta(hours=24)
     assert links.ttl_for("reset_password") == timedelta(hours=1)
 
 
 def test_the_url_points_at_the_frontend_with_the_token_in_the_query(links: LinkService) -> None:
+    """The issued URL is the frontend link path for the purpose, with the token in the query."""
     issued = links.issue(USER_ID, "reset_password")
     assert issued.url.startswith(f"{FRONTEND}{RESET_LINK_PATH}?token=")
     assert issued.token in issued.url
@@ -650,19 +597,14 @@ def test_the_url_points_at_the_frontend_with_the_token_in_the_query(links: LinkS
 
 
 def test_the_bare_page_carries_no_token_and_no_empty_query(links: LinkService) -> None:
-    """A notification email must not carry a live credential, which is what `page_for` is for."""
+    """`page_for` returns the bare frontend path with no token and no query string."""
     page = links.page_for("reset_password")
     assert page == f"{FRONTEND}{RESET_LINK_PATH}"
     assert "?" not in page
 
 
 def test_two_links_for_one_user_are_both_live(links: LinkService) -> None:
-    """Issuing does not revoke the outstanding link of the same purpose. See the M3 decisions.
-
-    `identity-tokens` carries no user index, so revoking would cost a scan or a write on the
-    click path to serve the issue path. What it would close is a link the user asked for,
-    which expires on its own inside the hour.
-    """
+    """Issuing a second link of the same purpose does not revoke the first: both confirm."""
     first = links.issue(USER_ID, "reset_password")
     second = links.issue(USER_ID, "reset_password")
 
@@ -673,6 +615,7 @@ def test_two_links_for_one_user_are_both_live(links: LinkService) -> None:
 def test_confirming_a_live_link_returns_the_record_and_marks_it_consumed(
     links: LinkService, stores: IdentityStores
 ) -> None:
+    """Confirming a live link returns its record and stamps `consumed_at` on the stored row."""
     issued = links.issue(USER_ID, "verify_email")
     record = links.confirm(issued.token, "verify_email")
 
@@ -683,6 +626,7 @@ def test_confirming_a_live_link_returns_the_record_and_marks_it_consumed(
 
 
 def test_confirming_an_unknown_token_is_refused(links: LinkService) -> None:
+    """An unknown token is refused with reason `unknown`."""
     with pytest.raises(ConfirmationFailed) as caught:
         links.confirm(new_token(), "verify_email")
     assert caught.value.reason == "unknown"
@@ -691,15 +635,14 @@ def test_confirming_an_unknown_token_is_refused(links: LinkService) -> None:
 def test_confirming_an_empty_token_is_refused_without_touching_the_store(
     links: LinkService,
 ) -> None:
-    """An empty string hashes to a real value, and a store lookup for it is a wasted read."""
+    """An empty token is refused with reason `empty` before any store lookup."""
     with pytest.raises(ConfirmationFailed) as caught:
         links.confirm("", "verify_email")
     assert caught.value.reason == "empty"
 
 
 def test_confirming_an_expired_link_is_refused(links: LinkService) -> None:
-    """Expiry is re-checked in code. The TTL attribute is storage reclamation, never access
-    control: DynamoDB deletes an expired item within days, not seconds."""
+    """Expiry is re-checked in code, so a link issued in the past is refused with reason `expired`."""
     past = datetime.now(UTC) - timedelta(hours=48)
     issued = links.issue(USER_ID, "verify_email", now=past)
 
@@ -709,6 +652,7 @@ def test_confirming_an_expired_link_is_refused(links: LinkService) -> None:
 
 
 def test_confirming_a_spent_link_a_second_time_is_refused(links: LinkService) -> None:
+    """A second confirmation of the same link is refused with reason `already_consumed`."""
     issued = links.issue(USER_ID, "verify_email")
     links.confirm(issued.token, "verify_email")
 
@@ -720,32 +664,20 @@ def test_confirming_a_spent_link_a_second_time_is_refused(links: LinkService) ->
 def test_a_verification_link_presented_to_the_reset_flow_is_refused_unspent(
     links: LinkService,
 ) -> None:
-    """The purpose check happens **before** the consume, deliberately.
-
-    A user who pastes their verification link into the reset page has done nothing wrong,
-    and burning their only link for it would leave them with neither flow available. The
-    check is still a real control: the record's purpose is what is compared, not the
-    caller's claim about it.
-    """
+    """A wrong-purpose confirmation is refused before the consume, leaving the link usable."""
     issued = links.issue(USER_ID, "verify_email")
 
     with pytest.raises(ConfirmationFailed) as caught:
         links.confirm(issued.token, "reset_password")
     assert caught.value.reason == "wrong_purpose"
 
-    # Still live for the flow it was issued for.
     assert links.confirm(issued.token, "verify_email").user_id == USER_ID
 
 
 def test_a_link_consumed_between_the_read_and_the_write_is_refused(
     settings: IdentitySettings, stores: IdentityStores
 ) -> None:
-    """The consume is a conditional write, so two racing clicks cannot both win.
-
-    Simulated by a store whose `consume` returns `None` the way a failed condition does. The
-    in-memory store cannot be raced from one thread, and the property under test is what the
-    service does with the `None`, not how DynamoDB produces it.
-    """
+    """A `consume` that returns None, as a failed conditional write does, is refused as `consumed_concurrently`."""
     store = stores.require_identity_tokens()
     links = LinkService(settings, store)
     issued = links.issue(USER_ID, "reset_password")
@@ -753,6 +685,7 @@ def test_a_link_consumed_between_the_read_and_the_write_is_refused(
     def already_gone(
         token_hash: str, *, consumed_at: str | None = None
     ) -> IdentityTokenRecord | None:
+        """Stand in for a conditional write that lost the race by returning None."""
         return None
 
     store.consume = already_gone  # type: ignore[method-assign]
@@ -763,11 +696,7 @@ def test_a_link_consumed_between_the_read_and_the_write_is_refused(
 
 
 def test_every_refusal_carries_the_same_message_and_code(links: LinkService) -> None:
-    """The reason is for the log. The caller gets one sentence whatever went wrong.
-
-    Telling a caller who guessed a value that it was "already used" confirms the guess found
-    a real token, which is a worse disclosure than the unhelpfulness costs.
-    """
+    """Every refusal reason shares one message, error code and status, whatever went wrong."""
     expired = links.issue(USER_ID, "verify_email", now=datetime.now(UTC) - timedelta(days=2))
     spent = links.issue(USER_ID, "verify_email")
     links.confirm(spent.token, "verify_email")
@@ -782,6 +711,7 @@ def test_every_refusal_carries_the_same_message_and_code(links: LinkService) -> 
 
 
 def test_describe_expiry_reads_like_a_sentence() -> None:
+    """`describe_expiry` renders hours and minutes with correct singulars."""
     assert describe_expiry(timedelta(hours=24)) == "24 hours"
     assert describe_expiry(timedelta(hours=1)) == "1 hour"
     assert describe_expiry(timedelta(minutes=30)) == "30 minutes"
@@ -789,20 +719,17 @@ def test_describe_expiry_reads_like_a_sentence() -> None:
 
 
 def test_the_issued_link_expiry_is_readable_as_a_datetime(links: LinkService) -> None:
+    """`expires_at_datetime` returns a timezone-aware moment about an hour out for a reset link."""
     issued = links.issue(USER_ID, "reset_password")
     moment = issued.expires_at_datetime()
     assert moment.tzinfo is not None
     assert timedelta(minutes=59) < moment - datetime.now(UTC) <= timedelta(hours=1)
 
 
-# ---------------------------------------------------------------------------
-# Verification flow
-# ---------------------------------------------------------------------------
-
-
 def test_registering_sends_a_verification_link(
     flows: IdentityFlows, sender: RecordingEmailSender
 ) -> None:
+    """Registering mails a verification link at the frontend verify path."""
     flows.register(email=EMAIL, password=PASSWORD)
 
     message = sender.last_for(EMAIL)
@@ -817,11 +744,7 @@ def test_registering_still_creates_the_account_when_the_send_fails(
     stores: IdentityStores,
     attempts: InMemoryLoginAttemptStore,
 ) -> None:
-    """Best effort on the register path, and deliberately so.
-
-    Failing the registration would leave a real account behind a 500 and a user who cannot
-    register again, because the address is now taken. The resend route is the remedy.
-    """
+    """A failing sender does not fail the registration: the account is still created."""
     settings = make_settings()
     failing = RecordingEmailSender(fail=True)
     flows = IdentityFlows(
@@ -842,7 +765,7 @@ def test_registering_still_creates_the_account_when_the_send_fails(
 def test_registering_a_taken_address_mails_the_existing_address_a_notice(
     flows: IdentityFlows, hooks: FakeHooks, stores: IdentityStores, sender: RecordingEmailSender
 ) -> None:
-    """Section 5.4: 200 for the form, and the owner of the address finds out."""
+    """Registering a taken address returns None and mails the owner a registration notice."""
     seed_account(hooks, stores)
     sender.clear()
 
@@ -856,11 +779,7 @@ def test_registering_a_taken_address_mails_the_existing_address_a_notice(
 def test_the_registration_notice_carries_no_live_token(
     flows: IdentityFlows, hooks: FakeHooks, stores: IdentityStores, sender: RecordingEmailSender
 ) -> None:
-    """A notice is sent to an address somebody else just typed into a form.
-
-    Putting a live reset link in it would mean anyone who can guess an address can cause a
-    working credential to be mailed, which is the reset flow without the rate limit on it.
-    """
+    """The registration notice carries the bare reset page, no token, and writes nothing to the token store."""
     seed_account(hooks, stores)
     sender.clear()
     flows.register(email=EMAIL, password="a completely different password")
@@ -869,17 +788,16 @@ def test_the_registration_notice_carries_no_live_token(
     assert message is not None
     assert "token=" not in message.text
     assert f"{FRONTEND}{RESET_LINK_PATH}" in message.text
-    # And nothing was written to the token store.
     assert stores.require_identity_tokens().get(hash_token(EMAIL)) is None
 
 
 def test_requesting_verification_sends_a_link(
     flows: IdentityFlows, hooks: FakeHooks, stores: IdentityStores, sender: RecordingEmailSender
 ) -> None:
+    """`request_verification` mails a verification link and returns nothing."""
     seed_account(hooks, stores)
     sender.clear()
 
-    # No return value at all, by signature: a router cannot branch on the outcome.
     flows.request_verification(EMAIL)
 
     message = sender.last_for(EMAIL)
@@ -890,6 +808,7 @@ def test_requesting_verification_sends_a_link(
 def test_requesting_verification_for_an_unknown_address_returns_none_and_sends_nothing(
     flows: IdentityFlows, sender: RecordingEmailSender
 ) -> None:
+    """An unknown address sends no mail."""
     flows.request_verification(OTHER_EMAIL)
     assert sender.sent == []
 
@@ -897,8 +816,7 @@ def test_requesting_verification_for_an_unknown_address_returns_none_and_sends_n
 def test_requesting_verification_for_an_already_verified_address_sends_nothing(
     flows: IdentityFlows, hooks: FakeHooks, stores: IdentityStores, sender: RecordingEmailSender
 ) -> None:
-    """A verification link is a credential, and one for an account that no longer needs it
-    widens the window in which a mailbox compromise is an account compromise for no gain."""
+    """An already verified address sends no mail."""
     seed_account(hooks, stores, email_verified=True)
     sender.clear()
 
@@ -909,6 +827,7 @@ def test_requesting_verification_for_an_already_verified_address_sends_nothing(
 def test_requesting_verification_for_a_blank_address_does_nothing(
     flows: IdentityFlows, sender: RecordingEmailSender
 ) -> None:
+    """A blank address sends no mail."""
     flows.request_verification("   ")
     assert sender.sent == []
 
@@ -916,6 +835,7 @@ def test_requesting_verification_for_a_blank_address_does_nothing(
 def test_confirming_verification_marks_the_address_verified(
     flows: IdentityFlows, hooks: FakeHooks, stores: IdentityStores, sender: RecordingEmailSender
 ) -> None:
+    """Confirming a verification link returns the user id and calls `mark_email_verified`."""
     seed_account(hooks, stores)
     sender.clear()
     flows.request_verification(EMAIL)
@@ -929,8 +849,7 @@ def test_confirming_verification_marks_the_address_verified(
 def test_the_hook_is_called_after_the_link_is_consumed(
     flows: IdentityFlows, hooks: FakeHooks, stores: IdentityStores, sender: RecordingEmailSender
 ) -> None:
-    """A hook that raises leaves the link spent, which is the documented price of ordering it
-    this way. The alternative lets a link be spent twice by racing a slow hook."""
+    """A raising verification hook still leaves the link spent, proving the consume happens first."""
     seed_account(hooks, stores)
     sender.clear()
     flows.request_verification(EMAIL)
@@ -948,6 +867,7 @@ def test_the_hook_is_called_after_the_link_is_consumed(
 def test_a_verification_link_cannot_be_confirmed_twice(
     flows: IdentityFlows, hooks: FakeHooks, stores: IdentityStores, sender: RecordingEmailSender
 ) -> None:
+    """A second confirmation of the same verification link raises `ConfirmationFailed`."""
     seed_account(hooks, stores)
     sender.clear()
     flows.request_verification(EMAIL)
@@ -964,15 +884,13 @@ def test_a_verified_address_can_then_sign_in_under_a_product_that_requires_it(
     attempts: InMemoryLoginAttemptStore,
     sender: RecordingEmailSender,
 ) -> None:
-    """The end to end property the whole milestone exists for.
-
-    A product that requires verification refuses the login until the link is clicked, and
-    admits it afterwards. Asserted with a hooks class that actually reads `email_verified`,
-    because that is the seam `mark_email_verified` writes through.
-    """
+    """A product requiring verification refuses login until the link is confirmed, then admits it."""
 
     class StrictHooks(FakeHooks):
+        """Hooks that refuse authentication until `email_verified` is set."""
+
         def may_authenticate(self, user: Mapping[str, Any]) -> None:
+            """Refuse the login unless the user's address is verified."""
             self.calls.append("may_authenticate")
             if not user.get("email_verified"):
                 raise AuthenticationRefused(
@@ -1003,14 +921,10 @@ def test_a_verified_address_can_then_sign_in_under_a_product_that_requires_it(
     assert result.access_token
 
 
-# ---------------------------------------------------------------------------
-# Password reset
-# ---------------------------------------------------------------------------
-
-
 def test_requesting_a_reset_sends_a_link(
     flows: IdentityFlows, hooks: FakeHooks, stores: IdentityStores, sender: RecordingEmailSender
 ) -> None:
+    """`request_password_reset` mails a reset link quoting the one hour expiry."""
     seed_account(hooks, stores)
     sender.clear()
 
@@ -1025,6 +939,7 @@ def test_requesting_a_reset_sends_a_link(
 def test_requesting_a_reset_for_an_unknown_address_returns_none_and_sends_nothing(
     flows: IdentityFlows, sender: RecordingEmailSender
 ) -> None:
+    """An unknown address sends no reset mail."""
     flows.request_password_reset(OTHER_EMAIL)
     assert sender.sent == []
 
@@ -1032,8 +947,7 @@ def test_requesting_a_reset_for_an_unknown_address_returns_none_and_sends_nothin
 def test_an_unverified_account_can_still_reset(
     flows: IdentityFlows, hooks: FakeHooks, stores: IdentityStores, sender: RecordingEmailSender
 ) -> None:
-    """Holding the reset back until verification would need the verification link the user
-    also cannot get, which is a lockout with no way out of it."""
+    """An unverified account still gets a reset link, so verification is not a lockout."""
     seed_account(hooks, stores, email_verified=False)
     sender.clear()
 
@@ -1044,11 +958,7 @@ def test_an_unverified_account_can_still_reset(
 def test_confirming_a_reset_writes_the_new_password_and_revokes_everything(
     flows: IdentityFlows, hooks: FakeHooks, stores: IdentityStores, sender: RecordingEmailSender
 ) -> None:
-    """Section 2.6: a reset revokes every refresh family, with nothing kept.
-
-    Nothing kept, unlike `change_password`, because the person resetting may not be signed in
-    at all and no session is known to be the owner's rather than the attacker's.
-    """
+    """A confirmed reset replaces the password and revokes every refresh family, keeping none."""
     seed_account(hooks, stores)
     first = flows.login(email=EMAIL, password=PASSWORD)
     second = flows.login(email=EMAIL, password=PASSWORD)
@@ -1061,11 +971,9 @@ def test_confirming_a_reset_writes_the_new_password_and_revokes_everything(
     )
 
     assert user_id == USER_ID
-    # The old password is gone and the new one works.
     with pytest.raises(LoginRejected):
         flows.login(email=EMAIL, password=PASSWORD)
     assert flows.login(email=EMAIL, password=NEW_PASSWORD).access_token
-    # Both pre-reset sessions are dead.
     for issued in (first, second):
         with pytest.raises(LoginRejected):
             flows.refresh(issued.refresh_token)
@@ -1074,11 +982,7 @@ def test_confirming_a_reset_writes_the_new_password_and_revokes_everything(
 def test_a_reset_marks_the_address_verified(
     flows: IdentityFlows, hooks: FakeHooks, stores: IdentityStores, sender: RecordingEmailSender
 ) -> None:
-    """A reset proves control of the mailbox, which is what a verification link proves.
-
-    Without this a user who never confirmed their address resets the password they were told
-    to reset and is then refused by `may_authenticate` anyway.
-    """
+    """A completed reset also marks the address verified, since it proves mailbox control."""
     seed_account(hooks, stores)
     login = flows.login(email=EMAIL, password=PASSWORD)
     sender.clear()
@@ -1094,11 +998,7 @@ def test_a_reset_marks_the_address_verified(
 def test_a_reset_succeeds_even_when_marking_verified_raises(
     flows: IdentityFlows, hooks: FakeHooks, stores: IdentityStores, sender: RecordingEmailSender
 ) -> None:
-    """The password is already written and every family is already revoked by then.
-
-    Failing here would tell the user their reset did not work when it did, and send them
-    back to a reset flow whose old password no longer exists.
-    """
+    """A raising `mark_email_verified` does not fail the reset: the new password works."""
     seed_account(hooks, stores)
     login = flows.login(email=EMAIL, password=PASSWORD)
     sender.clear()
@@ -1116,6 +1016,7 @@ def test_a_reset_succeeds_even_when_marking_verified_raises(
 def test_a_reset_sends_the_password_changed_notice(
     flows: IdentityFlows, hooks: FakeHooks, stores: IdentityStores, sender: RecordingEmailSender
 ) -> None:
+    """A completed reset mails a password changed notice carrying no token."""
     seed_account(hooks, stores)
     sender.clear()
     flows.request_password_reset(EMAIL)
@@ -1130,8 +1031,7 @@ def test_a_reset_sends_the_password_changed_notice(
 def test_changing_a_password_also_sends_the_notice(
     flows: IdentityFlows, hooks: FakeHooks, stores: IdentityStores, sender: RecordingEmailSender
 ) -> None:
-    """The one signal a user has that a takeover happened. An attacker who changes a password
-    locks the owner out silently otherwise."""
+    """`change_password` mails the same password changed notice."""
     seed_account(hooks, stores)
     login = flows.login(email=EMAIL, password=PASSWORD)
     sender.clear()
@@ -1151,12 +1051,7 @@ def test_changing_a_password_also_sends_the_notice(
 def test_the_link_is_spent_even_when_the_new_password_is_refused(
     flows: IdentityFlows, hooks: FakeHooks, stores: IdentityStores, sender: RecordingEmailSender
 ) -> None:
-    """Consume before the policy check, deliberately.
-
-    Checking first would let a caller with a valid link probe the policy without spending it,
-    and would let a user who fails the policy twice still hold a live link. The price is that
-    a rejected password costs a new link, which is the cheaper of the two.
-    """
+    """A password refused by policy still spends the link, and the old password keeps working."""
     from webbpulse.identity import PasswordRejected
 
     seed_account(hooks, stores)
@@ -1169,13 +1064,13 @@ def test_the_link_is_spent_even_when_the_new_password_is_refused(
 
     with pytest.raises(ConfirmationFailed):
         flows.confirm_password_reset(token=token, new_password=NEW_PASSWORD, family_ids=[])
-    # And the original password still works, so nothing half-happened.
     assert flows.login(email=EMAIL, password=PASSWORD).access_token
 
 
 def test_a_reset_link_cannot_be_used_for_verification(
     flows: IdentityFlows, hooks: FakeHooks, stores: IdentityStores, sender: RecordingEmailSender
 ) -> None:
+    """A reset link refused by the verification flow is left unspent and still resets."""
     seed_account(hooks, stores)
     sender.clear()
     flows.request_password_reset(EMAIL)
@@ -1183,13 +1078,7 @@ def test_a_reset_link_cannot_be_used_for_verification(
 
     with pytest.raises(ConfirmationFailed):
         flows.confirm_verification(token)
-    # Unspent, so the reset the user actually asked for still works.
     flows.confirm_password_reset(token=token, new_password=NEW_PASSWORD, family_ids=[])
-
-
-# ---------------------------------------------------------------------------
-# Configuration: the flows without an email sender
-# ---------------------------------------------------------------------------
 
 
 @pytest.fixture
@@ -1199,6 +1088,7 @@ def mailless_flows(
     stores: IdentityStores,
     attempts: InMemoryLoginAttemptStore,
 ) -> IdentityFlows:
+    """Identity flows built with no email sender attached."""
     settings = make_settings()
     return IdentityFlows(settings, hooks, stores, TokenService(settings, kms), attempts=attempts)
 
@@ -1206,6 +1096,7 @@ def mailless_flows(
 def test_email_enabled_needs_both_a_sender_and_a_token_store(
     kms: FakeKms, hooks: FakeHooks, attempts: InMemoryLoginAttemptStore
 ) -> None:
+    """`email_enabled` is true only when both an email sender and an identity token store are wired."""
     settings = make_settings()
     tokens = TokenService(settings, kms)
 
@@ -1230,7 +1121,7 @@ def test_email_enabled_needs_both_a_sender_and_a_token_store(
 def test_registering_without_email_configured_still_works(
     mailless_flows: IdentityFlows, hooks: FakeHooks
 ) -> None:
-    """The one tolerance. Every route that promises an email checks first."""
+    """Registration succeeds with no email configured; only the email routes check first."""
     assert mailless_flows.register(email=EMAIL, password=PASSWORD) is not None
     assert hooks.by_email[EMAIL]
 
@@ -1238,11 +1129,7 @@ def test_registering_without_email_configured_still_works(
 def test_the_email_flows_refuse_with_503_when_no_sender_is_configured(
     mailless_flows: IdentityFlows, hooks: FakeHooks, stores: IdentityStores
 ) -> None:
-    """A misconfiguration, not a client error, so a 5xx rather than a 4xx.
-
-    A caller cannot fix it by changing the request, and answering 200 would promise an email
-    that is never going to arrive.
-    """
+    """All four email flows raise a 503 `EMAIL_NOT_CONFIGURED` when no sender is wired."""
     seed_account(hooks, stores)
 
     for call in (
@@ -1257,11 +1144,6 @@ def test_the_email_flows_refuse_with_503_when_no_sender_is_configured(
         assert caught.value.error_code == "EMAIL_NOT_CONFIGURED"
 
 
-# ---------------------------------------------------------------------------
-# The routes
-# ---------------------------------------------------------------------------
-
-
 @pytest.fixture
 def client(
     kms: FakeKms,
@@ -1270,6 +1152,7 @@ def client(
     attempts: InMemoryLoginAttemptStore,
     sender: RecordingEmailSender,
 ) -> Iterator[TestClient]:
+    """A `TestClient` over an app mounting the identity router with the limiter off."""
     from webbpulse.http import register_error_handlers
 
     settings = make_settings()
@@ -1283,8 +1166,6 @@ def client(
             kms_client=kms,
             attempts=attempts,
             email_sender=sender,
-            # The limiter needs DynamoDB, and these tests are about the routes. The limits
-            # themselves are asserted separately against the constants.
             limiter_enabled=False,
         )
     )
@@ -1293,15 +1174,12 @@ def client(
 
 
 def prefix() -> str:
+    """The identity router path prefix for the suite's settings."""
     return identity_prefix(make_settings())
 
 
 def router_paths(**kwargs: Any) -> set[str]:
-    """The paths one built router declares.
-
-    Read off the router rather than off an app, the way the M2 suite does: an app's
-    `routes` list holds the include wrapper rather than the routes themselves.
-    """
+    """The paths one built router declares, read off the router rather than off an app."""
     router = build_identity_router(make_settings(), limiter_enabled=False, **kwargs)
     return {route.path for route in router.routes}  # type: ignore[attr-defined]
 
@@ -1309,6 +1187,7 @@ def router_paths(**kwargs: Any) -> set[str]:
 def test_the_four_routes_are_mounted_when_a_sender_and_a_token_store_are_supplied(
     kms: FakeKms, hooks: FakeHooks, stores: IdentityStores, sender: RecordingEmailSender
 ) -> None:
+    """All four email routes are declared when a sender and a token store are supplied."""
     mounted = router_paths(hooks=hooks, stores=stores, kms_client=kms, email_sender=sender)
     for suffix in (
         VERIFY_REQUEST_PATH,
@@ -1322,19 +1201,18 @@ def test_the_four_routes_are_mounted_when_a_sender_and_a_token_store_are_supplie
 def test_the_four_routes_are_absent_without_a_sender(
     kms: FakeKms, hooks: FakeHooks, stores: IdentityStores
 ) -> None:
-    """A route that cannot work should not exist, rather than answering 503 to its first
-    request. Same rule the M2 flow routes follow."""
+    """Without a sender the four email routes are absent, while the M2 login route remains."""
     mounted = router_paths(hooks=hooks, stores=stores, kms_client=kms)
 
     assert f"{prefix()}{VERIFY_REQUEST_PATH}" not in mounted
     assert f"{prefix()}{RESET_CONFIRM_PATH}" not in mounted
-    # The M2 routes are still there, because their collaborators are.
     assert f"{prefix()}/login" in mounted
 
 
 def test_the_four_routes_are_absent_without_a_token_store(
     kms: FakeKms, hooks: FakeHooks, sender: RecordingEmailSender
 ) -> None:
+    """Without an identity token store the email routes are absent, while login remains."""
     stores = IdentityStores(
         credentials=InMemoryCredentialStore(), refresh_tokens=InMemoryRefreshTokenStore()
     )
@@ -1347,11 +1225,7 @@ def test_the_four_routes_are_absent_without_a_token_store(
 def test_the_reset_request_route_answers_identically_for_a_known_and_unknown_address(
     client: TestClient, hooks: FakeHooks, stores: IdentityStores
 ) -> None:
-    """Section 5.4, tested as an equality rather than against a literal.
-
-    Comparing the two responses to each other catches the case a literal check misses: one
-    of them gaining a header, a different status, or an extra field.
-    """
+    """The reset request route returns byte-identical responses for a known and an unknown address."""
     seed_account(hooks, stores)
 
     known = client.post(f"{prefix()}{RESET_REQUEST_PATH}", json={"email": EMAIL})
@@ -1382,6 +1256,7 @@ def test_the_verification_request_route_answers_identically_in_all_three_cases(
 def test_the_verification_confirm_route_returns_the_user_id(
     client: TestClient, hooks: FakeHooks, stores: IdentityStores, sender: RecordingEmailSender
 ) -> None:
+    """The verification confirm route returns the user id and marks the address verified."""
     seed_account(hooks, stores)
     sender.clear()
     client.post(f"{prefix()}{VERIFY_REQUEST_PATH}", json={"email": EMAIL})
@@ -1394,6 +1269,7 @@ def test_the_verification_confirm_route_returns_the_user_id(
 
 
 def test_a_bad_token_is_a_400_in_the_shared_error_envelope(client: TestClient) -> None:
+    """A bad token is a 400 carrying `INVALID_LINK` in the shared error envelope."""
     response = client.post(f"{prefix()}{VERIFY_CONFIRM_PATH}", json={"token": new_token()})
 
     assert response.status_code == 400
@@ -1428,8 +1304,7 @@ def test_every_kind_of_bad_token_produces_the_same_body(
 def test_the_reset_confirm_route_clears_the_refresh_cookie(
     client: TestClient, hooks: FakeHooks, stores: IdentityStores, sender: RecordingEmailSender
 ) -> None:
-    """Every family is revoked, including whichever one this browser held. Leaving the cookie
-    would send a dead token on every request until it expired."""
+    """The reset confirm route clears the refresh cookie and the new password then logs in."""
     seed_account(hooks, stores)
     login = client.post(f"{prefix()}/login", json={"email": EMAIL, "password": PASSWORD})
     assert login.status_code == 200
@@ -1448,7 +1323,6 @@ def test_the_reset_confirm_route_clears_the_refresh_cookie(
     assert response.status_code == 200
     assert response.json() == {"reset": True}
     assert "wp_refresh=" in response.headers.get("set-cookie", "")
-    # And the new password is what works now.
     assert (
         client.post(
             f"{prefix()}/login", json={"email": EMAIL, "password": NEW_PASSWORD}
@@ -1460,6 +1334,7 @@ def test_the_reset_confirm_route_clears_the_refresh_cookie(
 def test_a_reset_with_a_refused_password_is_a_422(
     client: TestClient, hooks: FakeHooks, stores: IdentityStores, sender: RecordingEmailSender
 ) -> None:
+    """A reset whose new password fails policy is a 422 carrying an error code."""
     seed_account(hooks, stores)
     sender.clear()
     client.post(f"{prefix()}{RESET_REQUEST_PATH}", json={"email": EMAIL})
@@ -1474,19 +1349,13 @@ def test_a_reset_with_a_refused_password_is_a_422(
 
 
 def test_a_request_with_no_email_field_is_still_a_200(client: TestClient) -> None:
-    """A missing field must not be a different answer from a wrong one, or the 422 boundary
-    becomes the oracle the 200 was there to avoid."""
+    """A request body with no email field still answers 200, so validation is not an oracle."""
     response = client.post(f"{prefix()}{RESET_REQUEST_PATH}", json={})
     assert response.status_code == 200
 
 
 def test_the_rate_limits_match_section_5_1() -> None:
-    """The table in the standard and the constants, diffed against each other.
-
-    The per-IP verification ceiling is an addition rather than a transcription: section 5.1
-    gives reset an IP limit and verification only a per-address one, and an unlimited resend
-    route is a free mail relay pointed at addresses an attacker supplies.
-    """
+    """The reset and verification rate limit constants match the values the standard fixes."""
     from webbpulse.identity import (
         RESET_EMAIL_LIMIT,
         RESET_IP_LIMIT,

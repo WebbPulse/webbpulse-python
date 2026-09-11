@@ -33,6 +33,7 @@ class ServiceSettings(BaseServiceSettings):
 
 
 def test_defaults_are_safe_for_local_use() -> None:
+    """Unconfigured settings default to the local, non-production values."""
     settings = ServiceSettings()
     assert settings.environment == "local"
     assert settings.log_level == "INFO"
@@ -42,6 +43,7 @@ def test_defaults_are_safe_for_local_use() -> None:
 
 
 def test_environment_is_read_from_the_environment(monkeypatch: MonkeyPatch) -> None:
+    """ENVIRONMENT=production sets `environment` and flips `is_production`."""
     monkeypatch.setenv("ENVIRONMENT", "production")
     settings = ServiceSettings()
     assert settings.environment == "production"
@@ -55,6 +57,7 @@ def test_staging_is_not_production(monkeypatch: MonkeyPatch) -> None:
 
 
 def test_an_unknown_environment_is_rejected(monkeypatch: MonkeyPatch) -> None:
+    """An environment name outside the allowed set raises."""
     monkeypatch.setenv("ENVIRONMENT", "prod")
     with pytest.raises(ValueError, match="environment"):
         ServiceSettings()
@@ -62,6 +65,7 @@ def test_an_unknown_environment_is_rejected(monkeypatch: MonkeyPatch) -> None:
 
 @pytest.mark.parametrize("given,expected", [("debug", "DEBUG"), ("Warning", "WARNING")])
 def test_log_level_is_normalised(monkeypatch: MonkeyPatch, given: str, expected: str) -> None:
+    """A log level of any case is upper cased."""
     monkeypatch.setenv("LOG_LEVEL", given)
     assert ServiceSettings().log_level == expected
 
@@ -80,16 +84,19 @@ def test_cors_origins_accept_a_comma_separated_string(monkeypatch: MonkeyPatch) 
 
 
 def test_cors_origins_accept_a_json_list(monkeypatch: MonkeyPatch) -> None:
+    """A JSON list in CORS_ALLOW_ORIGINS parses into a list of origins."""
     monkeypatch.setenv("CORS_ALLOW_ORIGINS", '["https://a.example"]')
     assert ServiceSettings().cors_allow_origins == ["https://a.example"]
 
 
 def test_cors_origins_empty_string_is_no_origins(monkeypatch: MonkeyPatch) -> None:
+    """A blank CORS_ALLOW_ORIGINS means no allowed origins, not one empty origin."""
     monkeypatch.setenv("CORS_ALLOW_ORIGINS", "  ")
     assert ServiceSettings().cors_allow_origins == []
 
 
 def test_load_json_secret_returns_the_parsed_object() -> None:
+    """`load_json_secret` returns the secret string parsed as a JSON object."""
     with mock_aws():
         client = boto3.client("secretsmanager", region_name="us-west-2")
         arn = client.create_secret(
@@ -113,6 +120,7 @@ def test_load_json_secret_is_cached_per_arn() -> None:
 
 
 def test_a_non_json_secret_raises() -> None:
+    """A secret whose string is not JSON raises `SecretNotJsonObjectError`."""
     with mock_aws():
         client = boto3.client("secretsmanager", region_name="us-west-2")
         arn = client.create_secret(Name="plain/app", SecretString="not json")["ARN"]
@@ -136,6 +144,7 @@ def test_load_secrets_is_empty_without_an_arn(monkeypatch: MonkeyPatch) -> None:
 
 
 def test_load_secrets_reads_the_configured_arn(monkeypatch: MonkeyPatch) -> None:
+    """`load_secrets` reads the secret named by APP_SECRETS_ARN."""
     with mock_aws():
         client = boto3.client("secretsmanager", region_name="us-west-2")
         arn = client.create_secret(Name="wired/app", SecretString='{"K": "V"}')["ARN"]
@@ -145,13 +154,11 @@ def test_load_secrets_reads_the_configured_arn(monkeypatch: MonkeyPatch) -> None
 
 
 def test_importing_the_module_calls_no_aws(monkeypatch: MonkeyPatch) -> None:
-    """The whole point of the lazy client: importing must never make a network call.
-
-    Constructing settings is also import-time work in a service, so it too must stay free.
-    """
+    """Importing the module and constructing settings must make no boto3 client."""
     import boto3 as boto3_module
 
     def explode(*args: Any, **kwargs: Any) -> Any:
+        """Fail if boto3 builds a client during import or construction."""
         raise AssertionError("boto3.client must not be called during import or construction.")
 
     monkeypatch.setattr(boto3_module, "client", explode)

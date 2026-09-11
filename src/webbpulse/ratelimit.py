@@ -1,49 +1,8 @@
 """Per-identity fixed-window rate limiting on one DynamoDB table.
 
-One table per environment, `<prefix>-rate-limits`, partition key `pk` (string), holding a
-counter and a TTL. One `UpdateItem` per request, no read before the write.
-
-## The algorithm
-
-A fixed window, not a sliding log. The window a request falls into is computed from the
-clock (`floor(now / window) * window`), so the item key carries the window start and a new
-window is a new item rather than a mutation of the old one. Counting is a single
-`ADD count :one` with a conditional `SET` of the TTL, which is atomic on DynamoDB's side, so
-two concurrent requests in different execution environments cannot both read 9 and write 10.
-
-The honest trade of a fixed window is the boundary: a caller can send `limit` requests in
-the last instant of one window and `limit` more in the first instant of the next, so the
-worst case over a sliding window of the same length is twice the limit. A sliding log fixes
-that and costs a read plus an unbounded item. For protecting a login route or an expensive
-endpoint from abuse, the fixed window's guarantee is the right one, and it is one write per
-request instead of a read plus a write.
-
-## Fail open, deliberately
-
-Every boto3 error is caught, logged at WARNING with `rate_limit_failed_open=True`, and the
-request is allowed. A rate limiter is a protective control, not an authorisation control:
-if DynamoDB is unavailable, refusing every request converts a dependency blip into a full
-outage of the service, which is a strictly worse failure than briefly not enforcing a limit.
-Anything that must deny on failure is authorisation and does not belong here.
-
-The WARNING is the compensating control. Alarm on it: a limiter that has been failing open
-for a week is invisible otherwise, and that is the state in which it is not protecting
-anything at all.
-
-## The table
-
-Terraform creates it as part of the `dynamodb-tables` module::
-
-    rate-limits = {
-      hash_key       = "pk"
-      attributes     = [{ name = "pk", type = "S" }]
-      ttl_attribute  = "expires_at"
-      billing_mode   = "PAY_PER_REQUEST"
-    }
-
-TTL is what keeps the table from growing without bound. DynamoDB deletes expired items on
-its own schedule, typically within a couple of days, so the code never relies on an expired
-item being gone: an item whose window has passed is simply a different key.
+One `UpdateItem` per request against `<prefix>-rate-limits`, with the window start in the
+key and a TTL to reclaim it. Every boto3 error fails open and logs at WARNING with
+`rate_limit_failed_open=True`, which is the signal to alarm on.
 """
 
 from __future__ import annotations
@@ -57,7 +16,7 @@ from typing import TYPE_CHECKING, Any, Final, TypeAlias
 
 from webbpulse.dynamodb import Repository
 
-if TYPE_CHECKING:  # pragma: no cover - typing only
+if TYPE_CHECKING:  # pragma: no cover
     from fastapi import Request
 
 __all__ = [
@@ -72,14 +31,10 @@ __all__ = [
 
 _log = logging.getLogger(__name__)
 
-#: Logical table name. `webbpulse.dynamodb.table_name` prefixes it per environment.
 RATE_LIMIT_TABLE: Final = "rate-limits"
 
-#: TTL attribute on the table. Epoch seconds, as DynamoDB requires.
 TTL_ATTRIBUTE: Final = "expires_at"
 
-#: How long past the window end an item is kept before TTL may reclaim it. A small buffer
-#: keeps an item alive through clock skew between the writer and DynamoDB's reaper.
 _TTL_GRACE_SECONDS: Final = 60
 
 
@@ -98,6 +53,7 @@ class RateLimitDecision:
         window_seconds: int,
         failed_open: bool = False,
     ) -> None:
+        """Record one limiter outcome and the quota state that produced it."""
         self.allowed = allowed
         self.limit = limit
         self.remaining = remaining
@@ -106,6 +62,7 @@ class RateLimitDecision:
         self.failed_open = failed_open
 
     def __repr__(self) -> str:
+        """Summarise the decision and its quota counters."""
         return (
             f"RateLimitDecision(allowed={self.allowed}, limit={self.limit}, "
             f"remaining={self.remaining}, reset_after={self.reset_after}, "
@@ -116,28 +73,10 @@ class RateLimitDecision:
 def rate_limit_headers(
     decision: RateLimitDecision, *, policy_name: str = "default"
 ) -> dict[str, str]:
-    """Response headers describing the limit.
+    """Response headers describing the limit, in both header styles.
 
-    Two styles are emitted, on purpose.
-
-    The IETF draft `draft-ietf-httpapi-ratelimit-headers` **replaced** the older
-    `RateLimit-Limit` / `RateLimit-Remaining` / `RateLimit-Reset` triple. The current
-    revision, draft-11 of 23 May 2026, defines only two structured fields (RFC 9651), each
-    a list of items naming a policy. The triple was dropped in draft-08, which refactored
-    both fields into lists of items carrying parameters::
-
-        RateLimit: "default";r=50;t=30
-        RateLimit-Policy: "default";q=100;w=60
-
-    `r` is the remaining quota, `t` the seconds until the window resets, `q` the quota and
-    `w` the window length. The draft also defines an optional `qu` quota unit and a `pk`
-    partition key, neither of which this limiter needs. Emitting the abandoned triple as
-    the standards-track answer would be implementing something the draft no longer
-    contains, so this returns the current fields. The `X-RateLimit-*` set is emitted
-    alongside because that is what most existing clients and libraries actually parse; the
-    draft mentions it only as a survey of existing practice and it has never been
-    standardised, but it is the pragmatic compatibility surface and it costs three
-    headers.
+    The structured `RateLimit` and `RateLimit-Policy` fields are the current IETF draft's,
+    and the `X-RateLimit-*` trio is emitted alongside for the clients that parse it.
     """
     remaining = max(decision.remaining, 0)
     return {
@@ -149,28 +88,18 @@ def rate_limit_headers(
     }
 
 
-# Bound to `fastapi.Request` by `_bind_fastapi_request` on first use of `rate_limit`.
-# `fastapi` is an optional extra, so it cannot be imported at module scope: importing
-# `webbpulse.ratelimit` must keep working for a service that installed only the
-# `dynamodb` extra and uses `RateLimiter` directly. The placeholder is never used as an
-# annotation before it is replaced, because only `rate_limit` refers to it and that
-# function binds it first.
-#
-# Under TYPE_CHECKING this is the real `fastapi.Request`, so a type checker sees a type
-# rather than a module-level variable. Annotating it `Any` at runtime instead made
-# Pyright report "Variable not allowed in type expression" in every consuming service,
-# since the annotation below resolves to a value, not a type.
 if TYPE_CHECKING:
-    # Deliberately `TypeAlias` and not PEP 695 `type`: a `type` statement creates a lazy
-    # `TypeAliasType`, which FastAPI cannot resolve when it evaluates the annotation
-    # below to discover the request parameter.
     _FastAPIRequest: TypeAlias = Request  # noqa: UP040
 else:
     _FastAPIRequest = None
 
 
 def _bind_fastapi_request() -> None:
-    """Put `fastapi.Request` in this module's globals for FastAPI's annotation lookup."""
+    """Put `fastapi.Request` in this module's globals for FastAPI's annotation lookup.
+
+    `fastapi` is an optional extra, so the name starts as `None` and is bound on first use
+    of `rate_limit` rather than imported at module scope.
+    """
     global _FastAPIRequest
     if _FastAPIRequest is None:
         from fastapi import Request as ImportedRequest
@@ -191,12 +120,15 @@ class RateLimiter(Repository):
     logical_name = RATE_LIMIT_TABLE
 
     def __init__(self, *, namespace: str = "default", **kwargs: Any) -> None:
-        """`namespace` separates limits that share the table, so a login limit and a search
-        limit on the same IP are independent counters."""
+        """Build a limiter whose `namespace` separates limits sharing the table.
+
+        A login limit and a search limit on the same IP are independent counters.
+        """
         super().__init__(**kwargs)
         self.namespace = namespace
 
     def _key(self, identity: str, window_start: int) -> str:
+        """The partition key for one identity in one window of this namespace."""
         return f"{self.namespace}#{identity}#{window_start}"
 
     def check(
@@ -209,9 +141,8 @@ class RateLimiter(Repository):
     ) -> RateLimitDecision:
         """Count this request against `identity` and decide whether to allow it.
 
-        One `UpdateItem`. The counter is incremented before the decision is made, so a
-        rejected request still counts: that is what stops a caller from holding the counter
-        at exactly the limit by continuing to send requests that are refused.
+        One `UpdateItem`, counted before the decision, so a rejected request still counts.
+        Any boto3 failure fails open with `failed_open` set on the decision.
         """
         current = time.time() if now is None else now
         window_start = int(math.floor(current / window_seconds) * window_seconds)
@@ -221,19 +152,12 @@ class RateLimiter(Repository):
         try:
             attributes = self.update(
                 {"pk": self._key(identity, window_start)},
-                # ADD creates the attribute at zero and increments it when it is absent,
-                # which is what makes the first request of a window a single write with no
-                # read and no conditional retry.
                 update_expression="ADD #c :one SET #ttl = if_not_exists(#ttl, :ttl)",
                 expression_names={"#c": "count", "#ttl": TTL_ATTRIBUTE},
                 expression_values={":one": 1, ":ttl": window_end + _TTL_GRACE_SECONDS},
                 return_values="UPDATED_NEW",
             )
-        except Exception as exc:  # Fail open on anything boto3 raises. See below.
-            # Deliberately broad. botocore raises ClientError, EndpointConnectionError,
-            # NoCredentialsError, ReadTimeoutError and more from different base classes, and
-            # the correct response to every one of them is the same: allow the request and
-            # make the failure visible.
+        except Exception as exc:
             _log.warning(
                 "Rate limit check failed; allowing the request.",
                 extra={
@@ -270,49 +194,28 @@ def rate_limit(
     namespace: str = "default",
     limiter: RateLimiter | None = None,
 ) -> Callable[..., Awaitable[RateLimitDecision]]:
-    """Build a FastAPI dependency that enforces one limit.
+    """Build a FastAPI dependency that enforces one limit, per route.
 
-    Used per route, which is the point: a login route and a read route want very different
-    ceilings, and a global middleware cannot express that without a table of path patterns::
-
-        @router.post(
-            "/login",
-            dependencies=[Depends(rate_limit(limit=10, window_seconds=900, namespace="login"))],
-        )
-        async def login(...): ...
-
-    On rejection it raises `HTTPException(429)` carrying `Retry-After` and the RateLimit
-    headers. On success the headers are attached to the response through `request.state`, so
-    a caller can see its remaining quota before it runs out; wire that with
-    `RateLimitHeaderMiddleware` or read `request.state.rate_limit_headers` in the route.
-
-    The limiter is constructed once when the dependency is built, not per request, so the
-    cached DynamoDB table resource is reused.
+    Rejection raises `HTTPException(429)` with `Retry-After` and the RateLimit headers,
+    which a success instead leaves on `request.state.rate_limit_headers`. The limiter is
+    built once, when the dependency is, so the cached table resource is reused.
     """
     from fastapi import HTTPException
     from starlette.concurrency import run_in_threadpool
 
     resolved = limiter if limiter is not None else RateLimiter(namespace=namespace)
 
-    # The annotation below must be resolvable in this module's globals. `from __future__
-    # import annotations` makes every annotation a string, and FastAPI resolves a
-    # dependency's annotations against the defining module's namespace. A `Request`
-    # imported inside this function is not in that namespace, so FastAPI could not tell
-    # the parameter was the request object and treated it as a required query parameter,
-    # which made every guarded route answer 422 instead of running. `_FastAPIRequest` is
-    # bound at module level for exactly that lookup.
     _bind_fastapi_request()
 
     async def dependency(request: _FastAPIRequest) -> RateLimitDecision:
+        """Count the request in a threadpool, publish the headers, and refuse over the limit.
+
+        The parameter is annotated with the module-level `_FastAPIRequest` because FastAPI
+        resolves a dependency's annotations against the defining module's globals.
+        """
         produced = key_fn(request)
         identity = await produced if isinstance(produced, Awaitable) else produced
 
-        # `check` is synchronous boto3, which blocks on socket I/O. This dependency is
-        # `async def`, so calling it directly would block the event loop for the whole
-        # round trip and stall every other request the worker is serving. Starlette's
-        # threadpool is what a `def` dependency would have been given anyway; the
-        # annotation above has to stay resolvable in module globals, which is why this
-        # is an `async def` offloading rather than a plain `def`.
         decision = await run_in_threadpool(
             partial(resolved.check, identity, limit=limit, window_seconds=window_seconds)
         )

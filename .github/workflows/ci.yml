@@ -1,12 +1,3 @@
-# Lint, type check and test the shared package on every change.
-#
-# The reusable workflow defaults are written for the backend services, which keep their
-# project under `backend/` and install from a requirements file. This repository is a
-# package at the root installed from pyproject.toml, so those inputs are overridden here.
-#
-# No CodeArtifact login is passed. This package's own dependencies all come from PyPI, and
-# supplying `codeartifact-domain` would make the workflow require an OIDC role for no
-# benefit. A service that consumes this package does pass those inputs.
 name: CI
 
 on:
@@ -24,20 +15,14 @@ concurrency:
 
 jobs:
   ci:
+    name: Lint and test the shared package
     uses: WebbPulse/.github/.github/workflows/python-ci.yml@v2
-    # A called workflow cannot hold more permission than its caller grants, and the
-    # shared workflow requests id-token: write for its optional CodeArtifact login.
-    # Without this grant the run fails at startup before any job is created.
     permissions:
       contents: read
       id-token: write
     with:
       python-version: "3.13"
-      # The package lives at the repository root, not under backend/.
       working-directory: "."
-      # Install the package itself with every extra plus the dev tooling, so ruff, mypy
-      # and pytest are present and the optional imports the modules guard are exercised
-      # rather than skipped.
       install-command: >-
         python -m pip install --upgrade pip &&
         pip install -e ".[aws-otel,dynamodb,fastapi,identity,oauth,otel,passkeys,security,testing]" mypy ruff pytest-cov
@@ -45,11 +30,8 @@ jobs:
       ruff-target: "src tests"
       coverage-source: "webbpulse"
 
-  # The reusable workflow runs ruff and pytest but has no type checking step, and this
-  # package ships `py.typed` so its annotations are part of its contract with every
-  # consumer. Running mypy here rather than adding it to the shared workflow keeps that
-  # workflow usable by services that are not yet strict-clean.
   types:
+    name: Type check the shared package
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -74,16 +56,6 @@ jobs:
       - name: Mypy
         run: mypy
 
-  # The one stable name for `main-protection` to require, so auto-merge means merge on
-  # green rather than merge on mergeable.
-  #
-  # It has to be a job in this workflow rather than the reusable workflow's own gate: a
-  # job inside a called workflow reports as `<caller-job> / <job>`, which here would be
-  # `ci / all-checks-passed`, and that is not a bare name a ruleset can require.
-  #
-  # `skipped` counts as success, `failure` and `cancelled` do not. Cancellation matters
-  # because a cancelled job has proven nothing, and treating it as success would let a run
-  # cancelled mid-flight satisfy the ruleset.
   all-checks-passed:
     name: all-checks-passed
     runs-on: ubuntu-latest

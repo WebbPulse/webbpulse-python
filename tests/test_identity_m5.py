@@ -1,32 +1,4 @@
-"""Tests for the M5 identity work: passkeys, WebAuthn ceremonies, and the two new tables.
-
-The strategy is M4's, adapted to a protocol whose failure modes are almost all invisible
-from the happy path:
-
-- **The ceremonies run against real cryptography, not a stub.** `SoftAuthenticator` below is
-  a working ES256 WebAuthn authenticator: it builds real CBOR attestation objects, real
-  authenticator data with real flag bytes, and real ECDSA signatures over the concatenation
-  the specification defines. py_webauthn verifies them the way it would verify Chrome's. A
-  test that fed the verifier a fake it had itself produced would pass against an
-  implementation that verified nothing, which is exactly the bug that matters here.
-- **Every control is tested by violating it.** The challenge is replayed, the origin is
-  changed, the RP ID is changed, the signature counter is rewound, the purposes are crossed,
-  and one user's challenge is answered with another user's token. Each of those has a test
-  that asserts the refusal, because each of them is a way in if the check is missing and
-  none of them shows up in a passing happy path.
-- **The two `amr` shapes are asserted separately.** A user-verified passkey must produce
-  `mfa` and must skip the TOTP challenge; one without user verification must not, and must
-  be challenged exactly as a password is. Those are the two halves of the M5 decision on
-  multi-factor, and a test for one is no evidence for the other.
-- **The table contract is asserted as data.** The Terraform platform module creates
-  `passkeys` and `webauthn-challenges` with specific keys and a specific TTL attribute. The
-  names and key shapes are constants in this package, so the test pins them here: a rename
-  on either side is then a failing test rather than a deployment that writes to a table that
-  does not exist.
-
-The KMS fake and the `FakeHooks` product are M4's, redefined here rather than imported:
-`tests/` is not a package.
-"""
+"""Tests for passkeys, WebAuthn ceremonies, and the passkeys and webauthn-challenges tables."""
 
 from __future__ import annotations
 
@@ -111,35 +83,17 @@ PASSWORD = "correct horse battery staple"
 EMAIL = "person@example.com"
 USER_ID = "user-0001"
 
-#: The flag bits of the authenticator data byte, per WebAuthn section 6.1. Named because a
-#: test that asserts on a raw `0x45` is a test nobody can check against the specification.
 FLAG_USER_PRESENT = 0x01
 FLAG_USER_VERIFIED = 0x04
 FLAG_BACKUP_ELIGIBLE = 0x08
 FLAG_BACKUP_STATE = 0x10
 FLAG_ATTESTED_DATA = 0x40
 
-#: 16 zero bytes: the AAGUID a platform authenticator reports when it declines to identify
-#: its model, which is what Apple and Google both do for privacy.
 AAGUID_UNKNOWN = bytes(16)
 
 
-# ---------------------------------------------------------------------------
-# A working software authenticator
-# ---------------------------------------------------------------------------
-
-
 class SoftAuthenticator:
-    """An ES256 WebAuthn authenticator in about eighty lines.
-
-    Produces credentials py_webauthn accepts, which is the point: the verifier under test is
-    the real one, exercised against real signatures over the real byte layout, so a test
-    passing here is evidence the production path works against a browser.
-
-    `user_verified` and `backed_up` are constructor flags rather than fixed, because the two
-    `amr` shapes and the backup-state field are exactly what M5 has to get right and the flag
-    byte is where the browser expresses them.
-    """
+    """An ES256 WebAuthn authenticator in about eighty lines."""
 
     def __init__(
         self,
@@ -149,6 +103,7 @@ class SoftAuthenticator:
         user_verified: bool = True,
         backed_up: bool = True,
     ) -> None:
+        """Build an authenticator with a fresh P-256 key and a random credential id."""
         self.rp_id = rp_id
         self.origin = origin
         self.user_verified = user_verified
@@ -159,9 +114,11 @@ class SoftAuthenticator:
 
     @property
     def credential_id_b64(self) -> str:
+        """The credential id in the base64url form the wire uses."""
         return b64url_encode(self.credential_id)
 
     def _flags(self, *, attested: bool) -> int:
+        """The authenticator data flag byte for this authenticator's configuration."""
         flags = FLAG_USER_PRESENT
         if self.user_verified:
             flags |= FLAG_USER_VERIFIED
@@ -176,15 +133,16 @@ class SoftAuthenticator:
         numbers = self.key.public_key().public_numbers()
         return cbor2.dumps(
             {
-                1: 2,  # kty: EC2
-                3: -7,  # alg: ES256
-                -1: 1,  # crv: P-256
+                1: 2,
+                3: -7,
+                -1: 1,
                 -2: numbers.x.to_bytes(32, "big"),
                 -3: numbers.y.to_bytes(32, "big"),
             }
         )
 
     def _client_data(self, *, ceremony: str, challenge: str, origin: str = "") -> bytes:
+        """The clientDataJSON bytes for a ceremony, challenge and origin."""
         return json.dumps(
             {
                 "type": ceremony,
@@ -195,11 +153,7 @@ class SoftAuthenticator:
         ).encode("utf-8")
 
     def register(self, challenge: str, *, rp_id: str = "", origin: str = "") -> dict[str, Any]:
-        """An attestation for `challenge`, as `navigator.credentials.create` would return it.
-
-        `rp_id` and `origin` override the authenticator's own so a test can produce a
-        credential minted for the wrong relying party, which is the phishing case.
-        """
+        """An attestation for `challenge`, as `navigator.credentials.create` would return it."""
         rp_hash = hashlib.sha256((rp_id or self.rp_id).encode("utf-8")).digest()
         self.sign_count += 1
         cose = self._cose_key()
@@ -236,11 +190,7 @@ class SoftAuthenticator:
         origin: str = "",
         sign_count: int | None = None,
     ) -> dict[str, Any]:
-        """An assertion for `challenge`, as `navigator.credentials.get` would return it.
-
-        `sign_count` is overridable so a test can present a counter that did not advance,
-        which is the cloned-authenticator case section 6.1.3 exists for.
-        """
+        """An assertion for `challenge`, as `navigator.credentials.get` would return it."""
         rp_hash = hashlib.sha256((rp_id or self.rp_id).encode("utf-8")).digest()
         if sign_count is None:
             self.sign_count += 1
@@ -264,25 +214,16 @@ class SoftAuthenticator:
         }
 
 
-# ---------------------------------------------------------------------------
-# Fixtures: M4's, with the two M5 stores added
-# ---------------------------------------------------------------------------
-
-
 class FakeKms:
-    """M4's KMS fake, unchanged: local RSA signing plus a stand-in for the two envelope calls.
-
-    One object, because `IdentityFlows` hands the same `kms_client` to the token service and
-    the MFA service. The envelope half wraps a data key by base64-ing it with its encryption
-    context appended, which is not encryption and is not pretending to be; what it does
-    faithfully is fail a `decrypt` under the wrong context.
-    """
+    """A KMS fake: local RSA signing plus a stand-in for the two envelope calls."""
 
     def __init__(self, keys: dict[str, rsa.RSAPrivateKey]) -> None:
+        """Hold the RSA keys this fake signs with and a log of data key calls."""
         self._keys = keys
         self.data_key_calls: list[dict[str, Any]] = []
 
     def get_public_key(self, *, KeyId: str) -> dict[str, Any]:
+        """Return the DER public key for a key id, as KMS does."""
         der = (
             self._keys[KeyId]
             .public_key()
@@ -307,6 +248,7 @@ class FakeKms:
         MessageType: str,
         SigningAlgorithm: str,
     ) -> dict[str, Any]:
+        """Sign a prehashed message with the local private key for a key id."""
         signature = self._keys[KeyId].sign(
             Message, padding.PKCS1v15(), utils.Prehashed(hashes.SHA256())
         )
@@ -319,6 +261,7 @@ class FakeKms:
         NumberOfBytes: int,
         EncryptionContext: Mapping[str, str],
     ) -> dict[str, Any]:
+        """Return a random data key plus a blob binding it to its encryption context."""
         self.data_key_calls.append(
             {
                 "KeyId": KeyId,
@@ -338,6 +281,7 @@ class FakeKms:
         CiphertextBlob: bytes,
         EncryptionContext: Mapping[str, str],
     ) -> dict[str, Any]:
+        """Unwrap a data key blob, failing when the encryption context does not match."""
         try:
             encoded, context = CiphertextBlob.split(b"|", 1)
         except ValueError as exc:
@@ -348,21 +292,24 @@ class FakeKms:
 
 
 def _context_bytes(context: Mapping[str, str]) -> bytes:
+    """A stable byte encoding of an encryption context, for blob comparison."""
     return repr(sorted(context.items())).encode("utf-8")
 
 
 @pytest.fixture(autouse=True)
 def cheap_bcrypt(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
-    """Pin bcrypt to its minimum cost for the whole module. M2's fixture, unchanged."""
+    """Pin bcrypt to its minimum cost for the whole module."""
     import webbpulse.security as security
 
     real_hash = security.hash_password
     real_needs = security.needs_rehash
 
     def cheap(password: str, *, rounds: int = 4) -> str:
+        """Hash a password at the minimum bcrypt cost."""
         return real_hash(password, rounds=rounds)
 
     def needs(hashed: str, *, rounds: int = 4) -> bool:
+        """Report whether a hash needs rehashing at the minimum bcrypt cost."""
         return real_needs(hashed, rounds=rounds)
 
     monkeypatch.setattr(security, "hash_password", cheap)
@@ -375,15 +322,18 @@ def cheap_bcrypt(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
 
 @pytest.fixture(scope="module")
 def module_key() -> rsa.RSAPrivateKey:
+    """One 2048-bit RSA key for the module's own token signing."""
     return rsa.generate_private_key(public_exponent=65537, key_size=2048)
 
 
 @pytest.fixture
 def kms(module_key: rsa.RSAPrivateKey) -> FakeKms:
+    """A KMS fake holding the module signing key."""
     return FakeKms({KEY_A: module_key})
 
 
 def make_settings(**overrides: Any) -> IdentitySettings:
+    """Identity settings for this module, with per-test overrides applied."""
     base: dict[str, Any] = {
         "environment": "test",
         "issuer": ISSUER,
@@ -403,9 +353,10 @@ def make_settings(**overrides: Any) -> IdentitySettings:
 
 
 class FakeHooks(BaseIdentityHooks):
-    """A product's policy, in memory. M4's fake, unchanged."""
+    """A product's identity policy, in memory."""
 
     def __init__(self, *, refuse: str = "") -> None:
+        """Start with no users and no recorded hook calls."""
         self.users: dict[str, dict[str, Any]] = {}
         self.by_email: dict[str, str] = {}
         self.refuse = refuse
@@ -413,6 +364,7 @@ class FakeHooks(BaseIdentityHooks):
         self._next = 1
 
     def add(self, email: str, *, user_id: str = "", **attributes: Any) -> dict[str, Any]:
+        """Add a user, allocating an id when the caller gives none."""
         identifier = user_id or f"user-{self._next:04d}"
         self._next += 1
         user = {"id": identifier, "email": email, **attributes}
@@ -421,37 +373,42 @@ class FakeHooks(BaseIdentityHooks):
         return user
 
     def load_user_by_id(self, user_id: str) -> Mapping[str, Any] | None:
+        """Return the user with this id, or None."""
         self.calls.append("load_user_by_id")
         return self.users.get(user_id)
 
     def load_user_by_email(self, email: str) -> Mapping[str, Any] | None:
+        """Return the user with this email, matched case insensitively, or None."""
         self.calls.append("load_user_by_email")
         identifier = self.by_email.get(email.lower())
         return self.users.get(identifier) if identifier else None
 
     def may_authenticate(self, user: Mapping[str, Any]) -> None:
+        """Refuse authentication when this fake is configured to refuse."""
         self.calls.append("may_authenticate")
         if self.refuse:
             raise AuthenticationRefused(self.refuse, error_code="ACCOUNT_DISABLED")
 
     def claims_for(self, user: Mapping[str, Any]) -> Mapping[str, Any]:
+        """Return hook claims that try to forge `amr` and `auth_time`."""
         self.calls.append("claims_for")
-        # Deliberately tries to set both, as M4's fake does. `_mint_access` must overwrite
-        # them, or a hook could claim a passkey the user never presented.
         return {"amr": ["forged"], "auth_time": 1}
 
     def create_user(self, *, email: str, attributes: Mapping[str, Any]) -> Mapping[str, Any]:
+        """Create and store a user from the registration attributes."""
         self.calls.append("create_user")
         return self.add(email, **dict(attributes))
 
 
 @pytest.fixture
 def hooks() -> FakeHooks:
+    """A fresh in-memory hooks product."""
     return FakeHooks()
 
 
 @pytest.fixture
 def stores() -> IdentityStores:
+    """In-memory stores, including both passkey tables."""
     return IdentityStores(
         credentials=InMemoryCredentialStore(),
         refresh_tokens=InMemoryRefreshTokenStore(),
@@ -465,6 +422,7 @@ def stores() -> IdentityStores:
 
 @pytest.fixture
 def attempts() -> InMemoryLoginAttemptStore:
+    """An in-memory login attempt store."""
     return InMemoryLoginAttemptStore()
 
 
@@ -475,6 +433,7 @@ def flows(
     kms: FakeKms,
     attempts: InMemoryLoginAttemptStore,
 ) -> IdentityFlows:
+    """Identity flows wired to the in-memory stores, hooks and KMS fake."""
     settings = make_settings()
     return IdentityFlows(
         settings,
@@ -488,6 +447,7 @@ def flows(
 
 @pytest.fixture
 def passkeys(flows: IdentityFlows) -> PasskeyService:
+    """The passkey service the flows mounted."""
     service = flows.passkeys
     assert service is not None, "the fixtures wire both M5 stores, so passkeys must mount"
     return service
@@ -500,6 +460,7 @@ def client(
     kms: FakeKms,
     attempts: InMemoryLoginAttemptStore,
 ) -> Iterator[TestClient]:
+    """A `TestClient` over an app with the full identity router mounted."""
     from webbpulse.http import register_error_handlers
 
     settings = make_settings()
@@ -520,6 +481,7 @@ def client(
 
 
 def prefix() -> str:
+    """The identity router's path prefix for this module's settings."""
     return identity_prefix(make_settings())
 
 
@@ -532,11 +494,7 @@ def seed_account(
     user_id: str = USER_ID,
     **attributes: Any,
 ) -> dict[str, Any]:
-    """An account, with a stored bcrypt password unless `password` is `None`.
-
-    `password=None` is the passkey-only user, which is the case the last-credential guard
-    exists for and which cannot be produced any other way.
-    """
+    """An account, with a stored bcrypt password unless `password` is `None`."""
     from webbpulse.security import hash_password
 
     user = hooks.add(email, user_id=user_id, **attributes)
@@ -558,11 +516,7 @@ def enrol_passkey(
     user_verified: bool = True,
     name: str = "Test key",
 ) -> tuple[SoftAuthenticator, PasskeyRecord]:
-    """Run a full registration ceremony, returning the authenticator and the stored row.
-
-    Goes through the service rather than writing a row directly, so anything that depends on
-    an enrolled passkey is also exercising the enrolment path it depends on.
-    """
+    """Run a full registration ceremony, returning the authenticator and the stored row."""
     authenticator = SoftAuthenticator(user_verified=user_verified)
     challenge = service.begin_registration(user_id, user_name=EMAIL)
     credential = authenticator.register(_challenge_of(challenge.options))
@@ -587,46 +541,26 @@ def sign_in(service: PasskeyService, authenticator: SoftAuthenticator) -> Any:
     return service.finish_login(challenge_id=challenge.challenge_id, credential=credential)
 
 
-# ---------------------------------------------------------------------------
-# The table contract the Terraform platform module has to satisfy
-# ---------------------------------------------------------------------------
-
-
 class TestTableContract:
-    """The names and key shapes the `dynamodb-identity` platform module creates.
-
-    These are asserted as plain constants because that is the whole contract: Terraform
-    creates a table with a name and a key schema, and this package writes to a table with a
-    name and a key schema, and nothing checks that the two agree until a write fails in
-    production. Pinning them here turns a rename on either side into a failing test.
-    """
+    """The names and key shapes the `dynamodb-identity` platform module creates."""
 
     def test_passkeys_table_name_and_index(self) -> None:
+        """The passkeys table name and its credential id index are the names Terraform creates."""
         assert PASSKEYS_TABLE == "passkeys"
         assert PASSKEY_CREDENTIAL_INDEX == "credential_id-index"
 
     def test_webauthn_challenges_table_name(self) -> None:
+        """The challenge table name is the name Terraform creates."""
         assert WEBAUTHN_CHALLENGES_TABLE == "webauthn-challenges"
 
     def test_passkey_key_schema(self) -> None:
-        """Hash `user_id`, range `credential_id`. Both are fields on the record.
-
-        The direction matters: listing a user's passkeys must be a `query` on the base table
-        rather than on an index, because the management page reads its own writes and a GSI
-        cannot be read consistently.
-        """
+        """Hash `user_id`, range `credential_id`. Both are fields on the record."""
         record = PasskeyRecord(user_id=USER_ID, credential_id="cred", public_key="key")
         assert record.user_id == USER_ID
         assert record.credential_id == "cred"
 
     def test_webauthn_challenge_key_schema_and_ttl_attribute(self) -> None:
-        """Hash `challenge_id`, TTL attribute `expires_at`.
-
-        `expires_at` must be the name Terraform gives DynamoDB as the TTL attribute. If the
-        module were pointed at a different attribute the rows would simply never be reclaimed
-        and the table would grow without bound, which no functional test would notice because
-        expiry is enforced in code regardless.
-        """
+        """Hash `challenge_id`, TTL attribute `expires_at`."""
         record = WebAuthnChallengeRecord(
             challenge_id="chal",
             challenge="Y2hhbA",
@@ -638,16 +572,15 @@ class TestTableContract:
         assert record.expires_at == 1234567890
 
     def test_challenge_ttl_is_five_minutes(self) -> None:
+        """A WebAuthn challenge lives for 300 seconds."""
         assert CHALLENGE_TTL_SECONDS == 300
 
 
-# ---------------------------------------------------------------------------
-# Base64url, which every credential id passes through
-# ---------------------------------------------------------------------------
-
-
 class TestBase64Url:
+    """The base64url helpers every credential id passes through."""
+
     def test_round_trips_without_padding(self) -> None:
+        """Encoding produces no padding and decoding recovers the original bytes."""
         for length in range(1, 40):
             raw = os.urandom(length)
             encoded = b64url_encode(raw)
@@ -662,17 +595,16 @@ class TestBase64Url:
         assert b64url_decode(padded) == raw
 
     def test_rejects_garbage(self) -> None:
+        """Input that is not base64url raises a `ValueError` naming base64url."""
         with pytest.raises(ValueError, match="base64url"):
             b64url_decode("not valid base64!!!")
 
 
-# ---------------------------------------------------------------------------
-# Registration
-# ---------------------------------------------------------------------------
-
-
 class TestRegistration:
+    """The WebAuthn registration ceremony and the controls it enforces."""
+
     def test_round_trip_stores_the_credential(self, passkeys: PasskeyService) -> None:
+        """A completed registration stores the credential id, name, key, verification and transports."""
         authenticator, record = enrol_passkey(passkeys, name="Yubikey")
         assert record.credential_id == authenticator.credential_id_b64
         assert record.name == "Yubikey"
@@ -682,16 +614,13 @@ class TestRegistration:
         assert record.transports == ("internal", "hybrid")
 
     def test_sign_count_is_stored_as_reported_not_zero(self, passkeys: PasskeyService) -> None:
-        """The counter migrates as the authenticator reported it.
-
-        Storing zero would permanently disarm the clone check for this credential: every
-        subsequent assertion exceeds zero and so looks correct forever.
-        """
+        """The counter migrates as the authenticator reported it."""
         authenticator, record = enrol_passkey(passkeys)
         assert authenticator.sign_count > 0
         assert record.sign_count == authenticator.sign_count
 
     def test_backup_state_is_recorded(self, passkeys: PasskeyService) -> None:
+        """The authenticator's backup state is stored on the record."""
         _, record = enrol_passkey(passkeys)
         assert record.backup_state is True
 
@@ -732,11 +661,7 @@ class TestRegistration:
             )
 
     def test_another_users_challenge_is_refused(self, passkeys: PasskeyService) -> None:
-        """A challenge minted for one account cannot be answered as another.
-
-        Without this check, holding an access token for account B while starting an
-        enrolment on account A would land the passkey wherever the token pointed.
-        """
+        """A challenge minted for one account cannot be answered as another."""
         authenticator = SoftAuthenticator()
         challenge = passkeys.begin_registration(USER_ID, user_name=EMAIL)
         credential = authenticator.register(_challenge_of(challenge.options))
@@ -768,6 +693,7 @@ class TestRegistration:
             )
 
     def test_wrong_rp_id_is_refused(self, passkeys: PasskeyService) -> None:
+        """An attestation minted for another RP ID is refused."""
         authenticator = SoftAuthenticator()
         challenge = passkeys.begin_registration(USER_ID, user_name=EMAIL)
         credential = authenticator.register(
@@ -779,11 +705,7 @@ class TestRegistration:
             )
 
     def test_duplicate_credential_is_refused(self, passkeys: PasskeyService) -> None:
-        """Registering the same credential twice is a 409, to either account.
-
-        The message does not say whose it is: telling a caller their authenticator is
-        already enrolled elsewhere is an account oracle that needs only a security key.
-        """
+        """Registering the same credential twice is a 409, to either account."""
         authenticator, _ = enrol_passkey(passkeys)
         challenge = passkeys.begin_registration("user-0002", user_name="other@example.com")
         credential = authenticator.register(_challenge_of(challenge.options))
@@ -796,6 +718,7 @@ class TestRegistration:
         assert USER_ID not in caught.value.message
 
     def test_missing_rp_id_names_the_setting(self) -> None:
+        """Reading `rp_id` with none configured raises a `ValueError` naming IDENTITY_RP_ID."""
         settings = make_settings(rp_id="")
         service = PasskeyService(
             settings,
@@ -810,6 +733,7 @@ class TestRegistration:
             _ = service.rp_id
 
     def test_missing_origins_names_the_setting(self) -> None:
+        """Reading `origins` with none configured raises a `ValueError` naming IDENTITY_WEBAUTHN_ORIGINS."""
         settings = make_settings(webauthn_origins=[])
         service = PasskeyService(
             settings,
@@ -824,13 +748,11 @@ class TestRegistration:
             _ = service.origins
 
 
-# ---------------------------------------------------------------------------
-# Login
-# ---------------------------------------------------------------------------
-
-
 class TestLogin:
+    """The WebAuthn login ceremony and the controls it enforces."""
+
     def test_round_trip_identifies_the_user(self, passkeys: PasskeyService) -> None:
+        """A completed assertion resolves to the enrolled user, credential and verification state."""
         authenticator, record = enrol_passkey(passkeys)
         result = sign_in(passkeys, authenticator)
         assert result.user_id == USER_ID
@@ -840,6 +762,7 @@ class TestLogin:
     def test_records_the_new_sign_count(
         self, passkeys: PasskeyService, stores: IdentityStores
     ) -> None:
+        """A successful login advances the stored sign count and stamps `last_used_at`."""
         authenticator, record = enrol_passkey(passkeys)
         before = record.sign_count
         sign_in(passkeys, authenticator)
@@ -877,12 +800,7 @@ class TestLogin:
     def test_zero_counter_authenticator_is_allowed(
         self, passkeys: PasskeyService, stores: IdentityStores
     ) -> None:
-        """An authenticator with no counter sends zero every time, which is not a regression.
-
-        The WebAuthn specification says to skip the check when both the stored and the
-        presented count are zero. Apple's platform authenticator is that case, and refusing
-        it would make passkeys unusable on every iPhone.
-        """
+        """An authenticator with no counter sends zero every time, which is not a regression."""
         authenticator = SoftAuthenticator()
         authenticator.sign_count = 0
         challenge = passkeys.begin_registration(USER_ID, user_name=EMAIL)
@@ -890,8 +808,6 @@ class TestLogin:
         record = passkeys.finish_registration(
             USER_ID, challenge_id=challenge.challenge_id, credential=credential
         )
-        # The registration above incremented the counter, so put the row back to the
-        # counterless state a real zero-counter authenticator would have produced.
         stores.require_passkeys().record_use(
             USER_ID, record.credential_id, sign_count=0, used_at=""
         )
@@ -902,6 +818,7 @@ class TestLogin:
         assert result.user_id == USER_ID
 
     def test_challenge_is_single_use(self, passkeys: PasskeyService) -> None:
+        """Replaying a spent login challenge is refused."""
         authenticator, _ = enrol_passkey(passkeys)
         challenge = passkeys.begin_login()
         credential = authenticator.assertion(_challenge_of(challenge.options))
@@ -910,6 +827,7 @@ class TestLogin:
             passkeys.finish_login(challenge_id=challenge.challenge_id, credential=credential)
 
     def test_unknown_credential_is_refused(self, passkeys: PasskeyService) -> None:
+        """An assertion from a credential that was never enrolled is refused."""
         stranger = SoftAuthenticator()
         challenge = passkeys.begin_login()
         credential = stranger.assertion(_challenge_of(challenge.options))
@@ -917,6 +835,7 @@ class TestLogin:
             passkeys.finish_login(challenge_id=challenge.challenge_id, credential=credential)
 
     def test_wrong_origin_is_refused(self, passkeys: PasskeyService) -> None:
+        """An assertion whose client data names another origin is refused."""
         authenticator, _ = enrol_passkey(passkeys)
         challenge = passkeys.begin_login()
         credential = authenticator.assertion(
@@ -926,6 +845,7 @@ class TestLogin:
             passkeys.finish_login(challenge_id=challenge.challenge_id, credential=credential)
 
     def test_wrong_rp_id_is_refused(self, passkeys: PasskeyService) -> None:
+        """An assertion signed over another RP ID hash is refused."""
         authenticator, _ = enrol_passkey(passkeys)
         challenge = passkeys.begin_login()
         credential = authenticator.assertion(
@@ -935,6 +855,7 @@ class TestLogin:
             passkeys.finish_login(challenge_id=challenge.challenge_id, credential=credential)
 
     def test_registration_challenge_cannot_satisfy_login(self, passkeys: PasskeyService) -> None:
+        """A registration challenge cannot be answered with a login assertion."""
         authenticator, _ = enrol_passkey(passkeys)
         challenge = passkeys.begin_registration(USER_ID, user_name=EMAIL)
         credential = authenticator.assertion(_challenge_of(challenge.options))
@@ -944,25 +865,25 @@ class TestLogin:
     def test_options_for_a_known_user_list_their_credentials(
         self, passkeys: PasskeyService
     ) -> None:
+        """Login options for a named user list that user's enrolled credentials."""
         authenticator, _ = enrol_passkey(passkeys)
         options = passkeys.begin_login(user_id=USER_ID).options
         allowed = {entry["id"] for entry in options["allowCredentials"]}
         assert authenticator.credential_id_b64 in allowed
 
 
-# ---------------------------------------------------------------------------
-# `amr`, and whether a passkey is one factor or two
-# ---------------------------------------------------------------------------
-
-
 class TestAmr:
+    """Whether a passkey counts as one factor or two, expressed in `amr`."""
+
     def test_verified_passkey_is_multi_factor(self, passkeys: PasskeyService) -> None:
+        """A user-verified passkey reports both the passkey and the PIN `amr` values."""
         authenticator, _ = enrol_passkey(passkeys, user_verified=True)
         result = sign_in(passkeys, authenticator)
         assert AMR_PASSKEY in result.amr
         assert AMR_PIN in result.amr
 
     def test_unverified_passkey_is_single_factor(self, passkeys: PasskeyService) -> None:
+        """A passkey without user verification reports the passkey `amr` value alone."""
         authenticator, _ = enrol_passkey(passkeys, user_verified=False)
         result = sign_in(passkeys, authenticator)
         assert result.amr == [AMR_PASSKEY]
@@ -975,11 +896,7 @@ class TestAmr:
         passkeys: PasskeyService,
         kms: FakeKms,
     ) -> None:
-        """The whole login leg: a verified passkey produces `mfa` in the access token.
-
-        And `auth_time` is now rather than the 1 the hook tried to set, which is the check
-        that `_mint_access` still owns both claims on this path too.
-        """
+        """The whole login leg: a verified passkey produces `mfa` in the access token."""
         seed_account(hooks, stores)
         authenticator, _ = enrol_passkey(passkeys, user_verified=True)
         challenge = flows.begin_passkey_login()
@@ -1002,12 +919,7 @@ class TestAmr:
         stores: IdentityStores,
         passkeys: PasskeyService,
     ) -> None:
-        """A user with TOTP enrolled is not asked for a code after a verified passkey.
-
-        Two factors have already been presented in one gesture, so a third would be a policy
-        this package has no business inventing. This is the M5 multi-factor decision, and it
-        is the half a happy-path test would not notice.
-        """
+        """A user with TOTP enrolled is not asked for a code after a verified passkey."""
         seed_account(hooks, stores)
         _enrol_totp(flows)
         authenticator, _ = enrol_passkey(passkeys, user_verified=True)
@@ -1036,6 +948,7 @@ class TestAmr:
 
 
 def _enrol_totp(flows: IdentityFlows, user_id: str = USER_ID) -> str:
+    """Enrol and confirm a TOTP factor, returning the shared secret."""
     service = flows.mfa
     assert service is not None
     enrolment = service.begin_enrolment(user_id, account_name=EMAIL)
@@ -1044,12 +957,9 @@ def _enrol_totp(flows: IdentityFlows, user_id: str = USER_ID) -> str:
     return enrolment.secret
 
 
-# ---------------------------------------------------------------------------
-# The flow layer: hooks, passwordless gating, last-credential guard
-# ---------------------------------------------------------------------------
-
-
 class TestFlowRules:
+    """The flow layer: hooks, passwordless gating and the last-credential guard."""
+
     def test_disabled_account_cannot_sign_in_with_a_passkey(
         self,
         flows: IdentityFlows,
@@ -1072,11 +982,7 @@ class TestFlowRules:
         stores: IdentityStores,
         kms: FakeKms,
     ) -> None:
-        """With `passkeys_passwordless` false there is no way into an account here.
-
-        Enrolment still works: a passkey is then a credential for step-up and a second
-        factor, but not an entry point.
-        """
+        """With `passkeys_passwordless` false there is no way into an account here."""
         from webbpulse.identity.flows import LoginRejected
 
         settings = make_settings(passkeys_passwordless=False)
@@ -1094,12 +1000,13 @@ class TestFlowRules:
         stores: IdentityStores,
         kms: FakeKms,
     ) -> None:
+        """With `passkeys_enabled` false the flows mount no passkey service."""
         settings = make_settings(passkeys_enabled=False)
         flows = IdentityFlows(settings, hooks, stores, TokenService(settings, kms))
         assert flows.passkeys is None
 
     def test_missing_stores_mean_no_service(self, hooks: FakeHooks, kms: FakeKms) -> None:
-        """M3 and M4's gate, applied to M5: no tables, no capability, no routes."""
+        """Without the passkey stores there is no passkey service."""
         settings = make_settings()
         stores = IdentityStores(
             credentials=InMemoryCredentialStore(),
@@ -1109,11 +1016,7 @@ class TestFlowRules:
         assert flows.passkeys is None
 
     def test_unknown_email_still_gets_options(self, flows: IdentityFlows) -> None:
-        """Section 5.4: the options route must not become an account oracle.
-
-        An address with no account gets a challenge and an empty allow list, which is
-        byte-identical to a genuine discoverable-credential request.
-        """
+        """Section 5.4: the options route must not become an account oracle."""
         challenge = flows.begin_passkey_login(email="nobody@example.com")
         assert challenge.challenge_id
         assert not challenge.options.get("allowCredentials")
@@ -1125,6 +1028,7 @@ class TestFlowRules:
         stores: IdentityStores,
         passkeys: PasskeyService,
     ) -> None:
+        """Deleting the only credential on a passkey-only account is a 409 LAST_CREDENTIAL."""
         seed_account(hooks, stores, password=None)
         _, record = enrol_passkey(passkeys)
         with pytest.raises(PasskeyRejected) as caught:
@@ -1139,6 +1043,7 @@ class TestFlowRules:
         stores: IdentityStores,
         passkeys: PasskeyService,
     ) -> None:
+        """The last passkey can be deleted when a password remains on the account."""
         seed_account(hooks, stores)
         _, record = enrol_passkey(passkeys)
         flows.delete_passkey(user_id=USER_ID, credential_id=record.credential_id)
@@ -1166,6 +1071,7 @@ class TestFlowRules:
         stores: IdentityStores,
         passkeys: PasskeyService,
     ) -> None:
+        """Renaming updates the stored name and trims surrounding whitespace."""
         seed_account(hooks, stores)
         _, record = enrol_passkey(passkeys, name="Old")
         updated = flows.rename_passkey(
@@ -1196,6 +1102,7 @@ class TestFlowRules:
         stores: IdentityStores,
         passkeys: PasskeyService,
     ) -> None:
+        """A whitespace-only name is a 422."""
         seed_account(hooks, stores)
         _, record = enrol_passkey(passkeys)
         with pytest.raises(PasskeyRejected) as caught:
@@ -1203,13 +1110,11 @@ class TestFlowRules:
         assert caught.value.status_code == 422
 
 
-# ---------------------------------------------------------------------------
-# The stores
-# ---------------------------------------------------------------------------
-
-
 class TestStores:
+    """The in-memory passkey and challenge stores."""
+
     def test_challenge_consume_is_single_use(self) -> None:
+        """A challenge row can be consumed once and is gone on the second read."""
         store = InMemoryWebAuthnChallengeStore()
         record = WebAuthnChallengeRecord(
             challenge_id="c1",
@@ -1223,11 +1128,7 @@ class TestStores:
         assert store.consume("c1") is None
 
     def test_expired_challenge_is_refused_in_code(self) -> None:
-        """Expiry is enforced here, not by DynamoDB's TTL.
-
-        TTL is storage reclamation and runs on its own schedule, up to 48 hours late. A row
-        past its deadline must be unusable the moment it is past it.
-        """
+        """Expiry is enforced here, not by DynamoDB's TTL."""
         store = InMemoryWebAuthnChallengeStore()
         store.put(
             WebAuthnChallengeRecord(
@@ -1241,6 +1142,7 @@ class TestStores:
         assert store.consume("c1") is None
 
     def test_passkey_store_round_trip(self) -> None:
+        """A stored passkey reads back by key, by credential id and in the user's list."""
         store = InMemoryPasskeyStore()
         record = PasskeyRecord(
             user_id=USER_ID, credential_id="cred-1", public_key="key", sign_count=7
@@ -1251,13 +1153,12 @@ class TestStores:
         assert stored.credential_id == "cred-1"
         assert stored.public_key == "key"
         assert stored.sign_count == 7
-        # The store stamps `created_at` when the caller left it empty, so a row always
-        # carries one whether it came through the service or straight from a product.
         assert stored.created_at
         assert store.find_by_credential_id("cred-1") == stored
         assert store.list_for_user(USER_ID) == [stored]
 
     def test_passkey_store_refuses_a_duplicate(self) -> None:
+        """Putting the same credential id twice raises a `KeyError`."""
         store = InMemoryPasskeyStore()
         record = PasskeyRecord(user_id=USER_ID, credential_id="cred-1", public_key="key")
         store.put(record)
@@ -1265,6 +1166,7 @@ class TestStores:
             store.put(record)
 
     def test_record_use_advances_the_counter(self) -> None:
+        """Recording a use updates the sign count and `last_used_at`."""
         store = InMemoryPasskeyStore()
         store.put(PasskeyRecord(user_id=USER_ID, credential_id="c", public_key="k", sign_count=1))
         store.record_use(USER_ID, "c", sign_count=9, used_at="2026-01-01T00:00:00Z")
@@ -1274,42 +1176,34 @@ class TestStores:
         assert stored.last_used_at == "2026-01-01T00:00:00Z"
 
     def test_delete_and_rename_report_absence(self) -> None:
+        """Deleting or renaming a credential that is not there returns False."""
         store = InMemoryPasskeyStore()
         assert store.delete(USER_ID, "missing") is False
         assert store.rename(USER_ID, "missing", name="x") is False
 
 
 def _far_future() -> int:
+    """A TTL timestamp an hour from now."""
     import time
 
     return int(time.time()) + 3600
 
 
-# ---------------------------------------------------------------------------
-# The routes
-# ---------------------------------------------------------------------------
-
-
 def _router_paths(router: APIRouter) -> set[str]:
-    """Every path the router declares.
-
-    Enumerates the router rather than `app.routes`, which is what M1 to M4 do
-    and what the FastAPI version in CI forces: from FastAPI 0.141 /
-    Starlette 1.6 `include_router` no longer copies the child routes onto the
-    app, it appends a single `_IncludedRouter` wrapper holding them, so an app
-    with a fully mounted identity router shows only `/docs` and `/openapi.json`
-    at the top level. The router itself is flat on every version.
-    """
+    """Every path the router declares."""
     return {route.path for route in router.routes}  # type: ignore[attr-defined]
 
 
 class TestRoutes:
+    """The mounted passkey routes and their behaviour over HTTP."""
+
     def test_routes_are_mounted(
         self,
         hooks: FakeHooks,
         stores: IdentityStores,
         kms: FakeKms,
     ) -> None:
+        """All five passkey paths are on the router when the stores are wired."""
         paths = _router_paths(
             build_identity_router(
                 make_settings(), hooks, stores, kms_client=kms, limiter_enabled=False
@@ -1335,6 +1229,7 @@ class TestRoutes:
         assert f"{prefix()}{LOGIN_PASSKEY_OPTIONS_PATH}" not in paths
 
     def test_login_options_are_anonymous(self, client: TestClient) -> None:
+        """The login options route answers 200 with a challenge id and a challenge, unauthenticated."""
         response = client.post(f"{prefix()}{LOGIN_PASSKEY_OPTIONS_PATH}", json={})
         assert response.status_code == 200
         body = response.json()
@@ -1347,23 +1242,20 @@ class TestRoutes:
         assert response.status_code == 200
 
     def test_register_options_require_a_token(self, client: TestClient) -> None:
+        """Registration options without a token are a 401 NOT_AUTHENTICATED."""
         response = client.post(f"{prefix()}{PASSKEY_REGISTER_OPTIONS_PATH}")
         assert response.status_code == 401
         assert response.json()["error_code"] == "NOT_AUTHENTICATED"
 
     def test_list_requires_a_token(self, client: TestClient) -> None:
+        """Listing passkeys without a token is a 401."""
         response = client.get(f"{prefix()}{PASSKEYS_PATH}")
         assert response.status_code == 401
 
     def test_full_ceremony_over_http(
         self, client: TestClient, hooks: FakeHooks, stores: IdentityStores
     ) -> None:
-        """Register a passkey and sign in with it, entirely through the client.
-
-        The wire shape is asserted along the way, because `publicKey` and `challenge_id` are
-        what a frontend hands to `navigator.credentials`, and a rename there type-checks
-        perfectly and breaks every sign-in.
-        """
+        """Register a passkey and sign in with it, entirely through the client."""
         seed_account(hooks, stores)
         token = _password_login(client)
 
@@ -1388,7 +1280,6 @@ class TestRoutes:
         assert registered.status_code == 201
         summary = registered.json()["passkey"]
         assert summary["name"] == "Laptop"
-        # The public key is never in a response body.
         assert "public_key" not in summary
 
         listed = client.get(
@@ -1409,13 +1300,13 @@ class TestRoutes:
         assert signed_in.status_code == 200
         assert signed_in.json()["token_type"] == "Bearer"
         assert signed_in.json()["access_token"]
-        # The same token pair as a password login: refresh in the cookie, never in the body.
         assert "refresh_token" not in signed_in.json()
         assert signed_in.cookies.get(make_settings().cookie_name)
 
     def test_rename_and_delete_over_http(
         self, client: TestClient, hooks: FakeHooks, stores: IdentityStores
     ) -> None:
+        """A passkey can be renamed and then deleted through the HTTP routes."""
         seed_account(hooks, stores)
         token = _password_login(client)
         credential_id = _enrol_over_http(client, token)
@@ -1437,6 +1328,7 @@ class TestRoutes:
         assert deleted.json() == {"deleted": True}
 
     def test_verify_with_no_credential_is_a_422(self, client: TestClient) -> None:
+        """A verify call with no credential is a 422 CREDENTIAL_REQUIRED."""
         response = client.post(
             f"{prefix()}{LOGIN_PASSKEY_VERIFY_PATH}",
             json={"challenge_id": "whatever"},
@@ -1482,16 +1374,18 @@ class TestRoutes:
         assert response.status_code == 200
         assert response.json()["mfa_required"] is True
         assert response.json()["mfa_ticket"]
-        assert LOGIN_TOTP_PATH  # the leg the frontend posts that ticket to
+        assert LOGIN_TOTP_PATH
 
 
 def _password_login(client: TestClient) -> str:
+    """Sign in with the seeded password and return the access token."""
     response = client.post(f"{prefix()}{LOGIN_PATH}", json={"email": EMAIL, "password": PASSWORD})
     assert response.status_code == 200, response.text
     return str(response.json()["access_token"])
 
 
 def _enrol_over_http(client: TestClient, token: str) -> str:
+    """Run a registration ceremony over HTTP and return the new credential id."""
     options = client.post(
         f"{prefix()}{PASSKEY_REGISTER_OPTIONS_PATH}",
         headers={"Authorization": f"Bearer {token}"},
@@ -1507,33 +1401,16 @@ def _enrol_over_http(client: TestClient, token: str) -> str:
     return str(registered.json()["passkey"]["credential_id"])
 
 
-# ---------------------------------------------------------------------------
-# Availability discovery, 0.17.0
-# ---------------------------------------------------------------------------
-#
-# The route exists so a frontend stops inferring availability by probing
-# `POST /login/passkey/options` on sign-in page load. WebbPulse-Portfolio does that today,
-# and it is wrong twice: the probe spends that route's 30-per-15-minutes IP budget on page
-# loads rather than on sign-ins, and `begin_passkey_login` writes a WebAuthn challenge row
-# per call, so every page load in the estate leaves a row in the challenge table to expire.
-# PR 182 there added a sessionStorage cache as a stopgap and asked for this route. These
-# tests pin the three things a client depends on: the body shape, that `passwordless` cannot
-# contradict `enabled`, and that the answer exists in every deployment.
-
-
 class CountingChallengeStore(InMemoryWebAuthnChallengeStore):
-    """An `InMemoryWebAuthnChallengeStore` that counts writes.
-
-    The availability route's promise is that it writes nothing, and the only way to assert
-    "nothing" is to count. A subclass rather than a reach into the fake's private dict, so
-    the assertion survives a change to how the fake stores its rows.
-    """
+    """An `InMemoryWebAuthnChallengeStore` that counts writes."""
 
     def __init__(self) -> None:
+        """Start with no rows and a zero write count."""
         super().__init__()
         self.puts = 0
 
     def put(self, record: WebAuthnChallengeRecord) -> None:
+        """Store a challenge row and count the write."""
         self.puts += 1
         super().put(record)
 
@@ -1558,16 +1435,20 @@ def _availability_router(
 
 
 def _availability_client(router: Any) -> TestClient:
+    """A `TestClient` over an app with this router mounted."""
     app = FastAPI()
     app.include_router(router)
     return TestClient(app)
 
 
 def _get_availability(client: TestClient) -> Any:
+    """GET the passkey availability route."""
     return client.get(f"{prefix()}{PASSKEY_AVAILABILITY_PATH}")
 
 
 class TestAvailability:
+    """The passkey availability discovery route."""
+
     def test_enabled_and_passwordless_is_the_default_shape(
         self, hooks: FakeHooks, stores: IdentityStores, kms: FakeKms
     ) -> None:
@@ -1580,11 +1461,7 @@ class TestAvailability:
     def test_enabled_but_not_passwordless(
         self, hooks: FakeHooks, stores: IdentityStores, kms: FakeKms
     ) -> None:
-        """A passkey as a managed credential and a second factor, but not an entry point.
-
-        The distinction `begin_passkey_login` already enforces, reported so a settings page
-        can offer enrolment while a sign-in page does not offer the button.
-        """
+        """A passkey as a managed credential and a second factor, but not an entry point."""
         client = _availability_client(
             _availability_router(hooks, stores, kms, passkeys_passwordless=False)
         )
@@ -1593,24 +1470,18 @@ class TestAvailability:
     def test_disabled_reports_passwordless_false_whatever_the_setting_says(
         self, hooks: FakeHooks, stores: IdentityStores, kms: FakeKms
     ) -> None:
-        """`passkeys_passwordless` defaults on, so the pair can disagree unless gated.
-
-        A deployment with `passkeys_enabled=False` keeps the passwordless default of `True`
-        and means nothing by it, because no login route mounted. Reporting that pair would
-        tell a frontend to draw a "Sign in with a passkey" button against routes that do not
-        exist, which is the failure this route was added to prevent rather than cause.
-        """
+        """`passkeys_passwordless` defaults on, so the pair can disagree unless gated."""
         client = _availability_client(
             _availability_router(hooks, stores, kms, passkeys_enabled=False)
         )
         body = _get_availability(client).json()
         assert body == {"enabled": False, "passwordless": False}
-        # The setting itself is untouched: the gate is in the route, not in the settings.
         assert make_settings(passkeys_enabled=False).passkeys_passwordless is True
 
     def test_disabled_with_passwordless_off_too(
         self, hooks: FakeHooks, stores: IdentityStores, kms: FakeKms
     ) -> None:
+        """Both settings off reports both capabilities false."""
         client = _availability_client(
             _availability_router(
                 hooks, stores, kms, passkeys_enabled=False, passkeys_passwordless=False
@@ -1621,12 +1492,7 @@ class TestAvailability:
     def test_the_route_mounts_when_passkeys_are_disabled(
         self, hooks: FakeHooks, stores: IdentityStores, kms: FakeKms
     ) -> None:
-        """The seven flow routes are absent and this one is still present.
-
-        That is the whole point: one authoritative answer in every deployment. A route that
-        were absent here would answer 404, which is indistinguishable from a routing mistake
-        or an older version of this package, and is the ambiguous signal the route replaces.
-        """
+        """The seven flow routes are absent and this one is still present."""
         router = _availability_router(hooks, stores, kms, passkeys_enabled=False)
         paths = _router_paths(router)
         assert f"{prefix()}{LOGIN_PASSKEY_OPTIONS_PATH}" not in paths
@@ -1636,13 +1502,7 @@ class TestAvailability:
     def test_the_route_mounts_when_the_stores_are_missing(
         self, hooks: FakeHooks, kms: FakeKms
     ) -> None:
-        """No passkey table and no challenge table, and the answer is still served.
-
-        It reports what the operator configured rather than what the stores can support, so
-        a capability switched on with no table behind it stays visible as the configuration
-        error it is instead of being hidden by a frontend that quietly stops offering
-        passkeys.
-        """
+        """No passkey table and no challenge table, and the answer is still served."""
         stores = IdentityStores(
             credentials=InMemoryCredentialStore(),
             refresh_tokens=InMemoryRefreshTokenStore(),
@@ -1673,11 +1533,7 @@ class TestAvailability:
     def test_the_route_needs_no_token_and_sets_no_cookie(
         self, hooks: FakeHooks, stores: IdentityStores, kms: FakeKms
     ) -> None:
-        """It is read by the sign-in page, which by definition holds no token.
-
-        The absent `Authorization` header is the assertion: every management route in this
-        module answers 401 to exactly this request, and this one answers 200.
-        """
+        """It is read by the sign-in page, which by definition holds no token."""
         client = _availability_client(_availability_router(hooks, stores, kms))
         response = _get_availability(client)
         assert response.status_code == 200
@@ -1697,13 +1553,7 @@ class TestAvailability:
         kms: FakeKms,
         attempts: InMemoryLoginAttemptStore,
     ) -> None:
-        """The reason the route exists, asserted against the two costs the probe paid.
-
-        Forty calls is past the 30-per-15-minutes budget `PASSKEY_OPTIONS_LIMIT` sets, and
-        every one answers 200 with the limiter left on, so no bucket is consumed. The
-        counting challenge store is the other half: a probe of `login/passkey/options` would
-        have written forty rows into it.
-        """
+        """The reason the route exists, asserted against the two costs the probe paid."""
         challenges = CountingChallengeStore()
         stores = IdentityStores(
             credentials=InMemoryCredentialStore(),
@@ -1731,13 +1581,7 @@ class TestAvailability:
     def test_the_probe_this_replaces_does_write_a_challenge_row(
         self, hooks: FakeHooks, kms: FakeKms, attempts: InMemoryLoginAttemptStore
     ) -> None:
-        """The control for the test above, and the cost the stopgap cache only defers.
-
-        One call to the route a frontend probes today, and the challenge table has a row in
-        it. That is the storage cost paid per sign-in page load, and the reason a
-        sessionStorage cache in one frontend is not a fix: the first load of every session
-        still pays it and every other consumer pays it in full.
-        """
+        """The control for the test above, and the cost the stopgap cache only defers."""
         challenges = CountingChallengeStore()
         stores = IdentityStores(
             credentials=InMemoryCredentialStore(),
@@ -1765,15 +1609,7 @@ class TestAvailability:
     def test_the_route_appears_in_the_openapi_document_under_a_passkeys_tag(
         self, kms: FakeKms
     ) -> None:
-        """It is a documented public API, unlike the `.well-known` documents.
-
-        The assertion that the schema *builds at all* is the load-bearing half. Every other
-        route in this module is annotated `-> JSONResponse`, which under
-        `from __future__ import annotations` is an unresolvable string that FastAPI hands
-        pydantic as a response model, breaking `app.openapi()` for the whole app. This route
-        mounts in every deployment including the documents-only one, whose schema builds
-        today, so it must not be what takes `/docs` away from a product with no passkeys.
-        """
+        """It is a documented public API, unlike the `.well-known` documents."""
         app = FastAPI()
         app.include_router(_availability_router(kms=kms))
 
@@ -1783,23 +1619,13 @@ class TestAvailability:
         assert operation["tags"].count("identity") == 1
 
     def test_the_path_sits_under_the_passkeys_collection(self) -> None:
-        """`/passkeys/availability` rather than `/passkeys-availability`.
-
-        It reads as a property of the passkey surface, and it cannot collide with
-        `PASSKEY_ITEM_PATH`: FastAPI matches the literal segment before the parameterised
-        one, and a credential id is opaque bytes that never spells `availability`.
-        """
+        """`/passkeys/availability` rather than `/passkeys-availability`."""
         assert PASSKEY_AVAILABILITY_PATH.startswith(f"{PASSKEYS_PATH}/")
         assert PASSKEY_AVAILABILITY_PATH.removeprefix(PASSKEYS_PATH) == "/availability"
 
     def test_a_credential_named_availability_does_not_shadow_the_route(
         self, client: TestClient, hooks: FakeHooks, stores: IdentityStores
     ) -> None:
-        """The ordering claim above, exercised rather than asserted about.
-
-        `/passkeys/availability` is declared before `/passkeys/{credential_id}`, so the
-        literal wins. If it did not, this GET would fall into the item route and answer 401
-        to an anonymous caller.
-        """
+        """The ordering claim above, exercised rather than asserted about."""
         seed_account(hooks, stores)
         assert _get_availability(client).json() == {"enabled": True, "passwordless": True}

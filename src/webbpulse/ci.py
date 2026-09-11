@@ -1,42 +1,7 @@
 """Domain discovery for the per-domain pytest matrix.
 
-A service's test suite grows with its domains, and running it as one pytest invocation
-makes CI slower every time a domain is added. The reusable `python-ci.yml` workflow instead
-runs one job per domain, in parallel, so wall clock time tracks the *largest* domain rather
-than the sum of all of them. This module is what tells that workflow which jobs to create.
-
-The convention is declarative and lives in the service's own `pyproject.toml`, so adding a
-domain to CI is adding a line rather than editing a workflow::
-
-    [tool.webbpulse.ci]
-    test-root = "tests"
-
-    [tool.webbpulse.ci.domains]
-    identity = ["tests/auth", "tests/dependencies"]
-    catalog = ["tests/api/endpoints/test_parts.py", "tests/api/endpoints/test_categories.py"]
-
-Each key is a domain name and each value is the list of paths that domain owns, relative to
-the directory holding `pyproject.toml`. A path may be a directory or a single test file,
-because a suite that is not yet split by directory still has to be splittable: requiring the
-files to move first would make adopting this a refactor rather than a configuration change.
-
-Everything under `test-root` that no domain claims belongs to the `shared` job, which this
-module computes as a *deselection* rather than a list. `shared` runs the whole test root
-with `--ignore` for every claimed path, so a new test file is covered by CI the moment it is
-written. The failure mode of forgetting to claim a file is that it runs in `shared`, which
-is slower but never silent, and that is the right direction for the mistake to fall.
-
-Two commands, both of which write to stdout and are meant to be consumed by a workflow:
-
-`python -m webbpulse.ci domains`
-    A JSON array of domain names, for `fromJson` in a matrix `strategy`.
-
-`python -m webbpulse.ci pytest-args --domain <name>`
-    The pytest path arguments for one job. For a domain, its claimed paths. For the reserved
-    name `shared`, the test root followed by `--ignore=` for every claimed path.
-
-Nothing here imports pytest, FastAPI or boto3. The workflow calls it in a bare interpreter
-before dependencies are installed, so the only import is the standard library.
+Reads `[tool.webbpulse.ci]` from a service's `pyproject.toml` and prints either the
+declared domain names or the pytest path arguments for one matrix job.
 """
 
 from __future__ import annotations
@@ -57,12 +22,8 @@ __all__ = [
     "pytest_args_for",
 ]
 
-#: The reserved job name for everything no domain claims. Not usable as a domain name,
-#: because the two would produce the same job and the matrix would collide.
 SHARED_DOMAIN = "shared"
 
-#: Where the convention lives. A nested table rather than a top-level `[webbpulse]` so it
-#: cannot collide with a tool that claims the same name, per PEP 518's `[tool.*]` rule.
 _CONFIG_PATH = ("tool", "webbpulse", "ci")
 
 
@@ -70,9 +31,8 @@ _CONFIG_PATH = ("tool", "webbpulse", "ci")
 class CiConfig:
     """A service's parsed `[tool.webbpulse.ci]` table.
 
-    `domains` maps a domain name to the paths it owns. `test_root` is the directory the
-    `shared` job sweeps. Both are relative to the directory holding `pyproject.toml`, which
-    is the workflow's `working-directory`, so the strings can be passed to pytest unchanged.
+    `domains` maps a domain name to the paths it owns and `test_root` is the directory the
+    `shared` job sweeps, both relative to the directory holding `pyproject.toml`.
     """
 
     test_root: str
@@ -80,12 +40,7 @@ class CiConfig:
 
     @property
     def domain_names(self) -> tuple[str, ...]:
-        """Domain names in sorted order, so the matrix is stable across runs.
-
-        A matrix whose order changed between runs would renumber the jobs in the GitHub UI
-        and make a required status check's name unstable, so this is sorted rather than
-        left in the order the TOML happened to declare.
-        """
+        """Domain names in sorted order, so the matrix is stable across runs."""
         return tuple(sorted(self.domains))
 
     @property
@@ -100,14 +55,8 @@ class CiConfig:
 def load_config(project_dir: Path | str = ".") -> CiConfig:
     """Read `[tool.webbpulse.ci]` from `project_dir/pyproject.toml`.
 
-    A missing file, a missing table or an empty `domains` table all produce a config with no
-    domains rather than an error. That is deliberate: a repository that has not adopted the
-    convention still calls this command through the shared workflow, and it should get an
-    empty matrix and a `shared` job carrying its whole suite, which is exactly the behaviour
-    it had before the split existed.
-
-    Raises `ValueError` only for a table that is present but malformed, because that is a
-    typo in the service's configuration and failing loudly is what surfaces it.
+    A missing file, table or `domains` entry yields a config with no domains; a table that
+    is present but malformed raises `ValueError`.
     """
     root = Path(project_dir)
     pyproject = root / "pyproject.toml"
@@ -155,10 +104,8 @@ def load_config(project_dir: Path | str = ".") -> CiConfig:
 def pytest_args_for(config: CiConfig, domain: str) -> tuple[str, ...]:
     """The pytest path arguments for one matrix job.
 
-    For a domain, the paths it claims. For `shared`, the test root with an `--ignore` for
-    every claimed path, so the two kinds of job together run each test exactly once: a file
-    claimed by a domain is ignored by `shared`, and a file claimed by nobody is swept up by
-    `shared` without anyone having to remember to list it.
+    A domain gets the paths it claims; `shared` gets the test root with an `--ignore` for
+    every claimed path, so the jobs together run each test exactly once.
     """
     if domain == SHARED_DOMAIN:
         return (config.test_root, *(f"--ignore={path}" for path in config.claimed_paths))
@@ -170,12 +117,7 @@ def pytest_args_for(config: CiConfig, domain: str) -> tuple[str, ...]:
 
 
 def _shell_quote(value: str) -> str:
-    """Quote one argument for the `run:` line that consumes this output.
-
-    The workflow interpolates the result into a shell command, and a path containing a space
-    would otherwise split into two arguments and make pytest collect a directory that does
-    not exist. Single quotes because no other character is special inside them.
-    """
+    """Single quote one argument for the `run:` shell line that consumes this output."""
     return "'" + value.replace("'", "'\\''") + "'"
 
 
@@ -238,5 +180,5 @@ def main(argv: Sequence[str] | None = None) -> int:
     return 0
 
 
-if __name__ == "__main__":  # pragma: no cover - exercised as a subprocess
+if __name__ == "__main__":  # pragma: no cover
     raise SystemExit(main())

@@ -1,30 +1,4 @@
-"""Tests for `webbpulse.identity`.
-
-The important test in this file is `test_pyjwt_verifies_a_kms_shaped_token_against_the_jwk`.
-Everything else checks a detail; that one checks the whole claim M0 exists to make.
-
-**What it proves, and why the fake is not cheating.** A locally generated RSA key stands in
-for the KMS key. The fake client returns that key's DER SubjectPublicKeyInfo from
-`get_public_key` and, from `sign`, a real `RSASSA-PKCS1-v1_5` SHA-256 signature over the
-digest it was handed. That is precisely the contract the KMS documentation states for
-`MessageType="DIGEST"` with `SigningAlgorithm="RSASSA_PKCS1_V1_5_SHA_256"`: KMS "skips the
-hashing step in the signing algorithm" and returns a signature whose "encoding ... is
-defined by PKCS #1 in RFC 8017". So the fake differs from KMS in who holds the private key
-and in nothing else that the output depends on.
-
-PyJWT then verifies the resulting token using **only** the JWK this module emitted, through
-`PyJWKClient`'s own JWK-to-key path. Nothing in the verification touches the original key
-object. If `n` or `e` were encoded wrong, if `kid` disagreed between the header and the JWK,
-or if the signing input were assembled differently from what the signature covers, this test
-fails. That is the encoding proof the milestone asks for.
-
-**Why not moto.** The standard's section 9.4 records that moto's fidelity for `kms:Sign`
-with `RSASSA_PKCS1_V1_5_SHA_256` against a real JWT verifier could not be confirmed. A test
-that passes because moto and this module make the same mistake would prove nothing, so the
-signing seam is faked with a real cryptographic primitive instead and the fidelity question
-is settled against real KMS in the staging spike rather than here. `botocore.stub.Stubber`
-covers the request-shape assertions, where the point is the exact parameters sent.
-"""
+"""Tests for `webbpulse.identity`: KMS backed JWT signing, JWKs and discovery."""
 
 from __future__ import annotations
 
@@ -67,6 +41,7 @@ def rsa_key() -> rsa.RSAPrivateKey:
 
 @pytest.fixture(scope="module")
 def der_spki(rsa_key: rsa.RSAPrivateKey) -> bytes:
+    """Return the DER SubjectPublicKeyInfo for the shared test key."""
     return rsa_key.public_key().public_bytes(
         encoding=serialization.Encoding.DER,
         format=serialization.PublicFormat.SubjectPublicKeyInfo,
@@ -76,18 +51,19 @@ def der_spki(rsa_key: rsa.RSAPrivateKey) -> bytes:
 class FakeKms:
     """A KMS client that signs for real, with the private key held locally.
 
-    Faithful to the documented KMS contract in the two ways the output depends on: it
-    signs the digest it is given without re-hashing it (`MessageType="DIGEST"`), and it
-    returns the raw PKCS #1 signature octet string rather than any wrapper.
+    It signs the digest it is given without re-hashing it and returns the raw
+    PKCS #1 signature octet string, matching the documented KMS contract.
     """
 
     def __init__(self, key: rsa.RSAPrivateKey, der: bytes, *, key_spec: str = "RSA_2048"):
+        """Hold the signing key, its DER SPKI and the key spec to report."""
         self._key = key
         self._der = der
         self._key_spec = key_spec
         self.sign_calls: list[dict[str, Any]] = []
 
     def get_public_key(self, *, KeyId: str) -> dict[str, Any]:
+        """Return a `kms:GetPublicKey` shaped response for the local key."""
         return {
             "KeyId": KeyId,
             "PublicKey": self._der,
@@ -99,6 +75,7 @@ class FakeKms:
     def sign(
         self, *, KeyId: str, Message: bytes, MessageType: str, SigningAlgorithm: str
     ) -> dict[str, Any]:
+        """Record the call and return a real PKCS #1 v1.5 signature over the digest."""
         self.sign_calls.append(
             {
                 "KeyId": KeyId,
@@ -109,7 +86,6 @@ class FakeKms:
         )
         assert MessageType == DIGEST_MESSAGE_TYPE
         assert SigningAlgorithm == KMS_SIGNING_ALGORITHM
-        # Prehashed: sign the digest as-is, which is what DIGEST means.
         signature = self._key.sign(
             Message,
             padding.PKCS1v15(),
@@ -120,20 +96,12 @@ class FakeKms:
 
 @pytest.fixture
 def fake_kms(rsa_key: rsa.RSAPrivateKey, der_spki: bytes) -> FakeKms:
+    """Return a fresh locally signing KMS stand-in for one test."""
     return FakeKms(rsa_key, der_spki)
 
 
-# ---------------------------------------------------------------------------
-# The proof: a token of this module's construction verifies against this module's JWK.
-# ---------------------------------------------------------------------------
-
-
 def test_pyjwt_verifies_a_kms_shaped_token_against_the_jwk(fake_kms: FakeKms) -> None:
-    """End to end: sign with the KMS path, verify with PyJWT using only the emitted JWK.
-
-    This is the encoding proof. The verification key is reconstructed from the JWK's `n`
-    and `e` alone, so a wrong integer encoding cannot pass.
-    """
+    """Sign via the KMS path and verify with PyJWT using only the emitted JWK."""
     jwt = pytest.importorskip("jwt")
 
     signer = KmsSigner(fake_kms, KEY_ID)
@@ -147,7 +115,6 @@ def test_pyjwt_verifies_a_kms_shaped_token_against_the_jwk(fake_kms: FakeKms) ->
     )
 
     jwk = public_jwk_from_kms(fake_kms, KEY_ID)
-    # Reconstructed from the JWK, never from the original key object.
     verification_key = jwt.PyJWK.from_dict(jwk).key
 
     claims = jwt.decode(
@@ -205,24 +172,11 @@ def test_a_tampered_payload_fails_verification(fake_kms: FakeKms) -> None:
         )
 
 
-# ---------------------------------------------------------------------------
-# The KMS request shape, asserted against botocore's own model via Stubber.
-# ---------------------------------------------------------------------------
-
-
 def test_sign_sends_a_digest_with_the_pkcs1_algorithm(der_spki: bytes) -> None:
-    """`kms:Sign` is called with the SHA-256 digest, `DIGEST`, and the PKCS1 algorithm.
-
-    Through `Stubber`, so the parameter names and types are validated against botocore's
-    service model rather than against a hand-written fake that would accept a typo.
-    """
+    """`kms:Sign` is called with the SHA-256 digest, `DIGEST` and the PKCS1 algorithm."""
     boto3 = pytest.importorskip("boto3")
     from botocore.stub import Stubber
 
-    # An explicit session with dummy credentials, not the default one. `Stubber` never lets
-    # a request reach the network, but the client still resolves credentials when it is
-    # built, so a default session would pick up whatever profile the developer happens to
-    # have configured and fail here for reasons that have nothing to do with this module.
     session = boto3.session.Session(
         aws_access_key_id="testing",
         aws_secret_access_key="testing",
@@ -258,6 +212,7 @@ def test_get_public_key_is_called_once_per_signer_for_the_kid(fake_kms: FakeKms)
     original = fake_kms.get_public_key
 
     def counting(*, KeyId: str) -> dict[str, Any]:
+        """Record the key id and delegate to the real `get_public_key`."""
         calls.append(KeyId)
         return original(KeyId=KeyId)
 
@@ -268,12 +223,8 @@ def test_get_public_key_is_called_once_per_signer_for_the_kid(fake_kms: FakeKms)
     assert len(calls) == 1
 
 
-# ---------------------------------------------------------------------------
-# `kid` and the JWK fields.
-# ---------------------------------------------------------------------------
-
-
 def test_kid_is_the_base64url_sha256_of_the_der_spki(fake_kms: FakeKms, der_spki: bytes) -> None:
+    """`kid` is the unpadded base64url SHA-256 of the DER SPKI, everywhere it is produced."""
     expected = base64.urlsafe_b64encode(hashlib.sha256(der_spki).digest()).rstrip(b"=").decode()
     assert kid_for_der(der_spki) == expected
     assert public_jwk_from_kms(fake_kms, KEY_ID)["kid"] == expected
@@ -282,6 +233,7 @@ def test_kid_is_the_base64url_sha256_of_the_der_spki(fake_kms: FakeKms, der_spki
 
 
 def test_kid_differs_between_two_keys(der_spki: bytes) -> None:
+    """Two different RSA keys produce different `kid` values."""
     other = rsa.generate_private_key(public_exponent=65537, key_size=2048)
     other_der = other.public_key().public_bytes(
         encoding=serialization.Encoding.DER,
@@ -302,11 +254,8 @@ def test_jwk_fields_match_the_rsa_public_numbers(
 
     assert int.from_bytes(n_bytes, "big") == numbers.n
     assert int.from_bytes(e_bytes, "big") == numbers.e
-    # A 2048-bit modulus is exactly 256 bytes with no leading zero. DER would have added
-    # one to keep the integer positive, and carrying it here is the classic JWK bug.
     assert len(n_bytes) == 256
     assert n_bytes[0] != 0
-    # 65537 is the standard exponent and encodes as AQAB.
     assert jwk["e"] == "AQAB"
 
     assert jwk["kty"] == "RSA"
@@ -321,18 +270,15 @@ def test_a_non_rsa_2048_key_spec_is_refused(rsa_key: rsa.RSAPrivateKey, der_spki
         public_jwk_from_kms(wrong, KEY_ID)
 
 
-# ---------------------------------------------------------------------------
-# The two documents.
-# ---------------------------------------------------------------------------
-
-
 def test_build_jwks_wraps_keys_in_an_array(fake_kms: FakeKms) -> None:
+    """`build_jwks` wraps the given keys in a `keys` array, preserving order."""
     jwk = public_jwk_from_kms(fake_kms, KEY_ID)
     assert build_jwks([jwk]) == {"keys": [jwk]}
     assert build_jwks([jwk, jwk])["keys"] == [jwk, jwk]
 
 
 def test_discovery_document_has_the_five_required_members() -> None:
+    """The discovery document carries exactly the five expected members."""
     doc = build_discovery_document(ISSUER)
     assert set(doc) == {
         "issuer",
@@ -353,6 +299,7 @@ def test_a_trailing_slash_on_the_issuer_is_normalised_away() -> None:
 
 
 def test_router_serves_both_documents_at_the_origin(fake_kms: FakeKms) -> None:
+    """The router serves the JWKS and discovery documents at their well-known paths."""
     fastapi = pytest.importorskip("fastapi")
     from fastapi.testclient import TestClient
 
@@ -371,6 +318,7 @@ def test_router_serves_both_documents_at_the_origin(fake_kms: FakeKms) -> None:
 
 
 def test_router_rejects_a_non_callable_jwks() -> None:
+    """A non-callable `jwks` argument raises `TypeError`."""
     pytest.importorskip("fastapi")
     with pytest.raises(TypeError, match="callable"):
         identity_router(issuer=ISSUER, jwks=[{"kty": "RSA"}])
@@ -391,12 +339,8 @@ def test_the_jwks_callable_is_read_per_request(fake_kms: FakeKms) -> None:
     assert len(client.get("/.well-known/jwks.json").json()["keys"]) == 1
 
 
-# ---------------------------------------------------------------------------
-# `mint_test_token`'s two gates.
-# ---------------------------------------------------------------------------
-
-
 def test_mint_test_token_is_refused_unless_enabled(fake_kms: FakeKms) -> None:
+    """Minting raises `TokenMintingDisabled` when the enable flag is false."""
     with pytest.raises(TokenMintingDisabled, match="disabled"):
         mint_test_token(
             KmsSigner(fake_kms, KEY_ID),
@@ -412,7 +356,7 @@ def test_mint_test_token_is_refused_unless_enabled(fake_kms: FakeKms) -> None:
 def test_mint_test_token_is_refused_in_production_even_when_enabled(
     fake_kms: FakeKms, environment: str
 ) -> None:
-    """The second gate. A flag left true in the wrong place is still refused."""
+    """Minting is refused in production environments even when the enable flag is true."""
     with pytest.raises(TokenMintingDisabled, match="refused"):
         mint_test_token(
             KmsSigner(fake_kms, KEY_ID),
@@ -444,7 +388,7 @@ def test_extra_claims_cannot_overwrite_the_reserved_ones(fake_kms: FakeKms) -> N
 
 
 def test_expiry_defaults_to_ten_minutes(fake_kms: FakeKms) -> None:
-    """Section 3.2 of the standard: a ten minute access token."""
+    """An access token expires ten minutes after `iat` by default."""
     jwt = pytest.importorskip("jwt")
 
     token = mint_test_token(

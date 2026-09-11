@@ -1,34 +1,4 @@
-"""Tests for the M6 identity work: OAuth sign-in, account linking, and the two new tables.
-
-Section 9.4 of `docs/identity-standard.md` sets the strategy. Four things shape this file in
-ways the M2 through M4 suites did not need:
-
-- **The provider is mocked at the HTTP boundary, not above it.** Every provider call goes
-  through an `httpx.MockTransport` serving hand-written responses, so the code under test
-  builds a real request, encodes a real form body and parses a real JSON response. Stubbing
-  `OAuthService._identity_from_id_token` instead would leave the actual parsing, the actual
-  header handling and the actual GitHub two-call sequence untested, which is most of what
-  can go wrong in this module.
-- **Both halves of the auto-link rule get their own test.** The locked decision is that an
-  OAuth identity attaches to an existing account only when the provider email **and** the
-  local account email are verified. Those are two independent conditions and a test that
-  only exercised one would pass against an implementation that checked only the other. So
-  there is a test per side, plus one for the case where both hold.
-- **Unlink is tested by counting down to the last method.** The refusal only fires in one
-  state, and a test that unlinks a provider from an account with a password proves nothing
-  about it. Each remaining-method source gets a test: another link, a password, and the
-  `has_other_sign_in_method` hook.
-- **Single use is tested by using twice.** The state row is spent by the callback, so every
-  state test that matters replays it. A happy-path-only test passes against an
-  implementation with no replay defence at all.
-
-The KMS signing fake is M2's, redefined here rather than imported: `tests/` is not a package.
-
-Google's ID token is signed with a real RSA key and served through a real JWKS document, so
-`PyJWKClient` does the key lookup it does in production and the signature check is a real
-one. An unsigned token or a monkeypatched `jwt.decode` would let the most important
-assertion in the file, that a forged ID token is refused, pass vacuously.
-"""
+"""Tests for OAuth sign-in, account linking, and the oauth-states and oauth-links tables."""
 
 from __future__ import annotations
 
@@ -99,18 +69,15 @@ GOOGLE_SUB = "115538274652819374652"
 GITHUB_SUB = "8675309"
 
 
-# ---------------------------------------------------------------------------
-# KMS fake, signing only. M2's, unchanged.
-# ---------------------------------------------------------------------------
-
-
 class FakeKms:
     """Signs with a local private key, so `TokenService` mints verifiable tokens."""
 
     def __init__(self, keys: dict[str, rsa.RSAPrivateKey]) -> None:
+        """Hold the RSA keys this fake signs with."""
         self._keys = keys
 
     def get_public_key(self, *, KeyId: str) -> dict[str, Any]:
+        """Return the DER public key for a key id, as KMS does."""
         der = (
             self._keys[KeyId]
             .public_key()
@@ -130,6 +97,7 @@ class FakeKms:
     def sign(
         self, *, KeyId: str, Message: bytes, MessageType: str, SigningAlgorithm: str
     ) -> dict[str, Any]:
+        """Sign a prehashed message with the local private key for a key id."""
         signature = self._keys[KeyId].sign(
             Message, padding.PKCS1v15(), utils.Prehashed(hashes.SHA256())
         )
@@ -148,6 +116,7 @@ class FakeKms:
     def decrypt(
         self, *, CiphertextBlob: bytes, EncryptionContext: Mapping[str, str]
     ) -> dict[str, Any]:
+        """Unwrap a data key blob, failing when the encryption context does not match."""
         try:
             encoded, context = CiphertextBlob.split(b"|", 1)
         except ValueError as exc:
@@ -158,32 +127,20 @@ class FakeKms:
 
 
 def _context_bytes(context: Mapping[str, str]) -> bytes:
+    """A stable byte encoding of an encryption context, for blob comparison."""
     return repr(sorted(context.items())).encode("utf-8")
 
 
-# ---------------------------------------------------------------------------
-# The provider, mocked at the HTTP boundary
-# ---------------------------------------------------------------------------
-
-
 def _b64url(raw: bytes) -> str:
+    """Base64url encode bytes without padding."""
     return base64.urlsafe_b64encode(raw).rstrip(b"=").decode("ascii")
 
 
 class FakeProvider:
-    """An `httpx.MockTransport` standing in for Google and GitHub.
-
-    Routes by URL, so the code under test builds and sends the request it would send in
-    production and this only supplies the answer. Every knob a test needs to turn is an
-    attribute: the ID token claims, whether the token endpoint fails, what `/user/emails`
-    returns.
-
-    Google's ID token is genuinely signed with `key`, and `jwks` serves the matching public
-    key at the URL `PROVIDERS["google"].jwks_url` names, so `PyJWKClient` performs a real
-    lookup and `jwt.decode` performs a real signature verification.
-    """
+    """An `httpx.MockTransport` standing in for Google and GitHub."""
 
     def __init__(self, key: rsa.RSAPrivateKey) -> None:
+        """Start with the default Google and GitHub answers and no recorded requests."""
         self.key = key
         self.requests: list[httpx.Request] = []
         self.token_status = 200
@@ -195,18 +152,14 @@ class FakeProvider:
             {"email": EMAIL, "primary": True, "verified": True},
         ]
         self.github_emails_status = 200
-        #: The nonce the ID token echoes back. The token endpoint never receives the nonce,
-        #: so the fake cannot read it off the request: a test that wants a token to verify
-        #: sets this to the nonce from its own state row, and a test of the mismatch path
-        #: leaves it alone or overrides the token outright.
         self.nonce_to_echo = ""
 
-    # ---- key material ----------------------------------------------------------------
-
     def jwks(self) -> dict[str, Any]:
+        """The JWKS document serving this fake's public signing key."""
         numbers = self.key.public_key().public_numbers()
 
         def to_b64(value: int) -> str:
+            """Base64url encode an RSA key parameter."""
             length = (value.bit_length() + 7) // 8
             return _b64url(value.to_bytes(length, "big"))
 
@@ -243,9 +196,8 @@ class FakeProvider:
         claims.update(overrides)
         return jwt.encode(claims, self.key, algorithm="RS256", headers={"kid": "test-key"})
 
-    # ---- the transport ----------------------------------------------------------------
-
     def handler(self, request: httpx.Request) -> httpx.Response:
+        """Answer a provider request by URL, recording it first."""
         self.requests.append(request)
         url = str(request.url)
 
@@ -281,34 +233,33 @@ class FakeProvider:
         return httpx.Response(404, json={"error": "unexpected_url", "url": url})
 
     def client(self) -> Any:
+        """An HTTP client wired to this fake's mock transport."""
         from webbpulse.identity.oauth import HttpxClient
 
         return HttpxClient(client=httpx.Client(transport=httpx.MockTransport(self.handler)))
 
 
 def _parse_form(request: httpx.Request) -> dict[str, str]:
+    """The form-encoded body of a request, as a dict."""
     from urllib.parse import parse_qsl
 
     return dict(parse_qsl(request.content.decode()))
 
 
-# ---------------------------------------------------------------------------
-# Fixtures
-# ---------------------------------------------------------------------------
-
-
 @pytest.fixture(autouse=True)
 def cheap_bcrypt(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
-    """Pin bcrypt to its minimum cost for the whole module. M2's fixture, unchanged."""
+    """Pin bcrypt to its minimum cost for the whole module."""
     import webbpulse.security as security
 
     real_hash = security.hash_password
     real_needs = security.needs_rehash
 
     def cheap(password: str, *, rounds: int = 4) -> str:
+        """Hash a password at the minimum bcrypt cost."""
         return real_hash(password, rounds=rounds)
 
     def needs(hashed: str, *, rounds: int = 4) -> bool:
+        """Report whether a hash needs rehashing at the minimum bcrypt cost."""
         return real_needs(hashed, rounds=rounds)
 
     monkeypatch.setattr(security, "hash_password", cheap)
@@ -327,26 +278,24 @@ def module_key() -> rsa.RSAPrivateKey:
 
 @pytest.fixture(scope="module")
 def provider_key() -> rsa.RSAPrivateKey:
-    """A second key, standing in for Google's signing key.
-
-    Separate from `module_key` on purpose. If the provider signed with the same key this
-    service signs with, a test asserting that a forged ID token is refused could pass for
-    the wrong reason.
-    """
+    """A second key, standing in for Google's signing key."""
     return rsa.generate_private_key(public_exponent=65537, key_size=2048)
 
 
 @pytest.fixture
 def kms(module_key: rsa.RSAPrivateKey) -> FakeKms:
+    """A KMS fake holding the module signing key."""
     return FakeKms({KEY_A: module_key})
 
 
 @pytest.fixture
 def provider(provider_key: rsa.RSAPrivateKey) -> FakeProvider:
+    """A provider fake signing with the separate provider key."""
     return FakeProvider(provider_key)
 
 
 def make_settings(**overrides: Any) -> IdentitySettings:
+    """Identity settings for this module, with per-test overrides applied."""
     base: dict[str, Any] = {
         "environment": "test",
         "issuer": ISSUER,
@@ -364,9 +313,10 @@ def make_settings(**overrides: Any) -> IdentitySettings:
 
 
 class FakeHooks(BaseIdentityHooks):
-    """A product's policy, in memory. M4's fake plus M6's optional hook."""
+    """A product's identity policy, in memory."""
 
     def __init__(self, *, refuse: str = "") -> None:
+        """Start with no users, no recorded hook calls and no extra sign-in methods."""
         self.users: dict[str, dict[str, Any]] = {}
         self.by_email: dict[str, str] = {}
         self.refuse = refuse
@@ -376,6 +326,7 @@ class FakeHooks(BaseIdentityHooks):
         self._next = 1
 
     def add(self, email: str, *, user_id: str = "", **attributes: Any) -> dict[str, Any]:
+        """Add a user, allocating an id when the caller gives none."""
         identifier = user_id or f"user-{self._next:04d}"
         self._next += 1
         user = {"id": identifier, "email": email, **attributes}
@@ -384,42 +335,50 @@ class FakeHooks(BaseIdentityHooks):
         return user
 
     def load_user_by_id(self, user_id: str) -> Mapping[str, Any] | None:
+        """Return the user with this id, or None."""
         self.calls.append("load_user_by_id")
         return self.users.get(user_id)
 
     def load_user_by_email(self, email: str) -> Mapping[str, Any] | None:
+        """Return the user with this email, matched case insensitively, or None."""
         self.calls.append("load_user_by_email")
         identifier = self.by_email.get(email.lower())
         return self.users.get(identifier) if identifier else None
 
     def may_authenticate(self, user: Mapping[str, Any]) -> None:
+        """Refuse authentication when this fake is configured to refuse."""
         self.calls.append("may_authenticate")
         if self.refuse:
             raise AuthenticationRefused(self.refuse, error_code="ACCOUNT_DISABLED")
 
     def claims_for(self, user: Mapping[str, Any]) -> Mapping[str, Any]:
-        # Deliberately tries to forge both, as M4's fake does. `_mint_access` must overwrite.
+        """Return hook claims that try to forge `amr` and `auth_time`."""
         return {"amr": ["forged"], "auth_time": 1}
 
     def create_user(self, *, email: str, attributes: Mapping[str, Any]) -> Mapping[str, Any]:
+        """Create and store a user from the registration attributes."""
         self.calls.append("create_user")
         return self.add(email, **dict(attributes))
 
     def on_user_created(self, user: Mapping[str, Any], via: str) -> None:
+        """Record which provider a new user was created through."""
         self.created_via.append(via)
 
     def has_other_sign_in_method(self, user_id: str) -> bool:
+        """Report whether this fake was told the user holds another sign-in method."""
         self.calls.append("has_other_sign_in_method")
         return self.extra_sign_in_methods
 
 
 @pytest.fixture
 def hooks() -> FakeHooks:
+    """A fresh in-memory hooks product."""
     return FakeHooks()
 
 
 @pytest.fixture
 def stores() -> IdentityStores:
+    """In-memory stores, including both OAuth tables."""
     return IdentityStores(
         credentials=InMemoryCredentialStore(),
         refresh_tokens=InMemoryRefreshTokenStore(),
@@ -430,6 +389,7 @@ def stores() -> IdentityStores:
 
 @pytest.fixture
 def oauth(hooks: FakeHooks, stores: IdentityStores, provider: FakeProvider) -> OAuthService:
+    """An `OAuthService` wired to the in-memory stores, both client secrets and the provider fake."""
     return OAuthService(
         make_settings(),
         hooks,
@@ -444,21 +404,11 @@ def oauth(hooks: FakeHooks, stores: IdentityStores, provider: FakeProvider) -> O
 def run_google_callback(
     oauth: OAuthService, provider: FakeProvider, *, mode: str = "login", user_id: str = ""
 ) -> OAuthIdentity:
-    """Drive a Google start-then-callback and return the identity it resolved.
-
-    A helper rather than repetition, because almost every test needs a completed provider
-    leg before it can assert on the interesting part, and doing it by hand each time would
-    bury the assertion.
-    """
+    """Drive a Google start-then-callback and return the identity it resolved."""
     authorization = oauth.start(GOOGLE_PROVIDER, mode=mode, user_id=user_id)  # type: ignore[arg-type]
     record = oauth.consume_state(authorization.state)
     provider.nonce_to_echo = record.nonce
     return oauth.identity_from_callback(GOOGLE_PROVIDER, code="auth-code", state_record=record)
-
-
-# ---------------------------------------------------------------------------
-# PKCE
-# ---------------------------------------------------------------------------
 
 
 def test_pkce_verifier_meets_the_rfc_length_and_alphabet() -> None:
@@ -470,31 +420,18 @@ def test_pkce_verifier_meets_the_rfc_length_and_alphabet() -> None:
 
 
 def test_pkce_challenge_matches_the_rfc_7636_worked_example() -> None:
-    """Appendix B of RFC 7636 publishes one verifier and its S256 challenge.
-
-    Checking the challenge against our own implementation of the challenge would pass while
-    both were wrong in the same direction, and the provider would be the one to disagree.
-    """
+    """Appendix B of RFC 7636 publishes one verifier and its S256 challenge."""
     verifier = "dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk"
     assert pkce_challenge(verifier) == "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM"
 
 
 def test_pkce_verifiers_are_unique_per_start() -> None:
+    """Two verifiers generated in a row differ."""
     assert new_pkce_verifier() != new_pkce_verifier()
 
 
-# ---------------------------------------------------------------------------
-# Provider metadata
-# ---------------------------------------------------------------------------
-
-
 def test_google_offers_pkce_and_an_id_token_and_github_offers_neither() -> None:
-    """The per-provider flags are the whole reason the provider table exists.
-
-    GitHub's web flow documents no `code_challenge` and returns no ID token. Sending a
-    challenge it ignores would be security theatre, and expecting an ID token it never sends
-    would break every GitHub sign-in.
-    """
+    """The per-provider flags are the whole reason the provider table exists."""
     google = PROVIDERS[GOOGLE_PROVIDER]
     github = PROVIDERS[GITHUB_PROVIDER]
     assert google.supports_pkce and google.returns_id_token
@@ -516,12 +453,8 @@ def test_provider_account_key_namespaces_the_subject_by_provider() -> None:
     assert provider_account_key("github", "123") != provider_account_key("google", "123")
 
 
-# ---------------------------------------------------------------------------
-# start
-# ---------------------------------------------------------------------------
-
-
 def test_start_builds_a_google_url_with_pkce_and_a_nonce(oauth: OAuthService) -> None:
+    """The Google authorization URL carries the client id, S256 challenge, state, nonce and openid scope."""
     from urllib.parse import parse_qs, urlsplit
 
     authorization = oauth.start(GOOGLE_PROVIDER)
@@ -540,11 +473,7 @@ def test_start_builds_a_google_url_with_pkce_and_a_nonce(oauth: OAuthService) ->
 
 
 def test_start_sends_the_challenge_and_never_the_verifier(oauth: OAuthService) -> None:
-    """The verifier is the one value that must not reach the browser.
-
-    If it went in the authorization URL, PKCE would protect against nothing: anyone who
-    could intercept the code could read the verifier from the same place.
-    """
+    """The verifier is the one value that must not reach the browser."""
     from urllib.parse import parse_qs, urlsplit
 
     authorization = oauth.start(GOOGLE_PROVIDER)
@@ -557,6 +486,7 @@ def test_start_sends_the_challenge_and_never_the_verifier(oauth: OAuthService) -
 
 
 def test_start_omits_pkce_and_nonce_for_github(oauth: OAuthService) -> None:
+    """A GitHub start sends no challenge and no nonce, and stores neither."""
     authorization = oauth.start(GITHUB_PROVIDER)
     assert "code_challenge" not in authorization.authorization_url
     assert "nonce" not in authorization.authorization_url
@@ -566,6 +496,7 @@ def test_start_omits_pkce_and_nonce_for_github(oauth: OAuthService) -> None:
 
 
 def test_start_writes_a_state_row_with_the_ten_minute_ttl(oauth: OAuthService) -> None:
+    """The state row expires `OAUTH_STATE_TTL_SECONDS` after it is written."""
     before = int(time.time())
     authorization = oauth.start(GOOGLE_PROVIDER)
     record = oauth.consume_state(authorization.state)
@@ -577,6 +508,7 @@ def test_start_writes_a_state_row_with_the_ten_minute_ttl(oauth: OAuthService) -
 
 
 def test_two_starts_produce_different_states(oauth: OAuthService) -> None:
+    """Each start mints a distinct state value."""
     assert oauth.start(GOOGLE_PROVIDER).state != oauth.start(GOOGLE_PROVIDER).state
 
 
@@ -588,11 +520,7 @@ def test_a_link_start_requires_a_user_id(oauth: OAuthService) -> None:
 
 
 def test_a_login_state_never_carries_a_user_id(oauth: OAuthService) -> None:
-    """The property that stops a login callback being replayed as a link.
-
-    A login state with no user id on it means there is no account for a replayed callback
-    to attach a provider identity to.
-    """
+    """The property that stops a login callback being replayed as a link."""
     authorization = oauth.start(GOOGLE_PROVIDER, mode="login", user_id="user-0001")
     assert oauth.consume_state(authorization.state).user_id == ""
 
@@ -614,13 +542,9 @@ def test_an_unconfigured_provider_is_not_available(
 
 
 def test_an_unknown_provider_is_refused(oauth: OAuthService) -> None:
+    """A provider name that is not in the table is refused."""
     with pytest.raises(OAuthRejected):
         oauth.start("facebook")
-
-
-# ---------------------------------------------------------------------------
-# The redirect URI allow-list
-# ---------------------------------------------------------------------------
 
 
 def test_a_redirect_uri_outside_the_allow_list_is_refused(
@@ -633,8 +557,6 @@ def test_a_redirect_uri_outside_the_allow_list_is_refused(
         hooks,
         states=stores.require_oauth_states(),
         links=stores.require_oauth_links(),
-        # Present so `start` gets past the 0.16.0 client-secret check and reaches the
-        # redirect URI validation this test is about.
         client_secrets={GOOGLE_PROVIDER: GOOGLE_SECRET},
     )
     with pytest.raises(OAuthRejected) as excinfo:
@@ -643,11 +565,7 @@ def test_a_redirect_uri_outside_the_allow_list_is_refused(
 
 
 def test_the_allow_list_is_exact_and_not_a_prefix(hooks: FakeHooks, stores: IdentityStores) -> None:
-    """`https://app.example.com.attacker.test` is a domain an attacker can register today.
-
-    A prefix match on the allowed origin would admit it, which is why the check is string
-    equality.
-    """
+    """`https://app.example.com.attacker.test` is a domain an attacker can register today."""
     allowed = "https://app.example.com/oauth/callback"
     settings = make_settings(oauth_redirect_uris=[allowed])
     service = OAuthService(
@@ -659,7 +577,6 @@ def test_the_allow_list_is_exact_and_not_a_prefix(hooks: FakeHooks, stores: Iden
     )
     with pytest.raises(OAuthRejected):
         service.start(GOOGLE_PROVIDER, redirect_uri="https://app.example.com.attacker.test/cb")
-    # The exact value still works, so the check is not simply refusing everything.
     assert service.start(GOOGLE_PROVIDER, redirect_uri=allowed).authorization_url
 
 
@@ -689,13 +606,9 @@ def test_a_scheme_relative_return_to_is_refused(oauth: OAuthService) -> None:
 
 
 def test_a_relative_return_to_is_resolved_against_the_frontend(oauth: OAuthService) -> None:
+    """A path-only `return_to` is resolved against the frontend base URL."""
     authorization = oauth.start(GOOGLE_PROVIDER, return_to="/settings/security")
     assert oauth.consume_state(authorization.state).return_to == f"{FRONTEND}/settings/security"
-
-
-# ---------------------------------------------------------------------------
-# state: single use, expiry, provider binding
-# ---------------------------------------------------------------------------
 
 
 def test_a_state_can_be_spent_only_once(oauth: OAuthService) -> None:
@@ -708,11 +621,13 @@ def test_a_state_can_be_spent_only_once(oauth: OAuthService) -> None:
 
 
 def test_an_unknown_state_is_refused(oauth: OAuthService) -> None:
+    """A state value that was never issued is refused."""
     with pytest.raises(OAuthRejected):
         oauth.consume_state("not-a-real-state")
 
 
 def test_an_empty_state_is_refused(oauth: OAuthService) -> None:
+    """An empty state value is refused."""
     with pytest.raises(OAuthRejected):
         oauth.consume_state("")
 
@@ -733,6 +648,7 @@ def test_an_expired_state_is_refused_even_though_dynamo_ttl_is_lazy() -> None:
 
 
 def test_a_state_from_one_provider_is_refused_at_another(oauth: OAuthService) -> None:
+    """A Google state presented as a GitHub state is refused."""
     authorization = oauth.start(GOOGLE_PROVIDER)
     with pytest.raises(OAuthRejected):
         oauth.consume_state(authorization.state, provider=GITHUB_PROVIDER)
@@ -751,14 +667,10 @@ def test_every_state_failure_answers_identically(oauth: OAuthService) -> None:
     assert len(codes) == 1
 
 
-# ---------------------------------------------------------------------------
-# Google: the ID token is verified properly
-# ---------------------------------------------------------------------------
-
-
 def test_a_google_callback_yields_a_verified_identity(
     oauth: OAuthService, provider: FakeProvider
 ) -> None:
+    """A completed Google callback resolves the provider, subject, email and verification state."""
     identity = run_google_callback(oauth, provider)
     assert identity.provider == GOOGLE_PROVIDER
     assert identity.subject == GOOGLE_SUB
@@ -769,6 +681,7 @@ def test_a_google_callback_yields_a_verified_identity(
 def test_the_exchange_sends_the_pkce_verifier_and_the_client_secret(
     oauth: OAuthService, provider: FakeProvider
 ) -> None:
+    """The token exchange form carries the grant type, code, client secret and code verifier."""
     run_google_callback(oauth, provider)
     form = _parse_form(
         next(r for r in provider.requests if str(r.url) == PROVIDERS[GOOGLE_PROVIDER].token_url)
@@ -783,11 +696,7 @@ def test_the_exchange_sends_the_pkce_verifier_and_the_client_secret(
 def test_an_id_token_signed_by_the_wrong_key_is_refused(
     oauth: OAuthService, provider: FakeProvider, module_key: rsa.RSAPrivateKey
 ) -> None:
-    """The single most important assertion in this file.
-
-    An ID token verified by decoding without checking the signature turns the whole flow
-    into "anybody who can reach the callback is anybody they say they are".
-    """
+    """The single most important assertion in this file."""
     import jwt
 
     authorization = oauth.start(GOOGLE_PROVIDER)
@@ -804,7 +713,7 @@ def test_an_id_token_signed_by_the_wrong_key_is_refused(
             "exp": now + 3600,
             "nonce": record.nonce,
         },
-        module_key,  # not the provider's key
+        module_key,
         algorithm="RS256",
         headers={"kid": "test-key"},
     )
@@ -827,6 +736,7 @@ def test_an_id_token_for_another_audience_is_refused(
 def test_an_id_token_from_another_issuer_is_refused(
     oauth: OAuthService, provider: FakeProvider
 ) -> None:
+    """An ID token whose `iss` is not Google is refused."""
     authorization = oauth.start(GOOGLE_PROVIDER)
     record = oauth.consume_state(authorization.state)
     provider.id_token_override = provider.id_token(nonce=record.nonce, iss="https://evil.test")
@@ -835,6 +745,7 @@ def test_an_id_token_from_another_issuer_is_refused(
 
 
 def test_an_expired_id_token_is_refused(oauth: OAuthService, provider: FakeProvider) -> None:
+    """An ID token whose `exp` has passed is refused."""
     authorization = oauth.start(GOOGLE_PROVIDER)
     record = oauth.consume_state(authorization.state)
     now = int(time.time())
@@ -874,14 +785,7 @@ def test_a_failed_token_exchange_does_not_leak_the_provider_message(
 def test_a_missing_client_secret_is_a_503_that_names_no_configuration(
     hooks: FakeHooks, stores: IdentityStores, provider: FakeProvider
 ) -> None:
-    """The operator gets the detail in a log line; an anonymous caller gets none.
-
-    **The refusal moved to `start` in 0.16.0.** Before that, a provider holding a client id
-    and no secret redirected the user to Google, collected their consent, and only failed on
-    the way back at the token exchange, which spends a real person's attention on a
-    configuration error. Refusing before the redirect is checked here, and the callback leg
-    keeps its own check below because `identity_from_callback` is reachable directly.
-    """
+    """The operator gets the detail in a log line; an anonymous caller gets none."""
     service = OAuthService(
         make_settings(),
         hooks,
@@ -896,7 +800,6 @@ def test_a_missing_client_secret_is_a_503_that_names_no_configuration(
     assert excinfo.value.error_code == "OAUTH_PROVIDER_UNAVAILABLE"
     assert "secret" not in excinfo.value.message.lower()
 
-    # The exchange refuses too, for a caller that reached it by another path.
     usable = OAuthService(
         make_settings(),
         hooks,
@@ -930,14 +833,10 @@ def test_the_client_secret_never_appears_in_a_log_record(
     assert GITHUB_SECRET not in rendered
 
 
-# ---------------------------------------------------------------------------
-# GitHub: two calls, and the verified-primary rule
-# ---------------------------------------------------------------------------
-
-
 def test_github_identity_comes_from_user_and_user_emails(
     oauth: OAuthService, provider: FakeProvider
 ) -> None:
+    """A GitHub callback calls both the userinfo and the emails endpoints to build the identity."""
     authorization = oauth.start(GITHUB_PROVIDER)
     record = oauth.consume_state(authorization.state)
     identity = oauth.identity_from_callback(GITHUB_PROVIDER, code="c", state_record=record)
@@ -953,11 +852,7 @@ def test_github_identity_comes_from_user_and_user_emails(
 def test_github_prefers_the_verified_primary_over_an_unverified_one(
     oauth: OAuthService, provider: FakeProvider
 ) -> None:
-    """`/user`'s `email` is the public profile address: user-chosen and never verified.
-
-    Only `/user/emails` says which address GitHub confirmed, and the auto-link rule depends
-    on that being a real assertion.
-    """
+    """`/user`'s `email` is the public profile address: user-chosen and never verified."""
     provider.github_user = {
         "id": int(GITHUB_SUB),
         "login": "octocat",
@@ -978,6 +873,7 @@ def test_github_prefers_the_verified_primary_over_an_unverified_one(
 def test_github_reports_an_unverified_address_as_unverified(
     oauth: OAuthService, provider: FakeProvider
 ) -> None:
+    """An unverified GitHub primary address is carried through as unverified."""
     provider.github_emails = [{"email": EMAIL, "primary": True, "verified": False}]
     authorization = oauth.start(GITHUB_PROVIDER)
     record = oauth.consume_state(authorization.state)
@@ -990,6 +886,7 @@ def test_github_reports_an_unverified_address_as_unverified(
 def test_a_github_exchange_sends_no_pkce_verifier(
     oauth: OAuthService, provider: FakeProvider
 ) -> None:
+    """The GitHub token exchange form carries no code verifier."""
     authorization = oauth.start(GITHUB_PROVIDER)
     record = oauth.consume_state(authorization.state)
     oauth.identity_from_callback(GITHUB_PROVIDER, code="c", state_record=record)
@@ -1010,14 +907,10 @@ def test_the_github_exchange_asks_for_json(oauth: OAuthService, provider: FakePr
     assert request.headers["accept"] == "application/json"
 
 
-# ---------------------------------------------------------------------------
-# The auto-link rule: the heart of M6
-# ---------------------------------------------------------------------------
-
-
 def test_a_known_link_signs_the_user_in(
     oauth: OAuthService, provider: FakeProvider, hooks: FakeHooks
 ) -> None:
+    """An identity with an existing link resolves to that user with the `linked` outcome."""
     user = hooks.add(EMAIL, email_verified=True)
     identity = run_google_callback(oauth, provider)
     oauth.link(identity, user_id=str(user["id"]))
@@ -1043,11 +936,7 @@ def test_both_sides_verified_auto_links(
 def test_an_unverified_provider_email_never_auto_links(
     oauth: OAuthService, provider: FakeProvider, hooks: FakeHooks
 ) -> None:
-    """The provider is asserting an address the user typed and nobody checked.
-
-    Registering a GitHub account with somebody else's address would otherwise take over
-    their account.
-    """
+    """The provider is asserting an address the user typed and nobody checked."""
     user = hooks.add(EMAIL, email_verified=True)
     provider.claims_override = {"email_verified": False}
     identity = run_google_callback(oauth, provider)
@@ -1061,11 +950,7 @@ def test_an_unverified_provider_email_never_auto_links(
 def test_an_unverified_local_email_never_auto_links(
     oauth: OAuthService, provider: FakeProvider, hooks: FakeHooks
 ) -> None:
-    """Takeover in the other direction, and the half that is easy to forget.
-
-    An attacker who registered locally with a victim's address, unverified, would otherwise
-    be handed the victim's real Google identity.
-    """
+    """Takeover in the other direction, and the half that is easy to forget."""
     user = hooks.add(EMAIL, email_verified=False)
     identity = run_google_callback(oauth, provider)
 
@@ -1098,6 +983,7 @@ def test_a_refused_auto_link_says_the_same_thing_either_way(
 def test_an_unknown_identity_registers_a_new_account(
     oauth: OAuthService, provider: FakeProvider, hooks: FakeHooks
 ) -> None:
+    """An identity with no link and no matching account registers a new user."""
     identity = run_google_callback(oauth, provider)
     user, outcome = oauth.resolve_login(identity)
 
@@ -1122,6 +1008,7 @@ def test_a_registration_carries_the_providers_verification_state(
 def test_registration_can_be_switched_off(
     hooks: FakeHooks, stores: IdentityStores, provider: FakeProvider
 ) -> None:
+    """With registration disabled an unknown identity is refused with REGISTRATION_DISABLED."""
     service = OAuthService(
         make_settings(registration_enabled=False),
         hooks,
@@ -1137,6 +1024,7 @@ def test_registration_can_be_switched_off(
 
 
 def test_a_provider_that_shares_no_email_is_refused(oauth: OAuthService) -> None:
+    """An identity with no email is refused with OAUTH_EMAIL_MISSING."""
     identity = OAuthIdentity(
         provider=GITHUB_PROVIDER, subject=GITHUB_SUB, email="", email_verified=False
     )
@@ -1160,19 +1048,10 @@ def test_a_link_whose_user_vanished_is_refused_and_cleaned_up(
     assert oauth.list_links(str(user["id"])) == []
 
 
-# ---------------------------------------------------------------------------
-# link and list
-# ---------------------------------------------------------------------------
-
-
 def test_link_attaches_to_the_authenticated_account_without_an_email_check(
     oauth: OAuthService, provider: FakeProvider, hooks: FakeHooks
 ) -> None:
-    """The path a refused auto-link sends people to.
-
-    The user proved they hold the account with a token and the provider account with the
-    provider's own flow, so no email needs to match at all.
-    """
+    """The path a refused auto-link sends people to."""
     user = hooks.add("different@example.com", email_verified=False)
     identity = run_google_callback(oauth, provider)
 
@@ -1184,6 +1063,7 @@ def test_link_attaches_to_the_authenticated_account_without_an_email_check(
 def test_linking_an_already_linked_identity_is_refused(
     oauth: OAuthService, provider: FakeProvider, hooks: FakeHooks
 ) -> None:
+    """Linking an identity that is already attached elsewhere is a 409 OAUTH_ALREADY_LINKED."""
     first = hooks.add("first@example.com", email_verified=True)
     second = hooks.add("second@example.com", email_verified=True)
     identity = run_google_callback(oauth, provider)
@@ -1216,6 +1096,7 @@ def test_the_already_linked_refusal_does_not_say_whose_account(
 def test_list_links_returns_only_this_users_links(
     oauth: OAuthService, provider: FakeProvider, hooks: FakeHooks
 ) -> None:
+    """Listing links returns this user's links, in provider order, and nobody else's."""
     mine = hooks.add("mine@example.com", email_verified=True)
     theirs = hooks.add("theirs@example.com", email_verified=True)
     oauth.link(
@@ -1238,10 +1119,7 @@ def test_list_links_returns_only_this_users_links(
 def test_no_provider_tokens_are_stored(
     oauth: OAuthService, provider: FakeProvider, hooks: FakeHooks
 ) -> None:
-    """This design consumes a provider as an identity source and never calls its API.
-
-    A stored token nobody spends is a stored credential with no use, which is all cost.
-    """
+    """This design consumes a provider as an identity source and never calls its API."""
     import dataclasses
 
     user = hooks.add(EMAIL, email_verified=True)
@@ -1253,11 +1131,6 @@ def test_no_provider_tokens_are_stored(
     assert "gho_test" not in values
     fields = {field.name for field in dataclasses.fields(record)}
     assert not {"access_token", "refresh_token", "provider_token"} & fields
-
-
-# ---------------------------------------------------------------------------
-# unlink: the last sign-in method
-# ---------------------------------------------------------------------------
 
 
 def test_unlink_refuses_to_remove_the_only_sign_in_method(
@@ -1276,6 +1149,7 @@ def test_unlink_refuses_to_remove_the_only_sign_in_method(
 
 
 def test_unlink_allows_it_when_another_link_remains(oauth: OAuthService, hooks: FakeHooks) -> None:
+    """Unlinking succeeds while a second provider link remains."""
     user = hooks.add(EMAIL, email_verified=True)
     oauth.link(OAuthIdentity(GOOGLE_PROVIDER, "g", EMAIL, True), user_id=str(user["id"]))
     oauth.link(OAuthIdentity(GITHUB_PROVIDER, "h", EMAIL, True), user_id=str(user["id"]))
@@ -1287,6 +1161,7 @@ def test_unlink_allows_it_when_another_link_remains(oauth: OAuthService, hooks: 
 def test_unlink_allows_it_when_a_password_remains(
     oauth: OAuthService, stores: IdentityStores, hooks: FakeHooks
 ) -> None:
+    """Unlinking succeeds while a password credential remains."""
     user = hooks.add(EMAIL, email_verified=True)
     stores.require_credentials().put(
         CredentialRecord(
@@ -1304,7 +1179,7 @@ def test_unlink_allows_it_when_a_password_remains(
 def test_unlink_allows_it_when_the_hook_reports_a_passkey(
     oauth: OAuthService, hooks: FakeHooks
 ) -> None:
-    """Passkeys are M5's table, which this module cannot see, so the product is asked."""
+    """Unlink succeeds when `has_other_sign_in_method` reports another credential."""
     user = hooks.add(EMAIL, email_verified=True)
     oauth.link(OAuthIdentity(GOOGLE_PROVIDER, "g", EMAIL, True), user_id=str(user["id"]))
     hooks.extra_sign_in_methods = True
@@ -1325,6 +1200,7 @@ def test_the_new_hook_defaults_to_false_so_old_hooks_keep_working() -> None:
 def test_unlinking_a_provider_that_is_not_linked_is_a_404(
     oauth: OAuthService, hooks: FakeHooks
 ) -> None:
+    """Unlinking a provider the user never linked is a 404."""
     user = hooks.add(EMAIL, email_verified=True)
     with pytest.raises(OAuthRejected) as excinfo:
         oauth.unlink(user_id=str(user["id"]), provider=GOOGLE_PROVIDER)
@@ -1332,6 +1208,7 @@ def test_unlinking_a_provider_that_is_not_linked_is_a_404(
 
 
 def test_unlink_does_not_touch_another_users_link(oauth: OAuthService, hooks: FakeHooks) -> None:
+    """Unlinking one user's Google link leaves another user's Google link in place."""
     mine = hooks.add("mine@example.com", email_verified=True)
     theirs = hooks.add("theirs@example.com", email_verified=True)
     oauth.link(OAuthIdentity(GOOGLE_PROVIDER, "g1", "a@example.com", True), user_id=str(mine["id"]))
@@ -1344,13 +1221,9 @@ def test_unlink_does_not_touch_another_users_link(oauth: OAuthService, hooks: Fa
     assert len(oauth.list_links(str(theirs["id"]))) == 1
 
 
-# ---------------------------------------------------------------------------
-# The session an OAuth login issues, and MFA
-# ---------------------------------------------------------------------------
-
-
 @pytest.fixture
 def flows(hooks: FakeHooks, stores: IdentityStores, kms: FakeKms) -> IdentityFlows:
+    """Identity flows wired to the in-memory stores, hooks and KMS fake."""
     settings = make_settings()
     return IdentityFlows(settings, hooks, stores, TokenService(settings, kms), kms_client=kms)
 
@@ -1358,6 +1231,7 @@ def flows(hooks: FakeHooks, stores: IdentityStores, kms: FakeKms) -> IdentityFlo
 def test_an_oauth_login_issues_the_same_token_pair_a_password_login_does(
     flows: IdentityFlows, hooks: FakeHooks
 ) -> None:
+    """An OAuth login issues an access token, a refresh token, a family id and an expiry."""
     user = hooks.add(EMAIL, email_verified=True)
     result = flows.issue_for_oauth(user, provider=GOOGLE_PROVIDER)
 
@@ -1383,10 +1257,7 @@ def test_the_access_token_records_the_provider_in_amr(
 
 
 def test_an_oauth_login_honours_mfa(hooks: FakeHooks, stores: IdentityStores, kms: FakeKms) -> None:
-    """A provider proving identity does not prove possession of the second factor.
-
-    Without this, "add Google to your account" would be a way to turn MFA off.
-    """
+    """A provider proving identity does not prove possession of the second factor."""
     stores = IdentityStores(
         credentials=stores.credentials,
         refresh_tokens=stores.refresh_tokens,
@@ -1429,19 +1300,9 @@ def _totp_now(seed: str) -> str:
     return totp_module.generate_code(seed, step=totp_module.current_step())
 
 
-# ---------------------------------------------------------------------------
-# The routes
-# ---------------------------------------------------------------------------
-
-
 @pytest.fixture
 def client(hooks: FakeHooks, stores: IdentityStores, kms: FakeKms, provider: FakeProvider) -> Any:
-    """A `TestClient` over a router with the OAuth routes mounted.
-
-    The provider transport is injected by replacing the service's HTTP client after the
-    router is built, which is the only seam the router does not expose. Everything else,
-    including the state store and the link store, is the real code path.
-    """
+    """A `TestClient` over a router with the OAuth routes mounted."""
     settings = make_settings()
     app = FastAPI()
     router = build_identity_router(
@@ -1457,24 +1318,7 @@ def client(hooks: FakeHooks, stores: IdentityStores, kms: FakeKms, provider: Fak
 
 
 def _oauth_route_paths(router: Any) -> set[str]:
-    """The mounted paths that belong to this module, read off the router.
-
-    Matched against the route module's own path constants rather than by searching for the
-    substring "oauth", which also matches FastAPI's built-in `/docs/oauth2-redirect` and made
-    the "no routes are mounted" assertions pass for the wrong reason.
-
-    **Reads `router.routes`, not `app.routes`.** Under the FastAPI CI runs (0.141) an
-    `include_router` no longer flattens the router's routes into `app.routes`; it mounts the
-    router, so `app.routes` holds an empty-path mount and none of the real paths. This helper
-    used to take the app and therefore returned the empty set for *every* input, which meant
-    both "the routes are absent" tests below passed against a fully configured router. The
-    router is also the honest thing to inspect: it is what this package builds and what a
-    consumer mounts, and it reads the same on either FastAPI version.
-
-    `OAUTH_PROVIDERS_PATH` is deliberately not in `ours`. It is unconditional from 0.16.0, so
-    including it would make the absence assertions unsatisfiable; the tests that care about
-    it assert on it by name.
-    """
+    """The mounted paths that belong to this module, read off the router."""
     from webbpulse.identity.oauth_routes import (
         OAUTH_CALLBACK_PATH,
         OAUTH_LINK_PATH,
@@ -1489,12 +1333,14 @@ def _oauth_route_paths(router: Any) -> set[str]:
 
 
 def test_the_start_route_redirects_to_the_provider(client: Any) -> None:
+    """The start route answers 302 to the provider's authorize URL."""
     response = client.get(f"{identity_prefix(make_settings())}/oauth/google/start")
     assert response.status_code == 302
     assert response.headers["location"].startswith(PROVIDERS[GOOGLE_PROVIDER].authorize_url)
 
 
 def test_the_start_route_404s_for_an_unknown_provider(client: Any) -> None:
+    """The start route answers 404 for a provider that is not in the table."""
     response = client.get(f"{identity_prefix(make_settings())}/oauth/facebook/start")
     assert response.status_code == 404
 
@@ -1522,6 +1368,7 @@ def test_the_routes_are_absent_when_no_provider_is_configured(
 
 
 def test_the_routes_are_absent_when_the_stores_are_missing(hooks: FakeHooks, kms: FakeKms) -> None:
+    """Without the OAuth stores none of the flow routes are mounted."""
     settings = make_settings()
     router = build_identity_router(
         settings,
@@ -1545,6 +1392,7 @@ def test_a_callback_with_a_bad_state_redirects_rather_than_rendering_json(client
 
 
 def test_a_cancelled_consent_screen_redirects_without_an_error_page(client: Any) -> None:
+    """A callback carrying `error=access_denied` redirects with `oauth_error=OAUTH_CANCELLED`."""
     prefix = identity_prefix(make_settings())
     start = client.get(f"{prefix}/oauth/google/start")
     from urllib.parse import parse_qs, urlsplit
@@ -1554,11 +1402,6 @@ def test_a_cancelled_consent_screen_redirects_without_an_error_page(client: Any)
     response = client.get(f"{prefix}/oauth/callback?state={state}&error=access_denied")
     assert response.status_code == 303
     assert "oauth_error=OAUTH_CANCELLED" in response.headers["location"]
-
-
-# ---------------------------------------------------------------------------
-# The tables
-# ---------------------------------------------------------------------------
 
 
 def test_the_table_names_match_the_estate_convention() -> None:
@@ -1571,12 +1414,7 @@ def test_the_table_names_match_the_estate_convention() -> None:
 
 @pytest.fixture
 def oauth_tables(dynamodb_resource: Any) -> dict[str, Any]:
-    """The two M6 tables, shaped as the Terraform module must create them.
-
-    `oauth-links` is built here rather than through `webbpulse.testing.create_table` because
-    that helper has no GSI support, and the `user_id-index` is what `list` and the
-    last-method count in `unlink` both read.
-    """
+    """The two OAuth tables, shaped as the Terraform module must create them."""
     from webbpulse.testing import create_table
 
     states = create_table(
@@ -1603,6 +1441,7 @@ def oauth_tables(dynamodb_resource: Any) -> dict[str, Any]:
 
 
 def test_the_states_table_is_keyed_on_state_with_a_ttl(oauth_tables: dict[str, Any]) -> None:
+    """The states table hashes on `state` and has TTL enabled on `expires_at`."""
     table = oauth_tables["states"]
     assert table.key_schema == [{"AttributeName": "state", "KeyType": "HASH"}]
 
@@ -1615,6 +1454,7 @@ def test_the_states_table_is_keyed_on_state_with_a_ttl(oauth_tables: dict[str, A
 def test_the_links_table_is_keyed_on_provider_subject_with_a_user_index(
     oauth_tables: dict[str, Any],
 ) -> None:
+    """The links table hashes on `provider_subject` and carries a `user_id` index."""
     table = oauth_tables["links"]
     assert table.key_schema == [{"AttributeName": "provider_subject", "KeyType": "HASH"}]
     indexes = {index["IndexName"]: index for index in table.global_secondary_indexes}
@@ -1673,17 +1513,14 @@ def test_the_dynamo_state_store_refuses_an_expired_row(oauth_tables: dict[str, A
 def test_the_dynamo_link_store_claims_an_identity_exactly_once(
     oauth_tables: dict[str, Any],
 ) -> None:
-    """The conditional write is the security control, not a nicety.
-
-    A read-then-write would let a second concurrent callback silently move a provider
-    identity from one local account to another.
-    """
+    """The conditional write is the security control, not a nicety."""
     from webbpulse.dynamodb import Repository
     from webbpulse.identity.oauth import OAuthLinkRecord
 
     store = DynamoOAuthLinkStore(Repository("oauth-links", prefix="test"))
 
     def record_for(user_id: str) -> OAuthLinkRecord:
+        """A Google link record for this user id."""
         return OAuthLinkRecord(
             provider_subject=provider_account_key(GOOGLE_PROVIDER, GOOGLE_SUB),
             provider=GOOGLE_PROVIDER,
@@ -1703,6 +1540,7 @@ def test_the_dynamo_link_store_claims_an_identity_exactly_once(
 def test_the_dynamo_link_store_lists_by_user_through_the_index(
     oauth_tables: dict[str, Any],
 ) -> None:
+    """Listing by user returns that user's links through the index and nobody else's."""
     from webbpulse.dynamodb import Repository
     from webbpulse.identity.oauth import OAuthLinkRecord
 
@@ -1755,16 +1593,12 @@ def test_the_dynamo_link_store_round_trips_every_field(oauth_tables: dict[str, A
 
 
 def test_the_dynamo_link_store_delete_is_idempotent(oauth_tables: dict[str, Any]) -> None:
+    """Deleting a link that does not exist is a no-op."""
     from webbpulse.dynamodb import Repository
 
     store = DynamoOAuthLinkStore(Repository("oauth-links", prefix="test"))
     store.delete("google#never-existed")
     assert store.get("google#never-existed") is None
-
-
-# ---------------------------------------------------------------------------
-# The HTTP seam
-# ---------------------------------------------------------------------------
 
 
 def test_a_non_json_provider_response_becomes_a_refusal_not_a_crash(
@@ -1774,6 +1608,7 @@ def test_a_non_json_provider_response_becomes_a_refusal_not_a_crash(
     from webbpulse.identity.oauth import HttpxClient
 
     def handler(request: httpx.Request) -> httpx.Response:
+        """Answer every request with a non-JSON 502."""
         return httpx.Response(502, text="<html>Bad Gateway</html>")
 
     service = OAuthService(
@@ -1793,6 +1628,7 @@ def test_a_non_json_provider_response_becomes_a_refusal_not_a_crash(
 
 
 def test_http_response_reports_success_by_status_class() -> None:
+    """`HttpResponse.ok` is true for 2xx and false otherwise."""
     assert HttpResponse(200, {}).ok
     assert HttpResponse(299, {}).ok
     assert not HttpResponse(400, {}).ok
@@ -1812,25 +1648,10 @@ def test_http_response_reports_success_by_status_class() -> None:
     ],
 )
 def test_a_provider_boolean_is_read_in_both_spellings(raw: object, expected: bool) -> None:
-    """`bool("false")` is `True`, which is why this is a function and not a `bool()` call.
-
-    Google has returned `email_verified` as both a real boolean and its string spelling.
-    """
+    """`bool("false")` is `True`, which is why this is a function and not a `bool()` call."""
     from webbpulse.identity.oauth import _as_bool
 
     assert _as_bool(raw) is expected
-
-
-# ---------------------------------------------------------------------------
-# Provider discovery, 0.16.0
-# ---------------------------------------------------------------------------
-#
-# The route exists so a frontend stops inferring availability from the start route's status
-# code. WebbPulse-Portfolio PR 170 did that, and it is wrong twice: probing spends the start
-# route's 20-per-15-minutes IP budget on page loads rather than sign-ins, and a non-200
-# cannot distinguish "not configured" from "briefly broken", so a blip hides a sign-in
-# button. These tests therefore pin the three things a client depends on: which providers
-# appear, in what order, and that the answer exists in every deployment.
 
 
 def _providers_router(
@@ -1853,12 +1674,14 @@ def _providers_router(
 
 
 def _providers_client(router: Any) -> Any:
+    """A `TestClient` over an app with this router mounted."""
     app = FastAPI()
     app.include_router(router)
     return TestClient(app, follow_redirects=False)
 
 
 def _get_providers(client: Any) -> Any:
+    """GET the OAuth provider discovery route."""
     return client.get(f"{identity_prefix(make_settings())}/oauth/providers")
 
 
@@ -1887,12 +1710,7 @@ def test_discovery_lists_every_fully_configured_provider(
 def test_discovery_order_follows_the_provider_table_not_the_settings_list(
     hooks: FakeHooks, stores: IdentityStores, kms: FakeKms
 ) -> None:
-    """Stable order, so the buttons do not reshuffle between environments.
-
-    The settings list is written backwards here on purpose: a frontend that renders in
-    response order must get Google then GitHub either way, and an implementation that simply
-    iterated `oauth_providers` would fail this while passing the test above.
-    """
+    """Stable order, so the buttons do not reshuffle between environments."""
     client = _providers_client(
         _providers_router(
             hooks,
@@ -1911,12 +1729,7 @@ def test_discovery_order_follows_the_provider_table_not_the_settings_list(
 def test_a_provider_with_an_id_but_no_secret_is_not_advertised(
     hooks: FakeHooks, stores: IdentityStores, kms: FakeKms
 ) -> None:
-    """The partial-configuration case, and the reason this route checks both halves.
-
-    Both client ids are set; only Google has a secret. Advertising GitHub would put a button
-    on the sign-in page that sends the user to GitHub, collects their consent, and then fails
-    on the way back at the token exchange.
-    """
+    """The partial-configuration case, and the reason this route checks both halves."""
     client = _providers_client(
         _providers_router(hooks, stores, kms, secrets={GOOGLE_PROVIDER: GOOGLE_SECRET})
     )
@@ -1928,12 +1741,7 @@ def test_a_provider_with_an_id_but_no_secret_is_not_advertised(
 def test_the_start_route_refuses_a_provider_with_no_secret_before_redirecting(
     hooks: FakeHooks, stores: IdentityStores, kms: FakeKms
 ) -> None:
-    """The other half of the 0.16.0 decision: do not mount a doomed redirect.
-
-    A 503 with a named code, rather than a 302 to GitHub that wastes the user's consent and
-    fails at the exchange. Google, fully configured on the same router, still redirects, so
-    the refusal is about the provider rather than about the route being broken.
-    """
+    """A provider with a client id but no secret is refused with a 503, not redirected."""
     client = _providers_client(
         _providers_router(hooks, stores, kms, secrets={GOOGLE_PROVIDER: GOOGLE_SECRET})
     )
@@ -1959,6 +1767,7 @@ def test_discovery_is_empty_when_no_client_secret_is_supplied_at_all(
 def test_discovery_is_empty_when_no_provider_has_a_client_id(
     hooks: FakeHooks, stores: IdentityStores, kms: FakeKms
 ) -> None:
+    """Secrets without client ids advertise no providers."""
     client = _providers_client(
         _providers_router(
             hooks,
@@ -1975,11 +1784,7 @@ def test_discovery_is_empty_when_no_provider_has_a_client_id(
 def test_discovery_mounts_and_is_empty_when_the_oauth_stores_are_missing(
     hooks: FakeHooks, kms: FakeKms
 ) -> None:
-    """A deployment with nowhere to write a state row cannot complete a sign-in.
-
-    The five flow routes are absent here, and the discovery route is still present, which is
-    the whole point: one authoritative answer in every deployment.
-    """
+    """A deployment with nowhere to write a state row cannot complete a sign-in."""
     router = build_identity_router(
         make_settings(),
         hooks,
@@ -2023,11 +1828,7 @@ def test_discovery_carries_the_same_cache_policy_as_the_jwks(
 def test_discovery_needs_no_token_and_sets_no_cookie(
     hooks: FakeHooks, stores: IdentityStores, kms: FakeKms
 ) -> None:
-    """It is read by the sign-in page, which by definition holds no token.
-
-    The absent `Authorization` header is the assertion: every management route in this module
-    answers 401 to exactly this request, and this one answers 200.
-    """
+    """It is read by the sign-in page, which by definition holds no token."""
     client = _providers_client(
         _providers_router(
             hooks,
@@ -2062,11 +1863,7 @@ def test_discovery_never_reveals_a_client_secret_or_a_client_id(
 def test_available_providers_is_stricter_than_enabled_providers(
     hooks: FakeHooks, stores: IdentityStores, provider: FakeProvider
 ) -> None:
-    """The service-level distinction the route rests on, asserted without a request.
-
-    `enabled_providers` decides whether the routes mount and asks only for a client id;
-    `available_providers` decides what is advertised and additionally requires the secret.
-    """
+    """The service-level distinction the route rests on, asserted without a request."""
     service = OAuthService(
         make_settings(),
         hooks,
@@ -2088,19 +1885,7 @@ def test_every_provider_in_the_table_has_a_display_name() -> None:
 
 
 def test_discovery_appears_in_the_openapi_document_under_an_oauth_tag(kms: FakeKms) -> None:
-    """It is a documented public API, unlike the `.well-known` documents.
-
-    Those are `include_in_schema=False` because they are fetched by API Gateway rather than
-    written against by a client. This one is written against by every frontend, so it belongs
-    in `/docs`, tagged `oauth` so it groups with the rest of the OAuth surface.
-
-    The assertion that the schema *builds at all* is the load-bearing half. Every route in
-    this package annotated `-> JSONResponse` breaks `app.openapi()` for the whole app, since
-    under `from __future__ import annotations` that annotation is an unresolvable string that
-    FastAPI hands to pydantic as a response model. This route mounts in every deployment
-    including the documents-only one, whose schema builds today, so it must not be what takes
-    `/docs` away from a product with no OAuth at all.
-    """
+    """It is a documented public API, unlike the `.well-known` documents."""
     router = build_identity_router(make_settings(), kms_client=kms)
     app = FastAPI()
     app.include_router(router)
