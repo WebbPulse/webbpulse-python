@@ -58,14 +58,18 @@ class KmsDataKeyClient(Protocol):
         KeyId: str,
         NumberOfBytes: int,
         EncryptionContext: Mapping[str, str],
-    ) -> Mapping[str, Any]: ...
+    ) -> Mapping[str, Any]:
+        """Return a fresh data key, plaintext and encrypted under `KeyId`."""
+        ...
 
     def decrypt(
         self,
         *,
         CiphertextBlob: bytes,
         EncryptionContext: Mapping[str, str],
-    ) -> Mapping[str, Any]: ...
+    ) -> Mapping[str, Any]:
+        """Unwrap a data key, rejecting a mismatched encryption context."""
+        ...
 
 
 def encryption_context(user_id: str, *, purpose: str = TOTP_ENCRYPTION_PURPOSE) -> dict[str, str]:

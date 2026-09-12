@@ -82,9 +82,13 @@ class KmsClient(Protocol):
         Message: bytes,
         MessageType: str,
         SigningAlgorithm: str,
-    ) -> Mapping[str, Any]: ...
+    ) -> Mapping[str, Any]:
+        """Sign a message with the KMS private half and return the signature."""
+        ...
 
-    def get_public_key(self, *, KeyId: str) -> Mapping[str, Any]: ...
+    def get_public_key(self, *, KeyId: str) -> Mapping[str, Any]:
+        """Fetch the public half, used to derive `kid` and serve the JWKS."""
+        ...
 
 
 class KmsSigner:

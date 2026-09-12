@@ -78,7 +78,9 @@ class SesV2Client(Protocol):
     A protocol rather than a boto3 import, so the `identity` extra does not depend on boto3.
     """
 
-    def send_email(self, **kwargs: Any) -> Any: ...
+    def send_email(self, **kwargs: Any) -> Any:
+        """Send one message through SES v2."""
+        ...
 
 
 class SesV2EmailSender(EmailSender):
