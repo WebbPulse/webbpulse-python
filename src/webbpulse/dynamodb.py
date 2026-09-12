@@ -18,8 +18,12 @@ if TYPE_CHECKING:  # pragma: no cover
 
 __all__ = [
     "TABLE_PREFIX_ENV",
+    "ConditionFailed",
+    "DynamoError",
+    "ItemNotFound",
     "Page",
     "Repository",
+    "TransactionCanceled",
     "encode_numbers",
     "now_iso",
     "reset_resource_cache",
@@ -27,6 +31,64 @@ __all__ = [
     "ttl_at",
     "ttl_in",
 ]
+
+
+class DynamoError(Exception):
+    """Base class for every error the repository layer raises.
+
+    A service's own hierarchy can subclass this so one `exception_map` entry or one call to
+    `install_dynamodb_error_handlers` covers every type under it.
+    """
+
+
+class ItemNotFound(DynamoError):
+    """No item exists in `table` under `key`.
+
+    The table name and the key are recorded for the log, never for the response body, because
+    a key can be a user id or an email address.
+    """
+
+    def __init__(self, table: str, key: Mapping[str, Any] | None = None) -> None:
+        """Record the table and the key that had no item."""
+        self.table = table
+        self.key = dict(key) if key is not None else None
+        super().__init__(f"{table}: no item with key {self.key}")
+
+
+class ConditionFailed(DynamoError):
+    """A conditional write was rejected because its condition did not hold.
+
+    The ordinary outcome of losing a race on an optimistic create or an optimistic update, so
+    it renders as a 409 rather than a fault.
+    """
+
+    def __init__(
+        self, table: str, condition: str = "", key: Mapping[str, Any] | None = None
+    ) -> None:
+        """Record the table, the condition expression, and the key it guarded."""
+        self.table = table
+        self.condition = condition
+        self.key = dict(key) if key is not None else None
+        super().__init__(f"{table}: condition failed ({condition}) for key {self.key}")
+
+
+class TransactionCanceled(DynamoError):
+    """A transactional write was cancelled, carrying DynamoDB's per-item reasons.
+
+    Inspect `conditional_check_failed` rather than assuming: a cancellation caused by a failed
+    condition is a caller-visible conflict, and every other cause is a real fault.
+    """
+
+    def __init__(self, reasons: Sequence[Mapping[str, Any]] | None = None) -> None:
+        """Record DynamoDB's cancellation reasons, one per item in the transaction."""
+        self.reasons = [dict(reason) for reason in reasons or ()]
+        super().__init__(f"transaction canceled: {self.reasons}")
+
+    @property
+    def conditional_check_failed(self) -> bool:
+        """True when any item was cancelled by a failed conditional check."""
+        return any(reason.get("Code") == "ConditionalCheckFailed" for reason in self.reasons)
+
 
 TABLE_PREFIX_ENV: Final = "DYNAMODB_TABLE_PREFIX"
 

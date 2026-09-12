@@ -664,6 +664,79 @@ raise HTTPException(404, {"message": "No such post.", "error_code": "POST_NOT_FO
 A mapping detail with no usable `message` renders the generic "Request failed." rather than
 being echoed, so an internal dict cannot leak into a response.
 
+#### Choosing the envelope shape
+
+`error_codes` and `validation_details` compose one body a key at a time, which is fine for a
+service adding a field and awkward for one that has to match a shape it already ships.
+`error_envelope` names the whole shape instead, and it applies to every handler installed
+here, the unmatched-route 404 included:
+
+```python
+app = create_app([posts_router], error_envelope="detailed")
+```
+
+| `error_envelope` | Body |
+| --- | --- |
+| omitted, or `"default"` | The historical shape. `error_code` and `details` appear only under their own options, and a 422 carries `errors`. |
+| `"detailed"` | `{"success", "status", "message", "request_id", "error_code"}`, where `error_code` is never absent. A 422 carries a flat `details` list and **no** `errors` key. |
+| a callable | Whatever the callable returns. |
+
+`"detailed"` implies `error_codes=True` and `validation_details=True`, so naming the shape is
+the whole configuration:
+
+```json
+{
+  "success": false, "status": 422, "message": "Request validation failed.",
+  "request_id": "...", "error_code": "VALIDATION_ERROR",
+  "details": [{"field": "email", "message": "value is not a valid email address", "type": "value_error"}]
+}
+```
+
+That is the shape CarModPicker emits today, which is why it exists: the package can now
+express it, so the local handlers that were keeping it are no longer the reason to keep them.
+
+`detailed_error_body` is the same builder by hand, for a service with one handler of its own
+left over. It mirrors `error_body` and fills `error_code` from the status when none is given.
+
+No shape ever carries Starlette's `detail`, and a 5xx never echoes its own message, whichever
+shape is chosen. A shape is a choice about keys, not a relaxation of either rule.
+
+##### A renderer of your own
+
+A callable receives an `ErrorContext` and returns the body. Every handler routes through it,
+so one function covers HTTP errors, validation errors, unhandled faults, routing 404s, mapped
+exception types and the DynamoDB branches:
+
+```python
+from webbpulse.http import ErrorContext, create_app, request_id
+
+
+def render(context: ErrorContext) -> dict[str, object]:
+    return {
+        "ok": False,
+        "code": context.error_code,
+        "reason": context.message,
+        "request_id": request_id(context.request),
+    }
+
+
+app = create_app([posts_router], error_envelope=render)
+```
+
+The context carries `status`, `message`, `request`, `error_code`, `details`,
+`validation_errors`, `exception` and `extra`. Two fields are worth knowing:
+
+- `validation_errors` is populated only for a 422, as one `{loc, msg, type}` entry per
+  offending field, so a renderer can build its own field shape. As everywhere else, it never
+  carries the rejected input.
+- `error_code` is always supplied to a callable, because the renderer decides whether to emit
+  one. `error_codes=False` suppresses the code in the default shape only.
+
+Keep `request_id` in whatever you return. It is the only thing joining a caller's report to
+the CloudWatch line, and every operational runbook here assumes it is there.
+
+An unknown shape name raises `ValueError` when the app is built, not as a 500 under load.
+
 #### DynamoDB errors
 
 Opt in, because it imports botocore and the base install has no boto3. Needs the `dynamodb`
@@ -746,6 +819,42 @@ handlers changes nothing a caller can see. The details worth knowing:
 
 Starlette walks an exception's MRO, so a subclass without its own entry uses the nearest base
 class that has one, and a subclass with its own entry wins.
+
+#### The package's own DynamoDB exception types
+
+`exception_map` assumes the service already has exception classes to hand over. For one that
+does not, `webbpulse.dynamodb` now defines them, so a repository can raise the package's own
+types and the handlers come with them:
+
+```python
+from webbpulse.dynamodb import ConditionFailed, ItemNotFound, TransactionCanceled
+
+app = create_app([posts_router], dynamodb_error_handlers=True)
+# or, for an app not built by create_app:
+from webbpulse.http import install_dynamodb_error_handlers
+
+install_dynamodb_error_handlers(app)
+```
+
+| Exception | Status | Why |
+| --- | --- | --- |
+| `ItemNotFound` | 404 | The table and the key are recorded on the exception for the log and never reach the body, because a key can be a user id or an email address. |
+| `ConditionFailed` | 409 | A lost race on an optimistic write. The condition expression stays in the log. |
+| `TransactionCanceled` | 409 or 500 | Inspected, not assumed: 409 when `conditional_check_failed`, 500 otherwise, matching the botocore branch. |
+
+All three subclass `DynamoError`, so one `except DynamoError` or one `exception_map` entry
+covers the hierarchy, and a service's own subclass inherits the nearest handler without
+needing an entry. `not_found_message` and `conflict_message` change the wording without
+writing a handler.
+
+This needs no extra. The types are plain exceptions and importing them pulls in no botocore,
+which is the difference from `install_dynamodb_handlers`: that one handles the raw
+`ClientError` a repository did not translate, this one handles what a repository raises after
+translating it. A service doing both can install both, and the two never contend because they
+are keyed on different types.
+
+`dynamodb_error_handlers` composes with `error_envelope`, so these responses are the shape the
+rest of the application returns rather than a shape of their own.
 
 `RequestIdMiddleware` honours an inbound `X-Request-ID`, mints a UUID4 otherwise, bounds the
 length so a hostile header cannot inflate every downstream log line, echoes it on the
@@ -863,6 +972,15 @@ carries. `ttl_at(datetime)` and `ttl_in(seconds)` produce the integer epoch **se
 TTL attribute needs; milliseconds are the classic mistake and put expiry fifty thousand
 years out. A TTL is a storage reclaim mechanism on DynamoDB's own schedule, never an access
 control.
+
+`DynamoError` and its three subclasses `ItemNotFound`, `ConditionFailed` and
+`TransactionCanceled` are the vocabulary a repository raises once it has translated a botocore
+`ClientError`. Each records what an operator needs on the exception and nothing a response
+body should carry: the table and key, the condition expression, the cancellation reasons.
+`TransactionCanceled.conditional_check_failed` is the one decision worth not guessing at,
+since a cancellation caused by a failed condition is an ordinary lost race and every other
+cause is a real fault. `webbpulse.http.install_dynamodb_error_handlers` renders all three,
+and [that section](#the-packages-own-dynamodb-exception-types) has the mapping.
 
 ### `webbpulse.lambda_entry`
 

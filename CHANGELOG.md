@@ -5,6 +5,67 @@ Notable changes to the `webbpulse` package. The version here is the one in
 
 This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## 0.23.0
+
+`webbpulse.http` gains an `error_envelope` option choosing the whole error body shape, and
+`webbpulse.dynamodb` gains the three repository exception types plus the handlers that render
+them. Both are opt in and the default body is byte identical to 0.22.0, so taking the release
+changes nothing for a consumer that passes neither.
+
+### Why a shape, not more keys
+
+`error_codes` and `validation_details` compose a body one key at a time. That suited the
+service adding a field, and not the service that already ships a shape and has to match it:
+CarModPicker's handlers emit `{"success", "status", "message", "request_id", "error_code"}`
+with a flat 422 `details` list and no `errors` key, and no combination of the two flags
+produced exactly that, because `validation_details` adds `details` alongside `errors` rather
+than instead of it. So the local handlers stayed, which is the thing worth removing.
+
+`error_envelope` names the shape instead. `"default"` is the historical body. `"detailed"` is
+the shape above, and it implies both flags, so naming it is the whole configuration. The
+built-in shapes are pinned by tests adapted from CarModPicker's own exact-body tests, field by
+field, including the absence of `errors`.
+
+A callable is the third option, receiving an `ErrorContext` and returning the body. Every
+handler routes through the resolved renderer, including the Starlette 404 for an unmatched
+route, so a consumer never receives a raw `{"detail": "Not Found"}` unless it installs no
+handlers at all. `validation_errors` on the context is how a renderer builds its own field
+shape without reparsing pydantic's output, and `error_code` is always supplied to a callable,
+because a renderer decides for itself whether to emit one.
+
+Two rules are not shape choices and do not move: no shape carries Starlette's `detail`, and a
+5xx never echoes its own message. A mapped 503 still renders "Internal server error." under
+`"detailed"`, which has a test of its own, since the obvious reading of a named shape is that
+it turns the sanitising off.
+
+An unknown shape name raises `ValueError` when the app is built rather than as a 500 under
+load, matching how `exception_map` has validated its entries since 0.3.0.
+
+### The DynamoDB types the package was asking consumers to supply
+
+`exception_map` has always been able to map a repository's exception types, and it assumed the
+repository had some. `webbpulse.dynamodb` raised none of its own, so every consumer defined
+`ItemNotFound`, `ConditionFailed` and `TransactionCanceled` again, with the same three
+mappings, and the package documented the mapping it could not itself provide.
+
+All three now live in `webbpulse.dynamodb` under a shared `DynamoError` base, and
+`install_dynamodb_error_handlers` renders them: 404, 409, and for a cancelled transaction 409
+when any cancellation reason is `ConditionalCheckFailed` and 500 otherwise. That last one is
+the reason this is a handler rather than three `exception_map` entries, since the status
+depends on the instance and not just its type. `create_app(dynamodb_error_handlers=True)` is
+the same thing.
+
+It needs no extra: the types are plain exceptions and importing them pulls in no botocore,
+which is what separates this from `install_dynamodb_handlers`. That one handles a raw
+`ClientError` a repository did not translate; this one handles what a repository raises after
+translating it. A service doing both installs both, and they never contend because they are
+keyed on different types.
+
+Each exception records what an operator needs and nothing the caller should see. A table name
+and key, a condition expression and a set of cancellation reasons all stay in the log, and
+tests assert they are absent from the response text, because `ItemNotFound("users", {"id":
+email})` is the natural way to raise it.
+
 ## 0.22.0
 
 `webbpulse.otel`: buffered spans are flushed and the provider is shut down when the container
