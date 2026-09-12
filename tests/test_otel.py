@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 import threading
 import time
 from typing import Any, ClassVar, cast
@@ -1925,3 +1926,324 @@ def test_shutdown_tracing_without_a_timeout_is_still_backward_compatible() -> No
 
     assert otel._PROCESSOR is None
     assert otel._CONFIGURED is False
+
+
+class _AlternatingCredentialSession:
+    """A botocore-shaped session whose provider alternates credential values each resolution.
+
+    Re-resolving is what the real non-refreshable Lambda path does, and alternating the values
+    is what makes an inconsistent signature observable rather than merely possible.
+    """
+
+    PAIRS: ClassVar[list[tuple[str, str, str]]] = [
+        ("AKIAAAAAAAAAAAAAAAAA", "secret-a" + "a" * 32, "token-a"),
+        ("AKIABBBBBBBBBBBBBBBB", "secret-b" + "b" * 32, "token-b"),
+    ]
+
+    def __init__(self) -> None:
+        """Start with nothing resolved, like a fresh botocore session."""
+        self._credentials: Any = None
+        self._resolutions = 0
+        self._lock = threading.Lock()
+
+    def get_credentials(self) -> Any:
+        """Resolve a credential set, alternating values so a mix is detectable."""
+        from botocore.credentials import Credentials
+
+        if self._credentials is None:
+            with self._lock:
+                self._resolutions += 1
+                values = self.PAIRS[self._resolutions % 2]
+            self._credentials = Credentials(*values)
+        return self._credentials
+
+
+def _secret_for(access_key: str) -> str:
+    """The secret that belongs with an access key id in `_AlternatingCredentialSession`."""
+    return next(p[1] for p in _AlternatingCredentialSession.PAIRS if p[0] == access_key)
+
+
+def test_pinned_credentials_keep_one_signature_internally_consistent() -> None:
+    """A signature must not mix the access key of one resolution with the secret of another.
+
+    `SigV4Auth` reads `token`, `secret_key` and `access_key` separately, so without pinning a
+    concurrent re-resolution can stamp one resolution's key id beside another's signature.
+    X-Ray rejects that with 403, which is the intermittent failure this guards.
+    """
+    from botocore.auth import SigV4Auth
+    from botocore.awsrequest import AWSRequest
+
+    credentials = otel._ReresolvingCredentials(_AlternatingCredentialSession())
+    mixed: list[str] = []
+    barrier = threading.Barrier(8)
+
+    def sign_repeatedly() -> None:
+        """Sign many requests inside a pinned scope and check each one agrees with itself."""
+        barrier.wait()
+        for _ in range(150):
+            with credentials.pinned():
+                request = AWSRequest(
+                    method="POST",
+                    url="https://xray.us-west-2.amazonaws.com/v1/traces",
+                    data=b"payload",
+                    headers={"Content-Type": "application/x-protobuf"},
+                )
+                signer = SigV4Auth(cast("Any", credentials), "xray", "us-west-2")
+                secret_used = signer.credentials.secret_key
+                signer.add_auth(request)
+                key_id = request.headers["Authorization"].split("Credential=")[1].split("/")[0]
+                if _secret_for(key_id) != secret_used:
+                    mixed.append(key_id)
+
+    threads = [threading.Thread(target=sign_repeatedly) for _ in range(8)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+
+    assert mixed == []
+
+
+def test_pinned_scope_returns_the_same_snapshot_for_every_read() -> None:
+    """Inside one scope the three signing attributes come from a single resolution."""
+    credentials = otel._ReresolvingCredentials(_AlternatingCredentialSession())
+
+    with credentials.pinned():
+        first = credentials.get_frozen_credentials()
+        assert credentials.get_frozen_credentials() is first
+        assert _secret_for(credentials.access_key) == credentials.secret_key
+
+
+def test_pinned_scope_is_reentrant_and_keeps_the_outer_snapshot() -> None:
+    """A nested scope must not re-resolve, or a nested signer would see different values."""
+    credentials = otel._ReresolvingCredentials(_AlternatingCredentialSession())
+
+    with credentials.pinned():
+        outer = credentials.get_frozen_credentials()
+        with credentials.pinned():
+            assert credentials.get_frozen_credentials() is outer
+        assert credentials.get_frozen_credentials() is outer
+
+
+def test_credentials_resolve_afresh_once_the_pinned_scope_is_left() -> None:
+    """Pinning must not become a cache, or rotated credentials would never be picked up."""
+    credentials = otel._ReresolvingCredentials(_AlternatingCredentialSession())
+
+    with credentials.pinned():
+        inside = credentials.get_frozen_credentials()
+    after = credentials.get_frozen_credentials()
+
+    assert inside.access_key != after.access_key
+
+
+def test_pinned_scopes_in_different_threads_do_not_share_a_snapshot() -> None:
+    """The pin is per thread, so one thread's scope cannot leak into another's signature."""
+    credentials = otel._ReresolvingCredentials(_AlternatingCredentialSession())
+    seen: dict[str, Any] = {}
+    released = threading.Event()
+    entered = threading.Event()
+
+    def hold() -> None:
+        """Pin a snapshot and keep the scope open while the main thread pins its own."""
+        with credentials.pinned():
+            seen["other"] = credentials.get_frozen_credentials()
+            entered.set()
+            released.wait(5)
+
+    thread = threading.Thread(target=hold)
+    thread.start()
+    entered.wait(5)
+    with credentials.pinned():
+        seen["main"] = credentials.get_frozen_credentials()
+    released.set()
+    thread.join()
+
+    assert seen["main"] is not seen["other"]
+
+
+def test_no_credentials_inside_a_pinned_scope_raises() -> None:
+    """A session resolving nothing must fail loudly rather than sign with empty values."""
+    from botocore.exceptions import NoCredentialsError
+
+    class _EmptySession:
+        """A session that never resolves credentials."""
+
+        def get_credentials(self) -> Any:
+            """Resolve nothing."""
+            return None
+
+    credentials = otel._ReresolvingCredentials(_EmptySession())
+
+    with pytest.raises(NoCredentialsError), credentials.pinned():
+        pass
+
+
+def test_pinned_credential_session_wraps_each_request_in_one_scope() -> None:
+    """The signing session has to enter the scope, or the pin would never apply in production."""
+    credentials = otel._ReresolvingCredentials(_AlternatingCredentialSession())
+    snapshots: list[Any] = []
+
+    class _Inner:
+        """A transport that records the snapshot visible while it is called."""
+
+        def request(self, *args: Any, **kwargs: Any) -> str:
+            """Record the pinned snapshot and report success."""
+            snapshots.append(credentials.get_frozen_credentials())
+            return "ok"
+
+        def post(self, *args: Any, **kwargs: Any) -> str:
+            """Record the pinned snapshot and report success."""
+            return self.request(*args, **kwargs)
+
+    session = otel._PinnedCredentialSession(_Inner(), credentials)
+
+    assert session.request("POST", "https://example.invalid") == "ok"
+    assert session.post("https://example.invalid") == "ok"
+    assert len(snapshots) == 2
+    assert all(_secret_for(s.access_key) == s.secret_key for s in snapshots)
+
+
+def test_pinned_credential_session_delegates_unknown_attributes() -> None:
+    """Everything the exporter touches beyond the two request methods must still work."""
+
+    class _Inner:
+        """A transport carrying an attribute the wrapper does not define."""
+
+        headers: ClassVar[dict[str, str]] = {"x": "y"}
+
+    session = otel._PinnedCredentialSession(_Inner(), cast("Any", None))
+
+    assert session.headers == {"x": "y"}
+
+
+def test_exports_are_single_flight_across_threads() -> None:
+    """Two threads must never be inside the exporter at once.
+
+    The signing session underneath is driven per request, and overlapping exports were what
+    let two signatures interleave. At shutdown the overlap is the normal case, since an
+    in-flight request's flush and the lifespan flush run on separate executor threads.
+    """
+    overlap = {"max": 0, "now": 0, "entries": 0}
+    guard = threading.Lock()
+
+    class _OverlapDetectingExporter:
+        """Records the high-water mark of threads inside `export`."""
+
+        def export(self, spans: Any) -> None:
+            """Count concurrent entries and dwell long enough for a race to show."""
+            with guard:
+                overlap["now"] += 1
+                overlap["entries"] += 1
+                overlap["max"] = max(overlap["max"], overlap["now"])
+            time.sleep(0.005)
+            with guard:
+                overlap["now"] -= 1
+
+        def force_flush(self, timeout_millis: int = 30000) -> bool:
+            """Report success."""
+            return True
+
+        def shutdown(self) -> None:
+            """Shut down without complaint."""
+
+    from opentelemetry.sdk.trace import SpanProcessor, TracerProvider
+    from opentelemetry.sdk.trace.sampling import ALWAYS_ON, ParentBased
+
+    processor = TailSamplingSpanProcessor(
+        cast("Any", _OverlapDetectingExporter()), sample_ratio=1.0
+    )
+    provider = TracerProvider(sampler=ParentBased(root=ALWAYS_ON))
+    provider.add_span_processor(cast("SpanProcessor", processor))
+    tracer = provider.get_tracer("overlap")
+
+    stop = threading.Event()
+
+    def record() -> None:
+        """Keep completed traces arriving so both flush paths have work."""
+        while not stop.is_set():
+            with tracer.start_as_current_span("unit"):
+                pass
+            time.sleep(0.001)
+
+    def flush_repeatedly() -> None:
+        """Drive the per-request flush path."""
+        for _ in range(25):
+            processor.force_flush(5000)
+            time.sleep(0.001)
+
+    feeder = threading.Thread(target=record)
+    feeder.start()
+    time.sleep(0.05)
+    workers = [threading.Thread(target=flush_repeatedly) for _ in range(6)]
+    workers.append(threading.Thread(target=lambda: processor.shutdown(300)))
+    for worker in workers:
+        worker.start()
+    for worker in workers:
+        worker.join()
+    stop.set()
+    feeder.join()
+
+    assert overlap["entries"] > 1
+    assert overlap["max"] == 1
+
+
+def test_shutdown_demotes_the_otlp_exporters_own_error_lines(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A bounded teardown flush reporting a timeout is expected, so it must not stay ERROR."""
+    exporter_log = logging.getLogger(otel._OTLP_EXPORTER_LOGGER)
+
+    class _ComplainingExporter:
+        """An exporter that logs like the real OTLP one when a flush times out."""
+
+        def export(self, spans: Any) -> None:
+            """Accept the batch."""
+
+        def force_flush(self, timeout_millis: int = 30000) -> bool:
+            """Report the failure the way the upstream exporter does."""
+            exporter_log.error(
+                "Failed to export span batch due to timeout, max retries or shutdown."
+            )
+            return False
+
+        def shutdown(self) -> None:
+            """Shut down without complaint."""
+
+    processor = TailSamplingSpanProcessor(cast("Any", _ComplainingExporter()), sample_ratio=1.0)
+
+    with caplog.at_level(logging.WARNING, logger=otel._OTLP_EXPORTER_LOGGER):
+        processor.shutdown(300)
+
+    records = [r for r in caplog.records if "due to timeout" in r.getMessage()]
+    assert records
+    assert all(r.levelno == logging.WARNING for r in records)
+
+
+def test_the_demotion_is_scoped_to_the_teardown_flush(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Outside teardown an exporter error is a real fault and keeps its ERROR level."""
+    exporter_log = logging.getLogger(otel._OTLP_EXPORTER_LOGGER)
+
+    class _QuietExporter:
+        """An exporter that shuts down without logging anything."""
+
+        def export(self, spans: Any) -> None:
+            """Accept the batch."""
+
+        def force_flush(self, timeout_millis: int = 30000) -> bool:
+            """Report success."""
+            return True
+
+        def shutdown(self) -> None:
+            """Shut down without complaint."""
+
+    processor = TailSamplingSpanProcessor(cast("Any", _QuietExporter()), sample_ratio=1.0)
+    processor.shutdown(300)
+
+    with caplog.at_level(logging.ERROR, logger=otel._OTLP_EXPORTER_LOGGER):
+        exporter_log.error("Failed to export span batch code: 403, reason: Forbidden")
+
+    records = [r for r in caplog.records if "403" in r.getMessage()]
+    assert records
+    assert all(r.levelno == logging.ERROR for r in records)

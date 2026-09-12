@@ -5,6 +5,54 @@ Notable changes to the `webbpulse` package. The version here is the one in
 
 This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## 0.24.1
+
+Fixes the intermittent `Failed to export span batch code: 403, reason: Forbidden` from the
+X-Ray OTLP exporter. Exports are now single-flight across threads, and one SigV4 signature
+always resolves its credentials once. No API change.
+
+### Two threads signing at once produced a signature that did not match itself
+
+`SigV4Auth.add_auth` does not read a credentials object once. It reads `token` while rewriting
+headers, `secret_key` while deriving the signing key, and `access_key` while building
+`Credential=` in the `Authorization` header: four separate attribute reads per signature.
+`_ReresolvingCredentials` re-resolved on every one of them, and its non-refreshable branch
+re-resolves by nulling `session._credentials` so the next `get_credentials` rebuilds it, which
+mutates state every thread shares.
+
+Nothing serialised the exporter either. `TailSamplingSpanProcessor._export` ran outside the
+buffer lock by design, so the per-request flush, the lifespan shutdown flush and the provider
+shutdown could all be inside `exporter.export` at once; a probe saw three. Two overlapping
+signatures could then interleave, and a request went out with the access key id of one
+resolution beside a signature derived from another's secret. X-Ray cannot verify that and
+answers 403.
+
+That explains the shape of the failure exactly: a minority of exports, never during request
+handling, and clustered 20 to 160 ms after `Shutting down`, because the shutdown flush is the
+one moment an in-flight request's flush reliably overlaps another export. Steady-state
+single-threaded exports were always correctly signed, which is why spans kept landing.
+
+A harness driving the real signing path measured 0.05 to 1.2 percent of signatures mixed
+before the fix and none after, over 9600 signatures a run.
+
+Two changes, because either alone leaves a hole. `_ReresolvingCredentials.pinned` scopes one
+frozen snapshot to one signature, per thread and reentrant, and `_PinnedCredentialSession`
+enters it around each request so every read inside agrees; re-resolution happens under a lock.
+Outside a pinned scope each read still resolves afresh, so the credential refresh this class
+exists for is unchanged. An `_export_lock` then makes export, the exporter's own `force_flush`
+and its `shutdown` single-flight, which costs nothing in the steady state where the
+per-request flush is already the only caller.
+
+### Teardown export noise is no longer logged at ERROR
+
+The OTLP exporter reports a failed batch through its own logger, which this package does not
+route, so `Failed to export span batch due to timeout, max retries or shutdown.` and the read
+timeout behind it arrived at ERROR. On the teardown path both are the expected outcome of a
+flush deliberately bounded well under Lambda's grace period, not a fault, so they paged for
+working as designed. `shutdown` now demotes that logger's ERROR records to WARNING for the
+teardown window only, and never drops one. Every other export failure, the 403 included, keeps
+its ERROR.
+
 ## 0.24.0
 
 `register_error_handlers(dynamodb_errors=...)` and `create_app(dynamodb_error_handlers=...)`

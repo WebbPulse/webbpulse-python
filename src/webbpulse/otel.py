@@ -30,6 +30,17 @@ the request leaves nothing behind to retry. Both are resolved on container shutd
 the provider down. `shutdown_flush_timeout_millis` bounds that flush well under the grace
 period Lambda gives the runtime, because the alternative to a bounded flush is SIGKILL,
 which loses the spans anyway and fails the container's shutdown.
+
+## Why the export path is single-flight
+
+Those two flush paths run on separate worker threads of the default executor, so on the way
+out an in-flight request's flush overlaps the lifespan's. The SigV4 signing session under the
+exporter is not safe to drive concurrently: it reads the credentials object attribute by
+attribute per signature, so overlapping exports could emit a request whose access key id and
+signing key came from different resolutions, which X-Ray rejects with 403. So
+`TailSamplingSpanProcessor` serialises export, the exporter's `force_flush` and its
+`shutdown` behind one lock, and `_ReresolvingCredentials` pins one frozen snapshot per
+signature. See those classes for the detail.
 """
 
 from __future__ import annotations
@@ -38,11 +49,11 @@ import logging
 import os
 import threading
 import time
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, contextmanager
 from typing import TYPE_CHECKING, Any, Final, Literal, cast
 
 if TYPE_CHECKING:  # pragma: no cover
-    from collections.abc import AsyncIterator
+    from collections.abc import AsyncIterator, Iterator
 
     from fastapi import FastAPI
     from opentelemetry.context import Context
@@ -236,6 +247,40 @@ def _span_signals_error(span: ReadableSpan) -> bool:
     return any(event.name == _EXCEPTION_EVENT_NAME for event in span.events or ())
 
 
+_OTLP_EXPORTER_LOGGER: Final = "opentelemetry.exporter.otlp.proto.http.trace_exporter"
+
+
+class _DemoteToWarning(logging.Filter):
+    """Rewrites ERROR records to WARNING while attached.
+
+    The OTLP exporter reports a failed batch with its own `_logger.error`, which this package
+    does not route. On the teardown path that is the `timeout, max retries or shutdown` line
+    and any read timeout behind it, both of which are the expected outcome of a flush
+    deliberately bounded well under Lambda's grace period rather than a fault. Left at ERROR
+    they page someone for working as designed, so they are demoted for the teardown window
+    only and every other export failure keeps its ERROR.
+    """
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        """Demote one record, never dropping it."""
+        if record.levelno == logging.ERROR:
+            record.levelno = logging.WARNING
+            record.levelname = "WARNING"
+        return True
+
+
+@contextmanager
+def _exporter_teardown_logging() -> Iterator[None]:
+    """Demote the OTLP exporter's own ERROR lines for the duration of a teardown flush."""
+    logger = logging.getLogger(_OTLP_EXPORTER_LOGGER)
+    demote = _DemoteToWarning()
+    logger.addFilter(demote)
+    try:
+        yield
+    finally:
+        logger.removeFilter(demote)
+
+
 def _is_non_positive_timeout_error(error: ValueError) -> bool:
     """Whether a `ValueError` is urllib3 rejecting a timeout that had already expired.
 
@@ -302,6 +347,7 @@ class TailSamplingSpanProcessor:
         self._max_trace_age_seconds = max_trace_age_seconds
 
         self._lock = threading.Lock()
+        self._export_lock = threading.Lock()
         self._buffers: dict[int, list[ReadableSpan]] = {}
         self._open_spans: dict[int, int] = {}
         self._started_at: dict[int, float] = {}
@@ -461,14 +507,26 @@ class TailSamplingSpanProcessor:
             self.sampled_out_traces += 1
 
     def _export(self, spans: list[ReadableSpan]) -> None:
-        """Hand spans to the exporter.
+        """Hand spans to the exporter, one batch at a time across all threads.
 
-        Must not be called with the lock held, except from `_evict_one_locked`.
+        `_export_lock` makes the export single-flight. The exporter itself is not safe to
+        drive from several threads at once: the SigV4 signing session underneath it reads
+        credentials attribute by attribute per signature, so two overlapping exports could
+        emit a request whose access key id and signing key came from different resolutions,
+        which the endpoint rejects with 403. Overlap is the normal case on the way out, where
+        an in-flight request's flush and the lifespan's shutdown flush run on separate worker
+        threads of the default executor.
+
+        Serialising costs nothing in the steady state, where the per-request flush is already
+        the only exporter caller, and at shutdown the flush is deadline-bounded anyway.
+
+        Must not be called with `_lock` held, except from `_evict_one_locked`.
         """
         if not spans:
             return
         try:
-            self._exporter.export(spans)
+            with self._export_lock:
+                self._exporter.export(spans)
         except ValueError as error:
             if _is_non_positive_timeout_error(error):
                 _log.warning(
@@ -537,7 +595,8 @@ class TailSamplingSpanProcessor:
 
         flush = getattr(self._exporter, "force_flush", None)
         if callable(flush):
-            result = flush(timeout_millis)
+            with self._export_lock:
+                result = flush(timeout_millis)
             return bool(result) if result is not None else True
         return True
 
@@ -557,12 +616,13 @@ class TailSamplingSpanProcessor:
         """
         self._tearing_down = True
         try:
-            with self._lock:
-                self._open_spans.clear()
-            if timeout_millis is None:
-                self.force_flush()
-            else:
-                self.force_flush(timeout_millis)
+            with _exporter_teardown_logging():
+                with self._lock:
+                    self._open_spans.clear()
+                if timeout_millis is None:
+                    self.force_flush()
+                else:
+                    self.force_flush(timeout_millis)
         except Exception as error:
             _log.warning(
                 "Flushing buffered spans during shutdown failed; the last traces are lost.",
@@ -570,7 +630,8 @@ class TailSamplingSpanProcessor:
             )
         self._shutdown = True
         try:
-            self._exporter.shutdown()
+            with _exporter_teardown_logging(), self._export_lock:
+                self._exporter.shutdown()
         except Exception as error:
             _log.warning(
                 "Shutting the span exporter down failed.",
@@ -624,14 +685,41 @@ class _ReresolvingCredentials:
 
     Works around the distro caching a non-refreshable `Credentials` object, which under
     Lambda's env-var provider freezes the signing key at cold start and 403s once it expires.
+
+    ## Why one signature has to pin one snapshot
+
+    `SigV4Auth.add_auth` does not read a credentials object once. It reads `token` while
+    rewriting headers, `secret_key` while deriving the signing key, and `access_key` while
+    building `Credential=` in the `Authorization` header: four separate attribute reads per
+    signature. Re-resolving on each of them made every read independent, and the
+    non-refreshable branch re-resolves by nulling `session._credentials` so the next
+    `get_credentials` rebuilds it, which mutates state shared by every thread.
+
+    Two threads signing at once therefore interleaved, and a signature could derive its
+    signing key from one resolution while stamping the access key id of another into the same
+    header. The endpoint cannot verify that signature and answers 403. It is intermittent and
+    concurrency-only, which is why steady-state exports kept working and the failures clustered
+    on the shutdown path, where an in-flight request's flush overlaps the lifespan's flush.
+
+    A time-bounded cache is not enough on its own, because the reads of a single signature can
+    always straddle an expiry. So `pinned()` scopes one frozen snapshot to one signature: the
+    signing path enters it once per request, every attribute read inside returns that same
+    snapshot, and re-resolution happens under `_lock` so the session mutation is serialised.
+    Outside a pinned scope each read resolves afresh, which preserves the refresh behaviour
+    this class exists for.
     """
 
     def __init__(self, session: Any) -> None:
         """Hold the botocore session the credentials are re-resolved from."""
         self._session = session
+        self._lock = threading.Lock()
+        self._pinned = threading.local()
 
     def _current(self) -> Any:
-        """The credentials to sign with right now, re-resolved if they cannot refresh."""
+        """The credentials to sign with right now, re-resolved if they cannot refresh.
+
+        Called with `_lock` held, since the non-refreshable branch mutates session state.
+        """
         from botocore.credentials import RefreshableCredentials
 
         credentials = self._session.get_credentials()
@@ -642,14 +730,38 @@ class _ReresolvingCredentials:
             credentials = self._session.get_credentials()
         return credentials
 
-    def get_frozen_credentials(self) -> Any:
-        """The current frozen credentials, raising when none can be resolved."""
-        credentials = self._current()
-        if credentials is None:
-            from botocore.exceptions import NoCredentialsError
+    def _resolve_frozen(self) -> Any:
+        """Re-resolve and freeze the credentials, serialised against other threads."""
+        with self._lock:
+            credentials = self._current()
+            if credentials is None:
+                from botocore.exceptions import NoCredentialsError
 
-            raise NoCredentialsError()
-        return credentials.get_frozen_credentials()
+                raise NoCredentialsError()
+            return credentials.get_frozen_credentials()
+
+    @contextmanager
+    def pinned(self) -> Iterator[None]:
+        """Hold one frozen snapshot for the body, so one signature stays self consistent.
+
+        Reentrant and per thread: a nested scope keeps the outer snapshot, and concurrent
+        threads each pin their own.
+        """
+        if getattr(self._pinned, "frozen", None) is not None:
+            yield
+            return
+        self._pinned.frozen = self._resolve_frozen()
+        try:
+            yield
+        finally:
+            self._pinned.frozen = None
+
+    def get_frozen_credentials(self) -> Any:
+        """The frozen credentials for this signature, pinned if a scope is active."""
+        frozen = getattr(self._pinned, "frozen", None)
+        if frozen is not None:
+            return frozen
+        return self._resolve_frozen()
 
     @property
     def access_key(self) -> Any:
@@ -682,6 +794,35 @@ class _RefreshingCredentialSession:
     def get_credentials(self) -> Any:
         """The re-resolving credentials object the distro will cache."""
         return self._credentials
+
+    def __getattr__(self, name: str) -> Any:
+        """Delegate everything else to the wrapped session."""
+        return getattr(self._session, name)
+
+
+class _PinnedCredentialSession:
+    """A `requests` session that pins one credential snapshot per request.
+
+    The distro signs inside its own `request`, reading the credentials object several times.
+    Entering `_ReresolvingCredentials.pinned` around that call is what makes all of those
+    reads agree, so the access key id in `Credential=` always matches the secret the
+    signature was derived from.
+    """
+
+    def __init__(self, session: Any, credentials: _ReresolvingCredentials) -> None:
+        """Wrap the signing session with the credentials whose snapshot to pin."""
+        self._session = session
+        self._credentials = credentials
+
+    def post(self, *args: Any, **kwargs: Any) -> Any:
+        """POST with one credential snapshot held for the whole signature."""
+        with self._credentials.pinned():
+            return self._session.post(*args, **kwargs)
+
+    def request(self, *args: Any, **kwargs: Any) -> Any:
+        """Make a request with one credential snapshot held for the whole signature."""
+        with self._credentials.pinned():
+            return self._session.request(*args, **kwargs)
 
     def __getattr__(self, name: str) -> Any:
         """Delegate everything else to the wrapped session."""
@@ -760,14 +901,28 @@ def _build_span_exporter(endpoint: str, timeout_millis: int) -> SpanExporter:
         _guard_export_timeouts(exporter)
         return exporter
 
+    credential_session = _RefreshingCredentialSession(botocore.session.Session())
     signing_exporter = OTLPAwsSpanExporter(
         aws_region=_region_for_endpoint(endpoint),
-        session=_RefreshingCredentialSession(botocore.session.Session()),
+        session=credential_session,
         endpoint=endpoint,
         timeout=timeout_seconds,
     )
+    _pin_credentials_per_request(signing_exporter, credential_session.get_credentials())
     _guard_export_timeouts(signing_exporter)
     return cast("SpanExporter", signing_exporter)
+
+
+def _pin_credentials_per_request(exporter: Any, credentials: _ReresolvingCredentials) -> None:
+    """Wrap the exporter's signing session so each request signs from one credential snapshot.
+
+    Swaps the private `_session` after construction, guarded so a future rename loses only
+    the pinning rather than breaking exports.
+    """
+    session = getattr(exporter, "_session", None)
+    if session is None:  # pragma: no cover
+        return
+    exporter._session = _PinnedCredentialSession(session, credentials)
 
 
 def _guard_export_timeouts(exporter: Any) -> None:
