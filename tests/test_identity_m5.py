@@ -53,6 +53,7 @@ from webbpulse.identity.passkeys import (
     AMR_PASSKEY,
     AMR_PIN,
     CHALLENGE_TTL_SECONDS,
+    SUPPORTED_COSE_ALGS,
     PasskeyRejected,
     PasskeyService,
     b64url_decode,
@@ -623,6 +624,16 @@ class TestRegistration:
         """The authenticator's backup state is stored on the record."""
         _, record = enrol_passkey(passkeys)
         assert record.backup_state is True
+
+    def test_options_offer_the_named_algorithm_set(self, passkeys: PasskeyService) -> None:
+        """Registration offers exactly EdDSA, ES256 and RS256, whichever py_webauthn major resolves.
+
+        py_webauthn 3.0.0 narrowed its own default from nine algorithms to these three, so the
+        set is asserted here rather than left to the library.
+        """
+        options = passkeys.begin_registration(USER_ID, user_name=EMAIL).options
+        offered = [entry["alg"] for entry in options["pubKeyCredParams"]]
+        assert offered == list(SUPPORTED_COSE_ALGS)
 
     def test_options_exclude_existing_credentials(self, passkeys: PasskeyService) -> None:
         """A second enrolment lists the first, so the authenticator declines a duplicate."""

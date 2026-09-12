@@ -37,7 +37,7 @@ security = ["PyJWT>=2.10,<3", "bcrypt>=4.1"]
 testing = ["moto[dynamodb,secretsmanager]>=5", "pytest>=8", "httpx2>=2"]
 identity = ["PyJWT[crypto]>=2.9", "fastapi>=0.115"]
 oauth = ["httpx>=0.27"]
-passkeys = ["webauthn>=2.7,<3"]
+passkeys = ["webauthn>=2.7,<4"]
 
 [project.urls]
 Homepage = "https://github.com/WebbPulse/webbpulse-python"

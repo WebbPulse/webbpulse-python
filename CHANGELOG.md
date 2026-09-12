@@ -5,6 +5,35 @@ Notable changes to the `webbpulse` package. The version here is the one in
 
 This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## 0.21.0
+
+The `passkeys` extra accepts py_webauthn 3.x. The range is now `webauthn>=2.7,<4`, which
+unblocks consumers whose resolver was pinned to the 2.x line by the old upper bound.
+
+### py_webauthn 3.x needed no porting, only an unpinned ceiling
+
+3.0.0 is a major for reasons that do not touch this package. It adds ML-DSA-44, ML-DSA-65 and
+ML-DSA-87 for credential public key verification, rejects CBOR carrying duplicate keys, and
+changes which algorithms `generate_registration_options` offers. The call signatures this
+package uses are untouched: `generate_registration_options`, `generate_authentication_options`,
+`verify_registration_response`, `verify_authentication_response` and `options_to_json` keep
+their parameters and return types, `webauthn.helpers.structs` keeps every name imported here,
+and `VerifiedRegistration` and `VerifiedAuthentication` keep every field read here. The test
+suite passes unchanged against both 2.8.0 and 3.0.0.
+
+The one behaviour that does differ is the registration algorithm set. 2.x offered nine
+algorithms and defaulted `supported_pub_key_algs` to the same nine; 3.0.0 narrowed both to
+EdDSA, ES256 and RS256, and put EdDSA first. Left implicit, that would mean the algorithms an
+authenticator may enrol under depend on which minor a consumer's lockfile happens to resolve.
+So `passkeys.SUPPORTED_COSE_ALGS` names the three explicitly and passes them to both
+`generate_registration_options` and `verify_registration_response`, making the ceremony
+identical on either major. A new test asserts the offered set, and it fails on 2.x if the
+argument is dropped.
+
+Login is unaffected on both majors. `verify_authentication_response` consults no algorithm
+list; it verifies with the algorithm of the stored public key, so credentials enrolled under
+2.x with an algorithm outside the narrowed three keep working.
+
 ## 0.20.0
 
 `webbpulse.identity`: `POST /logout-all` no longer answers 500 on a DynamoDB deployment. The
