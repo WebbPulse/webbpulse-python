@@ -5,7 +5,7 @@ Notable changes to the `webbpulse` package. The version here is the one in
 
 This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## Unreleased
+## 0.22.0
 
 `webbpulse.otel`: buffered spans are flushed and the provider is shut down when the container
 shuts down, which stops the intermittent OTLP export errors CarModPicker's staging Lambdas were
