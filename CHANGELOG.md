@@ -5,6 +5,49 @@ Notable changes to the `webbpulse` package. The version here is the one in
 
 This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## 0.25.1
+
+Quietens the span exporter's teardown logging, stops the tracer provider being shut down
+twice, and logs the body of a rejected export so the X-Ray `403` can be diagnosed. No API
+change beyond two new helpers, `shutdown_signalled` and `note_shutdown_signal`.
+
+### The demotion window opened after the failure it explains
+
+An export that fails because the process is going away is not a fault, so it logs at WARNING.
+That judgement was made from `_tearing_down`, which is only set inside the processor's
+`shutdown`. Under the Lambda Web Adapter the last request's synchronous flush runs between
+uvicorn's "Shutting down" and "Waiting for application shutdown", so its `Failed to export
+span batch code: 403` was emitted before anything had set the flag and kept its ERROR.
+
+The window now opens at the first sign of shutdown. `configure_tracing` installs a `SIGTERM`
+handler that chains whatever handler was already there, so uvicorn's graceful shutdown is
+unchanged, and the lifespan wrapper flips the same flag when the ASGI shutdown event arrives.
+`shutdown_signalled` reports the state and `note_shutdown_signal` opens it from any other
+shutdown path. The OTLP exporter's own logger carries a filter for the life of the process that
+demotes ERROR only once a signal has been seen, so a steady-state export failure is untouched.
+
+### The provider was shut down twice
+
+`configure_tracing` never passed `shutdown_on_exit=False`, so the SDK's own `atexit` hook shut
+the provider down again after the lifespan had already done it, and the exporter answered
+`Exporter already shutdown, ignoring call`. The flag is now passed and this package owns the
+hook, registering an idempotent `atexit` so a process that never ran a lifespan still flushes.
+
+There was a second source of the same line in `shutdown_tracing` itself: it shuts this
+processor down for the bounded flush and then shuts the provider down, and the provider walks
+its processor list and calls the same processor again. `TailSamplingSpanProcessor.shutdown` is
+now idempotent, so only the first call reaches the exporter.
+
+### A rejected export now says why
+
+The OTLP HTTP exporter reports a failed batch as a status and a `reason` and discards the
+response body, which is the only place the endpoint explains a `403`. The exporter's `_export`
+is now wrapped so a non-2xx response logs one line carrying the status, the first 300
+characters of the body, and the `x-amzn-requestid` and `x-amzn-errortype` headers when present,
+at whatever level the teardown demotion decides. Only response data is read, never request
+headers, so no credential or signature can reach the logs. This is a diagnostic and it stays in
+the release.
+
 ## 0.25.0
 
 `create_app` now allows the `X-Request-ID` and `X-Retry-Attempt` request headers through CORS by

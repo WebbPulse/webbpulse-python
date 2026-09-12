@@ -41,6 +41,26 @@ signing key came from different resolutions, which X-Ray rejects with 403. So
 `TailSamplingSpanProcessor` serialises export, the exporter's `force_flush` and its
 `shutdown` behind one lock, and `_ReresolvingCredentials` pins one frozen snapshot per
 signature. See those classes for the detail.
+
+## When an export failure stops being a fault
+
+An export that fails because the process is going away says nothing about the application, so
+it logs at WARNING rather than ERROR. The window that judgement depends on opens at the first
+sign of shutdown, not at the provider's `shutdown`: under the Lambda Web Adapter the last
+request's synchronous flush runs between uvicorn's `SIGTERM` handler and the ASGI lifespan
+shutdown event, so a window opened inside `shutdown` is opened after the failure it exists to
+explain. `_install_sigterm_hook` chains uvicorn's handler and the lifespan wrapper flips the
+same flag, and `shutdown_signalled` is what the failure paths read.
+
+The provider is constructed with `shutdown_on_exit=False` because the SDK's `atexit` hook
+cannot see that the lifespan already shut the provider down and calls it again, which the
+exporter answers with `Exporter already shutdown, ignoring call`. `_register_shutdown_atexit`
+replaces it with an idempotent one, so a process that never ran a lifespan still flushes.
+
+`_log_export_response_bodies` wraps the exporter's `_export` to record a rejected batch's
+status, response body and `x-amzn-*` diagnostic headers, which the stock exporter discards
+before reporting the failure. Only response data is read, never request headers, so no
+credential or signature can reach the logs.
 """
 
 from __future__ import annotations
@@ -69,8 +89,10 @@ __all__ = [
     "flush_tracing",
     "instrument_fastapi",
     "is_tracing_enabled",
+    "note_shutdown_signal",
     "resolve_sample_ratio",
     "resolve_shutdown_flush_timeout",
+    "shutdown_signalled",
     "shutdown_tracing",
     "xray_otlp_endpoint",
 ]
@@ -112,6 +134,78 @@ _EXPORT_TIMEOUT_MILLIS: int = _DEFAULT_FLUSH_TIMEOUT_MILLIS
 _FLUSH_WRAPPED_ATTR: Final = "_webbpulse_flush_wrapped"
 
 _SHUTDOWN_WRAPPED_ATTR: Final = "_webbpulse_shutdown_flush_wrapped"
+
+_SHUTTING_DOWN = threading.Event()
+
+_SIGTERM_HOOKED = False
+
+_ATEXIT_REGISTERED = False
+
+
+def shutdown_signalled() -> bool:
+    """Whether a shutdown signal has been seen, from `SIGTERM` or an ASGI lifespan shutdown.
+
+    Read by the export failure paths to decide whether a failure is a fault worth an ERROR or
+    the expected outcome of a process already on its way out.
+    """
+    return _SHUTTING_DOWN.is_set()
+
+
+def note_shutdown_signal(source: str) -> None:
+    """Open the teardown window, so later export failures log at WARNING rather than ERROR.
+
+    Idempotent, and safe from a signal handler: setting an `Event` and a logging call are all
+    it does.
+
+    Args:
+        source: what observed the shutdown, recorded on the one log line this emits.
+    """
+    if _SHUTTING_DOWN.is_set():
+        return
+    _SHUTTING_DOWN.set()
+    _log.info("Shutdown signalled; demoting later span export failures.", extra={"shutdown_source": source})
+
+
+def _install_sigterm_hook() -> None:
+    """Flip the teardown flag on `SIGTERM`, then run whatever handler was already installed.
+
+    Lambda sends `SIGTERM` before the sandbox goes away, and uvicorn's own handler starts the
+    ASGI shutdown from it. The last request's synchronous flush runs between that signal and
+    the lifespan shutdown event, so waiting for the provider's `shutdown` to open the demotion
+    window leaves that flush's `403` at ERROR. Chaining rather than replacing keeps uvicorn's
+    graceful shutdown intact.
+
+    Only installable from the main thread, and a no-op anywhere else, which is what `signal`
+    itself requires.
+    """
+    global _SIGTERM_HOOKED
+    if _SIGTERM_HOOKED:
+        return
+
+    import signal
+
+    if threading.current_thread() is not threading.main_thread():
+        return
+
+    try:
+        previous = signal.getsignal(signal.SIGTERM)
+    except (OSError, ValueError):  # pragma: no cover
+        return
+
+    def handler(signum: int, frame: Any) -> None:
+        """Note the signal, then delegate to the handler that was installed before us."""
+        note_shutdown_signal("sigterm")
+        if callable(previous):
+            previous(signum, frame)
+        elif previous is signal.SIG_DFL:
+            signal.signal(signal.SIGTERM, signal.SIG_DFL)
+            signal.raise_signal(signal.SIGTERM)
+
+    try:
+        signal.signal(signal.SIGTERM, handler)
+    except (OSError, ValueError):  # pragma: no cover
+        return
+    _SIGTERM_HOOKED = True
 
 
 def is_tracing_enabled() -> bool:
@@ -246,34 +340,63 @@ _OTLP_EXPORTER_LOGGER: Final = "opentelemetry.exporter.otlp.proto.http.trace_exp
 
 
 class _DemoteToWarning(logging.Filter):
-    """Rewrites ERROR records to WARNING while attached.
+    """Rewrites ERROR records to WARNING while the process is shutting down.
 
     The OTLP exporter reports a failed batch with its own `_logger.error`, which this package
-    does not route. On the teardown path that is the `timeout, max retries or shutdown` line
-    and any read timeout behind it, both of which are the expected outcome of a flush
-    deliberately bounded well under Lambda's grace period rather than a fault. Left at ERROR
-    they page someone for working as designed, so they are demoted for the teardown window
-    only and every other export failure keeps its ERROR.
+    does not route. On the teardown path that is the `timeout, max retries or shutdown` line,
+    any read timeout behind it, and the `403` a torn-down sandbox answers with, all of which
+    are the expected outcome of a flush deliberately bounded well under Lambda's grace period
+    rather than a fault. Left at ERROR they page someone for working as designed.
+
+    The decision is made per record rather than by when the filter is attached, because the
+    window that matters opens before any code in this module is reached. Under the Lambda Web
+    Adapter the last request's synchronous flush runs between uvicorn's `SIGTERM` handler and
+    the ASGI lifespan shutdown event, so a filter attached only inside the provider's
+    `shutdown` is installed too late to catch it. `shutdown_signalled` is what both of those
+    moments flip, and an explicit teardown flush sets `forced` for the flush it wraps.
     """
+
+    def __init__(self) -> None:
+        """Start out demoting only once a shutdown has been signalled."""
+        super().__init__()
+        self.forced = False
 
     def filter(self, record: logging.LogRecord) -> bool:
         """Demote one record, never dropping it."""
-        if record.levelno == logging.ERROR:
+        if record.levelno == logging.ERROR and (self.forced or shutdown_signalled()):
             record.levelno = logging.WARNING
             record.levelname = "WARNING"
         return True
 
 
+_EXPORTER_DEMOTE_FILTER: Final = _DemoteToWarning()
+
+
+def _install_exporter_log_demotion() -> None:
+    """Attach the demotion filter to the OTLP exporter's logger for the life of the process.
+
+    Attached once and left in place. The filter is a no-op until a shutdown is signalled, so
+    a steady-state export failure still gets its ERROR.
+    """
+    logger = logging.getLogger(_OTLP_EXPORTER_LOGGER)
+    if _EXPORTER_DEMOTE_FILTER not in logger.filters:
+        logger.addFilter(_EXPORTER_DEMOTE_FILTER)
+
+
 @contextmanager
 def _exporter_teardown_logging() -> Iterator[None]:
-    """Demote the OTLP exporter's own ERROR lines for the duration of a teardown flush."""
-    logger = logging.getLogger(_OTLP_EXPORTER_LOGGER)
-    demote = _DemoteToWarning()
-    logger.addFilter(demote)
+    """Demote the OTLP exporter's own ERROR lines for the duration of a teardown flush.
+
+    Forces the demotion for the body even when no signal was seen, which covers a shutdown
+    driven straight from `shutdown_tracing` rather than by a signal.
+    """
+    _install_exporter_log_demotion()
+    previous = _EXPORTER_DEMOTE_FILTER.forced
+    _EXPORTER_DEMOTE_FILTER.forced = True
     try:
         yield
     finally:
-        logger.removeFilter(demote)
+        _EXPORTER_DEMOTE_FILTER.forced = previous
 
 
 def _is_non_positive_timeout_error(error: ValueError) -> bool:
@@ -540,7 +663,7 @@ class TailSamplingSpanProcessor:
         WARNING naming the lost span count is the whole signal. Everywhere else the failure is
         real and keeps its ERROR and its traceback.
         """
-        if self._tearing_down:
+        if self._tearing_down or shutdown_signalled():
             _log.warning(
                 "Dropping a span batch while shutting down: the final export did not complete "
                 "before the container went away. Expected on a Lambda sandbox teardown and not "
@@ -599,11 +722,18 @@ class TailSamplingSpanProcessor:
         Never raises. This runs on a container's way out, where the only thing a raise can
         achieve is to turn a lost span batch into a failed shutdown.
 
+        Idempotent, and it has to be: `shutdown_tracing` shuts this processor down for the
+        bounded flush and then shuts the provider down, and the provider walks its processor
+        list and calls this again. Without the guard the second call reaches the exporter, which
+        answers `Exporter already shutdown, ignoring call` at WARNING.
+
         Args:
             timeout_millis: ceiling on the final flush. `None` keeps the exporter's own
                 deadline, which is what a long-lived container wants; the Lambda shutdown path
                 passes the much smaller `resolve_shutdown_flush_timeout` value.
         """
+        if self._shutdown:
+            return
         self._tearing_down = True
         try:
             with _exporter_teardown_logging():
@@ -855,6 +985,75 @@ def _clamp_timeout(timeout: Any) -> Any:
     return max(_MIN_EXPORT_TIMEOUT_SECONDS, timeout)
 
 
+_RESPONSE_BODY_LIMIT: Final = 300
+
+_DIAGNOSTIC_RESPONSE_HEADERS: Final = ("x-amzn-requestid", "x-amzn-errortype")
+
+_BODY_LOGGING_ATTR: Final = "_webbpulse_body_logging_wrapped"
+
+
+def _log_failed_export_response(response: Any) -> None:
+    """Log one line describing a non-2xx export response, body included.
+
+    The OTLP HTTP exporter reports only the status and `reason`, so the endpoint's own
+    explanation of a `403` never reaches the logs. This records it once per failed response,
+    at the level the teardown demotion decides, truncated to `_RESPONSE_BODY_LIMIT`.
+
+    Only the status, the body and the two `x-amzn-*` diagnostic headers are read. Request
+    headers, and so the `Authorization` header and the SigV4 signature in it, are never
+    touched.
+    """
+    status = getattr(response, "status_code", None)
+    body = ""
+    try:
+        text = getattr(response, "text", "") or ""
+        body = text[:_RESPONSE_BODY_LIMIT]
+    except Exception:  # pragma: no cover
+        body = "<unreadable>"
+
+    extra: dict[str, Any] = {"http_response_status_code": status, "otlp_response_body": body}
+    headers = getattr(response, "headers", None)
+    if headers is not None:
+        for name in _DIAGNOSTIC_RESPONSE_HEADERS:
+            try:
+                value = headers.get(name)
+            except Exception:  # pragma: no cover
+                continue
+            if value:
+                extra[name.replace("-", "_")] = value
+
+    level = logging.WARNING if shutdown_signalled() else logging.ERROR
+    _log.log(
+        level,
+        "The OTLP span endpoint rejected an export.",
+        extra=extra,
+    )
+
+
+def _log_export_response_bodies(exporter: Any) -> None:
+    """Wrap an exporter's `_export` so a non-2xx response's body is logged once.
+
+    Wraps the private `_export`, which is the only place the response object exists before the
+    exporter throws it away. Guarded by a sentinel and by `getattr`, so a future rename loses
+    only the diagnostic rather than breaking exports.
+    """
+    if getattr(exporter, _BODY_LOGGING_ATTR, False):
+        return
+    inner = getattr(exporter, "_export", None)
+    if not callable(inner):  # pragma: no cover
+        return
+    setattr(exporter, _BODY_LOGGING_ATTR, True)
+
+    def _export(*args: Any, **kwargs: Any) -> Any:
+        """Export, then log the response body when the endpoint refused the batch."""
+        response = inner(*args, **kwargs)
+        if getattr(response, "ok", True) is False:
+            _log_failed_export_response(response)
+        return response
+
+    exporter._export = _export
+
+
 def _build_span_exporter(endpoint: str, timeout_millis: int) -> SpanExporter:
     """The exporter for an endpoint: SigV4 signing for X-Ray, plain OTLP for anything else.
 
@@ -867,6 +1066,7 @@ def _build_span_exporter(endpoint: str, timeout_millis: int) -> SpanExporter:
 
     if not _is_xray_endpoint(endpoint):
         exporter = OTLPSpanExporter(endpoint=endpoint, timeout=timeout_seconds)
+        _log_export_response_bodies(exporter)
         _guard_export_timeouts(exporter)
         return exporter
 
@@ -884,6 +1084,7 @@ def _build_span_exporter(endpoint: str, timeout_millis: int) -> SpanExporter:
             extra={"otlp_endpoint": endpoint},
         )
         exporter = OTLPSpanExporter(endpoint=endpoint, timeout=timeout_seconds)
+        _log_export_response_bodies(exporter)
         _guard_export_timeouts(exporter)
         return exporter
 
@@ -895,6 +1096,7 @@ def _build_span_exporter(endpoint: str, timeout_millis: int) -> SpanExporter:
         timeout=timeout_seconds,
     )
     _pin_credentials_per_request(signing_exporter, credential_session.get_credentials())
+    _log_export_response_bodies(signing_exporter)
     _guard_export_timeouts(signing_exporter)
     return cast("SpanExporter", signing_exporter)
 
@@ -993,7 +1195,11 @@ def configure_tracing(
 
     ratio = resolve_sample_ratio(sample_ratio)
 
-    provider = TracerProvider(sampler=ParentBased(root=ALWAYS_ON), resource=Resource.create(attributes))
+    provider = TracerProvider(
+        sampler=ParentBased(root=ALWAYS_ON),
+        resource=Resource.create(attributes),
+        shutdown_on_exit=False,
+    )
     processor = TailSamplingSpanProcessor(
         _build_span_exporter(resolved_endpoint, export_timeout_millis),
         sample_ratio=ratio,
@@ -1009,6 +1215,9 @@ def configure_tracing(
     trace.set_tracer_provider(provider)
 
     _instrument_botocore()
+    _install_exporter_log_demotion()
+    _install_sigterm_hook()
+    _register_shutdown_atexit()
     _CONFIGURED = True
     _PROCESSOR = processor
     _log.info(
@@ -1021,6 +1230,40 @@ def configure_tracing(
         },
     )
     return True
+
+
+def _register_shutdown_atexit() -> None:
+    """Shut tracing down at interpreter exit, once, if nothing else already did.
+
+    `configure_tracing` passes `shutdown_on_exit=False` to `TracerProvider`, because the SDK's
+    own `atexit` hook has no idea the lifespan wrapper already shut the provider down and calls
+    it a second time, which the exporter answers with `Exporter already shutdown, ignoring
+    call` at WARNING. Owning the hook here keeps the safety net for a process that never ran a
+    lifespan, while `shutdown_tracing` clearing `_PROCESSOR` makes a second run a no-op.
+
+    Registered once per process.
+    """
+    global _ATEXIT_REGISTERED
+    if _ATEXIT_REGISTERED:
+        return
+
+    import atexit
+
+    def run() -> None:
+        """Shut tracing down unless the app already did."""
+        if _PROCESSOR is None and not _CONFIGURED:
+            return
+        note_shutdown_signal("atexit")
+        try:
+            shutdown_tracing()
+        except Exception as error:  # pragma: no cover
+            _log.warning(
+                "Shutting tracing down at interpreter exit failed.",
+                extra={"exporter_error": str(error)},
+            )
+
+    atexit.register(run)
+    _ATEXIT_REGISTERED = True
 
 
 def _instrument_botocore() -> None:
@@ -1186,9 +1429,17 @@ def _wrap_lifespan_with_shutdown_flush(app: FastAPI, timeout_millis: int) -> Non
 
     @asynccontextmanager
     async def lifespan_context(scope: Any) -> AsyncIterator[Any]:
-        """Run the app's own lifespan, then flush and shut tracing down on the way out."""
+        """Run the app's own lifespan, then flush and shut tracing down on the way out.
+
+        The demotion window opens as soon as the shutdown event is seen, before the app's own
+        shutdown work runs, because an export failing anywhere past that point is the process
+        going away rather than a fault.
+        """
         async with inner(scope) as state:
-            yield state
+            try:
+                yield state
+            finally:
+                note_shutdown_signal("lifespan-shutdown")
         await _shutdown_tracing_async(timeout_millis)
 
     app.router.lifespan_context = lifespan_context
@@ -1236,6 +1487,10 @@ def shutdown_tracing(timeout_millis: int | None = None) -> None:
     Called for you from the lifespan wrapper `instrument_fastapi` installs, and safe to call
     directly from any other shutdown path: shutting the provider down flushes the tail
     buffers, so nothing recorded is lost.
+
+    Clearing `_PROCESSOR` and `_CONFIGURED` on the way out is what makes a second call a no-op,
+    which is what the `atexit` net this module registers relies on to avoid shutting an already
+    shut provider down again.
 
     Args:
         timeout_millis: ceiling on the final flush. `None` leaves the exporter's own deadline
