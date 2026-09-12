@@ -844,8 +844,28 @@ install_dynamodb_error_handlers(app)
 
 All three subclass `DynamoError`, so one `except DynamoError` or one `exception_map` entry
 covers the hierarchy, and a service's own subclass inherits the nearest handler without
-needing an entry. `not_found_message` and `conflict_message` change the wording without
-writing a handler.
+needing an entry. `not_found_message`, `conflict_message` and `internal_error_message` change
+the wording without writing a handler.
+
+A service with its own wording passes a `DynamoDBErrorHandlerOptions` in place of `True`,
+which both flags forward, so it does not have to drop to the bare installer to configure the
+messages:
+
+```python
+from webbpulse.http import DynamoDBErrorHandlerOptions, create_app
+
+app = create_app(
+    [posts_router],
+    dynamodb_error_handlers=DynamoDBErrorHandlerOptions(
+        not_found_message="Resource not found",
+        internal_error_message="Internal server error",
+    ),
+)
+```
+
+Each field left unset keeps the package default from `DYNAMODB_ERROR_MESSAGES`, so
+`DynamoDBErrorHandlerOptions()` is the same as `True`. `internal_error_message` is the wording
+the non-conditional `TransactionCanceled` branch renders, which until 0.24.0 was fixed.
 
 This needs no extra. The types are plain exceptions and importing them pulls in no botocore,
 which is the difference from `install_dynamodb_handlers`: that one handles the raw

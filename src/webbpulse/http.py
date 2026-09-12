@@ -34,6 +34,8 @@ __all__ = [
     "LAMBDA_CONTEXT_HEADER",
     "REQUEST_CONTEXT_HEADER",
     "REQUEST_ID_HEADER",
+    "DynamoDBErrorHandlerOptions",
+    "DynamoDBErrors",
     "ErrorContext",
     "ErrorEnvelope",
     "ErrorRenderer",
@@ -360,7 +362,7 @@ def register_error_handlers(
     validation_error_code: str = "VALIDATION_ERROR",
     error_envelope: ErrorEnvelope | None = None,
     dynamodb: bool = False,
-    dynamodb_errors: bool = False,
+    dynamodb_errors: DynamoDBErrors = False,
     exception_map: ExceptionMap | None = None,
 ) -> None:
     """Install handlers that render every error in one JSON envelope.
@@ -369,6 +371,9 @@ def register_error_handlers(
     `error_code`, `validation_details` adds per-field 422 `details`, `dynamodb` installs the
     botocore handlers, `dynamodb_errors` installs the handlers for this package's own
     `webbpulse.dynamodb` exception types, and `exception_map` maps the service's own types.
+
+    `dynamodb_errors` also accepts a `DynamoDBErrorHandlerOptions`, which installs the same
+    handlers with the consumer's own wording instead of the package defaults.
 
     `error_envelope` chooses the body shape for every handler installed here, including the
     unmatched-route 404. `"detailed"` implies `error_codes` and `validation_details`, so a
@@ -511,7 +516,19 @@ def register_error_handlers(
         )
 
     if dynamodb_errors:
-        install_dynamodb_error_handlers(app, error_codes=error_codes, error_envelope=renderer)
+        options = (
+            dynamodb_errors
+            if isinstance(dynamodb_errors, DynamoDBErrorHandlerOptions)
+            else DynamoDBErrorHandlerOptions()
+        )
+        install_dynamodb_error_handlers(
+            app,
+            error_codes=error_codes,
+            error_envelope=renderer,
+            not_found_message=options.not_found_message,
+            conflict_message=options.conflict_message,
+            internal_error_message=options.internal_error_message,
+        )
 
 
 DYNAMODB_RETRY_AFTER_SECONDS: Final = 1
@@ -765,7 +782,25 @@ def install_dynamodb_handlers(
 DYNAMODB_ERROR_MESSAGES: Final[Mapping[str, str]] = {
     "not_found": "The requested resource was not found.",
     "conflict": "The resource was modified by another request. Try again.",
+    "internal": "Internal server error.",
 }
+
+
+@dataclass(frozen=True, slots=True)
+class DynamoDBErrorHandlerOptions:
+    """The wording `install_dynamodb_error_handlers` renders, for forwarding through a flag.
+
+    Pass one in place of `True` to `register_error_handlers(dynamodb_errors=...)` or
+    `create_app(dynamodb_error_handlers=...)`. Every field left `None` keeps the package
+    default from `DYNAMODB_ERROR_MESSAGES`.
+    """
+
+    not_found_message: str | None = None
+    conflict_message: str | None = None
+    internal_error_message: str | None = None
+
+
+type DynamoDBErrors = bool | DynamoDBErrorHandlerOptions
 
 
 def install_dynamodb_error_handlers(
@@ -775,6 +810,7 @@ def install_dynamodb_error_handlers(
     error_envelope: ErrorEnvelope | None = None,
     not_found_message: str | None = None,
     conflict_message: str | None = None,
+    internal_error_message: str | None = None,
 ) -> None:
     """Install handlers for `webbpulse.dynamodb`'s own exception types.
 
@@ -782,6 +818,9 @@ def install_dynamodb_error_handlers(
     409 when any cancellation reason is a failed condition and a 500 otherwise. Opt in, and
     needs no extra: the types live in `webbpulse.dynamodb` and importing them pulls in no
     botocore. Pair it with `install_dynamodb_handlers` when raw `ClientError` can also escape.
+
+    The three message arguments pin a consumer's own wording; each one left `None` keeps the
+    package default.
     """
     from webbpulse.dynamodb import ConditionFailed, ItemNotFound, TransactionCanceled
 
@@ -791,6 +830,7 @@ def install_dynamodb_error_handlers(
     render_codes = _renders_codes(renderer, error_codes=error_codes)
     not_found = not_found_message or DYNAMODB_ERROR_MESSAGES["not_found"]
     conflict = conflict_message or DYNAMODB_ERROR_MESSAGES["conflict"]
+    internal = internal_error_message or DYNAMODB_ERROR_MESSAGES["internal"]
 
     def _body(status_code: int, message: str, request: Request, exc: BaseException) -> Any:
         """Render one repository failure through the configured envelope."""
@@ -836,9 +876,7 @@ def install_dynamodb_error_handlers(
             _log.warning("DynamoDB transaction cancelled by a failed condition.", extra=extra)
             return JSONResponse(status_code=409, content=_body(409, conflict, request, exc))
         _log.error("DynamoDB transaction cancelled.", extra=extra, exc_info=True)
-        return JSONResponse(
-            status_code=500, content=_body(500, "Internal server error.", request, exc)
-        )
+        return JSONResponse(status_code=500, content=_body(500, internal, request, exc))
 
 
 def create_app(
@@ -857,7 +895,7 @@ def create_app(
     validation_details: bool = False,
     error_envelope: ErrorEnvelope | None = None,
     dynamodb_handlers: bool = False,
-    dynamodb_error_handlers: bool = False,
+    dynamodb_error_handlers: DynamoDBErrors = False,
     exception_map: ExceptionMap | None = None,
     **fastapi_kwargs: Any,
 ) -> FastAPI:
@@ -869,7 +907,8 @@ def create_app(
 
     `error_envelope` chooses the error body shape: the default, `"detailed"`, or a callable
     taking an `ErrorContext`. `dynamodb_error_handlers` maps this package's own
-    `webbpulse.dynamodb` exception types, and `dynamodb_handlers` the raw botocore ones.
+    `webbpulse.dynamodb` exception types, and `dynamodb_handlers` the raw botocore ones. Pass a
+    `DynamoDBErrorHandlerOptions` in place of `True` to pin the wording those handlers render.
     """
     origins = (
         list(cors_allow_origins)

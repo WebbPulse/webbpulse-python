@@ -5,6 +5,40 @@ Notable changes to the `webbpulse` package. The version here is the one in
 
 This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## 0.24.0
+
+`register_error_handlers(dynamodb_errors=...)` and `create_app(dynamodb_error_handlers=...)`
+now accept a `DynamoDBErrorHandlerOptions` in place of `True`, and
+`install_dynamodb_error_handlers` gains an `internal_error_message`. `True` and `False` behave
+exactly as in 0.23.0, and the default wording is byte identical, so a consumer that passes
+neither sees no change.
+
+### The flag silently discarded the wording
+
+0.23.0 shipped two ways to install the `webbpulse.dynamodb` handlers, and only one of them
+could be configured. `install_dynamodb_error_handlers` took `not_found_message` and
+`conflict_message`; the `dynamodb_errors` and `dynamodb_error_handlers` flags took a bool and
+forwarded nothing. A consumer with its own wording that reached for the flag, which is the
+path the README shows first, got the package defaults and a green test suite, because the
+defaults are plausible sentences rather than placeholders. CarModPicker hit this adopting
+0.23.0.
+
+A bool cannot carry wording, so the flag now takes either. `DynamoDBErrorHandlerOptions` is a
+frozen dataclass of the three messages, each defaulting to `None` for the package default, and
+every field is forwarded. Passing `DynamoDBErrorHandlerOptions()` is the same as passing
+`True`, which has a test, because an options object that pinned nothing silently reverting to
+a different set of defaults would be the same class of bug one layer down.
+
+### The 500 branch had no knob at all
+
+`TransactionCanceled` renders a 409 when a cancellation reason is a failed condition and a 500
+otherwise, and that 500 rendered the literal `"Internal server error."` with no way to change
+it. Every other message in the handler was configurable, so a consumer pinning the other two
+ended up with two of its own sentences and one of the package's. `internal_error_message`
+closes it, and `DYNAMODB_ERROR_MESSAGES` gains an `"internal"` key holding the default, which
+is unchanged including the trailing period. CarModPicker pins `"Internal server error"`
+without one.
+
 ## 0.23.0
 
 `webbpulse.http` gains an `error_envelope` option choosing the whole error body shape, and

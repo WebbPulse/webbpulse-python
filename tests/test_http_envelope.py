@@ -8,6 +8,7 @@ changing a single byte any caller already reads.
 from __future__ import annotations
 
 from collections.abc import Mapping
+from dataclasses import FrozenInstanceError
 from typing import Any, ClassVar
 
 import pytest
@@ -17,6 +18,8 @@ from pydantic import BaseModel
 
 from webbpulse.dynamodb import ConditionFailed, DynamoError, ItemNotFound, TransactionCanceled
 from webbpulse.http import (
+    DYNAMODB_ERROR_MESSAGES,
+    DynamoDBErrorHandlerOptions,
     ErrorContext,
     create_app,
     detailed_error_body,
@@ -351,6 +354,129 @@ class TestDynamoDbErrorHandlers:
         response = client.get("/missing")
         assert response.status_code == 500
         assert response.json()["status"] == 500
+
+    def test_the_internal_message_is_overridable(self) -> None:
+        """A consumer can pin the non-conditional cancellation wording too."""
+        app = FastAPI()
+        register_error_handlers(app, error_envelope="detailed")
+        install_dynamodb_error_handlers(
+            app,
+            error_envelope="detailed",
+            internal_error_message="Internal server error",
+        )
+
+        @app.get("/canceled-other")
+        async def canceled_other() -> None:
+            """Raise a transaction cancelled for a reason that is not a conflict."""
+            raise TransactionCanceled([{"Code": "TransactionConflict"}])
+
+        client = TestClient(app, raise_server_exceptions=False)
+        response = client.get("/canceled-other")
+        assert response.status_code == 500
+        assert response.json()["message"] == "Internal server error"
+
+    def test_an_overridden_message_leaves_the_others_alone(self) -> None:
+        """Pinning one message keeps the package default for the other two."""
+        app = FastAPI()
+        register_error_handlers(app, error_envelope="detailed")
+        install_dynamodb_error_handlers(app, error_envelope="detailed", not_found_message="Gone")
+        app.include_router(_router())
+
+        client = TestClient(app, raise_server_exceptions=False)
+        assert client.get("/missing").json()["message"] == "Gone"
+        assert client.get("/duplicate").json()["message"] == DYNAMODB_ERROR_MESSAGES["conflict"]
+        assert (
+            client.get("/canceled-other").json()["message"] == DYNAMODB_ERROR_MESSAGES["internal"]
+        )
+
+
+class TestDynamoDbOptionsForwarding:
+    """`DynamoDBErrorHandlerOptions` reaching the handlers through either flag."""
+
+    OPTIONS: ClassVar[DynamoDBErrorHandlerOptions] = DynamoDBErrorHandlerOptions(
+        not_found_message="Resource not found",
+        conflict_message="Resource already exists or was modified concurrently",
+        internal_error_message="Internal server error",
+    )
+
+    def _assert_pinned(self, client: TestClient) -> None:
+        """Every one of the three messages is the consumer's, not the package's."""
+        assert client.get("/missing").json()["message"] == "Resource not found"
+        assert (
+            client.get("/duplicate").json()["message"]
+            == "Resource already exists or was modified concurrently"
+        )
+        assert client.get("/canceled-other").json()["message"] == "Internal server error"
+
+    def test_register_error_handlers_forwards_the_options(self) -> None:
+        """`dynamodb_errors` takes the options in place of `True` and forwards every field."""
+        app = FastAPI()
+        register_error_handlers(app, error_envelope="detailed", dynamodb_errors=self.OPTIONS)
+        app.include_router(_router())
+        self._assert_pinned(TestClient(app, raise_server_exceptions=False))
+
+    def test_create_app_forwards_the_options(self) -> None:
+        """`dynamodb_error_handlers` does the same, so a consumer needs no second call."""
+        app = create_app(
+            [_router()],
+            error_envelope="detailed",
+            dynamodb_error_handlers=self.OPTIONS,
+        )
+        self._assert_pinned(TestClient(app, raise_server_exceptions=False))
+
+    def test_the_options_work_under_the_default_envelope(self) -> None:
+        """Forwarding is independent of the shape, so the default envelope pins them too."""
+        app = create_app([_router()], dynamodb_error_handlers=self.OPTIONS)
+        client = TestClient(app, raise_server_exceptions=False)
+        self._assert_pinned(client)
+        assert client.get("/missing").json().keys() == BASE_KEYS
+
+    def test_empty_options_are_the_package_defaults(self) -> None:
+        """Passing options that pin nothing is exactly `True`."""
+        app = create_app(
+            [_router()],
+            error_envelope="detailed",
+            dynamodb_error_handlers=DynamoDBErrorHandlerOptions(),
+        )
+        client = TestClient(app, raise_server_exceptions=False)
+        assert client.get("/missing").json()["message"] == DYNAMODB_ERROR_MESSAGES["not_found"]
+        assert client.get("/duplicate").json()["message"] == DYNAMODB_ERROR_MESSAGES["conflict"]
+        assert (
+            client.get("/canceled-other").json()["message"] == DYNAMODB_ERROR_MESSAGES["internal"]
+        )
+
+    def test_the_options_are_frozen(self) -> None:
+        """The options carry no mutable state a consumer could change after installation."""
+        with pytest.raises((AttributeError, FrozenInstanceError)):
+            self.OPTIONS.not_found_message = "changed"  # type: ignore[misc]
+
+
+class TestDefaultDynamoDbMessagesUnchanged:
+    """A regression guard: `True` renders byte identically to 0.23.0."""
+
+    EXPECTED: ClassVar[Mapping[str, str]] = {
+        "/missing": "The requested resource was not found.",
+        "/duplicate": "The resource was modified by another request. Try again.",
+        "/canceled-conditional": "The resource was modified by another request. Try again.",
+        "/canceled-other": "Internal server error.",
+    }
+
+    @pytest.mark.parametrize("envelope", [None, "detailed"])
+    def test_the_flag_still_renders_the_0_23_0_wording(self, envelope: str | None) -> None:
+        """The literals are pinned here, not read from the package, so a drift fails."""
+        app = create_app([_router()], error_envelope=envelope, dynamodb_error_handlers=True)
+        client = TestClient(app, raise_server_exceptions=False)
+        for path, message in self.EXPECTED.items():
+            assert client.get(path).json()["message"] == message, path
+
+    def test_the_message_table_still_carries_the_0_23_0_entries(self) -> None:
+        """`DYNAMODB_ERROR_MESSAGES` gained a key and changed none of the two it had."""
+        assert DYNAMODB_ERROR_MESSAGES["not_found"] == "The requested resource was not found."
+        assert (
+            DYNAMODB_ERROR_MESSAGES["conflict"]
+            == "The resource was modified by another request. Try again."
+        )
+        assert DYNAMODB_ERROR_MESSAGES["internal"] == "Internal server error."
 
 
 class TestDynamoDbExceptionTypes:
