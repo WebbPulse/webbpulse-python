@@ -1988,7 +1988,7 @@ def test_pinned_credentials_keep_one_signature_internally_consistent() -> None:
                     data=b"payload",
                     headers={"Content-Type": "application/x-protobuf"},
                 )
-                signer = SigV4Auth(credentials, "xray", "us-west-2")
+                signer = SigV4Auth(cast("Any", credentials), "xray", "us-west-2")
                 secret_used = signer.credentials.secret_key
                 signer.add_auth(request)
                 key_id = request.headers["Authorization"].split("Credential=")[1].split("/")[0]
