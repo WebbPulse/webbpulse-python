@@ -1376,6 +1376,7 @@ class _NoUserIndexRefreshTokenStore(InMemoryRefreshTokenStore):
     """
 
     def revoke_all_for_user(self, user_id: str, *, except_family_id: str = "") -> int:
+        """Refuse the scan, as the deployed DynamoDB store does."""
         raise NotImplementedError("revoke_all_for_user needs the caller's family ids")
 
 
