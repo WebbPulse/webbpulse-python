@@ -227,6 +227,42 @@ def test_cors_headers_are_applied_for_a_listed_origin() -> None:
     assert response.headers["access-control-allow-credentials"] == "true"
 
 
+def test_cors_preflight_allows_the_client_request_and_retry_headers() -> None:
+    """The api clients send x-request-id always and x-retry-attempt on retries."""
+    app = create_app(cors_allow_origins=["https://webbpulse.com"])
+    client = TestClient(app)
+    response = client.options(
+        "/health",
+        headers={
+            "Origin": "https://webbpulse.com",
+            "Access-Control-Request-Method": "GET",
+            "Access-Control-Request-Headers": "content-type,x-request-id,x-retry-attempt",
+        },
+    )
+    assert response.status_code == 200, response.text
+    allowed = response.headers["access-control-allow-headers"].lower()
+    assert "x-request-id" in allowed
+    assert "x-retry-attempt" in allowed
+
+
+def test_cors_allow_headers_can_be_overridden() -> None:
+    """A caller that passes its own list replaces the default entirely."""
+    app = create_app(
+        cors_allow_origins=["https://webbpulse.com"],
+        cors_allow_headers=["Content-Type"],
+    )
+    client = TestClient(app)
+    response = client.options(
+        "/health",
+        headers={
+            "Origin": "https://webbpulse.com",
+            "Access-Control-Request-Method": "GET",
+            "Access-Control-Request-Headers": "x-retry-attempt",
+        },
+    )
+    assert response.status_code == 400
+
+
 def test_cors_headers_are_present_on_an_error_response() -> None:
     """Without CORS outermost, a browser reports an opaque CORS failure, not the real status."""
     router = APIRouter()

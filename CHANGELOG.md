@@ -5,6 +5,28 @@ Notable changes to the `webbpulse` package. The version here is the one in
 
 This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## 0.25.0
+
+`create_app` now allows the `X-Request-ID` and `X-Retry-Attempt` request headers through CORS by
+default, and takes a `cors_allow_headers` override.
+
+### A retried browser request failed its preflight
+
+`@webbpulse/api-client` sets `x-request-id` on every request and adds `x-retry-attempt` once it
+retries. The CORS allow list was hardcoded to `Accept, Authorization, Content-Type, Origin,
+X-Request-ID`, so the first attempt passed its preflight and the retry was answered 400
+`Disallowed CORS headers`. The browser then reported a CORS failure rather than the original
+error that caused the retry, and no `create_app` argument could widen the list.
+
+The default list is now `DEFAULT_CORS_ALLOW_HEADERS`, which adds `X-Retry-Attempt` alongside
+`Accept-Language` and `Content-Language` so it covers the CORS safelisted request headers in
+full. `RETRY_ATTEMPT_HEADER` is exported beside `REQUEST_ID_HEADER`. Passing
+`cors_allow_headers` replaces the default outright.
+
+Infrastructure in front of the app applies its own allow list. An API Gateway HTTP API with a
+`cors_configuration` answers preflights itself on the routes it owns, so that list needs
+`X-Retry-Attempt` too.
+
 ## 0.24.1
 
 Fixes the intermittent `Failed to export span batch code: 403, reason: Forbidden` from the
