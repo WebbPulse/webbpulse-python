@@ -167,9 +167,7 @@ class TestPytestArgs:
 class TestCommandLine:
     """Tests for the `main` command line entrypoint."""
 
-    def test_domains_prints_a_json_array(
-        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
-    ) -> None:
+    def test_domains_prints_a_json_array(self, tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
         """`fromJson` in the workflow parses exactly this, so it must be a bare array."""
         write_pyproject(
             tmp_path,
@@ -184,9 +182,7 @@ class TestCommandLine:
 
         assert json.loads(capsys.readouterr().out) == ["catalog", "identity"]
 
-    def test_domains_can_append_shared(
-        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
-    ) -> None:
+    def test_domains_can_append_shared(self, tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
         """`--include-shared` appends the shared job to the matrix."""
         write_pyproject(
             tmp_path,
@@ -200,17 +196,13 @@ class TestCommandLine:
 
         assert json.loads(capsys.readouterr().out) == ["identity", SHARED_DOMAIN]
 
-    def test_empty_config_prints_an_empty_array(
-        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
-    ) -> None:
+    def test_empty_config_prints_an_empty_array(self, tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
         """An empty matrix must still be valid JSON or the workflow fails to expand it."""
         assert main(["--project-dir", str(tmp_path), "domains"]) == 0
 
         assert json.loads(capsys.readouterr().out) == []
 
-    def test_pytest_args_prints_shell_quoted_paths(
-        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
-    ) -> None:
+    def test_pytest_args_prints_shell_quoted_paths(self, tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
         """`pytest-args` prints the domain's paths shell quoted, so spaces survive."""
         write_pyproject(
             tmp_path,
@@ -225,9 +217,7 @@ class TestCommandLine:
         assert code == 0
         assert capsys.readouterr().out.strip() == "'tests/auth' 'tests/dir with space'"
 
-    def test_pytest_args_for_shared(
-        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
-    ) -> None:
+    def test_pytest_args_for_shared(self, tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
         """`pytest-args --domain shared` prints the root plus an --ignore per claimed path."""
         write_pyproject(
             tmp_path,
@@ -245,9 +235,7 @@ class TestCommandLine:
         assert code == 0
         assert capsys.readouterr().out.strip() == "'tests' '--ignore=tests/auth'"
 
-    def test_an_unknown_domain_exits_two(
-        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
-    ) -> None:
+    def test_an_unknown_domain_exits_two(self, tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
         """An unknown domain exits 2 and names the problem on stderr."""
         write_pyproject(
             tmp_path,

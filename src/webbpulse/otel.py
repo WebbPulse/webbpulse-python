@@ -131,12 +131,7 @@ def xray_otlp_endpoint(region: str | None = None) -> str:
     Falls back to `AWS_REGION`, which Lambda always sets, and then to `us-west-2`, which is
     the only region this estate runs in.
     """
-    resolved = (
-        region
-        or os.environ.get("AWS_REGION")
-        or os.environ.get("AWS_DEFAULT_REGION")
-        or "us-west-2"
-    )
+    resolved = region or os.environ.get("AWS_REGION") or os.environ.get("AWS_DEFAULT_REGION") or "us-west-2"
     return f"https://xray.{resolved}.amazonaws.com/v1/traces"
 
 
@@ -333,9 +328,7 @@ class TailSamplingSpanProcessor:
         if max_buffered_traces < 1:
             raise ValueError(f"max_buffered_traces must be at least 1, got {max_buffered_traces!r}")
         if max_trace_age_seconds <= 0:
-            raise ValueError(
-                f"max_trace_age_seconds must be positive, got {max_trace_age_seconds!r}"
-            )
+            raise ValueError(f"max_trace_age_seconds must be positive, got {max_trace_age_seconds!r}")
 
         self._exporter = exporter
         self._sample_ratio = sample_ratio
@@ -452,8 +445,7 @@ class TailSamplingSpanProcessor:
 
         self._overflowed_keep.add(trace_id)
         _log.warning(
-            "Exporting a trace that exceeded the tail sampling buffer cap without a "
-            "sampling decision.",
+            "Exporting a trace that exceeded the tail sampling buffer cap without a sampling decision.",
             extra={
                 "otel_trace_id": f"{trace_id:032x}",
                 "max_spans_per_trace": self._max_spans_per_trace,
@@ -576,9 +568,7 @@ class TailSamplingSpanProcessor:
         """
         to_export: list[list[ReadableSpan]] = []
         with self._lock:
-            complete = [
-                trace_id for trace_id in self._buffers if not self._open_spans.get(trace_id)
-            ]
+            complete = [trace_id for trace_id in self._buffers if not self._open_spans.get(trace_id)]
             for trace_id in complete:
                 spans = self._buffers.pop(trace_id)
                 self._started_at.pop(trace_id, None)
@@ -652,11 +642,7 @@ def _xray_region(endpoint: str) -> str | None:
         return None
     labels = (parsed.hostname or "").lower().split(".")
 
-    if (
-        len(labels) == 4
-        and labels[0] in ("xray", "xray-fips")
-        and labels[2:] == ["amazonaws", "com"]
-    ):
+    if len(labels) == 4 and labels[0] in ("xray", "xray-fips") and labels[2:] == ["amazonaws", "com"]:
         return labels[1]
     if len(labels) == 6 and labels[1] == "xray" and labels[3:] == ["vpce", "amazonaws", "com"]:
         return labels[2]
@@ -992,9 +978,7 @@ def configure_tracing(
         _log.debug("OpenTelemetry SDK not installed; install webbpulse[otel] to enable tracing.")
         return False
 
-    resolved_endpoint = (
-        endpoint or os.environ.get("OTEL_EXPORTER_OTLP_TRACES_ENDPOINT") or xray_otlp_endpoint()
-    )
+    resolved_endpoint = endpoint or os.environ.get("OTEL_EXPORTER_OTLP_TRACES_ENDPOINT") or xray_otlp_endpoint()
 
     attributes: dict[str, Any] = {"service.name": service_name, "service.namespace": "webbpulse"}
     if environment:
@@ -1009,9 +993,7 @@ def configure_tracing(
 
     ratio = resolve_sample_ratio(sample_ratio)
 
-    provider = TracerProvider(
-        sampler=ParentBased(root=ALWAYS_ON), resource=Resource.create(attributes)
-    )
+    provider = TracerProvider(sampler=ParentBased(root=ALWAYS_ON), resource=Resource.create(attributes))
     processor = TailSamplingSpanProcessor(
         _build_span_exporter(resolved_endpoint, export_timeout_millis),
         sample_ratio=ratio,
@@ -1078,8 +1060,7 @@ class _FlushTracingASGIMiddleware:
             flush_tracing(self._timeout_millis)
         except Exception:
             _log.warning(
-                "Flushing spans at the end of the request failed; this request's trace may "
-                "be lost.",
+                "Flushing spans at the end of the request failed; this request's trace may be lost.",
                 exc_info=True,
             )
 
@@ -1157,9 +1138,7 @@ def instrument_fastapi(
         _wrap_with_flush(app, timeout)
 
     if flush_on_shutdown:
-        _wrap_lifespan_with_shutdown_flush(
-            app, resolve_shutdown_flush_timeout(shutdown_flush_timeout_millis)
-        )
+        _wrap_lifespan_with_shutdown_flush(app, resolve_shutdown_flush_timeout(shutdown_flush_timeout_millis))
 
 
 def _wrap_with_flush(app: FastAPI, timeout_millis: int) -> None:

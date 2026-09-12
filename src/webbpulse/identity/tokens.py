@@ -129,8 +129,7 @@ class KmsSigner:
         der = response["PublicKey"]
         if not isinstance(der, bytes):  # pragma: no cover
             raise TypeError(
-                "kms:GetPublicKey returned a non-bytes PublicKey; expected the DER "
-                "SubjectPublicKeyInfo as bytes."
+                "kms:GetPublicKey returned a non-bytes PublicKey; expected the DER SubjectPublicKeyInfo as bytes."
             )
         return der
 
@@ -145,10 +144,7 @@ class KmsSigner:
         )
         signature = response["Signature"]
         if not isinstance(signature, bytes):  # pragma: no cover
-            raise TypeError(
-                "kms:Sign returned a non-bytes Signature; expected the raw PKCS #1 "
-                "signature as bytes."
-            )
+            raise TypeError("kms:Sign returned a non-bytes Signature; expected the raw PKCS #1 signature as bytes.")
         return signature
 
     def encode(self, claims: Mapping[str, Any]) -> str:
@@ -277,8 +273,7 @@ def mint_test_token(
         )
     if environment.lower() in _REFUSED_ENVIRONMENTS:
         raise TokenMintingDisabled(
-            f"mint_test_token is refused in environment {environment!r}, whatever the "
-            "enable flag says."
+            f"mint_test_token is refused in environment {environment!r}, whatever the enable flag says."
         )
     issued_at = int(time.time()) if now is None else now
     claims: dict[str, Any] = {

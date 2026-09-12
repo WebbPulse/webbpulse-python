@@ -195,10 +195,7 @@ class PasskeyService:
 
         challenge = secrets.token_bytes(CHALLENGE_BYTES)
         existing = self._stores.require_passkeys().list_for_user(user_id)
-        exclude = [
-            PublicKeyCredentialDescriptor(id=b64url_decode(record.credential_id))
-            for record in existing
-        ]
+        exclude = [PublicKeyCredentialDescriptor(id=b64url_decode(record.credential_id)) for record in existing]
 
         options = generate_registration_options(
             rp_id=self.rp_id,
@@ -253,9 +250,7 @@ class PasskeyService:
                 expected_challenge=b64url_decode(record.challenge),
                 expected_rp_id=self.rp_id,
                 expected_origin=self.origins,
-                supported_pub_key_algs=[
-                    COSEAlgorithmIdentifier(alg) for alg in SUPPORTED_COSE_ALGS
-                ],
+                supported_pub_key_algs=[COSEAlgorithmIdentifier(alg) for alg in SUPPORTED_COSE_ALGS],
             )
         except (WebAuthnException, ValueError, KeyError) as exc:
             _log.info(
@@ -447,14 +442,10 @@ class PasskeyService:
             )
         store = self._stores.require_passkeys()
         if not store.rename(user_id, credential_id, name=cleaned):
-            raise PasskeyRejected(
-                "No such passkey.", error_code="PASSKEY_NOT_FOUND", status_code=404
-            )
+            raise PasskeyRejected("No such passkey.", error_code="PASSKEY_NOT_FOUND", status_code=404)
         updated = store.get(user_id, credential_id)
         if updated is None:  # pragma: no cover
-            raise PasskeyRejected(
-                "No such passkey.", error_code="PASSKEY_NOT_FOUND", status_code=404
-            )
+            raise PasskeyRejected("No such passkey.", error_code="PASSKEY_NOT_FOUND", status_code=404)
         return updated
 
     def delete_passkey(self, user_id: str, credential_id: str, *, has_password: bool) -> None:
@@ -466,9 +457,7 @@ class PasskeyService:
         store = self._stores.require_passkeys()
         existing = store.list_for_user(user_id)
         if not any(record.credential_id == credential_id for record in existing):
-            raise PasskeyRejected(
-                "No such passkey.", error_code="PASSKEY_NOT_FOUND", status_code=404
-            )
+            raise PasskeyRejected("No such passkey.", error_code="PASSKEY_NOT_FOUND", status_code=404)
         if len(existing) == 1 and not has_password:
             raise PasskeyRejected(
                 "This is your only way to sign in. Set a password before removing it.",

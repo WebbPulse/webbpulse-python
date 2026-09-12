@@ -93,8 +93,7 @@ def load_config(project_dir: Path | str = ".") -> CiConfig:
             raise ValueError(f"domain {name!r} must map to a list of path strings")
         if not paths:
             raise ValueError(
-                f"domain {name!r} claims no paths, so its job would run nothing; remove the "
-                "entry or give it paths"
+                f"domain {name!r} claims no paths, so its job would run nothing; remove the entry or give it paths"
             )
         domains[name] = tuple(paths)
 

@@ -135,9 +135,7 @@ class MetricsEmitter:
         """Replace the dimension set. Returns self so calls can be chained."""
         cleaned = {key: str(value) for key, value in dimensions.items()}
         if len(cleaned) > EMF_MAX_DIMENSIONS:
-            raise ValueError(
-                f"at most {EMF_MAX_DIMENSIONS} dimensions are allowed, got {len(cleaned)}"
-            )
+            raise ValueError(f"at most {EMF_MAX_DIMENSIONS} dimensions are allowed, got {len(cleaned)}")
         blank = sorted(key for key, value in cleaned.items() if not value.strip())
         if blank:
             raise ValueError(f"dimension values must not be blank: {', '.join(blank)}")
@@ -173,9 +171,7 @@ class MetricsEmitter:
     def document(self, *, timestamp_millis: int | None = None) -> dict[str, object]:
         """Build the EMF document without writing it. Useful in a test and in a dry run."""
         directive: dict[str, object] = {
-            "Timestamp": (
-                timestamp_millis if timestamp_millis is not None else int(time.time() * 1000)
-            ),
+            "Timestamp": (timestamp_millis if timestamp_millis is not None else int(time.time() * 1000)),
             "CloudWatchMetrics": [
                 {
                     "Namespace": self.namespace,

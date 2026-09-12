@@ -212,8 +212,7 @@ def test_every_modulus_and_exponent_is_unpadded_base64url(jwks: dict[str, Any]) 
             assert decoded, f"keys[{index}].{member} decodes to nothing."
         modulus = base64.urlsafe_b64decode(key["n"] + "=" * (-len(key["n"]) % 4))
         assert len(modulus) >= 256, (
-            f"keys[{index}].n decodes to {len(modulus)} bytes, which is smaller than the "
-            "256 an RSA_2048 modulus takes."
+            f"keys[{index}].n decodes to {len(modulus)} bytes, which is smaller than the 256 an RSA_2048 modulus takes."
         )
 
 

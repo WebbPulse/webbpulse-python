@@ -172,8 +172,7 @@ class MfaService:
             )
         if self._kms is None:
             raise ValueError(
-                "MfaService needs a KMS client to seal a TOTP seed. Pass kms_client to "
-                "build_identity_router."
+                "MfaService needs a KMS client to seal a TOTP seed. Pass kms_client to build_identity_router."
             )
         return EnvelopeCipher(self._settings.data_key_arn, self._kms)
 
@@ -382,9 +381,7 @@ class MfaService:
         codes = [_generate_recovery_code() for _ in range(RECOVERY_CODE_COUNT)]
         created = now_iso()
         store.put_many(
-            RecoveryCodeRecord(
-                user_id=user_id, code_hash=hash_recovery_code(code), created_at=created
-            )
+            RecoveryCodeRecord(user_id=user_id, code_hash=hash_recovery_code(code), created_at=created)
             for code in codes
         )
         _log.info("recovery.regenerated for %s", user_id)
@@ -392,8 +389,4 @@ class MfaService:
 
     def remaining_recovery_codes(self, user_id: str) -> int:
         """Count the codes still unspent, for showing the user a total."""
-        return sum(
-            1
-            for record in self._stores.require_recovery_codes().list_for_user(user_id)
-            if not record.used_at
-        )
+        return sum(1 for record in self._stores.require_recovery_codes().list_for_user(user_id) if not record.used_at)

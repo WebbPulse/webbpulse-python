@@ -55,9 +55,7 @@ def test_aws_lwa_port_takes_precedence_over_port(monkeypatch: MonkeyPatch) -> No
     assert resolve_port() == 9000, "AWS_LWA_PORT is the adapter's own variable and wins"
 
 
-def test_a_non_numeric_port_is_ignored_and_warned(
-    monkeypatch: MonkeyPatch, caplog: LogCaptureFixture
-) -> None:
+def test_a_non_numeric_port_is_ignored_and_warned(monkeypatch: MonkeyPatch, caplog: LogCaptureFixture) -> None:
     """A non-numeric port falls back to the default and logs a warning instead of crashing."""
     monkeypatch.setenv(AWS_LWA_PORT_ENV, "not-a-port")
     with caplog.at_level("WARNING"):

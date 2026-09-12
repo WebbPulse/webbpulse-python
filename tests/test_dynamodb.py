@@ -58,9 +58,7 @@ def test_ttl_at_returns_epoch_seconds_not_milliseconds() -> None:
 
     assert isinstance(value, int), "a DynamoDB TTL must be an integer Number"
     assert value == 1767225600, f"2026-01-01T00:00:00Z is 1767225600 epoch seconds, got {value}"
-    assert value < _MILLISECONDS_MAGNITUDE, (
-        f"ttl_at must return seconds (~1e9), not milliseconds (~1e12); got {value}"
-    )
+    assert value < _MILLISECONDS_MAGNITUDE, f"ttl_at must return seconds (~1e9), not milliseconds (~1e12); got {value}"
 
 
 def test_ttl_at_truncates_toward_zero() -> None:
@@ -326,9 +324,7 @@ def test_query_follows_an_explicit_start_key(events_repo: Repository) -> None:
     _seed_events(events_repo)
 
     first = events_repo.query(Key("pk").eq("session-1"), limit=5)
-    second = events_repo.query(
-        Key("pk").eq("session-1"), limit=5, start_key=first.last_evaluated_key
-    )
+    second = events_repo.query(Key("pk").eq("session-1"), limit=5, start_key=first.last_evaluated_key)
     assert [item["sk"] for item in second.items] == ["0005", "0006", "0007", "0008", "0009"]
 
 
@@ -362,14 +358,7 @@ def test_iter_query_max_items_larger_than_the_result_set(events_repo: Repository
     """A `max_items` above the result count yields every item."""
     _seed_events(events_repo)
     assert (
-        len(
-            list(
-                events_query := events_repo.iter_query(
-                    Key("pk").eq("session-1"), max_items=500, page_size=5
-                )
-            )
-        )
-        == 15
+        len(list(events_query := events_repo.iter_query(Key("pk").eq("session-1"), max_items=500, page_size=5))) == 15
     )
     assert events_query is not None
 
@@ -395,8 +384,6 @@ def test_iter_query_passes_a_start_key_through(events_repo: Repository) -> None:
     _seed_events(events_repo)
 
     collected = list(
-        events_repo.iter_query(
-            Key("pk").eq("session-1"), page_size=5, start_key={"pk": "session-1", "sk": "0009"}
-        )
+        events_repo.iter_query(Key("pk").eq("session-1"), page_size=5, start_key={"pk": "session-1", "sk": "0009"})
     )
     assert [item["sk"] for item in collected] == [f"{i:04d}" for i in range(10, 15)]

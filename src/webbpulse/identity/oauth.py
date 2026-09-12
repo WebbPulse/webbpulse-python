@@ -113,9 +113,7 @@ class HttpClient(Protocol):
     A Protocol, so `HttpxClient` and a test double satisfy it without inheritance.
     """
 
-    def post_form(
-        self, url: str, *, data: Mapping[str, str], headers: Mapping[str, str]
-    ) -> HttpResponse:
+    def post_form(self, url: str, *, data: Mapping[str, str], headers: Mapping[str, str]) -> HttpResponse:
         """Post an `application/x-www-form-urlencoded` body. The token exchange."""
         ...
 
@@ -144,9 +142,7 @@ class HttpxClient:
             self._client = httpx.Client(timeout=self._timeout, follow_redirects=False)
         return self._client
 
-    def post_form(
-        self, url: str, *, data: Mapping[str, str], headers: Mapping[str, str]
-    ) -> HttpResponse:
+    def post_form(self, url: str, *, data: Mapping[str, str], headers: Mapping[str, str]) -> HttpResponse:
         """Post an `application/x-www-form-urlencoded` body."""
         response = self._require().post(url, data=dict(data), headers=dict(headers))
         return _response_from(response)
@@ -468,9 +464,7 @@ class DynamoOAuthLinkStore(OAuthLinkStore):
 
         return [
             _link_from_item(item)
-            for item in self._repo.iter_query(
-                KeyCondition("user_id").eq(user_id), index_name=OAUTH_LINK_USER_INDEX
-            )
+            for item in self._repo.iter_query(KeyCondition("user_id").eq(user_id), index_name=OAUTH_LINK_USER_INDEX)
         ]
 
     def delete(self, provider_subject: str) -> None:
@@ -597,9 +591,7 @@ class OAuthService:
         return [
             config
             for name, config in PROVIDERS.items()
-            if name in self._settings.oauth_providers
-            and self._client_id(name)
-            and self._has_secret(name)
+            if name in self._settings.oauth_providers and self._client_id(name) and self._has_secret(name)
         ]
 
     def _has_secret(self, provider: str) -> bool:
@@ -768,9 +760,7 @@ class OAuthService:
             )
         return record
 
-    def identity_from_callback(
-        self, provider: str, *, code: str, state_record: OAuthStateRecord
-    ) -> OAuthIdentity:
+    def identity_from_callback(self, provider: str, *, code: str, state_record: OAuthStateRecord) -> OAuthIdentity:
         """Exchange the code and turn the provider's answer into an `OAuthIdentity`.
 
         One method, so a caller need not know whether the identity comes from a verified ID
@@ -786,9 +776,7 @@ class OAuthService:
         access_token = _require_str(token_body, "access_token", provider)
         return self._identity_from_userinfo(config, access_token)
 
-    def _token_body(
-        self, provider: str, *, code: str, state_record: OAuthStateRecord
-    ) -> Mapping[str, Any]:
+    def _token_body(self, provider: str, *, code: str, state_record: OAuthStateRecord) -> Mapping[str, Any]:
         """Trade the authorization code for the provider's whole token response body."""
         config = self._provider(provider)
         if not code:
@@ -806,9 +794,7 @@ class OAuthService:
         if state_record.pkce_verifier:
             data["code_verifier"] = state_record.pkce_verifier
 
-        response = self._http.post_form(
-            config.token_url, data=data, headers={"Accept": "application/json"}
-        )
+        response = self._http.post_form(config.token_url, data=data, headers={"Accept": "application/json"})
         body = response.json_body if isinstance(response.json_body, dict) else {}
         if not response.ok or body.get("error"):
             _log.warning(
@@ -860,9 +846,7 @@ class OAuthService:
             error_code="OAUTH_ID_TOKEN_INVALID",
         )
 
-    def _identity_from_id_token(
-        self, config: OAuthProviderConfig, id_token: str, *, nonce: str
-    ) -> OAuthIdentity:
+    def _identity_from_id_token(self, config: OAuthProviderConfig, id_token: str, *, nonce: str) -> OAuthIdentity:
         """Verify an OIDC ID token, then read the identity out of its claims.
 
         Checks the signature against the published JWKS, then `iss`, `aud`, `exp` and, after
@@ -915,9 +899,7 @@ class OAuthService:
             name=str(claims.get("name", "")),
         )
 
-    def _identity_from_userinfo(
-        self, config: OAuthProviderConfig, access_token: str
-    ) -> OAuthIdentity:
+    def _identity_from_userinfo(self, config: OAuthProviderConfig, access_token: str) -> OAuthIdentity:
         """GitHub's identity: the account from `/user`, the address from `/user/emails`.
 
         Both calls are needed: `/user` gives the immutable subject, and only `/user/emails`
@@ -951,9 +933,7 @@ class OAuthService:
             name=str(body.get("name", "") or body.get("login", "")),
         )
 
-    def _github_primary_email(
-        self, config: OAuthProviderConfig, headers: Mapping[str, str]
-    ) -> tuple[str, bool]:
+    def _github_primary_email(self, config: OAuthProviderConfig, headers: Mapping[str, str]) -> tuple[str, bool]:
         """The verified primary address, or the best available with `verified` false.
 
         Prefers the verified primary, then any verified address, then the primary whatever
@@ -1155,8 +1135,7 @@ class OAuthService:
         remaining = self._other_sign_in_methods(user_id, removing=removing)
         if not remaining:
             raise OAuthRejected(
-                "That is the only way to sign in to this account. Set a password or add "
-                "another sign-in method first.",
+                "That is the only way to sign in to this account. Set a password or add another sign-in method first.",
                 error_code="OAUTH_LAST_SIGN_IN_METHOD",
                 status_code=409,
             )

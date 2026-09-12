@@ -80,11 +80,7 @@ def register_oauth_provider_discovery(
         """
         configs = oauth.available_providers() if oauth is not None else []
         return _JSONResponse(
-            {
-                "providers": [
-                    {"id": config.name, "display_name": config.display_name} for config in configs
-                ]
-            },
+            {"providers": [{"id": config.name, "display_name": config.display_name} for config in configs]},
             headers={"Cache-Control": OAUTH_PROVIDERS_CACHE_CONTROL},
         )
 
@@ -136,9 +132,7 @@ def register_oauth_routes(
 
         target = return_to or settings.frontend_base_url or "/"
         separator = "&" if "?" in target else "?"
-        return RedirectResponse(
-            f"{target}{separator}oauth_error={quote(exc.error_code)}", status_code=303
-        )
+        return RedirectResponse(f"{target}{separator}oauth_error={quote(exc.error_code)}", status_code=303)
 
     def require_subject(request: Request) -> str:
         """Read the verified subject claim off the request, or an empty string."""
@@ -205,9 +199,7 @@ def register_oauth_routes(
         ip, user_agent = context(request)
         try:
             identity = await run_sync(
-                lambda: oauth.identity_from_callback(
-                    record.provider, code=code, state_record=record
-                )
+                lambda: oauth.identity_from_callback(record.provider, code=code, state_record=record)
             )
 
             if record.mode == "link":
@@ -219,9 +211,7 @@ def register_oauth_routes(
 
             user, _outcome = await run_sync(lambda: oauth.resolve_login(identity))
             result = await run_sync(
-                lambda: flows.issue_for_oauth(
-                    user, provider=record.provider, ip=ip, user_agent=user_agent
-                )
+                lambda: flows.issue_for_oauth(user, provider=record.provider, ip=ip, user_agent=user_agent)
             )
         except MfaChallengeRequired as challenge:
             body = challenge.challenge.as_body()

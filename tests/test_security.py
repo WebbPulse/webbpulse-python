@@ -282,9 +282,7 @@ def test_expired_and_invalid_are_both_token_errors() -> None:
 def test_leeway_tolerates_clock_skew() -> None:
     """A `leeway` wide enough to cover the skew accepts a just-expired token."""
     just_expired = datetime.now(UTC) - timedelta(seconds=61)
-    token = create_token(
-        {"sub": "alice"}, SECRET, expires_in=timedelta(seconds=30), now=just_expired
-    )
+    token = create_token({"sub": "alice"}, SECRET, expires_in=timedelta(seconds=30), now=just_expired)
 
     with pytest.raises(ExpiredToken):
         decode_token(token, SECRET)

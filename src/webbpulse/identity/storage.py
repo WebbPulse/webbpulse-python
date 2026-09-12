@@ -316,9 +316,7 @@ class IdentityTokenStore(ABC):
         """Write a new link."""
 
     @abstractmethod
-    def consume(
-        self, token_hash: str, *, consumed_at: str | None = None
-    ) -> IdentityTokenRecord | None:
+    def consume(self, token_hash: str, *, consumed_at: str | None = None) -> IdentityTokenRecord | None:
         """Atomically mark a link used, returning it as it was, or `None` if already used."""
 
     @abstractmethod
@@ -422,9 +420,7 @@ class PasskeyStore(ABC):
         """
 
     @abstractmethod
-    def record_use(
-        self, user_id: str, credential_id: str, *, sign_count: int, used_at: str
-    ) -> None:
+    def record_use(self, user_id: str, credential_id: str, *, sign_count: int, used_at: str) -> None:
         """Advance the signature counter and the last-used stamp after a good assertion.
 
         Unconditional, unlike `TotpFactorStore.record_use`: the challenge is the replay
@@ -628,16 +624,12 @@ class InMemoryIdentityTokenStore(IdentityTokenStore):
         """Write a new link."""
         self._items[record.token_hash] = record
 
-    def consume(
-        self, token_hash: str, *, consumed_at: str | None = None
-    ) -> IdentityTokenRecord | None:
+    def consume(self, token_hash: str, *, consumed_at: str | None = None) -> IdentityTokenRecord | None:
         """Atomically mark a link used, returning it as it was, or `None` if already used."""
         existing = self._items.get(token_hash)
         if existing is None or existing.consumed_at:
             return None
-        self._items[token_hash] = dataclasses.replace(
-            existing, consumed_at=consumed_at or now_iso()
-        )
+        self._items[token_hash] = dataclasses.replace(existing, consumed_at=consumed_at or now_iso())
         return existing
 
     def revoke_for_user(self, user_id: str, purpose: IdentityTokenPurpose) -> int:
@@ -710,9 +702,7 @@ class InMemoryRecoveryCodeStore(RecoveryCodeStore):
         existing = self._items.get((user_id, code_hash))
         if existing is None or existing.used_at:
             return False
-        self._items[(user_id, code_hash)] = dataclasses.replace(
-            existing, used_at=used_at or now_iso()
-        )
+        self._items[(user_id, code_hash)] = dataclasses.replace(existing, used_at=used_at or now_iso())
         return True
 
     def delete_for_user(self, user_id: str) -> int:
@@ -756,9 +746,7 @@ class InMemoryPasskeyStore(PasskeyStore):
             raise KeyError(f"passkey {record.credential_id[:12]} is already registered")
         self._items[key] = dataclasses.replace(record, created_at=record.created_at or now_iso())
 
-    def record_use(
-        self, user_id: str, credential_id: str, *, sign_count: int, used_at: str
-    ) -> None:
+    def record_use(self, user_id: str, credential_id: str, *, sign_count: int, used_at: str) -> None:
         """Advance the signature counter and the last-used stamp after a good assertion."""
         existing = self._items.get((user_id, credential_id))
         if existing is None:
@@ -887,8 +875,7 @@ class DynamoRefreshTokenStore(RefreshTokenStore):
                     ":successor": successor_hash,
                 },
                 condition=(
-                    Attr("token_hash").exists()
-                    & (Attr("consumed_at").not_exists() | Attr("consumed_at").eq(""))
+                    Attr("token_hash").exists() & (Attr("consumed_at").not_exists() | Attr("consumed_at").eq(""))
                 ),
                 return_values="ALL_OLD",
             )
@@ -958,9 +945,7 @@ class DynamoIdentityTokenStore(IdentityTokenStore):
             }
         )
 
-    def consume(
-        self, token_hash: str, *, consumed_at: str | None = None
-    ) -> IdentityTokenRecord | None:
+    def consume(self, token_hash: str, *, consumed_at: str | None = None) -> IdentityTokenRecord | None:
         """Atomically mark a link used, returning it as it was, or `None` if already used."""
         from boto3.dynamodb.conditions import Attr
         from botocore.exceptions import ClientError
@@ -971,8 +956,7 @@ class DynamoIdentityTokenStore(IdentityTokenStore):
                 update_expression="SET consumed_at = :now",
                 expression_values={":now": consumed_at or now_iso()},
                 condition=(
-                    Attr("token_hash").exists()
-                    & (Attr("consumed_at").not_exists() | Attr("consumed_at").eq(""))
+                    Attr("token_hash").exists() & (Attr("consumed_at").not_exists() | Attr("consumed_at").eq(""))
                 ),
                 return_values="ALL_OLD",
             )
@@ -1033,8 +1017,7 @@ class DynamoTotpFactorStore(TotpFactorStore):
                 update_expression="SET activated_at = :at, last_used_step = :step",
                 expression_values={":at": activated_at or now_iso(), ":step": step},
                 condition=(
-                    Attr("user_id").exists()
-                    & (Attr("activated_at").not_exists() | Attr("activated_at").eq(""))
+                    Attr("user_id").exists() & (Attr("activated_at").not_exists() | Attr("activated_at").eq(""))
                 ),
             )
         except ClientError as exc:
@@ -1054,8 +1037,7 @@ class DynamoTotpFactorStore(TotpFactorStore):
                 update_expression="SET last_used_step = :step",
                 expression_values={":step": step},
                 condition=(
-                    Attr("user_id").exists()
-                    & (Attr("last_used_step").not_exists() | Attr("last_used_step").lt(step))
+                    Attr("user_id").exists() & (Attr("last_used_step").not_exists() | Attr("last_used_step").lt(step))
                 ),
             )
         except ClientError as exc:
@@ -1109,10 +1091,7 @@ class DynamoRecoveryCodeStore(RecoveryCodeStore):
                 {"user_id": user_id, "code_hash": code_hash},
                 update_expression="SET used_at = :now",
                 expression_values={":now": used_at or now_iso()},
-                condition=(
-                    Attr("code_hash").exists()
-                    & (Attr("used_at").not_exists() | Attr("used_at").eq(""))
-                ),
+                condition=(Attr("code_hash").exists() & (Attr("used_at").not_exists() | Attr("used_at").eq(""))),
             )
         except ClientError as exc:
             if exc.response.get("Error", {}).get("Code") == "ConditionalCheckFailedException":
@@ -1195,14 +1174,10 @@ class DynamoPasskeyStore(PasskeyStore):
             )
         except ClientError as exc:
             if exc.response.get("Error", {}).get("Code") == "ConditionalCheckFailedException":
-                raise KeyError(
-                    f"passkey {record.credential_id[:12]} is already registered"
-                ) from exc
+                raise KeyError(f"passkey {record.credential_id[:12]} is already registered") from exc
             raise
 
-    def record_use(
-        self, user_id: str, credential_id: str, *, sign_count: int, used_at: str
-    ) -> None:
+    def record_use(self, user_id: str, credential_id: str, *, sign_count: int, used_at: str) -> None:
         """Advance the signature counter and the last-used stamp after a good assertion."""
         self._repo.update(
             {"user_id": user_id, "credential_id": credential_id},
@@ -1272,9 +1247,7 @@ class DynamoWebAuthnChallengeStore(WebAuthnChallengeStore):
 
     def consume(self, challenge_id: str) -> WebAuthnChallengeRecord | None:
         """Atomically spend a challenge, returning it, or `None` if unknown or already spent."""
-        response = self._repo.table.delete_item(
-            Key={"challenge_id": challenge_id}, ReturnValues="ALL_OLD"
-        )
+        response = self._repo.table.delete_item(Key={"challenge_id": challenge_id}, ReturnValues="ALL_OLD")
         attributes = response.get("Attributes")
         if not attributes:
             return None
@@ -1317,10 +1290,7 @@ def _identity_token_from_item(item: Mapping[str, Any]) -> IdentityTokenRecord:
     """Build an `IdentityTokenRecord` from a DynamoDB item, rejecting an unknown purpose."""
     purpose = str(item.get("purpose", ""))
     if purpose not in {"verify_email", "reset_password", "mfa_ticket"}:
-        raise ValueError(
-            f"Unknown identity token purpose {purpose!r} on token "
-            f"{str(item.get('token_hash', ''))[:8]}."
-        )
+        raise ValueError(f"Unknown identity token purpose {purpose!r} on token {str(item.get('token_hash', ''))[:8]}.")
     return IdentityTokenRecord(
         token_hash=str(item["token_hash"]),
         purpose=cast("IdentityTokenPurpose", purpose),
@@ -1347,9 +1317,7 @@ def _totp_factor_from_item(item: Mapping[str, Any]) -> TotpFactorRecord:
 def _passkey_from_item(item: Mapping[str, Any]) -> PasskeyRecord:
     """Build a `PasskeyRecord` from a DynamoDB item."""
     raw_transports = item.get("transports")
-    transports = (
-        tuple(str(value) for value in raw_transports) if isinstance(raw_transports, list) else ()
-    )
+    transports = tuple(str(value) for value in raw_transports) if isinstance(raw_transports, list) else ()
     return PasskeyRecord(
         user_id=str(item["user_id"]),
         credential_id=str(item["credential_id"]),
@@ -1371,8 +1339,7 @@ def _webauthn_challenge_from_item(item: Mapping[str, Any]) -> WebAuthnChallengeR
     purpose = str(item.get("purpose", ""))
     if purpose not in {"register", "login"}:
         raise ValueError(
-            f"Unknown WebAuthn challenge purpose {purpose!r} on challenge "
-            f"{str(item.get('challenge_id', ''))[:8]}."
+            f"Unknown WebAuthn challenge purpose {purpose!r} on challenge {str(item.get('challenge_id', ''))[:8]}."
         )
     return WebAuthnChallengeRecord(
         challenge_id=str(item["challenge_id"]),

@@ -180,11 +180,7 @@ class IdentityFlows:
             self.mfa = MfaService(settings, stores, tokens, kms_client=kms_client)
 
         self.passkeys: PasskeyService | None = None
-        if (
-            settings.passkeys_enabled
-            and stores.passkeys is not None
-            and stores.webauthn_challenges is not None
-        ):
+        if settings.passkeys_enabled and stores.passkeys is not None and stores.webauthn_challenges is not None:
             from webbpulse.identity.passkeys import PasskeyService
 
             self.passkeys = PasskeyService(settings, stores)
@@ -331,9 +327,7 @@ class IdentityFlows:
 
         credential = None
         if user is not None:
-            credential = self._stores.require_credentials().get(
-                _user_id(user), PASSWORD_CREDENTIAL_TYPE
-            )
+            credential = self._stores.require_credentials().get(_user_id(user), PASSWORD_CREDENTIAL_TYPE)
 
         if user is None or credential is None or not credential.secret:
             equalise_password_timing(presented)
@@ -572,13 +566,9 @@ class IdentityFlows:
 
         if credential is None or not credential.secret:
             equalise_password_timing(presented)
-            raise LoginRejected(
-                "Your current password is not correct.", error_code="INVALID_CREDENTIALS"
-            )
+            raise LoginRejected("Your current password is not correct.", error_code="INVALID_CREDENTIALS")
         if not verify_password(presented, credential.secret):
-            raise LoginRejected(
-                "Your current password is not correct.", error_code="INVALID_CREDENTIALS"
-            )
+            raise LoginRejected("Your current password is not correct.", error_code="INVALID_CREDENTIALS")
 
         checked = check_password(new_password, breach_check=self._settings.password_breach_check)
 
@@ -1022,9 +1012,7 @@ class IdentityFlows:
     ) -> PasskeyRecord:
         """Verify the attestation and store the credential against the caller's account."""
         service = self._require_passkeys()
-        record = service.finish_registration(
-            user_id, challenge_id=challenge_id, credential=credential, name=name
-        )
+        record = service.finish_registration(user_id, challenge_id=challenge_id, credential=credential, name=name)
         _log.info(
             "Passkey registered.",
             extra={"event": "passkey.register.success", "user_id": user_id},
@@ -1124,9 +1112,7 @@ class IdentityFlows:
         """
         service = self._require_passkeys()
         credential = self._stores.require_credentials().get(user_id, PASSWORD_CREDENTIAL_TYPE)
-        service.delete_passkey(
-            user_id, credential_id, has_password=credential is not None and bool(credential.secret)
-        )
+        service.delete_passkey(user_id, credential_id, has_password=credential is not None and bool(credential.secret))
 
     def _issue(
         self,
@@ -1185,9 +1171,7 @@ class IdentityFlows:
         """Revoke a user's families, using `family_ids` when the caller supplied them."""
         if family_ids is not None:
             targets = [family for family in family_ids if family]
-            return self._sessions.revoke_all_for_user(
-                user_id, family_ids=targets, except_family_id=keep_family_id
-            )
+            return self._sessions.revoke_all_for_user(user_id, family_ids=targets, except_family_id=keep_family_id)
         return self._sessions.revoke_all_for_user(user_id, except_family_id=keep_family_id)
 
     def _lockout_state(self, identity: str, *, now: datetime) -> LockoutState:

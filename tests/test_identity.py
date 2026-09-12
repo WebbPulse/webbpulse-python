@@ -72,9 +72,7 @@ class FakeKms:
             "SigningAlgorithms": [KMS_SIGNING_ALGORITHM],
         }
 
-    def sign(
-        self, *, KeyId: str, Message: bytes, MessageType: str, SigningAlgorithm: str
-    ) -> dict[str, Any]:
+    def sign(self, *, KeyId: str, Message: bytes, MessageType: str, SigningAlgorithm: str) -> dict[str, Any]:
         """Record the call and return a real PKCS #1 v1.5 signature over the digest."""
         self.sign_calls.append(
             {
@@ -155,11 +153,7 @@ def test_a_tampered_payload_fails_verification(fake_kms: FakeKms) -> None:
 
     payload = json.loads(base64.urlsafe_b64decode(payload_b64 + "=="))
     payload["sub"] = "somebody-else"
-    forged = (
-        base64.urlsafe_b64encode(json.dumps(payload, separators=(",", ":")).encode())
-        .rstrip(b"=")
-        .decode()
-    )
+    forged = base64.urlsafe_b64encode(json.dumps(payload, separators=(",", ":")).encode()).rstrip(b"=").decode()
 
     key = jwt.PyJWK.from_dict(public_jwk_from_kms(fake_kms, KEY_ID)).key
     with pytest.raises(jwt.InvalidSignatureError):
@@ -242,9 +236,7 @@ def test_kid_differs_between_two_keys(der_spki: bytes) -> None:
     assert kid_for_der(der_spki) != kid_for_der(other_der)
 
 
-def test_jwk_fields_match_the_rsa_public_numbers(
-    fake_kms: FakeKms, rsa_key: rsa.RSAPrivateKey
-) -> None:
+def test_jwk_fields_match_the_rsa_public_numbers(fake_kms: FakeKms, rsa_key: rsa.RSAPrivateKey) -> None:
     """`n` and `e` are minimum-length big-endian, with no DER leading zero carried over."""
     jwk = public_jwk_from_kms(fake_kms, KEY_ID)
     numbers = rsa_key.public_key().public_numbers()
@@ -353,9 +345,7 @@ def test_mint_test_token_is_refused_unless_enabled(fake_kms: FakeKms) -> None:
 
 
 @pytest.mark.parametrize("environment", ["production", "PRODUCTION", "prod"])
-def test_mint_test_token_is_refused_in_production_even_when_enabled(
-    fake_kms: FakeKms, environment: str
-) -> None:
+def test_mint_test_token_is_refused_in_production_even_when_enabled(fake_kms: FakeKms, environment: str) -> None:
     """Minting is refused in production environments even when the enable flag is true."""
     with pytest.raises(TokenMintingDisabled, match="refused"):
         mint_test_token(

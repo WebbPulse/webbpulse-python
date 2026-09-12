@@ -83,13 +83,9 @@ class FakeKms:
             "SigningAlgorithms": ["RSASSA_PKCS1_V1_5_SHA_256"],
         }
 
-    def sign(
-        self, *, KeyId: str, Message: bytes, MessageType: str, SigningAlgorithm: str
-    ) -> dict[str, Any]:
+    def sign(self, *, KeyId: str, Message: bytes, MessageType: str, SigningAlgorithm: str) -> dict[str, Any]:
         """Return a real PKCS #1 v1.5 signature over the digest, using the named key."""
-        signature = self._keys[KeyId].sign(
-            Message, padding.PKCS1v15(), utils.Prehashed(hashes.SHA256())
-        )
+        signature = self._keys[KeyId].sign(Message, padding.PKCS1v15(), utils.Prehashed(hashes.SHA256()))
         return {"KeyId": KeyId, "Signature": signature, "SigningAlgorithm": SigningAlgorithm}
 
 
@@ -438,9 +434,7 @@ def test_register_rejects_a_policy_violation_before_looking_the_email_up(
     assert "load_user_by_email" not in hooks.calls
 
 
-def test_register_refuses_when_registration_is_disabled(
-    kms: FakeKms, hooks: FakeHooks, stores: IdentityStores
-) -> None:
+def test_register_refuses_when_registration_is_disabled(kms: FakeKms, hooks: FakeHooks, stores: IdentityStores) -> None:
     """Registration with `registration_enabled=False` is a 403 `REGISTRATION_DISABLED`."""
     settings = make_settings(registration_enabled=False)
     disabled = IdentityFlows(settings, hooks, stores, TokenService(settings, kms))
@@ -477,17 +471,13 @@ def test_login_succeeds_and_mints_a_token_bound_to_the_family(
     assert claims["aud"] == AUDIENCE
 
 
-def test_login_is_case_insensitive_on_the_email(
-    flows: IdentityFlows, hooks: FakeHooks, stores: IdentityStores
-) -> None:
+def test_login_is_case_insensitive_on_the_email(flows: IdentityFlows, hooks: FakeHooks, stores: IdentityStores) -> None:
     """Login matches the account regardless of the email's case."""
     seed_account(hooks, stores)
     assert flows.login(email="PERSON@EXAMPLE.COM", password=PASSWORD).access_token
 
 
-def test_wrong_password_is_rejected(
-    flows: IdentityFlows, hooks: FakeHooks, stores: IdentityStores
-) -> None:
+def test_wrong_password_is_rejected(flows: IdentityFlows, hooks: FakeHooks, stores: IdentityStores) -> None:
     """A wrong password is a 401 carrying the shared invalid credentials message."""
     seed_account(hooks, stores)
     with pytest.raises(LoginRejected) as caught:
@@ -545,9 +535,7 @@ def test_both_login_failure_paths_spend_a_bcrypt_verification(
     assert calls[1].startswith("$2")
 
 
-def test_a_user_with_no_password_credential_still_costs_a_bcrypt_round(
-    flows: IdentityFlows, hooks: FakeHooks
-) -> None:
+def test_a_user_with_no_password_credential_still_costs_a_bcrypt_round(flows: IdentityFlows, hooks: FakeHooks) -> None:
     """Logging in to an account with no password credential fails with the shared message."""
     hooks.add(EMAIL, user_id=USER_ID)
     with pytest.raises(LoginRejected) as caught:
@@ -555,9 +543,7 @@ def test_a_user_with_no_password_credential_still_costs_a_bcrypt_round(
     assert caught.value.message == INVALID_CREDENTIALS_MESSAGE
 
 
-def test_a_disabled_user_is_refused_by_the_hook(
-    flows: IdentityFlows, hooks: FakeHooks, stores: IdentityStores
-) -> None:
+def test_a_disabled_user_is_refused_by_the_hook(flows: IdentityFlows, hooks: FakeHooks, stores: IdentityStores) -> None:
     """A disabled user is refused by `may_authenticate`, which runs after the user lookup."""
     seed_account(hooks, stores, disabled=True)
     with pytest.raises(LoginRejected) as caught:
@@ -631,12 +617,8 @@ def test_login_upgrades_a_weak_cost_factor(
 
     real_hash = security.hash_password
     real_needs = security.needs_rehash
-    monkeypatch.setattr(
-        security, "hash_password", lambda p, *, rounds=5: real_hash(p, rounds=rounds)
-    )
-    monkeypatch.setattr(
-        security, "needs_rehash", lambda h, *, rounds=5: real_needs(h, rounds=rounds)
-    )
+    monkeypatch.setattr(security, "hash_password", lambda p, *, rounds=5: real_hash(p, rounds=rounds))
+    monkeypatch.setattr(security, "needs_rehash", lambda h, *, rounds=5: real_needs(h, rounds=rounds))
 
     flows.login(email=EMAIL, password=PASSWORD)
 
@@ -693,9 +675,7 @@ def test_state_consumed_outside_the_grace_window_revokes_the_family(
     assert sessions.rotate(winner.issued.token, now=beyond).outcome == "revoked"
 
 
-def test_state_revoked_is_refused_without_re_revoking(
-    sessions: SessionService, stores: IdentityStores
-) -> None:
+def test_state_revoked_is_refused_without_re_revoking(sessions: SessionService, stores: IdentityStores) -> None:
     """Rotating a token from an already revoked family is refused without revoking again."""
     first = sessions.start_family(USER_ID)
     sessions.revoke_family(first.family_id)
@@ -716,9 +696,7 @@ def test_state_expired_is_refused_and_the_family_is_revoked(sessions: SessionSer
     assert result.revoked >= 1
 
 
-def test_state_unknown_is_refused_and_creates_nothing(
-    sessions: SessionService, stores: IdentityStores
-) -> None:
+def test_state_unknown_is_refused_and_creates_nothing(sessions: SessionService, stores: IdentityStores) -> None:
     """Rotating an unknown token is refused, issues nothing and writes no row."""
     result = sessions.rotate("not a token anybody issued")
     assert result.outcome == "unknown"
@@ -817,9 +795,7 @@ def test_logout_all_by_family_id_is_the_path_dynamodb_can_take(
 ) -> None:
     """Revoking all families for a user works when the caller supplies the family ids."""
     families = [sessions.start_family(USER_ID) for _ in range(2)]
-    revoked = sessions.revoke_all_for_user(
-        USER_ID, family_ids=[issued.family_id for issued in families]
-    )
+    revoked = sessions.revoke_all_for_user(USER_ID, family_ids=[issued.family_id for issued in families])
     assert revoked == 2
 
 
@@ -888,9 +864,7 @@ def test_change_password_requires_the_current_one(
     """Changing a password with the wrong current password is refused."""
     seed_account(hooks, stores)
     with pytest.raises(LoginRejected):
-        flows.change_password(
-            user_id=USER_ID, current_password=OTHER_PASSWORD, new_password="a new one entirely"
-        )
+        flows.change_password(user_id=USER_ID, current_password=OTHER_PASSWORD, new_password="a new one entirely")
 
 
 def test_change_password_applies_the_policy_to_the_new_password(
@@ -932,9 +906,7 @@ def test_change_password_on_an_account_with_no_credential_still_costs_a_bcrypt_r
     """Changing the password on an account with no credential is refused."""
     hooks.add(EMAIL, user_id=USER_ID)
     with pytest.raises(LoginRejected):
-        flows.change_password(
-            user_id=USER_ID, current_password=PASSWORD, new_password=OTHER_PASSWORD
-        )
+        flows.change_password(user_id=USER_ID, current_password=PASSWORD, new_password=OTHER_PASSWORD)
 
 
 @pytest.fixture
@@ -1140,9 +1112,7 @@ def test_unknown_email_and_wrong_password_are_byte_identical_over_http(
     """Over HTTP, a wrong password and an unknown email match in status, headers and body."""
     seed_account(hooks, stores)
     wrong = client.post("/api/auth/login", json={"email": EMAIL, "password": OTHER_PASSWORD})
-    unknown = client.post(
-        "/api/auth/login", json={"email": "nobody@example.com", "password": OTHER_PASSWORD}
-    )
+    unknown = client.post("/api/auth/login", json={"email": "nobody@example.com", "password": OTHER_PASSWORD})
 
     assert wrong.status_code == unknown.status_code
     left = {k: v for k, v in wrong.json().items() if k != "request_id"}
@@ -1150,9 +1120,7 @@ def test_unknown_email_and_wrong_password_are_byte_identical_over_http(
     assert left == right
 
     volatile = {"date", "content-length", "x-request-id"}
-    assert {k.lower() for k in wrong.headers} - volatile == {
-        k.lower() for k in unknown.headers
-    } - volatile
+    assert {k.lower() for k in wrong.headers} - volatile == {k.lower() for k in unknown.headers} - volatile
 
 
 def test_register_returns_the_same_shape_for_a_taken_address(
@@ -1176,9 +1144,7 @@ def test_a_short_password_is_a_422_with_a_specific_reason(client: TestClient) ->
     assert response.json()["error_code"] == "PASSWORD_TOO_SHORT"
 
 
-def test_refresh_rotates_the_cookie_over_http(
-    client: TestClient, hooks: FakeHooks, stores: IdentityStores
-) -> None:
+def test_refresh_rotates_the_cookie_over_http(client: TestClient, hooks: FakeHooks, stores: IdentityStores) -> None:
     """Refreshing over HTTP returns a new access token and replaces the refresh cookie."""
     seed_account(hooks, stores)
     login = client.post("/api/auth/login", json={"email": EMAIL, "password": PASSWORD})
@@ -1200,10 +1166,7 @@ def test_refresh_clears_the_cookie_on_every_refusal(
 
     response = client.post("/api/auth/refresh")
     assert response.status_code == 401
-    assert (
-        'wp_refresh=""' in response.headers["set-cookie"]
-        or "wp_refresh=;" in (response.headers["set-cookie"])
-    )
+    assert 'wp_refresh=""' in response.headers["set-cookie"] or "wp_refresh=;" in (response.headers["set-cookie"])
 
 
 def test_refresh_with_no_cookie_is_a_401(client: TestClient) -> None:
@@ -1237,21 +1200,15 @@ def test_a_missing_sec_fetch_site_header_is_allowed(
     assert client.post("/api/auth/refresh").status_code == 200
 
 
-def test_same_site_and_same_origin_are_allowed(
-    client: TestClient, hooks: FakeHooks, stores: IdentityStores
-) -> None:
+def test_same_site_and_same_origin_are_allowed(client: TestClient, hooks: FakeHooks, stores: IdentityStores) -> None:
     """`Sec-Fetch-Site` values of `same-origin` and `same-site` are both allowed."""
     seed_account(hooks, stores)
     client.post("/api/auth/login", json={"email": EMAIL, "password": PASSWORD})
     for value in ("same-origin", "same-site"):
-        assert (
-            client.post("/api/auth/refresh", headers={"Sec-Fetch-Site": value}).status_code == 200
-        )
+        assert client.post("/api/auth/refresh", headers={"Sec-Fetch-Site": value}).status_code == 200
 
 
-def test_logout_is_idempotent_and_always_succeeds(
-    client: TestClient, hooks: FakeHooks, stores: IdentityStores
-) -> None:
+def test_logout_is_idempotent_and_always_succeeds(client: TestClient, hooks: FakeHooks, stores: IdentityStores) -> None:
     """Logout answers 200 every time, and the revoked family cannot be refreshed afterwards."""
     seed_account(hooks, stores)
     client.post("/api/auth/login", json={"email": EMAIL, "password": PASSWORD})
@@ -1289,12 +1246,7 @@ def test_change_password_and_logout_all_read_the_subject_from_the_token(
     assert changed.status_code == 200
     assert changed.json() == {"changed": True}
 
-    assert (
-        client.post(
-            "/api/auth/login", json={"email": EMAIL, "password": OTHER_PASSWORD}
-        ).status_code
-        == 200
-    )
+    assert client.post("/api/auth/login", json={"email": EMAIL, "password": OTHER_PASSWORD}).status_code == 200
 
 
 def test_a_forged_bearer_token_is_not_accepted(client: TestClient) -> None:
@@ -1425,14 +1377,10 @@ def test_logout_all_succeeds_when_the_refresh_store_has_no_user_index(
     the store raises rather than scanning `refresh-tokens`.
     """
     seed_account(hooks, no_user_index_stores)
-    login = no_user_index_client.post(
-        "/api/auth/login", json={"email": EMAIL, "password": PASSWORD}
-    )
+    login = no_user_index_client.post("/api/auth/login", json={"email": EMAIL, "password": PASSWORD})
     access = login.json()["access_token"]
 
-    response = no_user_index_client.post(
-        "/api/auth/logout-all", headers={"Authorization": f"Bearer {access}"}
-    )
+    response = no_user_index_client.post("/api/auth/logout-all", headers={"Authorization": f"Bearer {access}"})
     assert response.status_code == 200
     assert response.json() == {"signed_out": True}
 
@@ -1442,15 +1390,11 @@ def test_logout_all_revokes_the_caller_own_family(
 ) -> None:
     """Signing out everywhere kills the family the caller is signed in with."""
     seed_account(hooks, no_user_index_stores)
-    login = no_user_index_client.post(
-        "/api/auth/login", json={"email": EMAIL, "password": PASSWORD}
-    )
+    login = no_user_index_client.post("/api/auth/login", json={"email": EMAIL, "password": PASSWORD})
     access = login.json()["access_token"]
 
     assert (
-        no_user_index_client.post(
-            "/api/auth/logout-all", headers={"Authorization": f"Bearer {access}"}
-        ).status_code
+        no_user_index_client.post("/api/auth/logout-all", headers={"Authorization": f"Bearer {access}"}).status_code
         == 200
     )
     assert no_user_index_client.post("/api/auth/refresh").status_code == 401

@@ -177,9 +177,7 @@ class TestDetailedShape:
             },
         )
 
-    def test_validation_error_has_flat_field_details_and_no_errors_key(
-        self, detailed: TestClient
-    ) -> None:
+    def test_validation_error_has_flat_field_details_and_no_errors_key(self, detailed: TestClient) -> None:
         """A 422 reports fields in a flat `details` list and drops the legacy `errors` key."""
         response = detailed.post("/validate", json={})
         assert response.status_code == 422
@@ -327,10 +325,7 @@ class TestDynamoDbErrorHandlers:
 
         client = TestClient(app, raise_server_exceptions=False)
         assert client.get("/missing").json()["message"] == "Resource not found"
-        assert (
-            client.get("/duplicate").json()["message"]
-            == "Resource already exists or was modified concurrently"
-        )
+        assert client.get("/duplicate").json()["message"] == "Resource already exists or was modified concurrently"
 
     def test_a_subclass_uses_its_base_handler(self) -> None:
         """Starlette walks the MRO, so a service's own subclass needs no entry of its own."""
@@ -385,9 +380,7 @@ class TestDynamoDbErrorHandlers:
         client = TestClient(app, raise_server_exceptions=False)
         assert client.get("/missing").json()["message"] == "Gone"
         assert client.get("/duplicate").json()["message"] == DYNAMODB_ERROR_MESSAGES["conflict"]
-        assert (
-            client.get("/canceled-other").json()["message"] == DYNAMODB_ERROR_MESSAGES["internal"]
-        )
+        assert client.get("/canceled-other").json()["message"] == DYNAMODB_ERROR_MESSAGES["internal"]
 
 
 class TestDynamoDbOptionsForwarding:
@@ -402,10 +395,7 @@ class TestDynamoDbOptionsForwarding:
     def _assert_pinned(self, client: TestClient) -> None:
         """Every one of the three messages is the consumer's, not the package's."""
         assert client.get("/missing").json()["message"] == "Resource not found"
-        assert (
-            client.get("/duplicate").json()["message"]
-            == "Resource already exists or was modified concurrently"
-        )
+        assert client.get("/duplicate").json()["message"] == "Resource already exists or was modified concurrently"
         assert client.get("/canceled-other").json()["message"] == "Internal server error"
 
     def test_register_error_handlers_forwards_the_options(self) -> None:
@@ -441,9 +431,7 @@ class TestDynamoDbOptionsForwarding:
         client = TestClient(app, raise_server_exceptions=False)
         assert client.get("/missing").json()["message"] == DYNAMODB_ERROR_MESSAGES["not_found"]
         assert client.get("/duplicate").json()["message"] == DYNAMODB_ERROR_MESSAGES["conflict"]
-        assert (
-            client.get("/canceled-other").json()["message"] == DYNAMODB_ERROR_MESSAGES["internal"]
-        )
+        assert client.get("/canceled-other").json()["message"] == DYNAMODB_ERROR_MESSAGES["internal"]
 
     def test_the_options_are_frozen(self) -> None:
         """The options carry no mutable state a consumer could change after installation."""
@@ -472,10 +460,7 @@ class TestDefaultDynamoDbMessagesUnchanged:
     def test_the_message_table_still_carries_the_0_23_0_entries(self) -> None:
         """`DYNAMODB_ERROR_MESSAGES` gained a key and changed none of the two it had."""
         assert DYNAMODB_ERROR_MESSAGES["not_found"] == "The requested resource was not found."
-        assert (
-            DYNAMODB_ERROR_MESSAGES["conflict"]
-            == "The resource was modified by another request. Try again."
-        )
+        assert DYNAMODB_ERROR_MESSAGES["conflict"] == "The resource was modified by another request. Try again."
         assert DYNAMODB_ERROR_MESSAGES["internal"] == "Internal server error."
 
 

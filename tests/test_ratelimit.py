@@ -76,9 +76,7 @@ def limiter(rate_limit_table: Any) -> RateLimiter:
 
 def test_check_allows_up_to_the_limit_and_denies_the_next(limiter: RateLimiter) -> None:
     """`check` allows requests up to the limit and denies the one after it."""
-    decisions = [
-        limiter.check("198.51.100.1", limit=3, window_seconds=60, now=1_000.0) for _ in range(4)
-    ]
+    decisions = [limiter.check("198.51.100.1", limit=3, window_seconds=60, now=1_000.0) for _ in range(4)]
 
     assert [d.allowed for d in decisions] == [True, True, True, False], (
         "the first 3 requests must be allowed and the 4th denied"
@@ -88,10 +86,7 @@ def test_check_allows_up_to_the_limit_and_denies_the_next(limiter: RateLimiter) 
 
 def test_check_decrements_remaining(limiter: RateLimiter) -> None:
     """`remaining` counts down to zero and clamps there."""
-    remaining = [
-        limiter.check("198.51.100.2", limit=3, window_seconds=60, now=1_000.0).remaining
-        for _ in range(4)
-    ]
+    remaining = [limiter.check("198.51.100.2", limit=3, window_seconds=60, now=1_000.0).remaining for _ in range(4)]
 
     assert remaining == [2, 1, 0, 0], "remaining must count down and then clamp at 0"
 
@@ -258,9 +253,7 @@ def test_dependency_allows_then_returns_429(limiter: RateLimiter, test_client: A
     assert third.status_code == 429, "the third request exceeds a limit of 2"
 
 
-def test_the_429_carries_retry_after_and_the_ratelimit_header(
-    limiter: RateLimiter, test_client: Any
-) -> None:
+def test_the_429_carries_retry_after_and_the_ratelimit_header(limiter: RateLimiter, test_client: Any) -> None:
     """A 429 carries Retry-After in delta seconds plus the rate limit headers."""
     client = test_client(_app(limiter, namespace="login"), source_ip="198.51.100.21")
     for _ in range(2):
@@ -278,9 +271,7 @@ def test_the_429_carries_retry_after_and_the_ratelimit_header(
     assert rejected.headers["X-RateLimit-Remaining"] == "0"
 
 
-def test_the_dependency_identifies_callers_by_source_ip(
-    limiter: RateLimiter, test_client: Any
-) -> None:
+def test_the_dependency_identifies_callers_by_source_ip(limiter: RateLimiter, test_client: Any) -> None:
     """Callers differing only by source IP get separate counters."""
     app = _app(limiter)
     first = test_client(app, source_ip="198.51.100.22")
@@ -292,9 +283,7 @@ def test_the_dependency_identifies_callers_by_source_ip(
     assert second.get("/limited").status_code == 200, "a different IP gets its own counter"
 
 
-def test_the_dependency_exposes_headers_on_a_successful_response(
-    limiter: RateLimiter, test_client: Any
-) -> None:
+def test_the_dependency_exposes_headers_on_a_successful_response(limiter: RateLimiter, test_client: Any) -> None:
     """The dependency stashes the rate limit headers on `request.state` for a middleware."""
     app = FastAPI()
     dependency = rate_limit(limit=5, window_seconds=60, limiter=limiter)
@@ -311,9 +300,7 @@ def test_the_dependency_exposes_headers_on_a_successful_response(
     assert Request is not None
 
 
-def test_the_dependency_accepts_a_custom_key_function(
-    limiter: RateLimiter, test_client: Any
-) -> None:
+def test_the_dependency_accepts_a_custom_key_function(limiter: RateLimiter, test_client: Any) -> None:
     """A custom key function gives each key its own counter."""
     app = FastAPI()
     dependency = rate_limit(
@@ -338,9 +325,7 @@ def test_the_dependency_accepts_a_custom_key_function(
     )
 
 
-def test_the_dependency_accepts_an_async_key_function(
-    limiter: RateLimiter, test_client: Any
-) -> None:
+def test_the_dependency_accepts_an_async_key_function(limiter: RateLimiter, test_client: Any) -> None:
     """An async key function is awaited, so callers key on the string and not a coroutine."""
     app = FastAPI()
 
@@ -348,9 +333,7 @@ def test_the_dependency_accepts_an_async_key_function(
         """Key the limiter on the tenant header."""
         return request.headers.get("x-tenant", "anonymous")
 
-    dependency = rate_limit(
-        key_fn, limit=1, window_seconds=60, namespace="async-tenant", limiter=limiter
-    )
+    dependency = rate_limit(key_fn, limit=1, window_seconds=60, namespace="async-tenant", limiter=limiter)
 
     @app.get("/tenant")
     async def tenant(decision: Any = Depends(dependency)) -> dict[str, bool]:
@@ -366,9 +349,7 @@ def test_the_dependency_accepts_an_async_key_function(
     assert client.get("/tenant", headers={"x-tenant": "globex"}).status_code == 200
 
 
-def test_the_dependency_does_not_block_the_event_loop(
-    limiter: RateLimiter, test_client: Any
-) -> None:
+def test_the_dependency_does_not_block_the_event_loop(limiter: RateLimiter, test_client: Any) -> None:
     """The blocking `check` call runs in a worker thread, not on the thread running the route."""
     import threading
 

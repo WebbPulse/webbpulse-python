@@ -94,13 +94,9 @@ class FakeKms:
             "SigningAlgorithms": ["RSASSA_PKCS1_V1_5_SHA_256"],
         }
 
-    def sign(
-        self, *, KeyId: str, Message: bytes, MessageType: str, SigningAlgorithm: str
-    ) -> dict[str, Any]:
+    def sign(self, *, KeyId: str, Message: bytes, MessageType: str, SigningAlgorithm: str) -> dict[str, Any]:
         """Sign a prehashed message with the local private key for a key id."""
-        signature = self._keys[KeyId].sign(
-            Message, padding.PKCS1v15(), utils.Prehashed(hashes.SHA256())
-        )
+        signature = self._keys[KeyId].sign(Message, padding.PKCS1v15(), utils.Prehashed(hashes.SHA256()))
         return {"KeyId": KeyId, "Signature": signature, "SigningAlgorithm": SigningAlgorithm}
 
     def generate_data_key(
@@ -113,9 +109,7 @@ class FakeKms:
         blob = base64.b64encode(plaintext) + b"|" + _context_bytes(EncryptionContext)
         return {"KeyId": KeyId, "Plaintext": plaintext, "CiphertextBlob": blob}
 
-    def decrypt(
-        self, *, CiphertextBlob: bytes, EncryptionContext: Mapping[str, str]
-    ) -> dict[str, Any]:
+    def decrypt(self, *, CiphertextBlob: bytes, EncryptionContext: Mapping[str, str]) -> dict[str, Any]:
         """Unwrap a data key blob, failing when the encryption context does not match."""
         try:
             encoded, context = CiphertextBlob.split(b"|", 1)
@@ -220,9 +214,7 @@ class FakeProvider:
         if url == PROVIDERS[GITHUB_PROVIDER].token_url:
             if self.token_error:
                 return httpx.Response(self.token_status, json={"error": self.token_error})
-            return httpx.Response(
-                self.token_status, json={"access_token": "gho_test", "token_type": "bearer"}
-            )
+            return httpx.Response(self.token_status, json={"access_token": "gho_test", "token_type": "bearer"})
 
         if url == PROVIDERS[GITHUB_PROVIDER].userinfo_url:
             return httpx.Response(200, json=self.github_user)
@@ -461,9 +453,7 @@ def test_start_builds_a_google_url_with_pkce_and_a_nonce(oauth: OAuthService) ->
     parts = urlsplit(authorization.authorization_url)
     params = {key: value[0] for key, value in parse_qs(parts.query).items()}
 
-    assert (
-        f"{parts.scheme}://{parts.netloc}{parts.path}" == PROVIDERS[GOOGLE_PROVIDER].authorize_url
-    )
+    assert f"{parts.scheme}://{parts.netloc}{parts.path}" == PROVIDERS[GOOGLE_PROVIDER].authorize_url
     assert params["client_id"] == GOOGLE_CLIENT_ID
     assert params["response_type"] == "code"
     assert params["code_challenge_method"] == "S256"
@@ -500,11 +490,7 @@ def test_start_writes_a_state_row_with_the_ten_minute_ttl(oauth: OAuthService) -
     before = int(time.time())
     authorization = oauth.start(GOOGLE_PROVIDER)
     record = oauth.consume_state(authorization.state)
-    assert (
-        before + OAUTH_STATE_TTL_SECONDS - 5
-        <= record.expires_at
-        <= before + OAUTH_STATE_TTL_SECONDS + 5
-    )
+    assert before + OAUTH_STATE_TTL_SECONDS - 5 <= record.expires_at <= before + OAUTH_STATE_TTL_SECONDS + 5
 
 
 def test_two_starts_produce_different_states(oauth: OAuthService) -> None:
@@ -525,9 +511,7 @@ def test_a_login_state_never_carries_a_user_id(oauth: OAuthService) -> None:
     assert oauth.consume_state(authorization.state).user_id == ""
 
 
-def test_an_unconfigured_provider_is_not_available(
-    hooks: FakeHooks, stores: IdentityStores
-) -> None:
+def test_an_unconfigured_provider_is_not_available(hooks: FakeHooks, stores: IdentityStores) -> None:
     """A provider listed but given no client id must not redirect to a broken consent screen."""
     service = OAuthService(
         make_settings(github_client_id=""),
@@ -547,9 +531,7 @@ def test_an_unknown_provider_is_refused(oauth: OAuthService) -> None:
         oauth.start("facebook")
 
 
-def test_a_redirect_uri_outside_the_allow_list_is_refused(
-    hooks: FakeHooks, stores: IdentityStores
-) -> None:
+def test_a_redirect_uri_outside_the_allow_list_is_refused(hooks: FakeHooks, stores: IdentityStores) -> None:
     """The parameter a provider sends a live authorization code to. It is not a suggestion."""
     settings = make_settings(oauth_redirect_uris=[f"{ISSUER}/oauth/callback"])
     service = OAuthService(
@@ -586,9 +568,7 @@ def test_an_allowed_redirect_uri_is_stored_and_replayed_on_the_exchange(
     """The provider refuses an exchange whose `redirect_uri` differs by a byte."""
     run_google_callback(oauth, provider)
     exchange = next(
-        request
-        for request in provider.requests
-        if str(request.url) == PROVIDERS[GOOGLE_PROVIDER].token_url
+        request for request in provider.requests if str(request.url) == PROVIDERS[GOOGLE_PROVIDER].token_url
     )
     assert _parse_form(exchange)["redirect_uri"] == f"{ISSUER}/oauth/callback"
 
@@ -667,9 +647,7 @@ def test_every_state_failure_answers_identically(oauth: OAuthService) -> None:
     assert len(codes) == 1
 
 
-def test_a_google_callback_yields_a_verified_identity(
-    oauth: OAuthService, provider: FakeProvider
-) -> None:
+def test_a_google_callback_yields_a_verified_identity(oauth: OAuthService, provider: FakeProvider) -> None:
     """A completed Google callback resolves the provider, subject, email and verification state."""
     identity = run_google_callback(oauth, provider)
     assert identity.provider == GOOGLE_PROVIDER
@@ -683,9 +661,7 @@ def test_the_exchange_sends_the_pkce_verifier_and_the_client_secret(
 ) -> None:
     """The token exchange form carries the grant type, code, client secret and code verifier."""
     run_google_callback(oauth, provider)
-    form = _parse_form(
-        next(r for r in provider.requests if str(r.url) == PROVIDERS[GOOGLE_PROVIDER].token_url)
-    )
+    form = _parse_form(next(r for r in provider.requests if str(r.url) == PROVIDERS[GOOGLE_PROVIDER].token_url))
     assert form["grant_type"] == "authorization_code"
     assert form["code"] == "auth-code"
     assert form["client_secret"] == GOOGLE_SECRET
@@ -722,9 +698,7 @@ def test_an_id_token_signed_by_the_wrong_key_is_refused(
     assert excinfo.value.error_code == "OAUTH_ID_TOKEN_INVALID"
 
 
-def test_an_id_token_for_another_audience_is_refused(
-    oauth: OAuthService, provider: FakeProvider
-) -> None:
+def test_an_id_token_for_another_audience_is_refused(oauth: OAuthService, provider: FakeProvider) -> None:
     """A token minted for a different client id is a token from a different application."""
     authorization = oauth.start(GOOGLE_PROVIDER)
     record = oauth.consume_state(authorization.state)
@@ -733,9 +707,7 @@ def test_an_id_token_for_another_audience_is_refused(
         oauth.identity_from_callback(GOOGLE_PROVIDER, code="c", state_record=record)
 
 
-def test_an_id_token_from_another_issuer_is_refused(
-    oauth: OAuthService, provider: FakeProvider
-) -> None:
+def test_an_id_token_from_another_issuer_is_refused(oauth: OAuthService, provider: FakeProvider) -> None:
     """An ID token whose `iss` is not Google is refused."""
     authorization = oauth.start(GOOGLE_PROVIDER)
     record = oauth.consume_state(authorization.state)
@@ -749,16 +721,12 @@ def test_an_expired_id_token_is_refused(oauth: OAuthService, provider: FakeProvi
     authorization = oauth.start(GOOGLE_PROVIDER)
     record = oauth.consume_state(authorization.state)
     now = int(time.time())
-    provider.id_token_override = provider.id_token(
-        nonce=record.nonce, iat=now - 7200, exp=now - 3600
-    )
+    provider.id_token_override = provider.id_token(nonce=record.nonce, iat=now - 7200, exp=now - 3600)
     with pytest.raises(OAuthRejected):
         oauth.identity_from_callback(GOOGLE_PROVIDER, code="c", state_record=record)
 
 
-def test_a_replayed_id_token_with_the_wrong_nonce_is_refused(
-    oauth: OAuthService, provider: FakeProvider
-) -> None:
+def test_a_replayed_id_token_with_the_wrong_nonce_is_refused(oauth: OAuthService, provider: FakeProvider) -> None:
     """The attack `nonce` exists to stop: a valid ID token lifted from another session."""
     authorization = oauth.start(GOOGLE_PROVIDER)
     record = oauth.consume_state(authorization.state)
@@ -833,9 +801,7 @@ def test_the_client_secret_never_appears_in_a_log_record(
     assert GITHUB_SECRET not in rendered
 
 
-def test_github_identity_comes_from_user_and_user_emails(
-    oauth: OAuthService, provider: FakeProvider
-) -> None:
+def test_github_identity_comes_from_user_and_user_emails(oauth: OAuthService, provider: FakeProvider) -> None:
     """A GitHub callback calls both the userinfo and the emails endpoints to build the identity."""
     authorization = oauth.start(GITHUB_PROVIDER)
     record = oauth.consume_state(authorization.state)
@@ -870,9 +836,7 @@ def test_github_prefers_the_verified_primary_over_an_unverified_one(
     assert identity.email_verified is True
 
 
-def test_github_reports_an_unverified_address_as_unverified(
-    oauth: OAuthService, provider: FakeProvider
-) -> None:
+def test_github_reports_an_unverified_address_as_unverified(oauth: OAuthService, provider: FakeProvider) -> None:
     """An unverified GitHub primary address is carried through as unverified."""
     provider.github_emails = [{"email": EMAIL, "primary": True, "verified": False}]
     authorization = oauth.start(GITHUB_PROVIDER)
@@ -883,16 +847,12 @@ def test_github_reports_an_unverified_address_as_unverified(
     assert identity.email_verified is False
 
 
-def test_a_github_exchange_sends_no_pkce_verifier(
-    oauth: OAuthService, provider: FakeProvider
-) -> None:
+def test_a_github_exchange_sends_no_pkce_verifier(oauth: OAuthService, provider: FakeProvider) -> None:
     """The GitHub token exchange form carries no code verifier."""
     authorization = oauth.start(GITHUB_PROVIDER)
     record = oauth.consume_state(authorization.state)
     oauth.identity_from_callback(GITHUB_PROVIDER, code="c", state_record=record)
-    form = _parse_form(
-        next(r for r in provider.requests if str(r.url) == PROVIDERS[GITHUB_PROVIDER].token_url)
-    )
+    form = _parse_form(next(r for r in provider.requests if str(r.url) == PROVIDERS[GITHUB_PROVIDER].token_url))
     assert "code_verifier" not in form
 
 
@@ -901,15 +861,11 @@ def test_the_github_exchange_asks_for_json(oauth: OAuthService, provider: FakePr
     authorization = oauth.start(GITHUB_PROVIDER)
     record = oauth.consume_state(authorization.state)
     oauth.identity_from_callback(GITHUB_PROVIDER, code="c", state_record=record)
-    request = next(
-        r for r in provider.requests if str(r.url) == PROVIDERS[GITHUB_PROVIDER].token_url
-    )
+    request = next(r for r in provider.requests if str(r.url) == PROVIDERS[GITHUB_PROVIDER].token_url)
     assert request.headers["accept"] == "application/json"
 
 
-def test_a_known_link_signs_the_user_in(
-    oauth: OAuthService, provider: FakeProvider, hooks: FakeHooks
-) -> None:
+def test_a_known_link_signs_the_user_in(oauth: OAuthService, provider: FakeProvider, hooks: FakeHooks) -> None:
     """An identity with an existing link resolves to that user with the `linked` outcome."""
     user = hooks.add(EMAIL, email_verified=True)
     identity = run_google_callback(oauth, provider)
@@ -920,9 +876,7 @@ def test_a_known_link_signs_the_user_in(
     assert resolved["id"] == user["id"]
 
 
-def test_both_sides_verified_auto_links(
-    oauth: OAuthService, provider: FakeProvider, hooks: FakeHooks
-) -> None:
+def test_both_sides_verified_auto_links(oauth: OAuthService, provider: FakeProvider, hooks: FakeHooks) -> None:
     """The locked decision's allowed case, and the only one."""
     user = hooks.add(EMAIL, email_verified=True)
     identity = run_google_callback(oauth, provider)
@@ -970,9 +924,7 @@ def test_a_refused_auto_link_says_the_same_thing_either_way(
         oauth.resolve_login(identity_a)
 
     provider.claims_override = {"email_verified": False}
-    identity_b = OAuthIdentity(
-        provider=GOOGLE_PROVIDER, subject="other", email=EMAIL, email_verified=False
-    )
+    identity_b = OAuthIdentity(provider=GOOGLE_PROVIDER, subject="other", email=EMAIL, email_verified=False)
     with pytest.raises(OAuthRejected) as second:
         oauth.resolve_login(identity_b)
 
@@ -993,9 +945,7 @@ def test_an_unknown_identity_registers_a_new_account(
     assert hooks.created_via == [GOOGLE_PROVIDER]
 
 
-def test_a_registration_carries_the_providers_verification_state(
-    oauth: OAuthService, provider: FakeProvider
-) -> None:
+def test_a_registration_carries_the_providers_verification_state(oauth: OAuthService, provider: FakeProvider) -> None:
     """An unverified provider address gives an unverified local account, not a trusted one."""
     provider.claims_override = {"email_verified": False}
     identity = run_google_callback(oauth, provider)
@@ -1005,9 +955,7 @@ def test_a_registration_carries_the_providers_verification_state(
     assert user["email_verified"] is False
 
 
-def test_registration_can_be_switched_off(
-    hooks: FakeHooks, stores: IdentityStores, provider: FakeProvider
-) -> None:
+def test_registration_can_be_switched_off(hooks: FakeHooks, stores: IdentityStores, provider: FakeProvider) -> None:
     """With registration disabled an unknown identity is refused with REGISTRATION_DISABLED."""
     service = OAuthService(
         make_settings(registration_enabled=False),
@@ -1025,9 +973,7 @@ def test_registration_can_be_switched_off(
 
 def test_a_provider_that_shares_no_email_is_refused(oauth: OAuthService) -> None:
     """An identity with no email is refused with OAUTH_EMAIL_MISSING."""
-    identity = OAuthIdentity(
-        provider=GITHUB_PROVIDER, subject=GITHUB_SUB, email="", email_verified=False
-    )
+    identity = OAuthIdentity(provider=GITHUB_PROVIDER, subject=GITHUB_SUB, email="", email_verified=False)
     with pytest.raises(OAuthRejected) as excinfo:
         oauth.resolve_login(identity)
     assert excinfo.value.error_code == "OAUTH_EMAIL_MISSING"
@@ -1099,15 +1045,9 @@ def test_list_links_returns_only_this_users_links(
     """Listing links returns this user's links, in provider order, and nobody else's."""
     mine = hooks.add("mine@example.com", email_verified=True)
     theirs = hooks.add("theirs@example.com", email_verified=True)
-    oauth.link(
-        OAuthIdentity(GOOGLE_PROVIDER, "sub-a", "a@example.com", True), user_id=str(mine["id"])
-    )
-    oauth.link(
-        OAuthIdentity(GITHUB_PROVIDER, "sub-b", "b@example.com", True), user_id=str(mine["id"])
-    )
-    oauth.link(
-        OAuthIdentity(GOOGLE_PROVIDER, "sub-c", "c@example.com", True), user_id=str(theirs["id"])
-    )
+    oauth.link(OAuthIdentity(GOOGLE_PROVIDER, "sub-a", "a@example.com", True), user_id=str(mine["id"]))
+    oauth.link(OAuthIdentity(GITHUB_PROVIDER, "sub-b", "b@example.com", True), user_id=str(mine["id"]))
+    oauth.link(OAuthIdentity(GOOGLE_PROVIDER, "sub-c", "c@example.com", True), user_id=str(theirs["id"]))
 
     assert [r.provider for r in oauth.list_links(str(mine["id"]))] == [
         GITHUB_PROVIDER,
@@ -1116,9 +1056,7 @@ def test_list_links_returns_only_this_users_links(
     assert len(oauth.list_links(str(theirs["id"]))) == 1
 
 
-def test_no_provider_tokens_are_stored(
-    oauth: OAuthService, provider: FakeProvider, hooks: FakeHooks
-) -> None:
+def test_no_provider_tokens_are_stored(oauth: OAuthService, provider: FakeProvider, hooks: FakeHooks) -> None:
     """This design consumes a provider as an identity source and never calls its API."""
     import dataclasses
 
@@ -1176,9 +1114,7 @@ def test_unlink_allows_it_when_a_password_remains(
     assert oauth.list_links(str(user["id"])) == []
 
 
-def test_unlink_allows_it_when_the_hook_reports_a_passkey(
-    oauth: OAuthService, hooks: FakeHooks
-) -> None:
+def test_unlink_allows_it_when_the_hook_reports_a_passkey(oauth: OAuthService, hooks: FakeHooks) -> None:
     """Unlink succeeds when `has_other_sign_in_method` reports another credential."""
     user = hooks.add(EMAIL, email_verified=True)
     oauth.link(OAuthIdentity(GOOGLE_PROVIDER, "g", EMAIL, True), user_id=str(user["id"]))
@@ -1197,9 +1133,7 @@ def test_the_new_hook_defaults_to_false_so_old_hooks_keep_working() -> None:
     assert PreM6Hooks().has_other_sign_in_method("user-0001") is False
 
 
-def test_unlinking_a_provider_that_is_not_linked_is_a_404(
-    oauth: OAuthService, hooks: FakeHooks
-) -> None:
+def test_unlinking_a_provider_that_is_not_linked_is_a_404(oauth: OAuthService, hooks: FakeHooks) -> None:
     """Unlinking a provider the user never linked is a 404."""
     user = hooks.add(EMAIL, email_verified=True)
     with pytest.raises(OAuthRejected) as excinfo:
@@ -1212,9 +1146,7 @@ def test_unlink_does_not_touch_another_users_link(oauth: OAuthService, hooks: Fa
     mine = hooks.add("mine@example.com", email_verified=True)
     theirs = hooks.add("theirs@example.com", email_verified=True)
     oauth.link(OAuthIdentity(GOOGLE_PROVIDER, "g1", "a@example.com", True), user_id=str(mine["id"]))
-    oauth.link(
-        OAuthIdentity(GOOGLE_PROVIDER, "g2", "b@example.com", True), user_id=str(theirs["id"])
-    )
+    oauth.link(OAuthIdentity(GOOGLE_PROVIDER, "g2", "b@example.com", True), user_id=str(theirs["id"]))
     hooks.extra_sign_in_methods = True
 
     oauth.unlink(user_id=str(mine["id"]), provider=GOOGLE_PROVIDER)
@@ -1241,9 +1173,7 @@ def test_an_oauth_login_issues_the_same_token_pair_a_password_login_does(
     assert result.expires_in > 0
 
 
-def test_the_access_token_records_the_provider_in_amr(
-    flows: IdentityFlows, hooks: FakeHooks, kms: FakeKms
-) -> None:
+def test_the_access_token_records_the_provider_in_amr(flows: IdentityFlows, hooks: FakeHooks, kms: FakeKms) -> None:
     """A policy that wants "a Google session" cannot express that against a shared value."""
     settings = make_settings()
     tokens = TokenService(settings, kms)
@@ -1280,9 +1210,7 @@ def test_an_oauth_login_honours_mfa(hooks: FakeHooks, stores: IdentityStores, km
     assert excinfo.value.challenge.as_body()["mfa_required"] is True
 
 
-def test_an_oauth_login_respects_may_authenticate(
-    hooks: FakeHooks, stores: IdentityStores, kms: FakeKms
-) -> None:
+def test_an_oauth_login_respects_may_authenticate(hooks: FakeHooks, stores: IdentityStores, kms: FakeKms) -> None:
     """A suspended account must not become reachable through a second front door."""
     hooks.refuse = "This account is disabled."
     settings = make_settings()
@@ -1417,9 +1345,7 @@ def oauth_tables(dynamodb_resource: Any) -> dict[str, Any]:
     """The two OAuth tables, shaped as the Terraform module must create them."""
     from webbpulse.testing import create_table
 
-    states = create_table(
-        dynamodb_resource, "test-oauth-states", hash_key="state", ttl_attribute="expires_at"
-    )
+    states = create_table(dynamodb_resource, "test-oauth-states", hash_key="state", ttl_attribute="expires_at")
     links = dynamodb_resource.create_table(
         TableName="test-oauth-links",
         KeySchema=[{"AttributeName": "provider_subject", "KeyType": "HASH"}],
@@ -1459,9 +1385,7 @@ def test_the_links_table_is_keyed_on_provider_subject_with_a_user_index(
     assert table.key_schema == [{"AttributeName": "provider_subject", "KeyType": "HASH"}]
     indexes = {index["IndexName"]: index for index in table.global_secondary_indexes}
     assert OAUTH_LINK_USER_INDEX in indexes
-    assert indexes[OAUTH_LINK_USER_INDEX]["KeySchema"] == [
-        {"AttributeName": "user_id", "KeyType": "HASH"}
-    ]
+    assert indexes[OAUTH_LINK_USER_INDEX]["KeySchema"] == [{"AttributeName": "user_id", "KeyType": "HASH"}]
 
 
 def test_the_links_table_has_no_ttl(oauth_tables: dict[str, Any]) -> None:
@@ -1601,9 +1525,7 @@ def test_the_dynamo_link_store_delete_is_idempotent(oauth_tables: dict[str, Any]
     assert store.get("google#never-existed") is None
 
 
-def test_a_non_json_provider_response_becomes_a_refusal_not_a_crash(
-    hooks: FakeHooks, stores: IdentityStores
-) -> None:
+def test_a_non_json_provider_response_becomes_a_refusal_not_a_crash(hooks: FakeHooks, stores: IdentityStores) -> None:
     """A provider answering an HTML error page is a real condition, not an exception."""
     from webbpulse.identity.oauth import HttpxClient
 
@@ -1730,21 +1652,15 @@ def test_a_provider_with_an_id_but_no_secret_is_not_advertised(
     hooks: FakeHooks, stores: IdentityStores, kms: FakeKms
 ) -> None:
     """The partial-configuration case, and the reason this route checks both halves."""
-    client = _providers_client(
-        _providers_router(hooks, stores, kms, secrets={GOOGLE_PROVIDER: GOOGLE_SECRET})
-    )
-    assert _get_providers(client).json() == {
-        "providers": [{"id": "google", "display_name": "Google"}]
-    }
+    client = _providers_client(_providers_router(hooks, stores, kms, secrets={GOOGLE_PROVIDER: GOOGLE_SECRET}))
+    assert _get_providers(client).json() == {"providers": [{"id": "google", "display_name": "Google"}]}
 
 
 def test_the_start_route_refuses_a_provider_with_no_secret_before_redirecting(
     hooks: FakeHooks, stores: IdentityStores, kms: FakeKms
 ) -> None:
     """A provider with a client id but no secret is refused with a 503, not redirected."""
-    client = _providers_client(
-        _providers_router(hooks, stores, kms, secrets={GOOGLE_PROVIDER: GOOGLE_SECRET})
-    )
+    client = _providers_client(_providers_router(hooks, stores, kms, secrets={GOOGLE_PROVIDER: GOOGLE_SECRET}))
     prefix = identity_prefix(make_settings())
 
     refused = client.get(f"{prefix}/oauth/github/start")
@@ -1759,9 +1675,7 @@ def test_discovery_is_empty_when_no_client_secret_is_supplied_at_all(
     hooks: FakeHooks, stores: IdentityStores, kms: FakeKms
 ) -> None:
     """Client ids without secrets is still nothing a user can sign in with."""
-    assert _get_providers(_providers_client(_providers_router(hooks, stores, kms))).json() == {
-        "providers": []
-    }
+    assert _get_providers(_providers_client(_providers_router(hooks, stores, kms))).json() == {"providers": []}
 
 
 def test_discovery_is_empty_when_no_provider_has_a_client_id(
@@ -1781,16 +1695,12 @@ def test_discovery_is_empty_when_no_provider_has_a_client_id(
     assert _get_providers(client).json() == {"providers": []}
 
 
-def test_discovery_mounts_and_is_empty_when_the_oauth_stores_are_missing(
-    hooks: FakeHooks, kms: FakeKms
-) -> None:
+def test_discovery_mounts_and_is_empty_when_the_oauth_stores_are_missing(hooks: FakeHooks, kms: FakeKms) -> None:
     """A deployment with nowhere to write a state row cannot complete a sign-in."""
     router = build_identity_router(
         make_settings(),
         hooks,
-        IdentityStores(
-            credentials=InMemoryCredentialStore(), refresh_tokens=InMemoryRefreshTokenStore()
-        ),
+        IdentityStores(credentials=InMemoryCredentialStore(), refresh_tokens=InMemoryRefreshTokenStore()),
         kms_client=kms,
         limiter_enabled=False,
         oauth_client_secrets={GOOGLE_PROVIDER: GOOGLE_SECRET, GITHUB_PROVIDER: GITHUB_SECRET},
@@ -1825,9 +1735,7 @@ def test_discovery_carries_the_same_cache_policy_as_the_jwks(
     assert OAUTH_PROVIDERS_CACHE_CONTROL == "public, max-age=300"
 
 
-def test_discovery_needs_no_token_and_sets_no_cookie(
-    hooks: FakeHooks, stores: IdentityStores, kms: FakeKms
-) -> None:
+def test_discovery_needs_no_token_and_sets_no_cookie(hooks: FakeHooks, stores: IdentityStores, kms: FakeKms) -> None:
     """It is read by the sign-in page, which by definition holds no token."""
     client = _providers_client(
         _providers_router(

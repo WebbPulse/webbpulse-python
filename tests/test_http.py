@@ -38,9 +38,7 @@ from webbpulse.http import (
 from webbpulse.logging import configure_logging
 
 
-def _request(
-    headers: dict[str, str] | None = None, client: tuple[str, int] | None = None
-) -> Request:
+def _request(headers: dict[str, str] | None = None, client: tuple[str, int] | None = None) -> Request:
     """Build a bare Starlette request with the given headers and optional peer address."""
     raw = [(k.lower().encode(), v.encode()) for k, v in (headers or {}).items()]
     scope: dict[str, Any] = {"type": "http", "method": "GET", "path": "/", "headers": raw}
@@ -68,11 +66,7 @@ def test_client_ip_reads_the_rest_api_v1_shape() -> None:
 
 def test_client_ip_prefers_v2_when_both_are_present() -> None:
     """The 2.0 shape wins when a context carries both."""
-    request = _request(
-        _context_header(
-            {"http": {"sourceIp": "203.0.113.7"}, "identity": {"sourceIp": "198.51.100.9"}}
-        )
-    )
+    request = _request(_context_header({"http": {"sourceIp": "203.0.113.7"}, "identity": {"sourceIp": "198.51.100.9"}}))
     assert client_ip(request) == "203.0.113.7"
 
 
@@ -291,9 +285,7 @@ def _domain_app(name: str) -> FastAPI:
 
 def test_mount_all_serves_every_domain_from_one_app() -> None:
     """The local and test composition root, built from the same app objects as production."""
-    parent = mount_all(
-        {"/api/v1/posts": _domain_app("posts"), "/api/v1/skills": _domain_app("skills")}
-    )
+    parent = mount_all({"/api/v1/posts": _domain_app("posts"), "/api/v1/skills": _domain_app("skills")})
     client = TestClient(parent)
 
     assert client.get("/api/v1/posts/").json() == {"domain": "posts"}
@@ -753,9 +745,7 @@ def test_a_mapped_conflict_reads_exactly_like_the_botocore_one() -> None:
 
 def test_the_internal_exception_message_never_reaches_the_caller() -> None:
     """A mapped exception's own message never reaches the response body."""
-    response = _mapped_app(ItemNotFound("pk=USER#42 sk=SECRET"), exception_map=_ADOPTION_MAP).get(
-        "/work"
-    )
+    response = _mapped_app(ItemNotFound("pk=USER#42 sk=SECRET"), exception_map=_ADOPTION_MAP).get("/work")
     assert "SECRET" not in response.text, "the exception's own text must not leak"
 
 
@@ -768,9 +758,7 @@ def test_a_mapped_status_carries_its_default_message() -> None:
 def test_an_error_spec_sets_the_message_and_the_code() -> None:
     """An `ErrorSpec` sets both the message and the error code."""
     spec = ErrorSpec(404, message="No such post.", error_code="POST_NOT_FOUND")
-    response = _mapped_app(
-        ItemNotFound(), exception_map={ItemNotFound: spec}, error_codes=True
-    ).get("/work")
+    response = _mapped_app(ItemNotFound(), exception_map={ItemNotFound: spec}, error_codes=True).get("/work")
 
     body = response.json()
     assert body["message"] == "No such post."
@@ -787,17 +775,13 @@ def test_an_error_spec_code_is_still_suppressed_without_error_codes() -> None:
 
 def test_a_mapped_status_gets_the_per_status_code_when_enabled() -> None:
     """A mapped status gets the per status error code when `error_codes=True`."""
-    response = _mapped_app(
-        ConditionFailed(), exception_map={ConditionFailed: 409}, error_codes=True
-    ).get("/work")
+    response = _mapped_app(ConditionFailed(), exception_map={ConditionFailed: 409}, error_codes=True).get("/work")
     assert response.json()["error_code"] == "CONFLICT"
 
 
 def test_an_unlisted_status_falls_back_to_a_generic_code() -> None:
     """A status with no wording of its own falls back to the generic code and message."""
-    response = _mapped_app(ItemNotFound(), exception_map={ItemNotFound: 418}, error_codes=True).get(
-        "/work"
-    )
+    response = _mapped_app(ItemNotFound(), exception_map={ItemNotFound: 418}, error_codes=True).get("/work")
 
     assert response.status_code == 418
     assert response.json()["error_code"] == "HTTP_ERROR"
@@ -828,9 +812,7 @@ def test_a_mapped_five_hundred_is_generic_and_logs_at_error(
     """A message written for an internal exception is not written for a stranger."""
     spec = ErrorSpec(500, message="the shard is wedged")
     with caplog.at_level(logging.ERROR, logger="webbpulse.http"):
-        response = _mapped_app(ConditionFailed(), exception_map={ConditionFailed: spec}).get(
-            "/work"
-        )
+        response = _mapped_app(ConditionFailed(), exception_map={ConditionFailed: spec}).get("/work")
 
     assert response.status_code == 500
     assert response.json()["message"] == "Internal server error."
@@ -1006,11 +988,7 @@ def _call_and_read_log(app: FastAPI, capsys: pytest.CaptureFixture[str]) -> tupl
     body = TestClient(app).get("/me").json()
 
     lines = [line for line in capsys.readouterr().out.splitlines() if line.strip()]
-    served = [
-        payload
-        for payload in (json.loads(line) for line in lines)
-        if payload.get("message") == "served"
-    ]
+    served = [payload for payload in (json.loads(line) for line in lines) if payload.get("message") == "served"]
     assert len(served) == 1, lines
     return body, served[0]
 
@@ -1091,9 +1069,7 @@ def test_user_id_dependency_passes_the_resolved_object_through_unchanged() -> No
         """Report whether the injected object is the very object the resolver returned."""
         return {"identical": user is sentinel}
 
-    assert TestClient(create_app([router], instrument=False)).get("/same").json() == {
-        "identical": True
-    }
+    assert TestClient(create_app([router], instrument=False)).get("/same").json() == {"identical": True}
 
 
 def test_user_id_dependency_wraps_an_async_resolver_too() -> None:
@@ -1131,9 +1107,7 @@ def test_user_id_dependency_keeps_the_wrapped_dependencys_own_dependencies() -> 
 
         return {"user_id": user_id_var.get()}
 
-    response = TestClient(create_app([router], instrument=False)).get(
-        "/me", headers={"x-test-user": "u-hdr"}
-    )
+    response = TestClient(create_app([router], instrument=False)).get("/me", headers={"x-test-user": "u-hdr"})
     assert response.json()["user_id"] == "u-hdr"
 
 
@@ -1211,9 +1185,7 @@ def test_user_id_dependency_honours_an_extract_callable() -> None:
 
         return {"user_id": user_id_var.get()}
 
-    assert (
-        TestClient(create_app([router], instrument=False)).get("/me").json()["user_id"] == "claim-7"
-    )
+    assert TestClient(create_app([router], instrument=False)).get("/me").json()["user_id"] == "claim-7"
 
 
 def test_user_id_dependency_takes_the_wrapped_callables_name() -> None:

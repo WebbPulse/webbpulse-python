@@ -102,13 +102,9 @@ class FakeKms:
             "SigningAlgorithms": ["RSASSA_PKCS1_V1_5_SHA_256"],
         }
 
-    def sign(
-        self, *, KeyId: str, Message: bytes, MessageType: str, SigningAlgorithm: str
-    ) -> dict[str, Any]:
+    def sign(self, *, KeyId: str, Message: bytes, MessageType: str, SigningAlgorithm: str) -> dict[str, Any]:
         """Sign a prehashed message with the local private key for a key id."""
-        signature = self._keys[KeyId].sign(
-            Message, padding.PKCS1v15(), utils.Prehashed(hashes.SHA256())
-        )
+        signature = self._keys[KeyId].sign(Message, padding.PKCS1v15(), utils.Prehashed(hashes.SHA256()))
         return {"KeyId": KeyId, "Signature": signature, "SigningAlgorithm": SigningAlgorithm}
 
 
@@ -367,12 +363,8 @@ def test_the_logo_is_included_only_when_it_is_configured() -> None:
     with_logo = make_settings(logo_url="https://cdn.example.com/logo.png")
     without = make_settings()
 
-    assert (
-        "<img" in render_verification(with_logo, to=EMAIL, link="https://x", expiry="1 hour").html
-    )
-    assert (
-        "<img" not in render_verification(without, to=EMAIL, link="https://x", expiry="1 hour").html
-    )
+    assert "<img" in render_verification(with_logo, to=EMAIL, link="https://x", expiry="1 hour").html
+    assert "<img" not in render_verification(without, to=EMAIL, link="https://x", expiry="1 hour").html
 
 
 def test_no_message_uses_an_em_dash_or_the_word_developer(settings: IdentitySettings) -> None:
@@ -412,9 +404,7 @@ def test_each_message_carries_a_distinct_purpose_tag(settings: IdentitySettings)
     """The four templates carry four distinct purpose tags."""
     purposes = {
         render_verification(settings, to=EMAIL, link="https://x", expiry="1 hour").tags["purpose"],
-        render_password_reset(settings, to=EMAIL, link="https://x", expiry="1 hour").tags[
-            "purpose"
-        ],
+        render_password_reset(settings, to=EMAIL, link="https://x", expiry="1 hour").tags["purpose"],
         render_registration_notice(settings, to=EMAIL, link="https://x").tags["purpose"],
         render_password_changed(settings, to=EMAIL, link="https://x").tags["purpose"],
     }
@@ -464,9 +454,7 @@ def test_the_ses_sender_builds_a_simple_content_with_both_parts() -> None:
 def test_the_configuration_set_key_is_omitted_when_it_is_unset() -> None:
     """`ConfigurationSetName` is absent, not empty, when unset or set to an empty string."""
     client = CapturingSesClient()
-    SesV2EmailSender(client, from_address="a@b.c").send(
-        EmailMessage(to=EMAIL, subject="s", text="t", html="<p>h</p>")
-    )
+    SesV2EmailSender(client, from_address="a@b.c").send(EmailMessage(to=EMAIL, subject="s", text="t", html="<p>h</p>"))
     assert "ConfigurationSetName" not in client.requests[0]
 
     client2 = CapturingSesClient()
@@ -493,19 +481,13 @@ def test_tags_become_email_tags_and_are_omitted_when_there_are_none() -> None:
     sender.send(EmailMessage(to=EMAIL, subject="s", text="t", html="<p>h</p>"))
     assert "EmailTags" not in client.requests[0]
 
-    sender.send(
-        EmailMessage(
-            to=EMAIL, subject="s", text="t", html="<p>h</p>", tags={"purpose": "verify_email"}
-        )
-    )
+    sender.send(EmailMessage(to=EMAIL, subject="s", text="t", html="<p>h</p>", tags={"purpose": "verify_email"}))
     assert client.requests[1]["EmailTags"] == [{"Name": "purpose", "Value": "verify_email"}]
 
 
 def test_from_settings_reads_the_two_fields_section_6_1_specifies() -> None:
     """`from_settings` reads `email_from` and `ses_configuration_set` into the request."""
-    settings = make_settings(
-        email_from="sender@example.com", ses_configuration_set="identity-events"
-    )
+    settings = make_settings(email_from="sender@example.com", ses_configuration_set="identity-events")
     client = CapturingSesClient()
     SesV2EmailSender.from_settings(settings, client).send(
         EmailMessage(to=EMAIL, subject="s", text="t", html="<p>h</p>")
@@ -537,9 +519,7 @@ def test_the_ses_sender_works_against_moto() -> None:
         client.create_email_identity(EmailIdentity="no-reply@example.com")
         sender = SesV2EmailSender(client, from_address="no-reply@example.com")
         message_id = sender.send(
-            render_verification(
-                make_settings(), to=EMAIL, link=f"{FRONTEND}/verify-email?token=x", expiry="1 hour"
-            )
+            render_verification(make_settings(), to=EMAIL, link=f"{FRONTEND}/verify-email?token=x", expiry="1 hour")
         )
 
     assert message_id
@@ -682,9 +662,7 @@ def test_a_link_consumed_between_the_read_and_the_write_is_refused(
     links = LinkService(settings, store)
     issued = links.issue(USER_ID, "reset_password")
 
-    def already_gone(
-        token_hash: str, *, consumed_at: str | None = None
-    ) -> IdentityTokenRecord | None:
+    def already_gone(token_hash: str, *, consumed_at: str | None = None) -> IdentityTokenRecord | None:
         """Stand in for a conditional write that lost the race by returning None."""
         return None
 
@@ -726,9 +704,7 @@ def test_the_issued_link_expiry_is_readable_as_a_datetime(links: LinkService) ->
     assert timedelta(minutes=59) < moment - datetime.now(UTC) <= timedelta(hours=1)
 
 
-def test_registering_sends_a_verification_link(
-    flows: IdentityFlows, sender: RecordingEmailSender
-) -> None:
+def test_registering_sends_a_verification_link(flows: IdentityFlows, sender: RecordingEmailSender) -> None:
     """Registering mails a verification link at the frontend verify path."""
     flows.register(email=EMAIL, password=PASSWORD)
 
@@ -893,9 +869,7 @@ def test_a_verified_address_can_then_sign_in_under_a_product_that_requires_it(
             """Refuse the login unless the user's address is verified."""
             self.calls.append("may_authenticate")
             if not user.get("email_verified"):
-                raise AuthenticationRefused(
-                    "Confirm your email address first.", error_code="EMAIL_NOT_VERIFIED"
-                )
+                raise AuthenticationRefused("Confirm your email address first.", error_code="EMAIL_NOT_VERIFIED")
 
     hooks = StrictHooks()
     settings = make_settings(email_verification_required=True)
@@ -966,9 +940,7 @@ def test_confirming_a_reset_writes_the_new_password_and_revokes_everything(
     sender.clear()
 
     flows.request_password_reset(EMAIL)
-    user_id = flows.confirm_password_reset(
-        token=token_from(sender), new_password=NEW_PASSWORD, family_ids=families
-    )
+    user_id = flows.confirm_password_reset(token=token_from(sender), new_password=NEW_PASSWORD, family_ids=families)
 
     assert user_id == USER_ID
     with pytest.raises(LoginRejected):
@@ -988,9 +960,7 @@ def test_a_reset_marks_the_address_verified(
     sender.clear()
 
     flows.request_password_reset(EMAIL)
-    flows.confirm_password_reset(
-        token=token_from(sender), new_password=NEW_PASSWORD, family_ids=[login.family_id]
-    )
+    flows.confirm_password_reset(token=token_from(sender), new_password=NEW_PASSWORD, family_ids=[login.family_id])
 
     assert hooks.verified == [USER_ID]
 
@@ -1100,9 +1070,7 @@ def test_email_enabled_needs_both_a_sender_and_a_token_store(
     settings = make_settings()
     tokens = TokenService(settings, kms)
 
-    no_store = IdentityStores(
-        credentials=InMemoryCredentialStore(), refresh_tokens=InMemoryRefreshTokenStore()
-    )
+    no_store = IdentityStores(credentials=InMemoryCredentialStore(), refresh_tokens=InMemoryRefreshTokenStore())
     assert not IdentityFlows(
         settings, hooks, no_store, tokens, attempts=attempts, email_sender=RecordingEmailSender()
     ).email_enabled
@@ -1118,9 +1086,7 @@ def test_email_enabled_needs_both_a_sender_and_a_token_store(
     ).email_enabled
 
 
-def test_registering_without_email_configured_still_works(
-    mailless_flows: IdentityFlows, hooks: FakeHooks
-) -> None:
+def test_registering_without_email_configured_still_works(mailless_flows: IdentityFlows, hooks: FakeHooks) -> None:
     """Registration succeeds with no email configured; only the email routes check first."""
     assert mailless_flows.register(email=EMAIL, password=PASSWORD) is not None
     assert hooks.by_email[EMAIL]
@@ -1198,9 +1164,7 @@ def test_the_four_routes_are_mounted_when_a_sender_and_a_token_store_are_supplie
         assert f"{prefix()}{suffix}" in mounted
 
 
-def test_the_four_routes_are_absent_without_a_sender(
-    kms: FakeKms, hooks: FakeHooks, stores: IdentityStores
-) -> None:
+def test_the_four_routes_are_absent_without_a_sender(kms: FakeKms, hooks: FakeHooks, stores: IdentityStores) -> None:
     """Without a sender the four email routes are absent, while the M2 login route remains."""
     mounted = router_paths(hooks=hooks, stores=stores, kms_client=kms)
 
@@ -1213,9 +1177,7 @@ def test_the_four_routes_are_absent_without_a_token_store(
     kms: FakeKms, hooks: FakeHooks, sender: RecordingEmailSender
 ) -> None:
     """Without an identity token store the email routes are absent, while login remains."""
-    stores = IdentityStores(
-        credentials=InMemoryCredentialStore(), refresh_tokens=InMemoryRefreshTokenStore()
-    )
+    stores = IdentityStores(credentials=InMemoryCredentialStore(), refresh_tokens=InMemoryRefreshTokenStore())
     mounted = router_paths(hooks=hooks, stores=stores, kms_client=kms, email_sender=sender)
 
     assert f"{prefix()}{RESET_REQUEST_PATH}" not in mounted
@@ -1323,12 +1285,7 @@ def test_the_reset_confirm_route_clears_the_refresh_cookie(
     assert response.status_code == 200
     assert response.json() == {"reset": True}
     assert "wp_refresh=" in response.headers.get("set-cookie", "")
-    assert (
-        client.post(
-            f"{prefix()}/login", json={"email": EMAIL, "password": NEW_PASSWORD}
-        ).status_code
-        == 200
-    )
+    assert client.post(f"{prefix()}/login", json={"email": EMAIL, "password": NEW_PASSWORD}).status_code == 200
 
 
 def test_a_reset_with_a_refused_password_is_a_422(

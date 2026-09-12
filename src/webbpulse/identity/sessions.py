@@ -167,9 +167,7 @@ class SessionService:
             return RotationResult(outcome="unknown")
 
         if record.revoked:
-            return RotationResult(
-                outcome="revoked", family_id=record.family_id, user_id=record.user_id
-            )
+            return RotationResult(outcome="revoked", family_id=record.family_id, user_id=record.user_id)
 
         if is_expired(record.expires_at, now=moment) or self._past_absolute_cap(record, moment):
             revoked = self._store.revoke_family(record.family_id)
@@ -216,9 +214,7 @@ class SessionService:
             return RotationResult(outcome="unknown")
 
         if current.revoked:
-            return RotationResult(
-                outcome="revoked", family_id=current.family_id, user_id=current.user_id
-            )
+            return RotationResult(outcome="revoked", family_id=current.family_id, user_id=current.user_id)
 
         consumed_at = _parse(current.consumed_at)
         grace = self._settings.refresh_reuse_grace
@@ -334,9 +330,7 @@ class SessionService:
         """
         if family_ids is not None:
             return sum(
-                self._store.revoke_family(family_id)
-                for family_id in family_ids
-                if family_id != except_family_id
+                self._store.revoke_family(family_id) for family_id in family_ids if family_id != except_family_id
             )
         return self._store.revoke_all_for_user(user_id, except_family_id=except_family_id)
 

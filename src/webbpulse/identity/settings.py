@@ -63,10 +63,7 @@ class IdentitySettings(BaseSettings):
     )
     data_key_arn: str = Field(
         default="",
-        description=(
-            "Symmetric KMS key for TOTP seed envelope encryption. Unused until M4 and "
-            "optional until then."
-        ),
+        description=("Symmetric KMS key for TOTP seed envelope encryption. Unused until M4 and optional until then."),
     )
 
     passwords_enabled: bool = True
@@ -75,9 +72,7 @@ class IdentitySettings(BaseSettings):
     totp_enabled: bool = True
     passkeys_enabled: bool = True
     passkeys_passwordless: bool = True
-    oauth_providers: list[OAuthProvider] = Field(
-        default_factory=lambda: _DEFAULT_OAUTH_PROVIDERS.copy()
-    )
+    oauth_providers: list[OAuthProvider] = Field(default_factory=lambda: _DEFAULT_OAUTH_PROVIDERS.copy())
     password_breach_check: bool = Field(
         default=False,
         description=(
@@ -183,9 +178,7 @@ class IdentitySettings(BaseSettings):
                 "builds the discovery URL by appending "
                 "'/.well-known/openid-configuration' to it."
             )
-        if parsed.scheme == "http" and self.environment.strip().lower() not in (
-            _PLAINTEXT_ISSUER_ENVIRONMENTS
-        ):
+        if parsed.scheme == "http" and self.environment.strip().lower() not in (_PLAINTEXT_ISSUER_ENVIRONMENTS):
             raise ValueError(
                 f"issuer {self.issuer!r} is plaintext http in environment "
                 f"{self.environment!r}. The JWKS served under this issuer is the trust "

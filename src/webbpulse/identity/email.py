@@ -134,9 +134,7 @@ class SesV2EmailSender(EmailSender):
         if self._configuration_set:
             request["ConfigurationSetName"] = self._configuration_set
         if message.tags:
-            request["EmailTags"] = [
-                {"Name": name, "Value": value} for name, value in sorted(message.tags.items())
-            ]
+            request["EmailTags"] = [{"Name": name, "Value": value} for name, value in sorted(message.tags.items())]
 
         try:
             response = self._client.send_email(**request)
@@ -306,9 +304,7 @@ $logo$body<p style="color: #666; font-size: 13px;">$product_name</p>
 )
 
 
-def render_verification(
-    settings: IdentitySettings, *, to: str, link: str, expiry: str
-) -> EmailMessage:
+def render_verification(settings: IdentitySettings, *, to: str, link: str, expiry: str) -> EmailMessage:
     """Render the email verification message."""
     return _render(
         settings,
@@ -322,9 +318,7 @@ def render_verification(
     )
 
 
-def render_password_reset(
-    settings: IdentitySettings, *, to: str, link: str, expiry: str
-) -> EmailMessage:
+def render_password_reset(settings: IdentitySettings, *, to: str, link: str, expiry: str) -> EmailMessage:
     """Render the password reset message."""
     return _render(
         settings,

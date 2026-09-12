@@ -158,19 +158,10 @@ class SoftAuthenticator:
         rp_hash = hashlib.sha256((rp_id or self.rp_id).encode("utf-8")).digest()
         self.sign_count += 1
         cose = self._cose_key()
-        attested = (
-            AAGUID_UNKNOWN + len(self.credential_id).to_bytes(2, "big") + self.credential_id + cose
-        )
-        auth_data = (
-            rp_hash
-            + bytes([self._flags(attested=True)])
-            + struct.pack(">I", self.sign_count)
-            + attested
-        )
+        attested = AAGUID_UNKNOWN + len(self.credential_id).to_bytes(2, "big") + self.credential_id + cose
+        auth_data = rp_hash + bytes([self._flags(attested=True)]) + struct.pack(">I", self.sign_count) + attested
         attestation = cbor2.dumps({"fmt": "none", "attStmt": {}, "authData": auth_data})
-        client_data = self._client_data(
-            ceremony="webauthn.create", challenge=challenge, origin=origin
-        )
+        client_data = self._client_data(ceremony="webauthn.create", challenge=challenge, origin=origin)
         return {
             "id": self.credential_id_b64,
             "rawId": self.credential_id_b64,
@@ -198,9 +189,7 @@ class SoftAuthenticator:
             sign_count = self.sign_count
         auth_data = rp_hash + bytes([self._flags(attested=False)]) + struct.pack(">I", sign_count)
         client_data = self._client_data(ceremony="webauthn.get", challenge=challenge, origin=origin)
-        signature = self.key.sign(
-            auth_data + hashlib.sha256(client_data).digest(), ec.ECDSA(hashes.SHA256())
-        )
+        signature = self.key.sign(auth_data + hashlib.sha256(client_data).digest(), ec.ECDSA(hashes.SHA256()))
         return {
             "id": self.credential_id_b64,
             "rawId": self.credential_id_b64,
@@ -250,9 +239,7 @@ class FakeKms:
         SigningAlgorithm: str,
     ) -> dict[str, Any]:
         """Sign a prehashed message with the local private key for a key id."""
-        signature = self._keys[KeyId].sign(
-            Message, padding.PKCS1v15(), utils.Prehashed(hashes.SHA256())
-        )
+        signature = self._keys[KeyId].sign(Message, padding.PKCS1v15(), utils.Prehashed(hashes.SHA256()))
         return {"KeyId": KeyId, "Signature": signature, "SigningAlgorithm": SigningAlgorithm}
 
     def generate_data_key(
@@ -647,29 +634,19 @@ class TestRegistration:
         authenticator = SoftAuthenticator()
         challenge = passkeys.begin_registration(USER_ID, user_name=EMAIL)
         credential = authenticator.register(_challenge_of(challenge.options))
-        passkeys.finish_registration(
-            USER_ID, challenge_id=challenge.challenge_id, credential=credential
-        )
+        passkeys.finish_registration(USER_ID, challenge_id=challenge.challenge_id, credential=credential)
         with pytest.raises(PasskeyRejected):
-            passkeys.finish_registration(
-                USER_ID, challenge_id=challenge.challenge_id, credential=credential
-            )
+            passkeys.finish_registration(USER_ID, challenge_id=challenge.challenge_id, credential=credential)
 
-    def test_challenge_is_spent_even_when_verification_fails(
-        self, passkeys: PasskeyService
-    ) -> None:
+    def test_challenge_is_spent_even_when_verification_fails(self, passkeys: PasskeyService) -> None:
         """A failed attempt burns the challenge, so a stolen one cannot be ground against."""
         authenticator = SoftAuthenticator()
         challenge = passkeys.begin_registration(USER_ID, user_name=EMAIL)
         with pytest.raises(PasskeyRejected):
-            passkeys.finish_registration(
-                USER_ID, challenge_id=challenge.challenge_id, credential={"id": "nonsense"}
-            )
+            passkeys.finish_registration(USER_ID, challenge_id=challenge.challenge_id, credential={"id": "nonsense"})
         credential = authenticator.register(_challenge_of(challenge.options))
         with pytest.raises(PasskeyRejected):
-            passkeys.finish_registration(
-                USER_ID, challenge_id=challenge.challenge_id, credential=credential
-            )
+            passkeys.finish_registration(USER_ID, challenge_id=challenge.challenge_id, credential=credential)
 
     def test_another_users_challenge_is_refused(self, passkeys: PasskeyService) -> None:
         """A challenge minted for one account cannot be answered as another."""
@@ -677,9 +654,7 @@ class TestRegistration:
         challenge = passkeys.begin_registration(USER_ID, user_name=EMAIL)
         credential = authenticator.register(_challenge_of(challenge.options))
         with pytest.raises(PasskeyRejected):
-            passkeys.finish_registration(
-                "user-9999", challenge_id=challenge.challenge_id, credential=credential
-            )
+            passkeys.finish_registration("user-9999", challenge_id=challenge.challenge_id, credential=credential)
 
     def test_login_challenge_cannot_satisfy_registration(self, passkeys: PasskeyService) -> None:
         """The purposes are kept apart, because the two legs verify different things."""
@@ -687,33 +662,23 @@ class TestRegistration:
         challenge = passkeys.begin_login()
         credential = authenticator.register(_challenge_of(challenge.options))
         with pytest.raises(PasskeyRejected):
-            passkeys.finish_registration(
-                USER_ID, challenge_id=challenge.challenge_id, credential=credential
-            )
+            passkeys.finish_registration(USER_ID, challenge_id=challenge.challenge_id, credential=credential)
 
     def test_wrong_origin_is_refused(self, passkeys: PasskeyService) -> None:
         """The origin check is what makes a passkey phishing resistant."""
         authenticator = SoftAuthenticator()
         challenge = passkeys.begin_registration(USER_ID, user_name=EMAIL)
-        credential = authenticator.register(
-            _challenge_of(challenge.options), origin="https://evil.example.net"
-        )
+        credential = authenticator.register(_challenge_of(challenge.options), origin="https://evil.example.net")
         with pytest.raises(PasskeyRejected):
-            passkeys.finish_registration(
-                USER_ID, challenge_id=challenge.challenge_id, credential=credential
-            )
+            passkeys.finish_registration(USER_ID, challenge_id=challenge.challenge_id, credential=credential)
 
     def test_wrong_rp_id_is_refused(self, passkeys: PasskeyService) -> None:
         """An attestation minted for another RP ID is refused."""
         authenticator = SoftAuthenticator()
         challenge = passkeys.begin_registration(USER_ID, user_name=EMAIL)
-        credential = authenticator.register(
-            _challenge_of(challenge.options), rp_id="evil.example.net"
-        )
+        credential = authenticator.register(_challenge_of(challenge.options), rp_id="evil.example.net")
         with pytest.raises(PasskeyRejected):
-            passkeys.finish_registration(
-                USER_ID, challenge_id=challenge.challenge_id, credential=credential
-            )
+            passkeys.finish_registration(USER_ID, challenge_id=challenge.challenge_id, credential=credential)
 
     def test_duplicate_credential_is_refused(self, passkeys: PasskeyService) -> None:
         """Registering the same credential twice is a 409, to either account."""
@@ -721,9 +686,7 @@ class TestRegistration:
         challenge = passkeys.begin_registration("user-0002", user_name="other@example.com")
         credential = authenticator.register(_challenge_of(challenge.options))
         with pytest.raises(PasskeyRejected) as caught:
-            passkeys.finish_registration(
-                "user-0002", challenge_id=challenge.challenge_id, credential=credential
-            )
+            passkeys.finish_registration("user-0002", challenge_id=challenge.challenge_id, credential=credential)
         assert caught.value.status_code == 409
         assert "user-0001" not in caught.value.message
         assert USER_ID not in caught.value.message
@@ -770,9 +733,7 @@ class TestLogin:
         assert result.credential_id == record.credential_id
         assert result.user_verified is True
 
-    def test_records_the_new_sign_count(
-        self, passkeys: PasskeyService, stores: IdentityStores
-    ) -> None:
+    def test_records_the_new_sign_count(self, passkeys: PasskeyService, stores: IdentityStores) -> None:
         """A successful login advances the stored sign count and stamps `last_used_at`."""
         authenticator, record = enrol_passkey(passkeys)
         before = record.sign_count
@@ -786,21 +747,15 @@ class TestLogin:
         """A counter that did not advance is evidence of a clone. Section 6.1.3."""
         authenticator, record = enrol_passkey(passkeys)
         challenge = passkeys.begin_login()
-        credential = authenticator.assertion(
-            _challenge_of(challenge.options), sign_count=record.sign_count
-        )
+        credential = authenticator.assertion(_challenge_of(challenge.options), sign_count=record.sign_count)
         with pytest.raises(PasskeyRejected):
             passkeys.finish_login(challenge_id=challenge.challenge_id, credential=credential)
 
-    def test_counter_regression_is_logged(
-        self, passkeys: PasskeyService, caplog: pytest.LogCaptureFixture
-    ) -> None:
+    def test_counter_regression_is_logged(self, passkeys: PasskeyService, caplog: pytest.LogCaptureFixture) -> None:
         """And logged at ERROR, because a clone is a finding and not a typo."""
         authenticator, record = enrol_passkey(passkeys)
         challenge = passkeys.begin_login()
-        credential = authenticator.assertion(
-            _challenge_of(challenge.options), sign_count=record.sign_count - 1
-        )
+        credential = authenticator.assertion(_challenge_of(challenge.options), sign_count=record.sign_count - 1)
         with (
             caplog.at_level("ERROR", logger="webbpulse.identity.passkeys"),
             pytest.raises(PasskeyRejected),
@@ -808,20 +763,14 @@ class TestLogin:
             passkeys.finish_login(challenge_id=challenge.challenge_id, credential=credential)
         assert any("counter_regression" in record.message for record in caplog.records)
 
-    def test_zero_counter_authenticator_is_allowed(
-        self, passkeys: PasskeyService, stores: IdentityStores
-    ) -> None:
+    def test_zero_counter_authenticator_is_allowed(self, passkeys: PasskeyService, stores: IdentityStores) -> None:
         """An authenticator with no counter sends zero every time, which is not a regression."""
         authenticator = SoftAuthenticator()
         authenticator.sign_count = 0
         challenge = passkeys.begin_registration(USER_ID, user_name=EMAIL)
         credential = authenticator.register(_challenge_of(challenge.options))
-        record = passkeys.finish_registration(
-            USER_ID, challenge_id=challenge.challenge_id, credential=credential
-        )
-        stores.require_passkeys().record_use(
-            USER_ID, record.credential_id, sign_count=0, used_at=""
-        )
+        record = passkeys.finish_registration(USER_ID, challenge_id=challenge.challenge_id, credential=credential)
+        stores.require_passkeys().record_use(USER_ID, record.credential_id, sign_count=0, used_at="")
 
         login = passkeys.begin_login()
         assertion = authenticator.assertion(_challenge_of(login.options), sign_count=0)
@@ -849,9 +798,7 @@ class TestLogin:
         """An assertion whose client data names another origin is refused."""
         authenticator, _ = enrol_passkey(passkeys)
         challenge = passkeys.begin_login()
-        credential = authenticator.assertion(
-            _challenge_of(challenge.options), origin="https://evil.example.net"
-        )
+        credential = authenticator.assertion(_challenge_of(challenge.options), origin="https://evil.example.net")
         with pytest.raises(PasskeyRejected):
             passkeys.finish_login(challenge_id=challenge.challenge_id, credential=credential)
 
@@ -859,9 +806,7 @@ class TestLogin:
         """An assertion signed over another RP ID hash is refused."""
         authenticator, _ = enrol_passkey(passkeys)
         challenge = passkeys.begin_login()
-        credential = authenticator.assertion(
-            _challenge_of(challenge.options), rp_id="evil.example.net"
-        )
+        credential = authenticator.assertion(_challenge_of(challenge.options), rp_id="evil.example.net")
         with pytest.raises(PasskeyRejected):
             passkeys.finish_login(challenge_id=challenge.challenge_id, credential=credential)
 
@@ -873,9 +818,7 @@ class TestLogin:
         with pytest.raises(PasskeyRejected):
             passkeys.finish_login(challenge_id=challenge.challenge_id, credential=credential)
 
-    def test_options_for_a_known_user_list_their_credentials(
-        self, passkeys: PasskeyService
-    ) -> None:
+    def test_options_for_a_known_user_list_their_credentials(self, passkeys: PasskeyService) -> None:
         """Login options for a named user list that user's enrolled credentials."""
         authenticator, _ = enrol_passkey(passkeys)
         options = passkeys.begin_login(user_id=USER_ID).options
@@ -912,9 +855,7 @@ class TestAmr:
         authenticator, _ = enrol_passkey(passkeys, user_verified=True)
         challenge = flows.begin_passkey_login()
         credential = authenticator.assertion(_challenge_of(challenge.options))
-        result = flows.login_with_passkey(
-            challenge_id=challenge.challenge_id, credential=credential
-        )
+        result = flows.login_with_passkey(challenge_id=challenge.challenge_id, credential=credential)
         settings = make_settings()
         claims = TokenService(settings, kms).verify_access_token(result.access_token)
         assert AMR_PASSKEY in claims["amr"]
@@ -936,9 +877,7 @@ class TestAmr:
         authenticator, _ = enrol_passkey(passkeys, user_verified=True)
         challenge = flows.begin_passkey_login()
         credential = authenticator.assertion(_challenge_of(challenge.options))
-        result = flows.login_with_passkey(
-            challenge_id=challenge.challenge_id, credential=credential
-        )
+        result = flows.login_with_passkey(challenge_id=challenge.challenge_id, credential=credential)
         assert result.access_token
 
     def test_unverified_passkey_still_gets_the_totp_challenge(
@@ -1085,9 +1024,7 @@ class TestFlowRules:
         """Renaming updates the stored name and trims surrounding whitespace."""
         seed_account(hooks, stores)
         _, record = enrol_passkey(passkeys, name="Old")
-        updated = flows.rename_passkey(
-            user_id=USER_ID, credential_id=record.credential_id, name="  New   name "
-        )
+        updated = flows.rename_passkey(user_id=USER_ID, credential_id=record.credential_id, name="  New   name ")
         assert updated.name == "New name"
 
     def test_rename_of_another_users_passkey_is_a_404(
@@ -1101,9 +1038,7 @@ class TestFlowRules:
         seed_account(hooks, stores)
         _, record = enrol_passkey(passkeys)
         with pytest.raises(PasskeyRejected) as caught:
-            flows.rename_passkey(
-                user_id="user-9999", credential_id=record.credential_id, name="Mine now"
-            )
+            flows.rename_passkey(user_id="user-9999", credential_id=record.credential_id, name="Mine now")
         assert caught.value.status_code == 404
 
     def test_empty_rename_is_refused(
@@ -1155,9 +1090,7 @@ class TestStores:
     def test_passkey_store_round_trip(self) -> None:
         """A stored passkey reads back by key, by credential id and in the user's list."""
         store = InMemoryPasskeyStore()
-        record = PasskeyRecord(
-            user_id=USER_ID, credential_id="cred-1", public_key="key", sign_count=7
-        )
+        record = PasskeyRecord(user_id=USER_ID, credential_id="cred-1", public_key="key", sign_count=7)
         store.put(record)
         stored = store.get(USER_ID, "cred-1")
         assert stored is not None
@@ -1216,9 +1149,7 @@ class TestRoutes:
     ) -> None:
         """All five passkey paths are on the router when the stores are wired."""
         paths = _router_paths(
-            build_identity_router(
-                make_settings(), hooks, stores, kms_client=kms, limiter_enabled=False
-            )
+            build_identity_router(make_settings(), hooks, stores, kms_client=kms, limiter_enabled=False)
         )
         base = prefix()
         assert f"{base}{PASSKEY_REGISTER_OPTIONS_PATH}" in paths
@@ -1234,9 +1165,7 @@ class TestRoutes:
             credentials=InMemoryCredentialStore(),
             refresh_tokens=InMemoryRefreshTokenStore(),
         )
-        paths = _router_paths(
-            build_identity_router(settings, hooks, stores, kms_client=kms, limiter_enabled=False)
-        )
+        paths = _router_paths(build_identity_router(settings, hooks, stores, kms_client=kms, limiter_enabled=False))
         assert f"{prefix()}{LOGIN_PASSKEY_OPTIONS_PATH}" not in paths
 
     def test_login_options_are_anonymous(self, client: TestClient) -> None:
@@ -1263,9 +1192,7 @@ class TestRoutes:
         response = client.get(f"{prefix()}{PASSKEYS_PATH}")
         assert response.status_code == 401
 
-    def test_full_ceremony_over_http(
-        self, client: TestClient, hooks: FakeHooks, stores: IdentityStores
-    ) -> None:
+    def test_full_ceremony_over_http(self, client: TestClient, hooks: FakeHooks, stores: IdentityStores) -> None:
         """Register a passkey and sign in with it, entirely through the client."""
         seed_account(hooks, stores)
         token = _password_login(client)
@@ -1293,9 +1220,7 @@ class TestRoutes:
         assert summary["name"] == "Laptop"
         assert "public_key" not in summary
 
-        listed = client.get(
-            f"{prefix()}{PASSKEYS_PATH}", headers={"Authorization": f"Bearer {token}"}
-        )
+        listed = client.get(f"{prefix()}{PASSKEYS_PATH}", headers={"Authorization": f"Bearer {token}"})
         assert listed.status_code == 200
         assert [entry["name"] for entry in listed.json()["passkeys"]] == ["Laptop"]
 
@@ -1314,9 +1239,7 @@ class TestRoutes:
         assert "refresh_token" not in signed_in.json()
         assert signed_in.cookies.get(make_settings().cookie_name)
 
-    def test_rename_and_delete_over_http(
-        self, client: TestClient, hooks: FakeHooks, stores: IdentityStores
-    ) -> None:
+    def test_rename_and_delete_over_http(self, client: TestClient, hooks: FakeHooks, stores: IdentityStores) -> None:
         """A passkey can be renamed and then deleted through the HTTP routes."""
         seed_account(hooks, stores)
         token = _password_login(client)
@@ -1469,34 +1392,24 @@ class TestAvailability:
         assert response.status_code == 200
         assert response.json() == {"enabled": True, "passwordless": True}
 
-    def test_enabled_but_not_passwordless(
-        self, hooks: FakeHooks, stores: IdentityStores, kms: FakeKms
-    ) -> None:
+    def test_enabled_but_not_passwordless(self, hooks: FakeHooks, stores: IdentityStores, kms: FakeKms) -> None:
         """A passkey as a managed credential and a second factor, but not an entry point."""
-        client = _availability_client(
-            _availability_router(hooks, stores, kms, passkeys_passwordless=False)
-        )
+        client = _availability_client(_availability_router(hooks, stores, kms, passkeys_passwordless=False))
         assert _get_availability(client).json() == {"enabled": True, "passwordless": False}
 
     def test_disabled_reports_passwordless_false_whatever_the_setting_says(
         self, hooks: FakeHooks, stores: IdentityStores, kms: FakeKms
     ) -> None:
         """`passkeys_passwordless` defaults on, so the pair can disagree unless gated."""
-        client = _availability_client(
-            _availability_router(hooks, stores, kms, passkeys_enabled=False)
-        )
+        client = _availability_client(_availability_router(hooks, stores, kms, passkeys_enabled=False))
         body = _get_availability(client).json()
         assert body == {"enabled": False, "passwordless": False}
         assert make_settings(passkeys_enabled=False).passkeys_passwordless is True
 
-    def test_disabled_with_passwordless_off_too(
-        self, hooks: FakeHooks, stores: IdentityStores, kms: FakeKms
-    ) -> None:
+    def test_disabled_with_passwordless_off_too(self, hooks: FakeHooks, stores: IdentityStores, kms: FakeKms) -> None:
         """Both settings off reports both capabilities false."""
         client = _availability_client(
-            _availability_router(
-                hooks, stores, kms, passkeys_enabled=False, passkeys_passwordless=False
-            )
+            _availability_router(hooks, stores, kms, passkeys_enabled=False, passkeys_passwordless=False)
         )
         assert _get_availability(client).json() == {"enabled": False, "passwordless": False}
 
@@ -1510,9 +1423,7 @@ class TestAvailability:
         assert f"{prefix()}{PASSKEYS_PATH}" not in paths
         assert f"{prefix()}{PASSKEY_AVAILABILITY_PATH}" in paths
 
-    def test_the_route_mounts_when_the_stores_are_missing(
-        self, hooks: FakeHooks, kms: FakeKms
-    ) -> None:
+    def test_the_route_mounts_when_the_stores_are_missing(self, hooks: FakeHooks, kms: FakeKms) -> None:
         """No passkey table and no challenge table, and the answer is still served."""
         stores = IdentityStores(
             credentials=InMemoryCredentialStore(),
@@ -1551,9 +1462,7 @@ class TestAvailability:
         assert "authorization" not in {key.lower() for key in response.request.headers}
         assert "set-cookie" not in {key.lower() for key in response.headers}
 
-    def test_the_management_routes_refuse_the_same_anonymous_request(
-        self, client: TestClient
-    ) -> None:
+    def test_the_management_routes_refuse_the_same_anonymous_request(self, client: TestClient) -> None:
         """The control for the test above, on the router the rest of this suite uses."""
         assert client.get(f"{prefix()}{PASSKEYS_PATH}").status_code == 401
         assert _get_availability(client).status_code == 200
@@ -1617,9 +1526,7 @@ class TestAvailability:
         assert client.post(f"{prefix()}{LOGIN_PASSKEY_OPTIONS_PATH}", json={}).status_code == 200
         assert challenges.puts == 1
 
-    def test_the_route_appears_in_the_openapi_document_under_a_passkeys_tag(
-        self, kms: FakeKms
-    ) -> None:
+    def test_the_route_appears_in_the_openapi_document_under_a_passkeys_tag(self, kms: FakeKms) -> None:
         """It is a documented public API, unlike the `.well-known` documents."""
         app = FastAPI()
         app.include_router(_availability_router(kms=kms))

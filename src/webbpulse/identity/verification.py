@@ -119,11 +119,7 @@ class LinkService:
         _log.info(
             "Identity link issued.",
             extra={
-                "event": (
-                    "email.verification_sent"
-                    if purpose == "verify_email"
-                    else "password.reset_requested"
-                ),
+                "event": ("email.verification_sent" if purpose == "verify_email" else "password.reset_requested"),
                 "user_id": user_id,
                 "purpose": purpose,
             },
@@ -142,11 +138,7 @@ class LinkService:
         A reset link is the credential that changes a password, so its window is the window
         in which a compromised mailbox is a compromised account.
         """
-        return (
-            self._settings.email_verification_ttl
-            if purpose == "verify_email"
-            else self._settings.password_reset_ttl
-        )
+        return self._settings.email_verification_ttl if purpose == "verify_email" else self._settings.password_reset_ttl
 
     def link_for(self, purpose: IdentityTokenPurpose, token: str) -> str:
         """Build the URL to mail, pointing at the frontend rather than at the API.
