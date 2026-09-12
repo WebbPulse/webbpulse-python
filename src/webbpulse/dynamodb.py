@@ -62,9 +62,7 @@ class ConditionFailed(DynamoError):
     it renders as a 409 rather than a fault.
     """
 
-    def __init__(
-        self, table: str, condition: str = "", key: Mapping[str, Any] | None = None
-    ) -> None:
+    def __init__(self, table: str, condition: str = "", key: Mapping[str, Any] | None = None) -> None:
         """Record the table, the condition expression, and the key it guarded."""
         self.table = table
         self.condition = condition
@@ -190,9 +188,7 @@ def _resource(region_name: str | None, endpoint_url: str | None) -> DynamoDBServ
     """
     import boto3
 
-    resource: DynamoDBServiceResource = boto3.resource(
-        "dynamodb", region_name=region_name, endpoint_url=endpoint_url
-    )
+    resource: DynamoDBServiceResource = boto3.resource("dynamodb", region_name=region_name, endpoint_url=endpoint_url)
     return resource
 
 
@@ -221,9 +217,7 @@ class Repository:
         """Resolve the physical table name and defer creating the table resource."""
         resolved = logical_name or self.logical_name
         if not resolved:
-            raise ValueError(
-                "A Repository needs a logical table name, as a class attribute or an argument."
-            )
+            raise ValueError("A Repository needs a logical table name, as a class attribute or an argument.")
         self.logical_name = resolved
         self.table_name = table_name(resolved, prefix)
         self._region_name = region_name

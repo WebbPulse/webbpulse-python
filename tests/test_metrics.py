@@ -224,9 +224,7 @@ def test_a_non_string_dimension_value_is_coerced() -> None:
 def test_setters_return_self_so_calls_chain() -> None:
     """`set_dimensions`, `set_properties` and `put` return the emitter, so calls chain."""
     emitter, stream = _emitter()
-    emitter.set_dimensions(Environment="staging").set_properties(job="x").put(
-        "Ingested", 1, "Count"
-    )
+    emitter.set_dimensions(Environment="staging").set_properties(job="x").put("Ingested", 1, "Count")
     emitter.flush()
     (payload,) = _lines(stream)
     assert payload["Environment"] == "staging"
@@ -567,9 +565,7 @@ def test_a_blank_environment_is_silent(clean_env: None, environment: str) -> Non
 
 
 @pytest.mark.parametrize("environment", ["Production", " STAGING ", "pRoDuCtIoN"])
-def test_the_environment_is_matched_case_insensitively_after_a_strip(
-    clean_env: None, environment: str
-) -> None:
+def test_the_environment_is_matched_case_insensitively_after_a_strip(clean_env: None, environment: str) -> None:
     """These values arrive from Terraform and a task definition, not from code."""
     assert metrics_enabled_from_env(environment) is True
 
@@ -585,15 +581,11 @@ def test_the_allowed_set_is_normalised_too(clean_env: None) -> None:
     assert metrics_enabled_from_env("preview", allowed=(" Preview ",)) is True
 
 
-def test_the_variable_names_can_be_overridden(
-    clean_env: None, monkeypatch: pytest.MonkeyPatch
-) -> None:
+def test_the_variable_names_can_be_overridden(clean_env: None, monkeypatch: pytest.MonkeyPatch) -> None:
     """`testing_var` and `environment_var` select which variables the gate reads."""
     monkeypatch.setenv("PYTEST_RUNNING", "true")
     monkeypatch.setenv("APP_ENV", "production")
-    assert (
-        metrics_enabled_from_env(testing_var="PYTEST_RUNNING", environment_var="APP_ENV") is False
-    )
+    assert metrics_enabled_from_env(testing_var="PYTEST_RUNNING", environment_var="APP_ENV") is False
     monkeypatch.delenv("PYTEST_RUNNING")
     assert metrics_enabled_from_env(testing_var="PYTEST_RUNNING", environment_var="APP_ENV") is True
 

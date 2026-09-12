@@ -376,9 +376,7 @@ def _mount_flows(
         f"{prefix}{REGISTER_PATH}",
         dependencies=limits(("register", REGISTER_IP_LIMIT, "ip")),
     )
-    async def register(
-        request: _FastAPIRequest, payload: dict[str, Any] = Body(...)
-    ) -> JSONResponse:
+    async def register(request: _FastAPIRequest, payload: dict[str, Any] = Body(...)) -> JSONResponse:
         """Register an account, returning tokens unless the address already has one."""
         ip, user_agent = context(request)
         try:
@@ -430,9 +428,7 @@ def _mount_flows(
         return set_refresh_cookie(JSONResponse(success_body(result)), result.refresh_token)
 
     @router.post(f"{prefix}{PASSWORD_PATH}")
-    async def change_password(
-        request: _FastAPIRequest, payload: dict[str, Any] = Body(...)
-    ) -> JSONResponse:
+    async def change_password(request: _FastAPIRequest, payload: dict[str, Any] = Body(...)) -> JSONResponse:
         """Change the caller's password, taking the subject from the verified claims."""
         subject = _subject_from_request(request, tokens)
         if not subject:
@@ -518,9 +514,7 @@ def _mount_flows(
         session_id = _session_from_request(request, tokens)
         presented = request.cookies.get(settings.cookie_name, "")
         await run_sync(
-            lambda: flows.logout_all(
-                subject, ip=ip, family_ids=[session_id] if session_id else [], presented=presented
-            )
+            lambda: flows.logout_all(subject, ip=ip, family_ids=[session_id] if session_id else [], presented=presented)
         )
         return clear_refresh_cookie(JSONResponse({"signed_out": True}))
 
@@ -604,9 +598,7 @@ def _mount_flows(
             ("verify-ip", VERIFY_IP_LIMIT, "ip"),
         ),
     )
-    async def request_verification(
-        request: _FastAPIRequest, payload: dict[str, Any] = Body(...)
-    ) -> JSONResponse:
+    async def request_verification(request: _FastAPIRequest, payload: dict[str, Any] = Body(...)) -> JSONResponse:
         """Send a verification link, answering the same 200 whatever the address is."""
         ip, _ = context(request)
         try:
@@ -616,15 +608,11 @@ def _mount_flows(
         return JSONResponse({"sent": True})
 
     @router.post(f"{prefix}{VERIFY_CONFIRM_PATH}")
-    async def confirm_verification(
-        request: _FastAPIRequest, payload: dict[str, Any] = Body(...)
-    ) -> JSONResponse:
+    async def confirm_verification(request: _FastAPIRequest, payload: dict[str, Any] = Body(...)) -> JSONResponse:
         """Spend a verification token and mark the address verified."""
         ip, _ = context(request)
         try:
-            user_id = await run_sync(
-                lambda: flows.confirm_verification(str(payload.get("token", "")), ip=ip)
-            )
+            user_id = await run_sync(lambda: flows.confirm_verification(str(payload.get("token", "")), ip=ip))
         except ConfirmationFailed as exc:
             return link_refused(request, exc)
         except LoginRejected as exc:
@@ -638,23 +626,17 @@ def _mount_flows(
             ("reset-ip", RESET_IP_LIMIT, "ip"),
         ),
     )
-    async def request_password_reset(
-        request: _FastAPIRequest, payload: dict[str, Any] = Body(...)
-    ) -> JSONResponse:
+    async def request_password_reset(request: _FastAPIRequest, payload: dict[str, Any] = Body(...)) -> JSONResponse:
         """Send a password reset link, answering the same 200 whatever the address is."""
         ip, _ = context(request)
         try:
-            await run_sync(
-                lambda: flows.request_password_reset(str(payload.get("email", "")), ip=ip)
-            )
+            await run_sync(lambda: flows.request_password_reset(str(payload.get("email", "")), ip=ip))
         except LoginRejected as exc:
             return rejected(request, exc)
         return JSONResponse({"sent": True, "detail": RESET_REQUESTED_MESSAGE})
 
     @router.post(f"{prefix}{RESET_CONFIRM_PATH}")
-    async def confirm_password_reset(
-        request: _FastAPIRequest, payload: dict[str, Any] = Body(...)
-    ) -> JSONResponse:
+    async def confirm_password_reset(request: _FastAPIRequest, payload: dict[str, Any] = Body(...)) -> JSONResponse:
         """Spend a reset token, set the new password and clear the refresh cookie."""
         ip, _ = context(request)
         try:
@@ -718,9 +700,7 @@ def _mount_mfa(
         f"{prefix}{LOGIN_TOTP_PATH}",
         dependencies=limits(("mfa-verify", TOTP_VERIFY_LIMIT, "ip")),
     )
-    async def complete_totp_login(
-        request: _FastAPIRequest, payload: dict[str, Any] = Body(...)
-    ) -> JSONResponse:
+    async def complete_totp_login(request: _FastAPIRequest, payload: dict[str, Any] = Body(...)) -> JSONResponse:
         """Complete the second leg of an MFA login using a ticket and a code."""
         ip, user_agent = context(request)
         try:
@@ -752,9 +732,7 @@ def _mount_mfa(
         claims = _claims_from_request(request, tokens)
         account = claims.get("email", "") or subject
         try:
-            enrolment = await run_sync(
-                lambda: flows.mfa.begin_enrolment(subject, account_name=account)
-            )
+            enrolment = await run_sync(lambda: flows.mfa.begin_enrolment(subject, account_name=account))
         except MfaRejected as exc:
             return mfa_refused(request, exc)
         return JSONResponse(
@@ -768,18 +746,14 @@ def _mount_mfa(
         f"{prefix}{TOTP_ACTIVATE_PATH}",
         dependencies=limits(("mfa-verify", TOTP_VERIFY_LIMIT, "ip")),
     )
-    async def activate_totp(
-        request: _FastAPIRequest, payload: dict[str, Any] = Body(...)
-    ) -> JSONResponse:
+    async def activate_totp(request: _FastAPIRequest, payload: dict[str, Any] = Body(...)) -> JSONResponse:
         """Activate TOTP with a code, returning the recovery codes exactly once."""
         try:
             subject = require_subject(request)
         except LoginRejected as exc:
             return rejected(request, exc)
         try:
-            codes = await run_sync(
-                lambda: flows.mfa.confirm_enrolment(subject, str(payload.get("code", "")))
-            )
+            codes = await run_sync(lambda: flows.mfa.confirm_enrolment(subject, str(payload.get("code", ""))))
         except MfaRejected as exc:
             return mfa_refused(request, exc)
         return JSONResponse({"activated": True, "recovery_codes": codes.codes})
@@ -788,9 +762,7 @@ def _mount_mfa(
         f"{prefix}{TOTP_DISABLE_PATH}",
         dependencies=limits(("mfa-verify", TOTP_VERIFY_LIMIT, "ip")),
     )
-    async def disable_totp(
-        request: _FastAPIRequest, payload: dict[str, Any] = Body(...)
-    ) -> JSONResponse:
+    async def disable_totp(request: _FastAPIRequest, payload: dict[str, Any] = Body(...)) -> JSONResponse:
         """Turn TOTP off, requiring a current code as well as the bearer token."""
         try:
             subject = require_subject(request)
@@ -807,9 +779,7 @@ def _mount_mfa(
         f"{prefix}{RECOVERY_CODES_PATH}",
         dependencies=limits(("mfa-verify", TOTP_VERIFY_LIMIT, "ip")),
     )
-    async def regenerate_recovery_codes(
-        request: _FastAPIRequest, payload: dict[str, Any] = Body(...)
-    ) -> JSONResponse:
+    async def regenerate_recovery_codes(request: _FastAPIRequest, payload: dict[str, Any] = Body(...)) -> JSONResponse:
         """Issue a fresh set of recovery codes, requiring a current code."""
         try:
             subject = require_subject(request)
@@ -817,9 +787,7 @@ def _mount_mfa(
             return rejected(request, exc)
         code = _required_code(payload)
         try:
-            codes = await run_sync(
-                lambda: flows.regenerate_recovery_codes(user_id=subject, code=code)
-            )
+            codes = await run_sync(lambda: flows.regenerate_recovery_codes(user_id=subject, code=code))
         except MfaRejected as exc:
             return mfa_refused(request, exc)
         return JSONResponse({"recovery_codes": codes.codes})
@@ -828,9 +796,7 @@ def _mount_mfa(
         f"{prefix}{STEP_UP_PATH}",
         dependencies=limits(("mfa-verify", TOTP_VERIFY_LIMIT, "ip")),
     )
-    async def step_up(
-        request: _FastAPIRequest, payload: dict[str, Any] = Body(...)
-    ) -> JSONResponse:
+    async def step_up(request: _FastAPIRequest, payload: dict[str, Any] = Body(...)) -> JSONResponse:
         """Re-assert the second factor, returning a stepped-up access token and no cookie."""
         try:
             subject = require_subject(request)

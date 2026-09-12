@@ -196,9 +196,7 @@ def load_json_secret(arn: str, region_name: str | None = None) -> dict[str, Any]
         raise SecretNotJsonObjectError(f"Secret {arn} is not valid JSON: {exc}") from exc
 
     if not isinstance(parsed, dict):
-        raise SecretNotJsonObjectError(
-            f"Secret {arn} parsed as {type(parsed).__name__}, expected a JSON object."
-        )
+        raise SecretNotJsonObjectError(f"Secret {arn} parsed as {type(parsed).__name__}, expected a JSON object.")
     return parsed
 
 

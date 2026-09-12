@@ -112,13 +112,9 @@ class FakeKms:
             "SigningAlgorithms": ["RSASSA_PKCS1_V1_5_SHA_256"],
         }
 
-    def sign(
-        self, *, KeyId: str, Message: bytes, MessageType: str, SigningAlgorithm: str
-    ) -> dict[str, Any]:
+    def sign(self, *, KeyId: str, Message: bytes, MessageType: str, SigningAlgorithm: str) -> dict[str, Any]:
         """Sign a prehashed message with the local private key for a key id."""
-        signature = self._keys[KeyId].sign(
-            Message, padding.PKCS1v15(), utils.Prehashed(hashes.SHA256())
-        )
+        signature = self._keys[KeyId].sign(Message, padding.PKCS1v15(), utils.Prehashed(hashes.SHA256()))
         return {"KeyId": KeyId, "Signature": signature, "SigningAlgorithm": SigningAlgorithm}
 
     def generate_data_key(
@@ -138,9 +134,7 @@ class FakeKms:
         blob = base64.b64encode(plaintext) + b"|" + _context_bytes(EncryptionContext)
         return {"KeyId": KeyId, "Plaintext": plaintext, "CiphertextBlob": blob}
 
-    def decrypt(
-        self, *, CiphertextBlob: bytes, EncryptionContext: Mapping[str, str]
-    ) -> dict[str, Any]:
+    def decrypt(self, *, CiphertextBlob: bytes, EncryptionContext: Mapping[str, str]) -> dict[str, Any]:
         """Unwrap a data key, raising when the encryption context does not match."""
         try:
             encoded, context = CiphertextBlob.split(b"|", 1)
@@ -522,9 +516,7 @@ def test_the_provisioning_uri_carries_the_issuer_in_both_places() -> None:
 
 def test_the_provisioning_uri_omits_the_parameters_that_are_defaults() -> None:
     """`algorithm`, `digits` and `period` are omitted, since every app assumes the defaults."""
-    uri = totp_module.provisioning_uri(
-        totp_module.generate_seed(), account_name=EMAIL, issuer="Example"
-    )
+    uri = totp_module.provisioning_uri(totp_module.generate_seed(), account_name=EMAIL, issuer="Example")
     assert "algorithm=" not in uri
     assert "digits=" not in uri
     assert "period=" not in uri
@@ -658,9 +650,7 @@ def test_the_cipher_names_the_missing_setting_rather_than_failing_deep(
         _ = service.cipher
 
 
-def test_enrolment_leaves_the_factor_inactive_until_a_code_confirms_it(
-    mfa: MfaService, stores: IdentityStores
-) -> None:
+def test_enrolment_leaves_the_factor_inactive_until_a_code_confirms_it(mfa: MfaService, stores: IdentityStores) -> None:
     """`begin_enrolment` writes an inactive factor, and `factors_for` reports none until confirmation."""
     mfa.begin_enrolment(USER_ID, account_name=EMAIL)
     factor = stores.require_totp_factors().get(USER_ID)
@@ -725,9 +715,7 @@ def test_confirming_with_no_pending_enrolment_is_refused(mfa: MfaService) -> Non
     assert caught.value.error_code == "NO_PENDING_ENROLMENT"
 
 
-def test_disabling_removes_the_factor_and_every_recovery_code(
-    mfa: MfaService, stores: IdentityStores
-) -> None:
+def test_disabling_removes_the_factor_and_every_recovery_code(mfa: MfaService, stores: IdentityStores) -> None:
     """Disabling removes the factor row and every recovery code, leaving no live credential."""
     _, codes = enrol(mfa)
     mfa.disable_totp(USER_ID)
@@ -836,9 +824,7 @@ def test_every_refusal_carries_the_same_message(mfa: MfaService) -> None:
     assert len(messages) == 1
 
 
-def test_a_seed_that_cannot_be_decrypted_is_an_ordinary_refusal(
-    mfa: MfaService, stores: IdentityStores
-) -> None:
+def test_a_seed_that_cannot_be_decrypted_is_an_ordinary_refusal(mfa: MfaService, stores: IdentityStores) -> None:
     """An undecryptable seed surfaces as the ordinary 401, not as a distinguishable failure."""
     enrol(mfa)
     store = stores.require_totp_factors()
@@ -892,9 +878,7 @@ def test_a_ticket_is_short_lived(mfa: MfaService) -> None:
     assert claims["exp"] - claims["iat"] == 300
 
 
-def test_a_ticket_is_recorded_before_it_is_returned(
-    mfa: MfaService, stores: IdentityStores
-) -> None:
+def test_a_ticket_is_recorded_before_it_is_returned(mfa: MfaService, stores: IdentityStores) -> None:
     """The ticket's row is in the identity token store by the time the ticket is returned."""
     from webbpulse.identity import hash_token
 
@@ -1031,9 +1015,7 @@ def test_one_users_ticket_cannot_be_completed_with_another_users_code(
     with pytest.raises(MfaChallengeRequired) as caught:
         flows.login(email=EMAIL, password=PASSWORD)
     with pytest.raises(MfaRejected):
-        flows.complete_mfa(
-            ticket=caught.value.challenge.ticket, code=code_now(other_seed, offset=1)
-        )
+        flows.complete_mfa(ticket=caught.value.challenge.ticket, code=code_now(other_seed, offset=1))
 
 
 def test_completing_with_no_ticket_is_refused(flows: IdentityFlows) -> None:
@@ -1042,9 +1024,7 @@ def test_completing_with_no_ticket_is_refused(flows: IdentityFlows) -> None:
         flows.complete_mfa(ticket="", code="123456")
 
 
-def test_a_password_only_login_claims_pwd_alone(
-    flows: IdentityFlows, hooks: FakeHooks, stores: IdentityStores
-) -> None:
+def test_a_password_only_login_claims_pwd_alone(flows: IdentityFlows, hooks: FakeHooks, stores: IdentityStores) -> None:
     """A single-factor login claims `pwd` alone and never `mfa`."""
     seed_account(hooks, stores)
     claims = claims_of(flows.login(email=EMAIL, password=PASSWORD).access_token)
@@ -1075,16 +1055,12 @@ def test_recovery_is_not_claimed_as_an_rfc_8176_factor(
     _, codes = enrol(mfa)
     with pytest.raises(MfaChallengeRequired) as caught:
         flows.login(email=EMAIL, password=PASSWORD)
-    amr = claims_of(
-        flows.complete_mfa(ticket=caught.value.challenge.ticket, code=codes[0]).access_token
-    )["amr"]
+    amr = claims_of(flows.complete_mfa(ticket=caught.value.challenge.ticket, code=codes[0]).access_token)["amr"]
     assert AMR_RECOVERY in amr
     assert AMR_OTP not in amr
 
 
-def test_a_hook_cannot_forge_amr_or_auth_time(
-    flows: IdentityFlows, hooks: FakeHooks, stores: IdentityStores
-) -> None:
+def test_a_hook_cannot_forge_amr_or_auth_time(flows: IdentityFlows, hooks: FakeHooks, stores: IdentityStores) -> None:
     """`amr` and `auth_time` from the product hook are overwritten, not merged."""
     seed_account(hooks, stores)
     claims = claims_of(flows.login(email=EMAIL, password=PASSWORD).access_token)
@@ -1198,9 +1174,7 @@ def test_a_recovery_code_consumes_exactly_once() -> None:
     """`consume` returns True once for a stored hash and False afterwards."""
     store = InMemoryRecoveryCodeStore()
     digest = hash_recovery_code("ABCDE-FGHIJ")
-    store.put_many(
-        [RecoveryCodeRecord(user_id=USER_ID, code_hash=digest, created_at="2026-09-10T00:00:00Z")]
-    )
+    store.put_many([RecoveryCodeRecord(user_id=USER_ID, code_hash=digest, created_at="2026-09-10T00:00:00Z")])
     assert store.consume(USER_ID, digest) is True
     assert store.consume(USER_ID, digest) is False
 
@@ -1215,9 +1189,7 @@ def test_recovery_codes_are_scoped_to_their_user() -> None:
     """A stored code hash consumes only for the user it was written for."""
     store = InMemoryRecoveryCodeStore()
     digest = hash_recovery_code("ABCDE-FGHIJ")
-    store.put_many(
-        [RecoveryCodeRecord(user_id=USER_ID, code_hash=digest, created_at="2026-09-10T00:00:00Z")]
-    )
+    store.put_many([RecoveryCodeRecord(user_id=USER_ID, code_hash=digest, created_at="2026-09-10T00:00:00Z")])
     assert store.consume("user-0002", digest) is False
     assert store.consume(USER_ID, digest) is True
 
@@ -1241,9 +1213,7 @@ def router_paths(**kwargs: Any) -> set[str]:
     return {route.path for route in router.routes}  # type: ignore[attr-defined]
 
 
-def test_the_mfa_routes_are_declared(
-    hooks: FakeHooks, stores: IdentityStores, kms: FakeKms
-) -> None:
+def test_the_mfa_routes_are_declared(hooks: FakeHooks, stores: IdentityStores, kms: FakeKms) -> None:
     """All six MFA routes are declared when the stores and the KMS client are wired."""
     paths = router_paths(hooks=hooks, stores=stores, kms_client=kms)
     for path in (
@@ -1257,9 +1227,7 @@ def test_the_mfa_routes_are_declared(
         assert f"{prefix()}{path}" in paths
 
 
-def test_the_mfa_routes_are_absent_when_the_stores_are_not_wired(
-    hooks: FakeHooks, kms: FakeKms
-) -> None:
+def test_the_mfa_routes_are_absent_when_the_stores_are_not_wired(hooks: FakeHooks, kms: FakeKms) -> None:
     """Without the TOTP and recovery stores the MFA routes are absent, while login remains."""
     paths = router_paths(
         hooks=hooks,
@@ -1357,9 +1325,7 @@ def test_the_enrolment_routes_refuse_an_unauthenticated_caller(client: TestClien
         assert response.json()["error_code"] == "NOT_AUTHENTICATED"
 
 
-def test_the_enrolment_round_trip_over_http(
-    client: TestClient, hooks: FakeHooks, stores: IdentityStores
-) -> None:
+def test_the_enrolment_round_trip_over_http(client: TestClient, hooks: FakeHooks, stores: IdentityStores) -> None:
     """Enrol, activate, then sign in again through the challenge, entirely over the routes."""
     seed_account(hooks, stores)
     login = client.post(f"{prefix()}{LOGIN_PATH}", json={"email": EMAIL, "password": PASSWORD})
@@ -1371,9 +1337,7 @@ def test_the_enrolment_round_trip_over_http(
     secret = enrolment.json()["secret"]
     assert enrolment.json()["provisioning_uri"].startswith("otpauth://totp/")
 
-    activation = client.post(
-        f"{prefix()}{TOTP_ACTIVATE_PATH}", headers=auth, json={"code": code_now(secret)}
-    )
+    activation = client.post(f"{prefix()}{TOTP_ACTIVATE_PATH}", headers=auth, json={"code": code_now(secret)})
     assert activation.status_code == 200
     assert activation.json()["activated"] is True
     codes = activation.json()["recovery_codes"]
@@ -1421,9 +1385,7 @@ def test_regenerating_over_http_replaces_the_set(
     auth = {"Authorization": f"Bearer {completed.json()['access_token']}"}
 
     with clock_advanced(monkeypatch, 2):
-        response = client.post(
-            f"{prefix()}{RECOVERY_CODES_PATH}", headers=auth, json={"code": code_now(seed)}
-        )
+        response = client.post(f"{prefix()}{RECOVERY_CODES_PATH}", headers=auth, json={"code": code_now(seed)})
     assert response.status_code == 200
     fresh = response.json()["recovery_codes"]
     assert len(fresh) == RECOVERY_CODE_COUNT
@@ -1451,9 +1413,7 @@ def test_step_up_over_http_does_not_rotate_the_refresh_cookie(
     auth = {"Authorization": f"Bearer {completed.json()['access_token']}"}
 
     with clock_advanced(monkeypatch, 2):
-        response = client.post(
-            f"{prefix()}{STEP_UP_PATH}", headers=auth, json={"code": code_now(seed)}
-        )
+        response = client.post(f"{prefix()}{STEP_UP_PATH}", headers=auth, json={"code": code_now(seed)})
     assert response.status_code == 200
     assert "set-cookie" not in {name.lower() for name in response.headers}
     assert AMR_OTP in claims_of(response.json()["access_token"])["amr"]
@@ -1611,9 +1571,7 @@ def test_disabling_over_http_needs_the_code(
     auth = _signed_in(client, seed)
 
     with clock_advanced(monkeypatch, 2):
-        response = client.post(
-            f"{prefix()}{TOTP_DISABLE_PATH}", headers=auth, json={"code": code_now(seed)}
-        )
+        response = client.post(f"{prefix()}{TOTP_DISABLE_PATH}", headers=auth, json={"code": code_now(seed)})
     assert response.status_code == 200
     assert response.json()["disabled"] is True
     assert stores.require_totp_factors().get(USER_ID) is None
@@ -1711,9 +1669,7 @@ def test_the_two_routes_have_no_limit_when_the_limiter_is_off(
     hooks: FakeHooks, stores: IdentityStores, kms: FakeKms
 ) -> None:
     """With the limiter off both routes declare no dependencies, which is the mode the fixtures use."""
-    router = build_identity_router(
-        make_settings(), hooks, stores, kms_client=kms, limiter_enabled=False
-    )
+    router = build_identity_router(make_settings(), hooks, stores, kms_client=kms, limiter_enabled=False)
     for route in router.routes:
         if route.path in (  # type: ignore[attr-defined]
             f"{prefix()}{TOTP_DISABLE_PATH}",

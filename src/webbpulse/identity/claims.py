@@ -199,8 +199,7 @@ def read_authorizer_claims(request: Request) -> AuthorizerClaims:
         ) from exc
     if not isinstance(context, Mapping):
         raise UnparseableRequestContext(
-            f"The {REQUEST_CONTEXT_HEADER} header parsed as {type(context).__name__} "
-            "rather than a JSON object."
+            f"The {REQUEST_CONTEXT_HEADER} header parsed as {type(context).__name__} rather than a JSON object."
         )
 
     authorizer = context.get("authorizer")
@@ -220,9 +219,7 @@ def read_authorizer_claims(request: Request) -> AuthorizerClaims:
         )
     claims = jwt_section.get("claims")
     if not isinstance(claims, Mapping):
-        raise NoClaimsSection(
-            "The request context has `authorizer.jwt` and no `claims` beneath it."
-        )
+        raise NoClaimsSection("The request context has `authorizer.jwt` and no `claims` beneath it.")
     return AuthorizerClaims(claims)
 
 
@@ -287,12 +284,8 @@ def authorizer_claims(
                     detail="Not authenticated.",
                     headers={"WWW-Authenticate": "Bearer"},
                 ) from exc
-            return (
-                resolved if isinstance(resolved, AuthorizerClaims) else AuthorizerClaims(resolved)
-            )
+            return resolved if isinstance(resolved, AuthorizerClaims) else AuthorizerClaims(resolved)
 
     dependency.__name__ = "authorizer_claims"
-    dependency.__doc__ = (
-        "The verified JWT claims for this request, read from the API Gateway authorizer."
-    )
+    dependency.__doc__ = "The verified JWT claims for this request, read from the API Gateway authorizer."
     return dependency

@@ -64,7 +64,7 @@ packages = ["src/webbpulse"]
 include = ["src/webbpulse", "README.md", "LICENSE"]
 
 [tool.ruff]
-line-length = 100
+line-length = 120
 target-version = "py313"
 src = ["src", "tests"]
 
@@ -82,10 +82,6 @@ select = [
 ignore = [
   "B008",
 ]
-
-[tool.ruff.lint.per-file-ignores]
-"tests/*" = ["E501"]
-"src/webbpulse/lambda_entry.py" = ["E501"]
 
 [tool.ruff.lint.isort]
 known-first-party = ["webbpulse"]

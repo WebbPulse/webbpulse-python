@@ -70,9 +70,7 @@ class RateLimitDecision:
         )
 
 
-def rate_limit_headers(
-    decision: RateLimitDecision, *, policy_name: str = "default"
-) -> dict[str, str]:
+def rate_limit_headers(decision: RateLimitDecision, *, policy_name: str = "default") -> dict[str, str]:
     """Response headers describing the limit, in both header styles.
 
     The structured `RateLimit` and `RateLimit-Policy` fields are the current IETF draft's,

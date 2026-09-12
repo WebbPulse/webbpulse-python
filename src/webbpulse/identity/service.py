@@ -32,9 +32,7 @@ __all__ = [
     "TokenService",
 ]
 
-REGISTERED_CLAIMS: Final[frozenset[str]] = frozenset(
-    {"iss", "sub", "aud", "exp", "iat", "nbf", "jti", "typ", "sid"}
-)
+REGISTERED_CLAIMS: Final[frozenset[str]] = frozenset({"iss", "sub", "aud", "exp", "iat", "nbf", "jti", "typ", "sid"})
 
 ACCESS_TOKEN_TYPE: Final = "access"
 
@@ -140,16 +138,12 @@ class TokenService:
 
         payload: dict[str, Any] = {}
         if claims:
-            payload.update(
-                {key: value for key, value in claims.items() if key not in REGISTERED_CLAIMS}
-            )
+            payload.update({key: value for key, value in claims.items() if key not in REGISTERED_CLAIMS})
         payload.update(
             {
                 "iss": self._settings.issuer,
                 "sub": subject,
-                "aud": list(audience)
-                if isinstance(audience, (list, tuple))
-                else (audience or self._settings.audience),
+                "aud": list(audience) if isinstance(audience, (list, tuple)) else (audience or self._settings.audience),
                 "iat": issued_at,
                 "exp": issued_at + ttl,
                 "jti": uuid.uuid4().hex,

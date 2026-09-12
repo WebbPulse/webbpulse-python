@@ -183,9 +183,7 @@ def _without_adot_distro(monkeypatch: MonkeyPatch) -> None:
     monkeypatch.setattr(builtins, "__import__", fake_import)
 
 
-def test_an_unsigned_xray_export_warns(
-    monkeypatch: MonkeyPatch, caplog: pytest.LogCaptureFixture
-) -> None:
+def test_an_unsigned_xray_export_warns(monkeypatch: MonkeyPatch, caplog: pytest.LogCaptureFixture) -> None:
     """Without the distro an X-Ray endpoint warns about SigV4 and still returns a usable exporter."""
     from opentelemetry.exporter.otlp.proto.http.trace_exporter import OTLPSpanExporter
 
@@ -218,9 +216,7 @@ def test_no_warning_when_the_distro_is_present(caplog: pytest.LogCaptureFixture)
     assert not [r for r in caplog.records if "SigV4" in r.message]
 
 
-def test_a_non_aws_endpoint_gets_the_plain_exporter(
-    monkeypatch: MonkeyPatch, caplog: pytest.LogCaptureFixture
-) -> None:
+def test_a_non_aws_endpoint_gets_the_plain_exporter(monkeypatch: MonkeyPatch, caplog: pytest.LogCaptureFixture) -> None:
     """A local collector needs no SigV4, so it must not be signed and must not warn."""
     from opentelemetry.exporter.otlp.proto.http.trace_exporter import OTLPSpanExporter
 
@@ -237,9 +233,7 @@ def test_the_signing_region_comes_from_the_endpoint(monkeypatch: MonkeyPatch) ->
     """An explicit cross-region endpoint must be signed for its own region, not AWS_REGION."""
     monkeypatch.setenv("AWS_REGION", "us-west-2")
 
-    assert (
-        otel._region_for_endpoint("https://xray.eu-west-1.amazonaws.com/v1/traces") == "eu-west-1"
-    )
+    assert otel._region_for_endpoint("https://xray.eu-west-1.amazonaws.com/v1/traces") == "eu-west-1"
 
 
 def test_the_signing_region_falls_back_to_the_environment(monkeypatch: MonkeyPatch) -> None:
@@ -606,9 +600,7 @@ def test_the_package_env_var_beats_the_sampler_arg(monkeypatch: MonkeyPatch) -> 
 
 
 @pytest.mark.parametrize("value", ["not-a-number", "-0.5", "2.0", ""])
-def test_an_unusable_ratio_degrades_to_keeping_everything(
-    monkeypatch: MonkeyPatch, value: str
-) -> None:
+def test_an_unusable_ratio_degrades_to_keeping_everything(monkeypatch: MonkeyPatch, value: str) -> None:
     """A typo in a Terraform variable should cost money, not availability."""
     monkeypatch.setenv(SAMPLE_RATIO_ENV, value)
     assert resolve_sample_ratio() == 1.0
@@ -722,9 +714,7 @@ def test_a_record_only_span_is_still_tail_sampled() -> None:
             trace_state: Any = None,
         ) -> SamplingResult:
             """Delegate to the root sampler, turning a DROP into RECORD_ONLY."""
-            result = self._root.should_sample(
-                parent_context, trace_id, name, kind, attributes, links, trace_state
-            )
+            result = self._root.should_sample(parent_context, trace_id, name, kind, attributes, links, trace_state)
             if result.decision is Decision.DROP:
                 return SamplingResult(Decision.RECORD_ONLY, attributes or {}, result.trace_state)
             return result
@@ -1132,9 +1122,7 @@ def test_an_overflowed_keep_trace_also_clears_its_marker() -> None:
 
 def test_traces_that_never_complete_are_reclaimed_by_age() -> None:
     """The age bound reclaims buffers for traces whose spans never end."""
-    _exporter, processor, tracer = _tail_harness(
-        1.0, max_buffered_traces=10, max_trace_age_seconds=0.05
-    )
+    _exporter, processor, tracer = _tail_harness(1.0, max_buffered_traces=10, max_trace_age_seconds=0.05)
 
     leaked = []
     for i in range(50):
@@ -1366,9 +1354,7 @@ def _signing_probe(monkeypatch: MonkeyPatch, exporter: Any) -> tuple[Any, list[s
     signed: list[str] = []
     auth_session = exporter._session._session
 
-    def fake_request(
-        self: Any, method: Any = None, url: Any = None, *args: Any, **kwargs: Any
-    ) -> Any:
+    def fake_request(self: Any, method: Any = None, url: Any = None, *args: Any, **kwargs: Any) -> Any:
         """Record the access key id from the Authorization header and return a stub response."""
         header = dict(kwargs.get("headers") or {}).get("Authorization", "")
         signed.append(header.split("Credential=")[1].split("/")[0])
@@ -1655,9 +1641,7 @@ def test_an_explicit_non_positive_shutdown_timeout_is_a_programming_error() -> N
         resolve_shutdown_flush_timeout(0)
 
 
-def _app_with_lifespan(
-    ratio: float = 1.0, *, record_on_shutdown: list[str] | None = None
-) -> tuple[Any, Any]:
+def _app_with_lifespan(ratio: float = 1.0, *, record_on_shutdown: list[str] | None = None) -> tuple[Any, Any]:
     """A real app with an explicit lifespan, exporting into memory through the tail processor.
 
     The explicit `lifespan=` is the point: it is what every service in this estate passes, and
@@ -2149,9 +2133,7 @@ def test_exports_are_single_flight_across_threads() -> None:
     from opentelemetry.sdk.trace import SpanProcessor, TracerProvider
     from opentelemetry.sdk.trace.sampling import ALWAYS_ON, ParentBased
 
-    processor = TailSamplingSpanProcessor(
-        cast("Any", _OverlapDetectingExporter()), sample_ratio=1.0
-    )
+    processor = TailSamplingSpanProcessor(cast("Any", _OverlapDetectingExporter()), sample_ratio=1.0)
     provider = TracerProvider(sampler=ParentBased(root=ALWAYS_ON))
     provider.add_span_processor(cast("SpanProcessor", processor))
     tracer = provider.get_tracer("overlap")
@@ -2201,9 +2183,7 @@ def test_shutdown_demotes_the_otlp_exporters_own_error_lines(
 
         def force_flush(self, timeout_millis: int = 30000) -> bool:
             """Report the failure the way the upstream exporter does."""
-            exporter_log.error(
-                "Failed to export span batch due to timeout, max retries or shutdown."
-            )
+            exporter_log.error("Failed to export span batch due to timeout, max retries or shutdown.")
             return False
 
         def shutdown(self) -> None:

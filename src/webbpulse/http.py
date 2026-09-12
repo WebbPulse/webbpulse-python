@@ -195,9 +195,7 @@ class RequestIdMiddleware(BaseHTTPMiddleware):
         return response
 
 
-def health_router(
-    *, service: str, version: str, checks: Mapping[str, Any] | None = None
-) -> APIRouter:
+def health_router(*, service: str, version: str, checks: Mapping[str, Any] | None = None) -> APIRouter:
     """A router exposing `GET /health`.
 
     Liveness only: it always returns 200 and touches no dependency, because the Lambda Web
@@ -340,9 +338,7 @@ def resolve_error_envelope(envelope: ErrorEnvelope | None) -> ErrorRenderer:
         return _render_detailed
     if callable(envelope):
         return envelope
-    raise ValueError(
-        f"error_envelope must be one of {_ENVELOPE_SHAPES} or a callable, got {envelope!r}."
-    )
+    raise ValueError(f"error_envelope must be one of {_ENVELOPE_SHAPES} or a callable, got {envelope!r}.")
 
 
 def _renders_codes(renderer: ErrorRenderer, *, error_codes: bool) -> bool:
@@ -590,13 +586,11 @@ def _normalise_exception_map(
         spec = ErrorSpec(value) if isinstance(value, int) else value
         if not isinstance(spec, ErrorSpec):
             raise TypeError(
-                f"exception_map values must be an int status or an ErrorSpec, "
-                f"got {value!r} for {exc_type.__name__}."
+                f"exception_map values must be an int status or an ErrorSpec, got {value!r} for {exc_type.__name__}."
             )
         if not 100 <= spec.status <= 599:
             raise ValueError(
-                f"exception_map status for {exc_type.__name__} must be a valid HTTP "
-                f"status, got {spec.status}."
+                f"exception_map status for {exc_type.__name__} must be a valid HTTP status, got {spec.status}."
             )
         entries.append((exc_type, spec))
 
@@ -724,9 +718,7 @@ def install_dynamodb_handlers(
             _log.warning("DynamoDB conditional check failed.", extra=log_extra)
             return JSONResponse(
                 status_code=409,
-                content=_body(
-                    409, "The resource was modified by another request. Try again.", request, exc
-                ),
+                content=_body(409, "The resource was modified by another request. Try again.", request, exc),
             )
 
         if aws_code in _DYNAMODB_THROTTLE_CODES:
@@ -921,9 +913,7 @@ def create_app(
         else (settings.cors_allow_credentials if settings is not None else True)
     )
     if allow_credentials and "*" in origins:
-        raise ValueError(
-            "CORS cannot allow credentials with a wildcard origin. List the exact origins."
-        )
+        raise ValueError("CORS cannot allow credentials with a wildcard origin. List the exact origins.")
 
     app = FastAPI(title=title, version=version, **fastapi_kwargs)
 

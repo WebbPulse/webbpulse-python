@@ -92,13 +92,9 @@ class MultiKeyFakeKms:
             "SigningAlgorithms": [KMS_SIGNING_ALGORITHM],
         }
 
-    def sign(
-        self, *, KeyId: str, Message: bytes, MessageType: str, SigningAlgorithm: str
-    ) -> dict[str, Any]:
+    def sign(self, *, KeyId: str, Message: bytes, MessageType: str, SigningAlgorithm: str) -> dict[str, Any]:
         """Return a real PKCS #1 v1.5 signature over the digest, using the named key."""
-        signature = self._keys[KeyId].sign(
-            Message, padding.PKCS1v15(), utils.Prehashed(hashes.SHA256())
-        )
+        signature = self._keys[KeyId].sign(Message, padding.PKCS1v15(), utils.Prehashed(hashes.SHA256()))
         return {"KeyId": KeyId, "Signature": signature, "SigningAlgorithm": SigningAlgorithm}
 
 
@@ -509,9 +505,7 @@ def test_health_matches_the_package_shape(kms: MultiKeyFakeKms) -> None:
     from fastapi.testclient import TestClient
 
     app = FastAPI()
-    app.include_router(
-        build_identity_router(make_settings(), kms_client=kms, service="identity", version="0.9.0")
-    )
+    app.include_router(build_identity_router(make_settings(), kms_client=kms, service="identity", version="0.9.0"))
     body = TestClient(app).get("/api/auth/health").json()
     assert body == {"status": "healthy", "service": "identity", "version": "0.9.0"}
 

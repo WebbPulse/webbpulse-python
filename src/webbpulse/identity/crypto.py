@@ -171,9 +171,7 @@ class EnvelopeCipher:
             wrapped_key=_b64(wrapped),
         )
 
-    def open(
-        self, sealed: SealedSecret, *, user_id: str, purpose: str = TOTP_ENCRYPTION_PURPOSE
-    ) -> bytes:
+    def open(self, sealed: SealedSecret, *, user_id: str, purpose: str = TOTP_ENCRYPTION_PURPOSE) -> bytes:
         """Decrypt a sealed secret, or raise `EnvelopeDecryptionFailed`.
 
         The encryption context is rebuilt from the caller's `user_id`, never from the row, so

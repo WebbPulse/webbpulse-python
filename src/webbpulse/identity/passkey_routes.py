@@ -165,17 +165,13 @@ def register_passkey_routes(
             return passkey_refused(request, exc)
         except LoginRejected as exc:
             return rejected(request, exc)
-        return JSONResponse(
-            {"challenge_id": challenge.challenge_id, "publicKey": challenge.options}
-        )
+        return JSONResponse({"challenge_id": challenge.challenge_id, "publicKey": challenge.options})
 
     @router.post(
         f"{prefix}{PASSKEY_REGISTER_VERIFY_PATH}",
         dependencies=limits(("passkey-register", PASSKEY_REGISTER_LIMIT, "ip")),
     )
-    async def passkey_register_verify(
-        request: _FastAPIRequest, payload: dict[str, Any] = Body(...)
-    ) -> JSONResponse:
+    async def passkey_register_verify(request: _FastAPIRequest, payload: dict[str, Any] = Body(...)) -> JSONResponse:
         """Verify a WebAuthn creation response and store the new passkey."""
         try:
             subject = require_subject(request)
@@ -204,9 +200,7 @@ def register_passkey_routes(
             return passkey_refused(request, exc)
         except LoginRejected as exc:
             return rejected(request, exc)
-        return JSONResponse(
-            {"registered": True, "passkey": passkey_summary(record)}, status_code=201
-        )
+        return JSONResponse({"registered": True, "passkey": passkey_summary(record)}, status_code=201)
 
     @router.post(
         f"{prefix}{LOGIN_PASSKEY_OPTIONS_PATH}",
@@ -217,24 +211,18 @@ def register_passkey_routes(
     ) -> JSONResponse:
         """Issue an anonymous WebAuthn assertion challenge; the body is optional."""
         try:
-            challenge = await run_sync(
-                lambda: flows.begin_passkey_login(email=str(payload.get("email", "")))
-            )
+            challenge = await run_sync(lambda: flows.begin_passkey_login(email=str(payload.get("email", ""))))
         except PasskeyRejected as exc:
             return passkey_refused(request, exc)
         except LoginRejected as exc:
             return rejected(request, exc)
-        return JSONResponse(
-            {"challenge_id": challenge.challenge_id, "publicKey": challenge.options}
-        )
+        return JSONResponse({"challenge_id": challenge.challenge_id, "publicKey": challenge.options})
 
     @router.post(
         f"{prefix}{LOGIN_PASSKEY_VERIFY_PATH}",
         dependencies=limits(("passkey-login", PASSKEY_LOGIN_LIMIT, "ip")),
     )
-    async def passkey_login_verify(
-        request: _FastAPIRequest, payload: dict[str, Any] = Body(...)
-    ) -> JSONResponse:
+    async def passkey_login_verify(request: _FastAPIRequest, payload: dict[str, Any] = Body(...)) -> JSONResponse:
         """Verify an assertion and issue tokens, or answer an MFA challenge."""
         ip, user_agent = context(request)
         credential = payload.get("credential")
@@ -310,9 +298,7 @@ def register_passkey_routes(
         except LoginRejected as exc:
             return rejected(request, exc)
         try:
-            await run_sync(
-                lambda: flows.delete_passkey(user_id=subject, credential_id=credential_id)
-            )
+            await run_sync(lambda: flows.delete_passkey(user_id=subject, credential_id=credential_id))
         except PasskeyRejected as exc:
             return passkey_refused(request, exc)
         except LoginRejected as exc:

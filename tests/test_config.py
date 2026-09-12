@@ -99,9 +99,7 @@ def test_load_json_secret_returns_the_parsed_object() -> None:
     """`load_json_secret` returns the secret string parsed as a JSON object."""
     with mock_aws():
         client = boto3.client("secretsmanager", region_name="us-west-2")
-        arn = client.create_secret(
-            Name="webbpulse-test/app", SecretString=json.dumps({"SECRET_KEY": "s3cret"})
-        )["ARN"]
+        arn = client.create_secret(Name="webbpulse-test/app", SecretString=json.dumps({"SECRET_KEY": "s3cret"}))["ARN"]
         assert load_json_secret(arn, "us-west-2") == {"SECRET_KEY": "s3cret"}
 
 
