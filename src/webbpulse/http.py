@@ -29,11 +29,13 @@ if TYPE_CHECKING:  # pragma: no cover
     from webbpulse.config import BaseServiceSettings
 
 __all__ = [
+    "DEFAULT_CORS_ALLOW_HEADERS",
     "DYNAMODB_ERROR_MESSAGES",
     "DYNAMODB_RETRY_AFTER_SECONDS",
     "LAMBDA_CONTEXT_HEADER",
     "REQUEST_CONTEXT_HEADER",
     "REQUEST_ID_HEADER",
+    "RETRY_ATTEMPT_HEADER",
     "DynamoDBErrorHandlerOptions",
     "DynamoDBErrors",
     "ErrorContext",
@@ -64,6 +66,19 @@ REQUEST_CONTEXT_HEADER: Final = "x-amzn-request-context"
 LAMBDA_CONTEXT_HEADER: Final = "x-amzn-lambda-context"
 
 REQUEST_ID_HEADER: Final = "X-Request-ID"
+
+RETRY_ATTEMPT_HEADER: Final = "X-Retry-Attempt"
+
+DEFAULT_CORS_ALLOW_HEADERS: Final = (
+    "Accept",
+    "Accept-Language",
+    "Authorization",
+    "Content-Language",
+    "Content-Type",
+    "Origin",
+    REQUEST_ID_HEADER,
+    RETRY_ATTEMPT_HEADER,
+)
 
 _REQUEST_ID_STATE: Final = "webbpulse_request_id"
 
@@ -880,6 +895,7 @@ def create_app(
     settings: BaseServiceSettings | None = None,
     cors_allow_origins: Sequence[str] | None = None,
     cors_allow_credentials: bool | None = None,
+    cors_allow_headers: Sequence[str] | None = None,
     router_prefix: str = "",
     include_health: bool = True,
     instrument: bool = True,
@@ -895,7 +911,8 @@ def create_app(
 
     Adds CORS, the request id middleware, the structured error handlers and `GET /health`.
     CORS origins come from `settings` or `cors_allow_origins`, and must be exact when
-    credentials are allowed.
+    credentials are allowed. `cors_allow_headers` replaces `DEFAULT_CORS_ALLOW_HEADERS`,
+    which covers the request id and retry attempt headers the API clients send.
 
     `error_envelope` chooses the error body shape: the default, `"detailed"`, or a callable
     taking an `ErrorContext`. `dynamodb_error_handlers` maps this package's own
@@ -915,6 +932,8 @@ def create_app(
     if allow_credentials and "*" in origins:
         raise ValueError("CORS cannot allow credentials with a wildcard origin. List the exact origins.")
 
+    allow_headers = list(cors_allow_headers) if cors_allow_headers is not None else list(DEFAULT_CORS_ALLOW_HEADERS)
+
     app = FastAPI(title=title, version=version, **fastapi_kwargs)
 
     app.add_middleware(RequestIdMiddleware)
@@ -924,7 +943,7 @@ def create_app(
             allow_origins=origins,
             allow_credentials=allow_credentials,
             allow_methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
-            allow_headers=["Accept", "Authorization", "Content-Type", "Origin", REQUEST_ID_HEADER],
+            allow_headers=allow_headers,
             expose_headers=[
                 REQUEST_ID_HEADER,
                 "RateLimit",
