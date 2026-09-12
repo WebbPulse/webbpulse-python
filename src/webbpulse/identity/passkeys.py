@@ -2,6 +2,13 @@
 
 Owns the challenge lifecycle and what a caller may learn from a failure; token minting and
 policy stay in `flows.IdentityFlows`. Challenges are single-use rows, not tokens.
+
+`SUPPORTED_COSE_ALGS` is the COSE algorithm set registration offers and accepts, as the
+identifiers the WebAuthn registry assigns: EdDSA (-8), ES256 (-7), RS256 (-257). It is named
+rather than inherited because py_webauthn narrowed its own default from nine algorithms to
+these three in 3.0.0, and a silent change in what an authenticator may register should not
+ride on the resolved minor. Login is unaffected either way, since an assertion is verified
+with the algorithm of the stored public key and consults no list.
 """
 
 from __future__ import annotations
@@ -33,6 +40,7 @@ __all__ = [
     "CHALLENGE_TTL_SECONDS",
     "MAX_PASSKEY_NAME",
     "PASSKEY_REJECTED_MESSAGE",
+    "SUPPORTED_COSE_ALGS",
     "AssertionResult",
     "PasskeyRejected",
     "PasskeyService",
@@ -53,6 +61,8 @@ CHALLENGE_TTL_SECONDS: Final = 300
 MAX_PASSKEY_NAME: Final = 64
 
 PASSKEY_REJECTED_MESSAGE: Final = "That passkey could not be verified."
+
+SUPPORTED_COSE_ALGS: Final = (-8, -7, -257)
 
 
 def b64url_encode(raw: bytes) -> str:
@@ -175,6 +185,7 @@ class PasskeyService:
         declines a duplicate. The row is written before the options are returned.
         """
         from webauthn import generate_registration_options, options_to_json
+        from webauthn.helpers.cose import COSEAlgorithmIdentifier
         from webauthn.helpers.structs import (
             AuthenticatorSelectionCriteria,
             PublicKeyCredentialDescriptor,
@@ -201,6 +212,7 @@ class PasskeyService:
                 resident_key=ResidentKeyRequirement.PREFERRED,
                 user_verification=UserVerificationRequirement.PREFERRED,
             ),
+            supported_pub_key_algs=[COSEAlgorithmIdentifier(alg) for alg in SUPPORTED_COSE_ALGS],
         )
 
         record = self._new_challenge("register", challenge, user_id=user_id)
@@ -224,6 +236,7 @@ class PasskeyService:
         must match the caller so a challenge cannot be answered against another account.
         """
         from webauthn import verify_registration_response
+        from webauthn.helpers.cose import COSEAlgorithmIdentifier
         from webauthn.helpers.exceptions import WebAuthnException
 
         record = self._spend_challenge(challenge_id, expected_purpose="register")
@@ -240,6 +253,9 @@ class PasskeyService:
                 expected_challenge=b64url_decode(record.challenge),
                 expected_rp_id=self.rp_id,
                 expected_origin=self.origins,
+                supported_pub_key_algs=[
+                    COSEAlgorithmIdentifier(alg) for alg in SUPPORTED_COSE_ALGS
+                ],
             )
         except (WebAuthnException, ValueError, KeyError) as exc:
             _log.info(
