@@ -14,11 +14,13 @@ from webbpulse import otel
 from webbpulse.otel import (
     OTEL_DISABLED_ENV,
     SAMPLE_RATIO_ENV,
+    SHUTDOWN_FLUSH_TIMEOUT_ENV,
     TailSamplingSpanProcessor,
     configure_tracing,
     flush_tracing,
     is_tracing_enabled,
     resolve_sample_ratio,
+    resolve_shutdown_flush_timeout,
     shutdown_tracing,
     xray_otlp_endpoint,
 )
@@ -47,7 +49,12 @@ def _reset_provider() -> Any:
 @pytest.fixture(autouse=True)
 def _clear_sampling_env(monkeypatch: MonkeyPatch) -> None:
     """Each test starts from an environment with no sampling configuration in it."""
-    for name in (SAMPLE_RATIO_ENV, "OTEL_TRACES_SAMPLER", "OTEL_TRACES_SAMPLER_ARG"):
+    for name in (
+        SAMPLE_RATIO_ENV,
+        SHUTDOWN_FLUSH_TIMEOUT_ENV,
+        "OTEL_TRACES_SAMPLER",
+        "OTEL_TRACES_SAMPLER_ARG",
+    ):
         monkeypatch.delenv(name, raising=False)
 
 
@@ -1600,3 +1607,321 @@ def test_the_timeout_guard_survives_an_upstream_rename(caplog: pytest.LogCapture
     otel._guard_export_timeouts(exporter)
 
     assert not hasattr(exporter, "_session")
+
+
+def test_the_shutdown_flush_timeout_defaults_to_the_lambda_grace_period() -> None:
+    """300 ms, which fits inside the slice Lambda gives the runtime before SIGKILL."""
+    assert resolve_shutdown_flush_timeout() == 300
+
+
+def test_an_explicit_shutdown_flush_timeout_wins(monkeypatch: MonkeyPatch) -> None:
+    """The argument beats the environment, matching `resolve_sample_ratio`."""
+    monkeypatch.setenv(SHUTDOWN_FLUSH_TIMEOUT_ENV, "900")
+    assert resolve_shutdown_flush_timeout(250) == 250
+
+
+def test_the_env_var_sets_the_shutdown_flush_timeout(monkeypatch: MonkeyPatch) -> None:
+    """Configuration comes through the environment, as everywhere else in this module."""
+    monkeypatch.setenv(SHUTDOWN_FLUSH_TIMEOUT_ENV, "450")
+    assert resolve_shutdown_flush_timeout() == 450
+
+
+def test_the_shutdown_flush_timeout_is_clamped_to_the_shutdown_budget(
+    monkeypatch: MonkeyPatch,
+) -> None:
+    """No configuration may push the flush past the whole 2000 ms shutdown phase."""
+    monkeypatch.setenv(SHUTDOWN_FLUSH_TIMEOUT_ENV, "60000")
+    assert resolve_shutdown_flush_timeout() == 1500
+    assert resolve_shutdown_flush_timeout(60000) == 1500
+
+
+@pytest.mark.parametrize("raw", ["nonsense", "0", "-5"])
+def test_an_unusable_shutdown_flush_timeout_falls_back_to_the_default(
+    monkeypatch: MonkeyPatch, caplog: pytest.LogCaptureFixture, raw: str
+) -> None:
+    """A bad value warns and degrades rather than raising on the shutdown path."""
+    monkeypatch.setenv(SHUTDOWN_FLUSH_TIMEOUT_ENV, raw)
+
+    with caplog.at_level("WARNING", logger="webbpulse.otel"):
+        assert resolve_shutdown_flush_timeout() == 300
+
+    assert [record for record in caplog.records if record.levelname == "WARNING"]
+
+
+def test_an_explicit_non_positive_shutdown_timeout_is_a_programming_error() -> None:
+    """An argument is the caller's own code, so it raises rather than degrading silently."""
+    with pytest.raises(ValueError, match="at least 1"):
+        resolve_shutdown_flush_timeout(0)
+
+
+def _app_with_lifespan(
+    ratio: float = 1.0, *, record_on_shutdown: list[str] | None = None
+) -> tuple[Any, Any]:
+    """A real app with an explicit lifespan, exporting into memory through the tail processor.
+
+    The explicit `lifespan=` is the point: it is what every service in this estate passes, and
+    it is what makes `router.on_shutdown` unusable as a hook.
+    """
+    from contextlib import asynccontextmanager
+
+    from fastapi import FastAPI
+    from opentelemetry import trace
+    from opentelemetry.sdk.trace import SpanProcessor, TracerProvider
+    from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
+    from opentelemetry.sdk.trace.sampling import ALWAYS_ON, ParentBased
+
+    from webbpulse.otel import instrument_fastapi
+
+    exporter = InMemorySpanExporter()
+    processor = TailSamplingSpanProcessor(exporter, sample_ratio=ratio)
+    provider = TracerProvider(sampler=ParentBased(root=ALWAYS_ON))
+    provider.add_span_processor(cast("SpanProcessor", processor))
+    trace.set_tracer_provider(provider)
+    otel._PROCESSOR = processor
+
+    @asynccontextmanager
+    async def lifespan(_app: Any) -> Any:
+        """Record a span on the way out, as a client being closed at shutdown would."""
+        yield
+        if record_on_shutdown is not None:
+            record_on_shutdown.append("app-shutdown")
+            tracer = trace.get_tracer("test")
+            with tracer.start_as_current_span("closing-the-client"):
+                pass
+
+    app = FastAPI(lifespan=lifespan)
+
+    @app.get("/thing")
+    def thing() -> dict[str, str]:
+        """Return a trivial payload."""
+        return {"ok": "yes"}
+
+    instrument_fastapi(app, excluded_urls="", flush_per_request=False)
+    return app, exporter
+
+
+def test_a_span_recorded_just_before_shutdown_is_exported() -> None:
+    """The gap this closes: a trace still buffered when the container goes away.
+
+    `flush_per_request=False` is what leaves the request's own trace buffered, which is the
+    same state a trace with a still-open span is in when the response returns.
+    """
+    from fastapi.testclient import TestClient
+
+    app, exporter = _app_with_lifespan()
+
+    with TestClient(app) as client:
+        assert client.get("/thing").status_code == 200
+        assert exporter.get_finished_spans() == (), "nothing should be exported before shutdown"
+
+    names = [span.name for span in exporter.get_finished_spans()]
+    assert names, "the buffered trace was lost when the lifespan shut down"
+    assert any("/thing" in name for name in names), names
+
+
+def test_the_shutdown_flush_runs_after_the_apps_own_lifespan_shutdown() -> None:
+    """A span recorded while the app closes its own resources still gets exported."""
+    from fastapi.testclient import TestClient
+
+    order: list[str] = []
+    app, exporter = _app_with_lifespan(record_on_shutdown=order)
+
+    with TestClient(app) as client:
+        assert client.get("/thing").status_code == 200
+
+    assert order == ["app-shutdown"]
+    names = [span.name for span in exporter.get_finished_spans()]
+    assert "closing-the-client" in names, names
+
+
+def test_the_lifespan_wrapper_is_installed_only_once() -> None:
+    """Wrapping twice would flush twice, and the second flush has nothing left to export."""
+    from fastapi import FastAPI
+
+    from webbpulse.otel import instrument_fastapi
+
+    configure_tracing("posts", endpoint="http://localhost:4318/v1/traces")
+    app = FastAPI()
+    first = app.router.lifespan_context
+
+    instrument_fastapi(app, flush_per_request=False)
+    wrapped = app.router.lifespan_context
+    assert wrapped is not first
+
+    instrument_fastapi(app, flush_per_request=False)
+    assert app.router.lifespan_context is wrapped
+    shutdown_tracing()
+
+
+def test_the_lifespan_wrapper_can_be_turned_off() -> None:
+    """A consumer owning its own shutdown path must be able to opt out."""
+    from fastapi import FastAPI
+
+    from webbpulse.otel import instrument_fastapi
+
+    configure_tracing("posts", endpoint="http://localhost:4318/v1/traces")
+    app = FastAPI()
+    first = app.router.lifespan_context
+
+    instrument_fastapi(app, flush_per_request=False, flush_on_shutdown=False)
+
+    assert app.router.lifespan_context is first
+    shutdown_tracing()
+
+
+def test_a_shutdown_flush_failure_does_not_break_the_shutdown(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """An export that fails on the way out must not turn into a failed container shutdown."""
+    from fastapi.testclient import TestClient
+
+    app, _ = _app_with_lifespan()
+
+    def boom(spans: Any) -> None:
+        """Raise instead of exporting."""
+        raise RuntimeError("the endpoint went away")
+
+    assert otel._PROCESSOR is not None
+    monkeypatched = otel._PROCESSOR
+    cast("Any", monkeypatched)._exporter.export = boom
+
+    with caplog.at_level("WARNING", logger="webbpulse.otel"), TestClient(app) as client:
+        assert client.get("/thing").status_code == 200
+
+    assert not [record for record in caplog.records if record.levelname == "ERROR"]
+    assert [record for record in caplog.records if record.levelname == "WARNING"]
+
+
+def test_a_teardown_export_failure_is_a_single_warning_without_a_traceback(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """The flush-on-exit path must not page anyone with an ERROR and a stack trace."""
+
+    class _RaisingExporter:
+        """An exporter that fails the way a torn-down sandbox does."""
+
+        def export(self, spans: Any) -> None:
+            """Raise as a connection against a dying sandbox would."""
+            raise OSError("connection reset by peer")
+
+        def shutdown(self) -> None:
+            """Shut down without complaint."""
+
+    processor = TailSamplingSpanProcessor(cast("Any", _RaisingExporter()), sample_ratio=1.0)
+
+    with caplog.at_level("WARNING", logger="webbpulse.otel"):
+        processor._tearing_down = True
+        processor._export([cast("Any", object())])
+
+    assert not [record for record in caplog.records if record.levelname == "ERROR"]
+    warnings = [record for record in caplog.records if record.levelname == "WARNING"]
+    assert len(warnings) == 1
+    assert warnings[0].exc_info is None
+    assert "shutting down" in warnings[0].message
+
+
+def test_an_export_failure_outside_teardown_keeps_its_error_and_traceback(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Quieting the teardown path must not quiet a real in-request export failure."""
+
+    class _RaisingExporter:
+        """An exporter that raises mid-request."""
+
+        def export(self, spans: Any) -> None:
+            """Raise a genuine failure."""
+            raise OSError("connection reset by peer")
+
+    processor = TailSamplingSpanProcessor(cast("Any", _RaisingExporter()), sample_ratio=1.0)
+
+    with caplog.at_level("WARNING", logger="webbpulse.otel"):
+        processor._export([cast("Any", object())])
+
+    errors = [record for record in caplog.records if record.levelname == "ERROR"]
+    assert len(errors) == 1
+    assert errors[0].exc_info is not None
+
+
+def test_processor_shutdown_never_raises() -> None:
+    """Shutdown runs on the way out, where a raise can only make things worse."""
+
+    class _HostileExporter:
+        """An exporter that fails at both export and shutdown."""
+
+        def export(self, spans: Any) -> None:
+            """Raise on export."""
+            raise RuntimeError("export is down")
+
+        def force_flush(self, timeout_millis: int = 30000) -> bool:
+            """Raise on flush."""
+            raise RuntimeError("flush is down")
+
+        def shutdown(self) -> None:
+            """Raise on shutdown."""
+            raise RuntimeError("shutdown is down")
+
+    processor = TailSamplingSpanProcessor(cast("Any", _HostileExporter()), sample_ratio=1.0)
+
+    processor.shutdown(250)
+
+    assert processor._shutdown is True
+
+
+def test_the_shutdown_flush_is_bounded_by_the_timeout() -> None:
+    """The bound is what keeps the flush inside Lambda's grace period."""
+    seen: list[int] = []
+
+    class _RecordingExporter:
+        """An exporter that records the flush deadline it was given."""
+
+        def export(self, spans: Any) -> None:
+            """Accept the batch."""
+
+        def force_flush(self, timeout_millis: int = 30000) -> bool:
+            """Record the deadline and report success."""
+            seen.append(timeout_millis)
+            return True
+
+        def shutdown(self) -> None:
+            """Shut down without complaint."""
+
+    processor = TailSamplingSpanProcessor(cast("Any", _RecordingExporter()), sample_ratio=1.0)
+    processor.shutdown(275)
+
+    assert seen == [275]
+
+
+def test_shutdown_tracing_passes_the_timeout_through_to_the_processor() -> None:
+    """`shutdown_tracing` is the public door onto the bounded processor shutdown."""
+    seen: list[int] = []
+
+    class _RecordingExporter:
+        """An exporter that records the flush deadline it was given."""
+
+        def export(self, spans: Any) -> None:
+            """Accept the batch."""
+
+        def force_flush(self, timeout_millis: int = 30000) -> bool:
+            """Record the deadline and report success."""
+            seen.append(timeout_millis)
+            return True
+
+        def shutdown(self) -> None:
+            """Shut down without complaint."""
+
+    otel._PROCESSOR = TailSamplingSpanProcessor(cast("Any", _RecordingExporter()), sample_ratio=1.0)
+
+    shutdown_tracing(300)
+
+    assert seen == [300]
+    assert otel._PROCESSOR is None
+
+
+def test_shutdown_tracing_without_a_timeout_is_still_backward_compatible() -> None:
+    """The old no-argument call must keep working for any consumer already making it."""
+    configure_tracing("posts", endpoint="http://localhost:4318/v1/traces")
+
+    shutdown_tracing()
+
+    assert otel._PROCESSOR is None
+    assert otel._CONFIGURED is False

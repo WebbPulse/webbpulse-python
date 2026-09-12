@@ -5,6 +5,70 @@ Notable changes to the `webbpulse` package. The version here is the one in
 
 This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## Unreleased
+
+`webbpulse.otel`: buffered spans are flushed and the provider is shut down when the container
+shuts down, which stops the intermittent OTLP export errors CarModPicker's staging Lambdas were
+logging at teardown. Nothing in the public API changed shape, so consumers pick this up by
+taking the release.
+
+### The export was racing the sandbox teardown
+
+The per-request flush `instrument_fastapi` installs resolves the trace a request produced and
+exports it before the response returns, so the common case was never the problem. Two traces
+survived it. One whose spans are still open when the response returns stays buffered by
+design, because the tail decision cannot be made on an incomplete trace, and a background task
+outliving the request is the normal way that happens. And a trace whose in-request export
+failed is simply gone, with nothing holding it for a retry.
+
+Both were left to whatever ran last. Nothing did: `shutdown_tracing` existed and was
+documented as worth calling from a container's shutdown path, but nothing in the package called
+it, and no consumer did either. So the final export attempt was whatever the exporter's own
+teardown happened to do as the sandbox was torn down underneath it, which is the 403 and
+failed-export noise, about 100 ms after uvicorn's shutdown.
+
+`instrument_fastapi` now wraps the application's lifespan, so the ASGI shutdown event flushes
+what is left and shuts the provider down. It wraps `router.lifespan_context` rather than
+appending to `router.on_shutdown`, and that distinction is load bearing: Starlette only runs
+`on_shutdown` under its default lifespan, and passing `lifespan=` replaces `lifespan_context`
+outright and never consults the handler lists. Every service here builds its app with an
+explicit `lifespan=`, so an `on_shutdown` hook would have been silently dead in exactly the
+deployments that needed it. The wrapper runs after the application's own shutdown work, so a
+span recorded while closing a client is still exported.
+
+### The flush is bounded, and failing it is quiet
+
+Lambda reserves only a slice of the 2000 ms shutdown budget for the runtime process before
+`SIGKILL`, so the flush is bounded at 300 ms by default, settable with
+`WEBBPULSE_OTEL_SHUTDOWN_FLUSH_TIMEOUT_MILLIS` or the new `shutdown_flush_timeout_millis`
+argument, and clamped at 1500 ms however it is set. An unbounded flush does not export more; it
+gets killed, loses the spans anyway, and fails the container's shutdown as well.
+
+An export that fails on the way out now logs one WARNING naming the lost span count instead of
+an ERROR with a traceback. On that path the failure is a race with the sandbox going away and
+says nothing about the application, which is what made the noise worth alarming on and then
+worth ignoring. An in-request export failure keeps its ERROR and its traceback. Neither
+`TailSamplingSpanProcessor.shutdown` nor the lifespan hook can raise, because the only thing a
+raise achieves there is turning a lost span batch into a failed shutdown.
+
+### Why the processor is still not a `BatchSpanProcessor`
+
+Worth recording, since the obvious reading of these symptoms is that the batch schedule needs
+tuning. There is no `BatchSpanProcessor` in this pipeline and adding one would be a regression.
+Its background thread does not run while the sandbox is frozen, so a batch waits until either
+the next invocation thaws it past its own export deadline or the sandbox is destroyed, and
+lowering `schedule_delay_millis` only narrows a window the freeze can land anywhere inside.
+`SimpleSpanProcessor` is the usual Lambda answer and this module already matches its
+synchronicity while keeping the tail decision, which `SimpleSpanProcessor` cannot make because
+it exports each span before the trace's outcome is known. The module docstring now says so.
+
+### Backward compatible
+
+`shutdown_tracing()` still takes no arguments and behaves as before; the timeout is optional.
+The lifespan wrapping is on by default and can be turned off with `flush_on_shutdown=False` for
+a consumer that owns its own shutdown path. `TailSamplingSpanProcessor.shutdown` still accepts
+a bare call. New names are `SHUTDOWN_FLUSH_TIMEOUT_ENV` and `resolve_shutdown_flush_timeout`.
+
 ## 0.21.0
 
 The `passkeys` extra accepts py_webauthn 3.x. The range is now `webauthn>=2.7,<4`, which

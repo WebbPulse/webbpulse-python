@@ -2,6 +2,34 @@
 
 Builds the whole pipeline in process from `configure_tracing`: a SigV4-signed OTLP
 exporter behind a tail sampling processor that always keeps error traces.
+
+## Why there is no `BatchSpanProcessor`
+
+The SDK's default pipeline is a `BatchSpanProcessor`, which hands spans to a background
+thread that exports on a `schedule_delay_millis` timer. That is the wrong shape for Lambda.
+Between invocations the sandbox is frozen, so the timer does not fire and the background
+thread does not run; the batch sits in the queue until either the next invocation thaws the
+sandbox, by which time the export deadline it was computed against has already passed, or
+the sandbox is torn down and the batch is lost. Tuning the schedule delay down only narrows
+the window, because the freeze can land anywhere inside it.
+
+`SimpleSpanProcessor` is the usual Lambda answer: it exports on the thread that ended the
+span, so nothing is ever queued across a freeze. This module takes the same synchronous
+approach but keeps the tail decision, which `SimpleSpanProcessor` cannot make because it has
+already exported a span before the trace's outcome is known. `TailSamplingSpanProcessor`
+buffers a trace in memory only until the trace is complete, and
+`_FlushTracingASGIMiddleware` then exports it synchronously, inside the invocation, before
+the response returns. The cost is the same as `SimpleSpanProcessor`'s, one blocking export
+per request rather than per span, and no span is ever owned by a thread the freeze can stop.
+
+Two paths remain where a buffered trace would otherwise outlive the process. A trace whose
+spans are still open when the response returns stays buffered by design, and a background
+task outliving the request is the normal way that happens. And an export that fails inside
+the request leaves nothing behind to retry. Both are resolved on container shutdown:
+`instrument_fastapi` wraps the app's lifespan so the ASGI shutdown event flushes and shuts
+the provider down. `shutdown_flush_timeout_millis` bounds that flush well under the grace
+period Lambda gives the runtime, because the alternative to a bounded flush is SIGKILL,
+which loses the spans anyway and fails the container's shutdown.
 """
 
 from __future__ import annotations
@@ -10,9 +38,12 @@ import logging
 import os
 import threading
 import time
+from contextlib import asynccontextmanager
 from typing import TYPE_CHECKING, Any, Final, Literal, cast
 
 if TYPE_CHECKING:  # pragma: no cover
+    from collections.abc import AsyncIterator
+
     from fastapi import FastAPI
     from opentelemetry.context import Context
     from opentelemetry.sdk.trace import ReadableSpan, Span, SpanProcessor
@@ -21,12 +52,14 @@ if TYPE_CHECKING:  # pragma: no cover
 __all__ = [
     "OTEL_DISABLED_ENV",
     "SAMPLE_RATIO_ENV",
+    "SHUTDOWN_FLUSH_TIMEOUT_ENV",
     "TailSamplingSpanProcessor",
     "configure_tracing",
     "flush_tracing",
     "instrument_fastapi",
     "is_tracing_enabled",
     "resolve_sample_ratio",
+    "resolve_shutdown_flush_timeout",
     "shutdown_tracing",
     "xray_otlp_endpoint",
 ]
@@ -36,6 +69,8 @@ _log = logging.getLogger(__name__)
 OTEL_DISABLED_ENV: Final = "WEBBPULSE_OTEL_DISABLED"
 
 SAMPLE_RATIO_ENV: Final = "WEBBPULSE_OTEL_SAMPLE_RATIO"
+
+SHUTDOWN_FLUSH_TIMEOUT_ENV: Final = "WEBBPULSE_OTEL_SHUTDOWN_FLUSH_TIMEOUT_MILLIS"
 
 _TRUTHY: Final[frozenset[str]] = frozenset({"1", "true", "yes", "on"})
 
@@ -51,6 +86,10 @@ _DEFAULT_MAX_TRACE_AGE_SECONDS: Final = 300.0
 
 _DEFAULT_FLUSH_TIMEOUT_MILLIS: Final = 1000
 
+_DEFAULT_SHUTDOWN_FLUSH_TIMEOUT_MILLIS: Final = 300
+
+_MAX_SHUTDOWN_FLUSH_TIMEOUT_MILLIS: Final = 1500
+
 OverflowPolicy = Literal["export", "drop"]
 
 _CONFIGURED = False
@@ -60,6 +99,8 @@ _PROCESSOR: TailSamplingSpanProcessor | None = None
 _EXPORT_TIMEOUT_MILLIS: int = _DEFAULT_FLUSH_TIMEOUT_MILLIS
 
 _FLUSH_WRAPPED_ATTR: Final = "_webbpulse_flush_wrapped"
+
+_SHUTDOWN_WRAPPED_ATTR: Final = "_webbpulse_shutdown_flush_wrapped"
 
 
 def is_tracing_enabled() -> bool:
@@ -129,6 +170,43 @@ def resolve_sample_ratio(explicit: float | None = None) -> float:
             return value
 
     return 1.0
+
+
+def resolve_shutdown_flush_timeout(explicit: int | None = None) -> int:
+    """The ceiling on the shutdown flush, in milliseconds.
+
+    First match wins: `explicit`, then `WEBBPULSE_OTEL_SHUTDOWN_FLUSH_TIMEOUT_MILLIS`, then
+    300 ms. The default is deliberately small. Lambda reserves only a slice of the 2000 ms
+    shutdown budget for the runtime process before `SIGKILL`, and a flush that outlasts it
+    loses the spans anyway while also failing the container's shutdown, so a bounded flush
+    that gives up is strictly better than an unbounded one that is killed.
+
+    Anything above `_MAX_SHUTDOWN_FLUSH_TIMEOUT_MILLIS` is clamped rather than honoured, so
+    no configuration can push the flush past the whole shutdown budget.
+    """
+    if explicit is not None:
+        if explicit < 1:
+            raise ValueError(f"shutdown_flush_timeout_millis must be at least 1, got {explicit!r}")
+        return min(explicit, _MAX_SHUTDOWN_FLUSH_TIMEOUT_MILLIS)
+
+    if raw := os.environ.get(SHUTDOWN_FLUSH_TIMEOUT_ENV, "").strip():
+        try:
+            value = int(raw)
+        except ValueError:
+            _log.warning(
+                "Ignoring unparseable shutdown flush timeout.",
+                extra={"source": SHUTDOWN_FLUSH_TIMEOUT_ENV, "value": raw},
+            )
+        else:
+            if value < 1:
+                _log.warning(
+                    "Ignoring non-positive shutdown flush timeout.",
+                    extra={"source": SHUTDOWN_FLUSH_TIMEOUT_ENV, "value": raw},
+                )
+            else:
+                return min(value, _MAX_SHUTDOWN_FLUSH_TIMEOUT_MILLIS)
+
+    return _DEFAULT_SHUTDOWN_FLUSH_TIMEOUT_MILLIS
 
 
 def _ratio_bound(ratio: float) -> int:
@@ -230,6 +308,7 @@ class TailSamplingSpanProcessor:
         self._overflowed_keep: set[int] = set()
         self._overflowed_drop: set[int] = set()
         self._shutdown = False
+        self._tearing_down = False
 
         self.dropped_traces = 0
         self.sampled_out_traces = 0
@@ -399,9 +478,31 @@ class TailSamplingSpanProcessor:
                     extra={"span_count": len(spans), "exporter_error": str(error)},
                 )
                 return
-            _log.exception("The span exporter raised while exporting a sampled trace.")
-        except Exception:  # pragma: no cover
-            _log.exception("The span exporter raised while exporting a sampled trace.")
+            self._log_export_failure(spans, error)
+        except Exception as error:
+            self._log_export_failure(spans, error)
+
+    def _log_export_failure(self, spans: list[ReadableSpan], error: BaseException) -> None:
+        """Report a failed export, quietly when the process is already going away.
+
+        On the teardown path the export is racing the sandbox being torn down, so a failure
+        says nothing about the application and a traceback at ERROR only pages someone. One
+        WARNING naming the lost span count is the whole signal. Everywhere else the failure is
+        real and keeps its ERROR and its traceback.
+        """
+        if self._tearing_down:
+            _log.warning(
+                "Dropping a span batch while shutting down: the final export did not complete "
+                "before the container went away. Expected on a Lambda sandbox teardown and not "
+                "an application fault.",
+                extra={"span_count": len(spans), "exporter_error": str(error)},
+            )
+            return
+        _log.error(
+            "The span exporter raised while exporting a sampled trace.",
+            exc_info=error,
+            extra={"span_count": len(spans)},
+        )
 
     def _should_keep(self, trace_id: int, spans: list[ReadableSpan]) -> bool:
         """The tail decision for one buffered trace."""
@@ -440,17 +541,41 @@ class TailSamplingSpanProcessor:
             return bool(result) if result is not None else True
         return True
 
-    def shutdown(self) -> None:
+    def shutdown(self, timeout_millis: int | None = None) -> None:
         """Resolve everything still buffered, in flight or not, then shut the exporter down.
 
         Unlike `force_flush` there is no later, so an incomplete trace is judged on what it
         has rather than discarded silently.
+
+        Never raises. This runs on a container's way out, where the only thing a raise can
+        achieve is to turn a lost span batch into a failed shutdown.
+
+        Args:
+            timeout_millis: ceiling on the final flush. `None` keeps the exporter's own
+                deadline, which is what a long-lived container wants; the Lambda shutdown path
+                passes the much smaller `resolve_shutdown_flush_timeout` value.
         """
-        with self._lock:
-            self._open_spans.clear()
-        self.force_flush()
+        self._tearing_down = True
+        try:
+            with self._lock:
+                self._open_spans.clear()
+            if timeout_millis is None:
+                self.force_flush()
+            else:
+                self.force_flush(timeout_millis)
+        except Exception as error:
+            _log.warning(
+                "Flushing buffered spans during shutdown failed; the last traces are lost.",
+                extra={"exporter_error": str(error)},
+            )
         self._shutdown = True
-        self._exporter.shutdown()
+        try:
+            self._exporter.shutdown()
+        except Exception as error:
+            _log.warning(
+                "Shutting the span exporter down failed.",
+                extra={"exporter_error": str(error)},
+            )
 
 
 def _xray_region(endpoint: str) -> str | None:
@@ -828,11 +953,15 @@ def instrument_fastapi(
     excluded_urls: str | None = None,
     flush_per_request: bool | None = None,
     flush_timeout_millis: int | None = None,
+    flush_on_shutdown: bool = True,
+    shutdown_flush_timeout_millis: int | None = None,
 ) -> None:
     """Instrument one FastAPI app so each request becomes a server span.
 
     A no-op when the `otel` extra is absent or tracing is disabled. On Lambda it also wraps
-    the app in an ASGI middleware that flushes buffered spans once the response is complete.
+    the app in an ASGI middleware that flushes buffered spans once the response is complete,
+    and it wraps the app's lifespan so the ASGI shutdown event flushes whatever the
+    per-request flush left buffered and then shuts the provider down.
 
     Args:
         app: the FastAPI application to instrument.
@@ -841,6 +970,12 @@ def instrument_fastapi(
         flush_timeout_millis: ceiling on that flush, in milliseconds. `None` uses the export
             deadline `configure_tracing` already gave the exporter, which is the value that
             actually binds; passing a larger number here does not extend it.
+        flush_on_shutdown: wrap the lifespan so container shutdown flushes and shuts the
+            provider down. On by default and on every platform, since a container being
+            replaced loses buffered spans the same way a Lambda sandbox does.
+        shutdown_flush_timeout_millis: ceiling on the shutdown flush. `None` reads
+            `resolve_shutdown_flush_timeout`, which defaults to 300 ms so the flush finishes
+            inside the grace period Lambda gives the runtime before `SIGKILL`.
     """
     if not is_tracing_enabled():
         return
@@ -866,6 +1001,11 @@ def instrument_fastapi(
         timeout = _EXPORT_TIMEOUT_MILLIS if flush_timeout_millis is None else flush_timeout_millis
         _wrap_with_flush(app, timeout)
 
+    if flush_on_shutdown:
+        _wrap_lifespan_with_shutdown_flush(
+            app, resolve_shutdown_flush_timeout(shutdown_flush_timeout_millis)
+        )
+
 
 def _wrap_with_flush(app: FastAPI, timeout_millis: int) -> None:
     """Put the flush wrapper outside everything, including the OTel server span middleware.
@@ -888,6 +1028,55 @@ def _wrap_with_flush(app: FastAPI, timeout_millis: int) -> None:
         app.middleware_stack = _FlushTracingASGIMiddleware(app.middleware_stack, timeout_millis)
 
 
+def _wrap_lifespan_with_shutdown_flush(app: FastAPI, timeout_millis: int) -> None:
+    """Flush and shut tracing down after the app's own lifespan shutdown has finished.
+
+    Wraps `router.lifespan_context` rather than appending to `router.on_shutdown`, and that is
+    the whole reason this function exists rather than one `append`. Starlette only runs
+    `on_shutdown` under its default lifespan: passing `lifespan=` replaces `lifespan_context`
+    outright and the handler lists are never consulted. Every service in this estate builds
+    its app with an explicit `lifespan=`, so an `on_shutdown` hook would be silently dead in
+    exactly the deployments that need it.
+
+    Ordering matters too. The flush has to run after the application's own shutdown work, so a
+    span recorded while closing a client is still in the buffer when the flush happens.
+    Wrapping around the inner context manager's exit gives that for free.
+
+    Guarded by a sentinel, since wrapping twice would flush twice.
+    """
+    if getattr(app, _SHUTDOWN_WRAPPED_ATTR, False):
+        return
+    setattr(app, _SHUTDOWN_WRAPPED_ATTR, True)
+
+    inner = app.router.lifespan_context
+
+    @asynccontextmanager
+    async def lifespan_context(scope: Any) -> AsyncIterator[Any]:
+        """Run the app's own lifespan, then flush and shut tracing down on the way out."""
+        async with inner(scope) as state:
+            yield state
+        await _shutdown_tracing_async(timeout_millis)
+
+    app.router.lifespan_context = lifespan_context
+
+
+async def _shutdown_tracing_async(timeout_millis: int) -> None:
+    """Shut tracing down off the event loop, since the final export is synchronous HTTP."""
+    import asyncio
+
+    def run() -> None:
+        """Shut tracing down, swallowing whatever the exporter does on the way out."""
+        try:
+            shutdown_tracing(timeout_millis)
+        except Exception as error:
+            _log.warning(
+                "Shutting tracing down at container shutdown failed; the last traces are lost.",
+                extra={"exporter_error": str(error)},
+            )
+
+    await asyncio.get_running_loop().run_in_executor(None, run)
+
+
 def flush_tracing(timeout_millis: int = 30000) -> bool:
     """Resolve and export the traces buffered so far. Returns whether a flush happened.
 
@@ -907,17 +1096,29 @@ def flush_tracing(timeout_millis: int = 30000) -> bool:
     return False
 
 
-def shutdown_tracing() -> None:
+def shutdown_tracing(timeout_millis: int | None = None) -> None:
     """Flush and shut down the tracer provider.
 
-    Worth calling from a container's shutdown path: shutting the provider down flushes the
-    tail buffers, so nothing recorded is lost.
+    Called for you from the lifespan wrapper `instrument_fastapi` installs, and safe to call
+    directly from any other shutdown path: shutting the provider down flushes the tail
+    buffers, so nothing recorded is lost.
+
+    Args:
+        timeout_millis: ceiling on the final flush. `None` leaves the exporter's own deadline
+            in place. The provider's `shutdown` takes no timeout, so a bound is applied by
+            flushing this module's own processor first and only then shutting the provider
+            down, which finds the buffers already empty.
     """
     global _CONFIGURED, _PROCESSOR
     try:
         from opentelemetry import trace
     except ImportError:
         return
+
+    processor = _PROCESSOR
+    if processor is not None:
+        processor.shutdown(timeout_millis)
+
     provider = trace.get_tracer_provider()
     shutdown = getattr(provider, "shutdown", None)
     if callable(shutdown):
