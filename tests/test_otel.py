@@ -35,15 +35,27 @@ def _clear_global_tracer_provider() -> None:
     trace._TRACER_PROVIDER_SET_ONCE._done = False
 
 
+def _reset_shutdown_state() -> None:
+    """Close the teardown window a previous test opened.
+
+    A real process only shuts down once, so the flag is deliberately global and never cleared
+    in production. Tests need it back to its cold-start state.
+    """
+    otel._SHUTTING_DOWN.clear()
+    otel._EXPORTER_DEMOTE_FILTER.forced = False
+
+
 @pytest.fixture(autouse=True)
 def _reset_provider() -> Any:
     """The tracer provider is a process global, so each test starts from a clean one."""
     otel._CONFIGURED = False
     otel._PROCESSOR = None
+    _reset_shutdown_state()
     _clear_global_tracer_provider()
     yield
     otel._CONFIGURED = False
     otel._PROCESSOR = None
+    _reset_shutdown_state()
     _clear_global_tracer_provider()
 
 
@@ -2227,3 +2239,363 @@ def test_the_demotion_is_scoped_to_the_teardown_flush(
     records = [r for r in caplog.records if "403" in r.getMessage()]
     assert records
     assert all(r.levelno == logging.ERROR for r in records)
+
+
+def test_the_sigterm_hook_chains_the_handler_that_was_already_installed() -> None:
+    """uvicorn's graceful shutdown must survive the hook that watches for the same signal."""
+    import signal
+
+    calls: list[str] = []
+
+    def previous(signum: int, frame: Any) -> None:
+        """Stand in for uvicorn's own SIGTERM handler."""
+        calls.append("previous")
+
+    installed = signal.signal(signal.SIGTERM, previous)
+    otel._SIGTERM_HOOKED = False
+    try:
+        otel._install_sigterm_hook()
+        handler = signal.getsignal(signal.SIGTERM)
+        assert handler is not previous, "the hook was never installed"
+        assert callable(handler)
+
+        handler(signal.SIGTERM, None)
+
+        assert calls == ["previous"], "the previously installed handler was not called"
+        assert otel.shutdown_signalled(), "the demotion window did not open on SIGTERM"
+    finally:
+        signal.signal(signal.SIGTERM, installed)
+        otel._SIGTERM_HOOKED = False
+
+
+def test_the_sigterm_hook_is_installed_only_once() -> None:
+    """Re-entering configure_tracing must not stack a second hook onto the first."""
+    import signal
+
+    installed = signal.signal(signal.SIGTERM, signal.SIG_IGN)
+    otel._SIGTERM_HOOKED = False
+    try:
+        otel._install_sigterm_hook()
+        first = signal.getsignal(signal.SIGTERM)
+        otel._install_sigterm_hook()
+        assert signal.getsignal(signal.SIGTERM) is first
+    finally:
+        signal.signal(signal.SIGTERM, installed)
+        otel._SIGTERM_HOOKED = False
+
+
+def test_an_export_failure_after_a_shutdown_signal_is_demoted(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """The window the signal opens is what the last request's flush failure is judged against.
+
+    `_tearing_down` is still false here, which is exactly the state the in-flight flush is in
+    when it runs between the signal and the lifespan shutdown event.
+    """
+
+    class _RaisingExporter:
+        """An exporter that fails the way a sandbox being torn down does."""
+
+        def export(self, spans: Any) -> None:
+            """Raise as a 403 against a dying sandbox would."""
+            raise OSError("connection reset by peer")
+
+    processor = TailSamplingSpanProcessor(cast("Any", _RaisingExporter()), sample_ratio=1.0)
+    otel.note_shutdown_signal("test")
+
+    with caplog.at_level("WARNING", logger="webbpulse.otel"):
+        assert not processor._tearing_down
+        processor._export([cast("Any", object())])
+
+    assert not [r for r in caplog.records if r.levelname == "ERROR"]
+    warnings = [r for r in caplog.records if r.levelname == "WARNING" and "Dropping" in r.message]
+    assert len(warnings) == 1
+    assert "shutting down" in warnings[0].message
+
+
+def test_the_lifespan_shutdown_opens_the_demotion_window_before_the_flush() -> None:
+    """The flag has to be set by the time the shutdown flush reaches the exporter."""
+    from fastapi.testclient import TestClient
+
+    seen: list[bool] = []
+
+    app, _ = _app_with_lifespan()
+
+    assert otel._PROCESSOR is not None
+    real_export = cast("Any", otel._PROCESSOR)._exporter.export
+
+    def export(spans: Any) -> Any:
+        """Record whether the demotion window was already open for this export."""
+        seen.append(otel.shutdown_signalled())
+        return real_export(spans)
+
+    cast("Any", otel._PROCESSOR)._exporter.export = export
+
+    with TestClient(app) as client:
+        assert client.get("/thing").status_code == 200
+        assert not otel.shutdown_signalled(), "the window must stay shut while serving requests"
+
+    assert seen, "the shutdown flush never reached the exporter"
+    assert all(seen), "the shutdown flush exported before the demotion window opened"
+
+
+def test_the_exporter_log_demotion_follows_the_shutdown_signal(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """The exporter's own ERROR line is demoted once a signal is seen, whoever logs it."""
+    exporter_log = logging.getLogger(otel._OTLP_EXPORTER_LOGGER)
+    otel._install_exporter_log_demotion()
+
+    with caplog.at_level(logging.WARNING, logger=otel._OTLP_EXPORTER_LOGGER):
+        exporter_log.error("Failed to export span batch code: 403, reason: Forbidden")
+        assert [r for r in caplog.records if r.levelno == logging.ERROR], "not signalled yet, so still an ERROR"
+        caplog.clear()
+
+        otel.note_shutdown_signal("test")
+        exporter_log.error("Failed to export span batch code: 403, reason: Forbidden")
+
+    records = [r for r in caplog.records if "403" in r.getMessage()]
+    assert records
+    assert all(r.levelno == logging.WARNING for r in records)
+    assert all(r.levelname == "WARNING" for r in records)
+
+
+def test_the_provider_is_not_shut_down_twice() -> None:
+    """The SDK's atexit hook is off, so nothing shuts an already shut exporter down again."""
+    shutdowns: list[str] = []
+
+    class _CountingExporter:
+        """An exporter that records every shutdown it is asked for."""
+
+        def export(self, spans: Any) -> None:
+            """Accept the batch."""
+
+        def force_flush(self, timeout_millis: int = 30000) -> bool:
+            """Report success."""
+            return True
+
+        def shutdown(self) -> None:
+            """Record the shutdown, as the real exporter's warning would."""
+            shutdowns.append("shutdown")
+
+    from opentelemetry import trace
+    from opentelemetry.sdk.trace import SpanProcessor, TracerProvider
+
+    processor = TailSamplingSpanProcessor(cast("Any", _CountingExporter()), sample_ratio=1.0)
+    provider = TracerProvider(shutdown_on_exit=False)
+    provider.add_span_processor(cast("SpanProcessor", processor))
+    trace.set_tracer_provider(provider)
+    otel._PROCESSOR = processor
+    otel._CONFIGURED = True
+
+    shutdown_tracing(300)
+    assert shutdowns == ["shutdown"]
+
+    shutdown_tracing(300)
+    assert shutdowns == ["shutdown"], "the second shutdown reached the exporter again"
+
+
+def test_configure_tracing_turns_the_sdk_atexit_hook_off(monkeypatch: MonkeyPatch) -> None:
+    """Owning the hook is what keeps the SDK from shutting the provider down a second time."""
+    captured: dict[str, Any] = {}
+
+    from opentelemetry.sdk.trace import TracerProvider
+
+    real_init = TracerProvider.__init__
+
+    def init(self: Any, *args: Any, **kwargs: Any) -> None:
+        """Record the shutdown_on_exit the module asked for."""
+        captured.update(kwargs)
+        real_init(self, *args, **kwargs)
+
+    monkeypatch.setattr(TracerProvider, "__init__", init)
+    monkeypatch.setenv("OTEL_EXPORTER_OTLP_TRACES_ENDPOINT", "http://localhost:4318/v1/traces")
+
+    assert configure_tracing("svc") is True
+    assert captured.get("shutdown_on_exit") is False
+    shutdown_tracing()
+
+
+def test_the_atexit_net_is_registered_once_and_is_idempotent(monkeypatch: MonkeyPatch) -> None:
+    """A process that never ran a lifespan still flushes, and one that did is untouched."""
+    registered: list[Any] = []
+
+    import atexit
+
+    def register(fn: Any) -> Any:
+        """Record the hook instead of letting the interpreter hold it."""
+        registered.append(fn)
+        return fn
+
+    monkeypatch.setattr(atexit, "register", register)
+    monkeypatch.setattr(otel, "_ATEXIT_REGISTERED", False)
+
+    otel._register_shutdown_atexit()
+    otel._register_shutdown_atexit()
+    assert len(registered) == 1
+
+    shutdowns: list[str] = []
+    monkeypatch.setattr(otel, "_PROCESSOR", None)
+    monkeypatch.setattr(otel, "_CONFIGURED", False)
+    monkeypatch.setattr(otel, "shutdown_tracing", lambda *a, **k: shutdowns.append("ran"))
+
+    registered[0]()
+    assert shutdowns == [], "tracing was already shut down, so the net must do nothing"
+
+
+def test_a_rejected_export_logs_the_response_body_truncated(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """The body is the only place the endpoint explains a 403, so one line must carry it."""
+
+    class _Response:
+        """A rejected OTLP response carrying an over-long body and the AWS headers."""
+
+        ok = False
+        status_code = 403
+        text = "x" * 1000
+        headers: ClassVar[dict[str, str]] = {
+            "x-amzn-requestid": "abc-123",
+            "x-amzn-errortype": "AccessDeniedException",
+        }
+
+    class _Exporter:
+        """An exporter whose private _export returns a rejected response."""
+
+        def _export(self, data: Any, timeout_sec: Any = None) -> Any:
+            """Answer the way the endpoint does when it refuses the batch."""
+            return _Response()
+
+    exporter = _Exporter()
+    otel._log_export_response_bodies(exporter)
+
+    with caplog.at_level(logging.WARNING, logger="webbpulse.otel"):
+        exporter._export(b"")
+
+    records = [r for r in caplog.records if "rejected an export" in r.message]
+    assert len(records) == 1
+    record = records[0]
+    assert record.levelno == logging.ERROR
+    assert record.http_response_status_code == 403  # type: ignore[attr-defined]
+    body = record.otlp_response_body  # type: ignore[attr-defined]
+    assert len(body) == 300
+    assert body == "x" * 300
+    assert record.x_amzn_requestid == "abc-123"  # type: ignore[attr-defined]
+    assert record.x_amzn_errortype == "AccessDeniedException"  # type: ignore[attr-defined]
+
+
+def test_the_rejected_response_log_is_demoted_on_the_way_out(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A 403 on the teardown path is the sandbox going away, not something to page for."""
+
+    class _Response:
+        """A rejected response with no diagnostic headers on it."""
+
+        ok = False
+        status_code = 403
+        text = "Forbidden"
+        headers: ClassVar[dict[str, str]] = {}
+
+    class _Exporter:
+        """An exporter whose private _export returns a rejected response."""
+
+        def _export(self, data: Any, timeout_sec: Any = None) -> Any:
+            """Answer with the rejection."""
+            return _Response()
+
+    exporter = _Exporter()
+    otel._log_export_response_bodies(exporter)
+    otel.note_shutdown_signal("test")
+
+    with caplog.at_level(logging.WARNING, logger="webbpulse.otel"):
+        exporter._export(b"")
+
+    records = [r for r in caplog.records if "rejected an export" in r.message]
+    assert len(records) == 1
+    assert records[0].levelno == logging.WARNING
+    assert not hasattr(records[0], "x_amzn_requestid")
+
+
+def test_a_successful_export_logs_no_response_body(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """The diagnostic stays in the release, so it must be silent on the happy path."""
+
+    class _Response:
+        """An accepted OTLP response."""
+
+        ok = True
+        status_code = 200
+        text = "should never be logged"
+        headers: ClassVar[dict[str, str]] = {}
+
+    class _Exporter:
+        """An exporter whose private _export succeeds."""
+
+        def _export(self, data: Any, timeout_sec: Any = None) -> Any:
+            """Answer with success."""
+            return _Response()
+
+    exporter = _Exporter()
+    otel._log_export_response_bodies(exporter)
+
+    with caplog.at_level(logging.DEBUG, logger="webbpulse.otel"):
+        exporter._export(b"")
+
+    assert not [r for r in caplog.records if "rejected an export" in r.message]
+
+
+def test_the_body_logging_wrapper_is_installed_only_once() -> None:
+    """Wrapping twice would log the same rejected batch twice."""
+
+    class _Exporter:
+        """An exporter whose private _export is wrappable."""
+
+        def _export(self, data: Any, timeout_sec: Any = None) -> Any:
+            """Answer with success."""
+            return None
+
+    exporter = _Exporter()
+    otel._log_export_response_bodies(exporter)
+    first = exporter._export
+    otel._log_export_response_bodies(exporter)
+    assert exporter._export is first
+
+
+def test_the_built_exporter_logs_rejected_response_bodies(monkeypatch: MonkeyPatch) -> None:
+    """The wiring matters as much as the wrapper, so check the real construction path."""
+    monkeypatch.delenv("OTEL_EXPORTER_OTLP_TRACES_ENDPOINT", raising=False)
+    exporter = otel._build_span_exporter("http://localhost:4318/v1/traces", 1000)
+    assert getattr(exporter, otel._BODY_LOGGING_ATTR, False) is True
+
+
+def test_the_processor_shutdown_reaches_the_exporter_only_once() -> None:
+    """`shutdown_tracing` shuts the processor down and then the provider walks to it again."""
+    shutdowns: list[str] = []
+    flushes: list[str] = []
+
+    class _CountingExporter:
+        """An exporter that records every flush and shutdown it is asked for."""
+
+        def export(self, spans: Any) -> None:
+            """Accept the batch."""
+
+        def force_flush(self, timeout_millis: int = 30000) -> bool:
+            """Record the flush and report success."""
+            flushes.append("flush")
+            return True
+
+        def shutdown(self) -> None:
+            """Record the shutdown."""
+            shutdowns.append("shutdown")
+
+    processor = TailSamplingSpanProcessor(cast("Any", _CountingExporter()), sample_ratio=1.0)
+
+    processor.shutdown(300)
+    assert flushes == ["flush"], "the first shutdown must still flush"
+    assert shutdowns == ["shutdown"]
+
+    processor.shutdown(300)
+    assert shutdowns == ["shutdown"], "the repeat shutdown reached the exporter"
+    assert flushes == ["flush"], "the repeat shutdown flushed again"
