@@ -5,6 +5,14 @@ Notable changes to the `webbpulse` package. The version here is the one in
 
 This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## 0.28.1
+
+Fixes the stream route refusing the pass-through it exists for. The AWS Lambda Web Adapter
+stamps `x-amzn-request-context` on every invocation, and on a pass-through the value is the
+literal `null`; 0.28.0 read any non-empty header as a gateway caller and answered 404, so the
+event source mapping consumed each `REMOVE` record without purging anything. The guard now
+refuses only a request whose context is a JSON object, and no longer reads `x-amzn-requestid`.
+
 ## 0.28.0
 
 Adds the asynchronous half of account deletion. `IdentityFlows.purge_user` deletes every

@@ -804,11 +804,33 @@ def test_a_gateway_originated_request_is_refused(events_client: tuple[TestClient
         json=body,
         headers={REQUEST_CONTEXT_HEADER: json.dumps({"requestId": "abc", "http": {"method": "POST"}})},
     )
-    request_id = client.post(DEFAULT_EVENTS_PATH, json=body, headers={"x-amzn-requestid": "abc"})
+    unreadable = client.post(DEFAULT_EVENTS_PATH, json=body, headers={REQUEST_CONTEXT_HEADER: "{not json"})
 
     assert context.status_code == 404
-    assert request_id.status_code == 404
+    assert unreadable.status_code == 404
     assert stores.require_credentials().get(USER_ID, "password") is not None
+
+
+def test_the_adapters_pass_through_headers_are_admitted(events_client: tuple[TestClient, IdentityStores]) -> None:
+    """A pass-through carries a `null` request context, a Lambda context and a request id, and is admitted."""
+    from webbpulse.http import LAMBDA_CONTEXT_HEADER, REQUEST_CONTEXT_HEADER
+
+    client, stores = events_client
+    seed_every_table(stores)
+
+    response = client.post(
+        DEFAULT_EVENTS_PATH,
+        json={"Records": [remove_record(USER_ID)]},
+        headers={
+            REQUEST_CONTEXT_HEADER: "null",
+            LAMBDA_CONTEXT_HEADER: json.dumps({"request_id": "abc"}),
+            "x-amzn-requestid": "abc",
+        },
+    )
+
+    assert response.status_code == 200
+    assert response.json() == {"batchItemFailures": []}
+    assert stores.require_credentials().get(USER_ID, "password") is None
 
 
 def test_a_record_with_no_readable_user_id_is_skipped(
