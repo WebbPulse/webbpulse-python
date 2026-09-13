@@ -9,6 +9,7 @@ import pytest
 from botocore.exceptions import ClientError
 from fastapi import Depends, FastAPI, Request
 
+from webbpulse.messages import rate_limited
 from webbpulse.ratelimit import (
     RateLimitDecision,
     RateLimiter,
@@ -261,6 +262,7 @@ def test_the_429_carries_retry_after_and_the_ratelimit_header(limiter: RateLimit
 
     rejected = client.get("/limited")
     assert rejected.status_code == 429
+    assert rejected.json()["detail"] == rate_limited(), "the 429 sentence comes from webbpulse.messages"
 
     retry_after = rejected.headers["Retry-After"]
     assert retry_after.isdigit(), f"Retry-After must be delta seconds, got {retry_after!r}"

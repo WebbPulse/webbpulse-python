@@ -36,6 +36,7 @@ from webbpulse.identity.passwords import (
     normalise_password,
 )
 from webbpulse.identity.sessions import SessionService
+from webbpulse.messages import rate_limited
 
 if TYPE_CHECKING:  # pragma: no cover
     from collections.abc import Callable, Mapping, Sequence
@@ -99,7 +100,7 @@ class RateLimited(LoginRejected):
     def __init__(self, retry_after: int) -> None:
         """Build the 429 refusal, carrying the seconds until the lockout decays."""
         super().__init__(
-            "Too many failed attempts. Try again shortly.",
+            rate_limited(scope="failed attempts"),
             error_code="TOO_MANY_ATTEMPTS",
             status_code=429,
         )

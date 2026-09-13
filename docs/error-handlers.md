@@ -87,6 +87,27 @@ handlers changes nothing a caller can see. The details worth knowing:
 Starlette walks an exception's MRO, so a subclass without its own entry uses the nearest base
 class that has one, and a subclass with its own entry wins.
 
+## The wording itself
+
+"The wording already used for that status" is `webbpulse.messages.STATUS_MESSAGES`, a public
+table these handlers read for every message no `ErrorSpec` names. Products take their own
+refusal copy from the same place rather than writing it again, so the org has one sentence per
+status instead of three for 403 and four for 429:
+
+```python
+from webbpulse import messages
+
+messages.forbidden("delete", "this user")   # "Not authorized to delete this user."
+messages.unauthenticated()                  # "Authentication is required."
+messages.rate_limited(retry_after=30)       # "Too many requests. Try again in 30 seconds."
+messages.refusal(404, subject="that part")  # "Could not find that part."
+```
+
+The helpers are parameterised because a 403 that names the action tells the caller what to
+change and "Access denied" does not. Naming nothing gives the plain `STATUS_MESSAGES`
+sentence, so a caller that has no subject is not forced to invent one. A product keeps its own
+envelope and takes only the sentence inside `detail` from here.
+
 ## The package's own DynamoDB exception types
 
 `exception_map` assumes the service already has exception classes to hand over. For one that

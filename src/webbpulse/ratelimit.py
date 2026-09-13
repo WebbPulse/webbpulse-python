@@ -15,6 +15,7 @@ from functools import partial
 from typing import TYPE_CHECKING, Any, Final, TypeAlias
 
 from webbpulse.dynamodb import Repository
+from webbpulse.messages import rate_limited
 
 if TYPE_CHECKING:  # pragma: no cover
     from fastapi import Request
@@ -223,7 +224,7 @@ def rate_limit(
         if not decision.allowed:
             raise HTTPException(
                 status_code=429,
-                detail="Too many requests. Try again later.",
+                detail=rate_limited(),
                 headers={**headers, "Retry-After": str(decision.reset_after)},
             )
         return decision

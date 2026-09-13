@@ -26,6 +26,7 @@ from starlette.middleware.base import BaseHTTPMiddleware, RequestResponseEndpoin
 from starlette.responses import Response
 
 from webbpulse.log_context import current_context, request_id_var, set_request_id, set_user_id
+from webbpulse.messages import DEFAULT_MESSAGE, STATUS_MESSAGES
 
 if TYPE_CHECKING:  # pragma: no cover
     from webbpulse.config import BaseServiceSettings
@@ -719,17 +720,8 @@ class ErrorSpec:
 
 type ExceptionMap = Mapping[type[BaseException], int | ErrorSpec]
 
-_STATUS_MESSAGES: Final[Mapping[int, str]] = {
-    400: "The request could not be understood.",
-    401: "Authentication is required.",
-    403: "You do not have access to this resource.",
-    404: "The requested resource was not found.",
-    405: "That method is not allowed on this resource.",
-    409: "The resource was modified by another request. Try again.",
-    422: "Request validation failed.",
-    429: "Too many requests. Try again shortly.",
-    503: "The service is busy. Try again shortly.",
-}
+_STATUS_MESSAGES: Final[Mapping[int, str]] = STATUS_MESSAGES
+"""The per-status default wording, owned by `webbpulse.messages` and aliased here."""
 
 
 def _normalise_exception_map(
@@ -784,7 +776,7 @@ def _install_exception_map(
         message = (
             "Internal server error."
             if is_server_fault
-            else (spec.message or _STATUS_MESSAGES.get(status) or "Request failed.")
+            else (spec.message or _STATUS_MESSAGES.get(status) or DEFAULT_MESSAGE)
         )
         code: str | None = None
         if render_codes:

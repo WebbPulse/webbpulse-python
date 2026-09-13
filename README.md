@@ -58,6 +58,8 @@ its dev dependencies.
 | `webbpulse.metrics` | `emit`, `timed`, `MetricsEmitter`, `metrics_enabled_from_env`: CloudWatch Embedded Metric Format on stdout | [logging-and-metrics.md](docs/logging-and-metrics.md) |
 | `webbpulse.otel` | `configure_tracing`, `instrument_fastapi`, `TailSamplingSpanProcessor`: tracing with errors always sampled | [tracing.md](docs/tracing.md), [tracing-sampling.md](docs/tracing-sampling.md) |
 | `webbpulse.http` | `create_app`, `mount_all`, `health_router`, `RequestIdMiddleware`, `user_id_dependency`, and the shared error envelope | [http.md](docs/http.md), [error-handlers.md](docs/error-handlers.md) |
+| `webbpulse.events` | `stream_consumer_app`, `register_stream_consumer`, `events_path`: the one route a DynamoDB Streams or SQS consumer serves behind the Web Adapter | [events.md](docs/events.md) |
+| `webbpulse.messages` | `STATUS_MESSAGES`, `refusal`, `forbidden`, `unauthenticated`, `rate_limited`: the user-facing sentence each refusal renders | [error-handlers.md](docs/error-handlers.md) |
 | `webbpulse.dynamodb` | `Repository`, `Page`, `table_name`, `ttl_at`, `ttl_in`, `encode_numbers`, and the `DynamoError` family | [data-access.md](docs/data-access.md) |
 | `webbpulse.ratelimit` | `rate_limit`, a per-route fixed window limiter on one DynamoDB table, failing open | [data-access.md](docs/data-access.md) |
 | `webbpulse.security` | `hash_password`, `verify_password`, `needs_rehash`, `create_token`, `decode_token`, `bearer_claims` | [security.md](docs/security.md) |
@@ -264,6 +266,7 @@ app.include_router(build_identity_router(settings, hooks, stores, tokens=tokens)
 | [docs/identity-passkeys.md](docs/identity-passkeys.md) | WebAuthn registration, passwordless sign-in and credential management |
 | [docs/http.md](docs/http.md) | `create_app` and the error envelope shapes |
 | [docs/error-handlers.md](docs/error-handlers.md) | DynamoDB and custom exception handlers |
+| [docs/events.md](docs/events.md) | The stream and queue consumer route |
 | [docs/data-access.md](docs/data-access.md) | The repository base and the rate limiter |
 | [docs/logging-and-metrics.md](docs/logging-and-metrics.md) | JSON logging, log context and EMF metrics |
 | [docs/tracing.md](docs/tracing.md) | Tracing setup |

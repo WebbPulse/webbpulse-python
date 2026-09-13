@@ -4,15 +4,28 @@ Identity Lambdas run behind the AWS Lambda Web Adapter, which posts a non-HTTP i
 as a JSON body to its pass-through path and returns the response body as the function's
 result. That makes a stream handler an ordinary route: this module mounts one, and
 `build_identity_router` includes it wherever the purge flow can run.
+
+The route itself is `webbpulse.events.register_stream_consumer`, which owns the path, the
+gateway guard and the batch item failure envelope. What is identity's own is here: reading
+the deleted user's id out of a record's keys, and the purge itself.
 """
 
 from __future__ import annotations
 
-import json
 import logging
 import os
 from collections.abc import Mapping
 from typing import TYPE_CHECKING, Any, Final
+
+from webbpulse.events import (
+    DEFAULT_EVENTS_PATH,
+    EVENTS_PATH_ENV,
+    LWA_PASS_THROUGH_PATH_ENV,
+    arrived_through_api_gateway,
+    events_path,
+    record_id,
+    register_stream_consumer,
+)
 
 if TYPE_CHECKING:  # pragma: no cover
     from fastapi import APIRouter
@@ -34,43 +47,11 @@ __all__ = [
 
 _log = logging.getLogger(__name__)
 
-_FastAPIRequest: Any = None
-
-
-def _bind_fastapi_request() -> None:
-    """Put `fastapi.Request` in this module's globals for FastAPI's annotation lookup."""
-    global _FastAPIRequest
-    if _FastAPIRequest is None:
-        from fastapi import Request as _Request
-
-        _FastAPIRequest = _Request
-
-
-DEFAULT_EVENTS_PATH: Final = "/events"
-
-EVENTS_PATH_ENV: Final = "IDENTITY_EVENTS_PATH"
-
-LWA_PASS_THROUGH_PATH_ENV: Final = "AWS_LWA_PASS_THROUGH_PATH"
-
 DEFAULT_USERS_KEY_ATTRIBUTE: Final = "id"
 
 USERS_KEY_ATTRIBUTE_ENV: Final = "IDENTITY_USERS_KEY_ATTRIBUTE"
 
 REMOVE_EVENT_NAME: Final = "REMOVE"
-
-
-def events_path() -> str:
-    """The path the stream route mounts at, absolute and without a trailing slash.
-
-    `IDENTITY_EVENTS_PATH` wins, then `AWS_LWA_PASS_THROUGH_PATH`, which is the adapter's
-    own variable and the one that actually decides where the invocation is posted, then
-    `/events`, which is the adapter's default.
-    """
-    for name in (EVENTS_PATH_ENV, LWA_PASS_THROUGH_PATH_ENV):
-        raw = os.environ.get(name, "").strip()
-        if raw:
-            return "/" + raw.strip("/")
-    return DEFAULT_EVENTS_PATH
 
 
 def users_key_attribute() -> str:
@@ -80,26 +61,6 @@ def users_key_attribute() -> str:
     names as the users table's hash key.
     """
     return os.environ.get(USERS_KEY_ATTRIBUTE_ENV, "").strip() or DEFAULT_USERS_KEY_ATTRIBUTE
-
-
-def arrived_through_api_gateway(request: Any) -> bool:
-    """Whether this request reached the function through API Gateway rather than the adapter's pass-through.
-
-    The adapter stamps `x-amzn-request-context` on every invocation it forwards. Behind API
-    Gateway it is the gateway's request context, a JSON object; on a pass-through it is the
-    literal `null`, because there was no HTTP request at the edge to describe. Only a JSON
-    object counts, so a bare request id header, which the runtime adds to both, proves nothing.
-    """
-    from webbpulse.http import REQUEST_CONTEXT_HEADER
-
-    raw = (request.headers.get(REQUEST_CONTEXT_HEADER) or "").strip()
-    if not raw:
-        return False
-    try:
-        context = json.loads(raw)
-    except ValueError:
-        return True
-    return isinstance(context, Mapping) and bool(context)
 
 
 def _user_id_from_record(record: Mapping[str, Any], *, key_attribute: str) -> str:
@@ -132,60 +93,37 @@ def register_user_purge_events(router: APIRouter, flows: IdentityFlows) -> None:
     about identity data. Returns the `ReportBatchItemFailures` shape, so the event source
     mapping retries only the records that raised rather than the whole batch.
     """
-    from fastapi import HTTPException
-    from fastapi.responses import JSONResponse
-
-    _bind_fastapi_request()
-    path = events_path()
     key_attribute = users_key_attribute()
 
-    @router.post(path, include_in_schema=False)
-    async def user_stream_events(request: _FastAPIRequest) -> JSONResponse:
-        """Purge each removed user in a DynamoDB Streams batch, reporting per-record failures."""
-        if arrived_through_api_gateway(request):
-            raise HTTPException(status_code=404, detail="Not Found.")
+    def purge_record(record: Mapping[str, Any]) -> None:
+        """Purge the user one `REMOVE` record deleted, raising so that record is retried."""
+        user_id = _user_id_from_record(record, key_attribute=key_attribute)
+        if not user_id:
+            _log.warning(
+                "A REMOVE record carried no user id under the configured key attribute.",
+                extra={
+                    "event": "identity.purge_record_unreadable",
+                    "key_attribute": key_attribute,
+                    "event_id": record_id(record),
+                },
+            )
+            return
+        try:
+            flows.purge_user(user_id)
+        except Exception:
+            _log.exception(
+                "Purging a deleted user failed; the event source mapping will retry this record.",
+                extra={
+                    "event": "identity.purge_failed",
+                    "user_id": user_id,
+                    "event_id": record_id(record),
+                },
+            )
+            raise
 
-        event = await request.json()
-        records = event.get("Records", []) if isinstance(event, Mapping) else []
-        failures: list[dict[str, str]] = []
-        purged = 0
-
-        for record in records:
-            if not isinstance(record, Mapping) or record.get("eventName") != REMOVE_EVENT_NAME:
-                continue
-            user_id = _user_id_from_record(record, key_attribute=key_attribute)
-            if not user_id:
-                _log.warning(
-                    "A REMOVE record carried no user id under the configured key attribute.",
-                    extra={
-                        "event": "identity.purge_record_unreadable",
-                        "key_attribute": key_attribute,
-                        "event_id": str(record.get("eventID", "")),
-                    },
-                )
-                continue
-            try:
-                flows.purge_user(user_id)
-            except Exception:
-                _log.exception(
-                    "Purging a deleted user failed; the event source mapping will retry this record.",
-                    extra={
-                        "event": "identity.purge_failed",
-                        "user_id": user_id,
-                        "event_id": str(record.get("eventID", "")),
-                    },
-                )
-                failures.append({"itemIdentifier": str(record.get("eventID", ""))})
-            else:
-                purged += 1
-
-        _log.info(
-            "Handled a users table stream batch.",
-            extra={
-                "event": "identity.purge_batch",
-                "records": len(records),
-                "purged": purged,
-                "failed": len(failures),
-            },
-        )
-        return JSONResponse({"batchItemFailures": failures})
+    register_stream_consumer(
+        router,
+        purge_record,
+        event_names={REMOVE_EVENT_NAME},
+        log_event="identity.purge_batch",
+    )
