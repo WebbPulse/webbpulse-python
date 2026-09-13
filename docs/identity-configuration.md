@@ -96,6 +96,50 @@ def build() -> APIRouter:
 (`identity_prefix`). Your own prefix doubles it, giving `/api/auth/api/auth/login`, and puts
 the `.well-known` documents where API Gateway will not look.
 
+### 6.3 Account deletion purge
+
+Refresh tokens, identity tokens and WebAuthn challenges carry a TTL. Credentials, passkeys,
+the TOTP factor, recovery codes and OAuth links never expire, so a deleted user's identity
+rows would otherwise stay forever.
+
+When the product deletes a user, its `users` Lambda hard-deletes the users row and nothing
+else. The identity Lambda purges that user's identity data asynchronously from the users
+table's DynamoDB stream. The users Lambda never writes identity tables.
+
+`build_identity_router` mounts a stream route wherever the flows mount, at an absolute path
+outside the issuer prefix. Identity Lambdas run behind the AWS Lambda Web Adapter, which posts
+a non-HTTP invocation as a JSON body to its pass-through path and returns the response body as
+the function's result, so the stream handler is an ordinary route. The route handles only
+`REMOVE` records, calls `purge_user` for each, and answers with the
+`ReportBatchItemFailures` shape so the event source mapping retries only the records that
+raised. It takes no auth, and returns 404 to any request carrying an API Gateway request
+context or request id, so it is reachable only through the pass-through.
+
+| Variable | Default | What it sets |
+| --- | --- | --- |
+| `IDENTITY_EVENTS_PATH` | unset | The path the stream route mounts at. |
+| `AWS_LWA_PASS_THROUGH_PATH` | `/events` | The adapter's own variable, and the one that decides where the invocation is posted. Used when `IDENTITY_EVENTS_PATH` is unset. |
+| `IDENTITY_USERS_KEY_ATTRIBUTE` | `id` | The attribute of the users table key holding the user id. |
+
+Set only `AWS_LWA_PASS_THROUGH_PATH` unless the route has to sit somewhere the adapter is not
+posting to. `IDENTITY_EVENTS_PATH` wins where both are set, which will silently stop the purge
+if they disagree.
+
+`purge_user(user_id)` returns a `PurgeResult` carrying a count per table and a `total`. It is
+idempotent: purging a user with no rows succeeds with zero counts, which is what makes the
+stream's at-least-once delivery and any retry of a partial purge converge. It logs one
+`identity.user_purged` event with the counts and the user id.
+
+The `identity-tokens` and `webauthn-challenges` tables carry no user index, so their DynamoDB
+stores cannot enumerate a user's rows and name themselves in `PurgeResult.unsupported` rather
+than failing the purge. Both tables have a TTL, so nothing is retained permanently. Any other
+store error propagates, which reports that record as a batch item failure.
+
+The adopter's identity Terraform module must enable a DynamoDB stream on the users table with
+`NEW_AND_OLD_IMAGES` or `KEYS_ONLY`, and create an event source mapping from that stream to
+the identity Lambda with `ReportBatchItemFailures` as the function response type. Without both,
+the purge never runs and identity rows survive the user.
+
 ### 6.3 `IdentityHooks`, the product's own policy
 
 The product decides **who may sign in and what they may do**; the package decides **how signing
