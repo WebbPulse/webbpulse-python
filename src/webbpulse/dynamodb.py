@@ -17,17 +17,23 @@ if TYPE_CHECKING:  # pragma: no cover
     from mypy_boto3_dynamodb.service_resource import DynamoDBServiceResource, Table
 
 __all__ = [
+    "BATCH_GET_LIMIT",
     "TABLE_PREFIX_ENV",
+    "TRANSACT_WRITE_LIMIT",
+    "UNPROCESSED_RETRY_ATTEMPTS",
+    "UNPROCESSED_RETRY_BASE_DELAY",
     "ConditionFailed",
     "DynamoError",
     "ItemNotFound",
     "Page",
     "Repository",
     "TransactionCanceled",
+    "UnprocessedItems",
     "encode_numbers",
     "now_iso",
     "reset_resource_cache",
     "table_name",
+    "transact_write",
     "ttl_at",
     "ttl_in",
 ]
@@ -53,6 +59,22 @@ class ItemNotFound(DynamoError):
         self.table = table
         self.key = dict(key) if key is not None else None
         super().__init__(f"{table}: no item with key {self.key}")
+
+
+class UnprocessedItems(DynamoError):
+    """A batch left keys or items unprocessed after the retry cap was reached.
+
+    Raised rather than looping forever or silently returning a short result: sustained
+    throttling can leave the same keys unprocessed on every attempt, so the caller has to
+    learn that the read or write was incomplete.
+    """
+
+    def __init__(self, table: str, count: int, attempts: int) -> None:
+        """Record the table, how many keys or items were left, and how many attempts ran."""
+        self.table = table
+        self.count = count
+        self.attempts = attempts
+        super().__init__(f"{table}: {count} item(s) still unprocessed after {attempts} attempts")
 
 
 class ConditionFailed(DynamoError):
@@ -91,6 +113,26 @@ class TransactionCanceled(DynamoError):
 TABLE_PREFIX_ENV: Final = "DYNAMODB_TABLE_PREFIX"
 
 DEFAULT_PAGE_SIZE: Final = 100
+
+BATCH_GET_LIMIT: Final = 100
+"""DynamoDB's hard cap on the keys one `BatchGetItem` accepts."""
+
+TRANSACT_WRITE_LIMIT: Final = 100
+"""DynamoDB's hard cap on the actions one `TransactWriteItems` accepts."""
+
+UNPROCESSED_RETRY_ATTEMPTS: Final = 5
+"""How many times an unprocessed batch is retried before the call gives up.
+
+Bounded on purpose: DynamoDB can return the same keys unprocessed indefinitely under
+sustained throttling, so an unbounded loop is a hang rather than a retry.
+"""
+
+UNPROCESSED_RETRY_BASE_DELAY: Final = 0.05
+"""The first backoff pause, in seconds. Each attempt doubles it."""
+
+_CONDITIONAL_CHECK_FAILED: Final = "ConditionalCheckFailed"
+
+_TRANSACTION_CANCELED: Final = "TransactionCanceledException"
 
 type Item = dict[str, Any]
 type Key = Mapping[str, Any]
@@ -178,6 +220,88 @@ class Page:
             f"Page(items={len(self.items)}, has_more={self.has_more}, "
             f"count={self.count}, scanned_count={self.scanned_count})"
         )
+
+
+def _chunks(values: Sequence[Any], size: int) -> Iterator[list[Any]]:
+    """Split `values` into consecutive lists of at most `size`."""
+    for start in range(0, len(values), size):
+        yield list(values[start : start + size])
+
+
+def _apply_condition(action: dict[str, Any], condition: Any) -> None:
+    """Render `condition` into `action` as an expression plus its placeholder maps.
+
+    A `boto3.dynamodb.conditions` object is translated by the resource layer, which for a
+    transaction action hoists its placeholders to the top of the request where the API
+    rejects them. Building the expression here keeps the names and values inside the action
+    they belong to. A condition that is already a string is used as it stands.
+    """
+    if isinstance(condition, str):
+        action["ConditionExpression"] = condition
+        return
+
+    from boto3.dynamodb.conditions import ConditionExpressionBuilder
+
+    built = ConditionExpressionBuilder().build_expression(condition, is_key_condition=False)
+    action["ConditionExpression"] = built.condition_expression
+    if built.attribute_name_placeholders:
+        names = dict(action.get("ExpressionAttributeNames", {}))
+        names.update(built.attribute_name_placeholders)
+        action["ExpressionAttributeNames"] = names
+    if built.attribute_value_placeholders:
+        values = dict(action.get("ExpressionAttributeValues", {}))
+        values.update(encode_numbers(built.attribute_value_placeholders))
+        action["ExpressionAttributeValues"] = values
+
+
+def transact_write(
+    actions: Sequence[Mapping[str, Any]],
+    *,
+    region_name: str | None = None,
+    endpoint_url: str | None = None,
+    client_request_token: str | None = None,
+) -> None:
+    """Apply `actions` as one all-or-nothing `TransactWriteItems`.
+
+    Each action is DynamoDB's own shape, a single-key mapping of `Put`, `Update`, `Delete`
+    or `ConditionCheck` to its arguments; `Repository.put_action` and its siblings build
+    them. An empty sequence is a no-op rather than an error, so a caller that assembled
+    actions conditionally need not check.
+
+    Args:
+        actions: The transaction's actions, at most `TRANSACT_WRITE_LIMIT` of them.
+        region_name: Region for the client, defaulting to the ambient configuration.
+        endpoint_url: Endpoint for the client, for DynamoDB Local.
+        client_request_token: An idempotency token. DynamoDB treats a repeat of the same
+            token within ten minutes as the same transaction, which makes a retry after an
+            ambiguous network failure safe.
+
+    Raises:
+        ValueError: When more actions are given than DynamoDB accepts. Raised before the
+            call, since the service would reject the whole transaction anyway.
+        TransactionCanceled: When DynamoDB cancelled the transaction, carrying the
+            per-action reasons. Check `conditional_check_failed` to tell an ordinary lost
+            race from a real fault.
+    """
+    if not actions:
+        return
+    if len(actions) > TRANSACT_WRITE_LIMIT:
+        raise ValueError(f"transact_write accepts at most {TRANSACT_WRITE_LIMIT} actions, got {len(actions)}.")
+
+    from botocore.exceptions import ClientError
+
+    kwargs: dict[str, Any] = {"TransactItems": [dict(action) for action in actions]}
+    if client_request_token is not None:
+        kwargs["ClientRequestToken"] = client_request_token
+
+    client = _resource(region_name, endpoint_url).meta.client
+    try:
+        client.transact_write_items(**kwargs)
+    except ClientError as exc:
+        if exc.response.get("Error", {}).get("Code") != _TRANSACTION_CANCELED:
+            raise
+        reasons = exc.response.get("CancellationReasons", [])
+        raise TransactionCanceled(reasons) from exc
 
 
 @lru_cache(maxsize=4)
@@ -378,3 +502,194 @@ class Repository:
             for key in keys:
                 batch.delete_item(Key=dict(key))
         return len(keys)
+
+    def scan(
+        self,
+        *,
+        filter_expression: Any | None = None,
+        limit: int = DEFAULT_PAGE_SIZE,
+        start_key: Item | None = None,
+        index_name: str | None = None,
+        consistent: bool = False,
+        projection: str | None = None,
+        segment: int | None = None,
+        total_segments: int | None = None,
+    ) -> Page:
+        """Read one page of a full table or index scan.
+
+        A scan reads every item and charges for every item read, filtered or not, so reach
+        for `query` whenever a key condition can express the same thing. `segment` and
+        `total_segments` together run one worker of a parallel scan.
+
+        Raises:
+            ValueError: When only one of `segment` and `total_segments` is given, which
+                DynamoDB rejects.
+        """
+        if (segment is None) != (total_segments is None):
+            raise ValueError("A parallel scan needs both segment and total_segments, or neither.")
+
+        kwargs: dict[str, Any] = {"Limit": limit}
+        if index_name is not None:
+            kwargs["IndexName"] = index_name
+        else:
+            kwargs["ConsistentRead"] = consistent
+        if filter_expression is not None:
+            kwargs["FilterExpression"] = filter_expression
+        if start_key is not None:
+            kwargs["ExclusiveStartKey"] = start_key
+        if projection is not None:
+            kwargs["ProjectionExpression"] = projection
+        if segment is not None:
+            kwargs["Segment"] = segment
+            kwargs["TotalSegments"] = total_segments
+
+        response = self.table.scan(**kwargs)
+        return Page(
+            items=[dict(item) for item in response.get("Items", [])],
+            last_evaluated_key=response.get("LastEvaluatedKey"),
+            count=int(response.get("Count", 0)),
+            scanned_count=int(response.get("ScannedCount", 0)),
+        )
+
+    def iter_scan(
+        self,
+        *,
+        max_items: int | None = None,
+        page_size: int = DEFAULT_PAGE_SIZE,
+        **kwargs: Any,
+    ) -> Iterator[Item]:
+        """Yield every item in the table or index, following `LastEvaluatedKey` across pages.
+
+        The scan counterpart of `iter_query`, and the reason neither product should keep its
+        own paging loop: an empty page with a cursor still set is normal after a filter and
+        is the bug a hand-rolled loop reliably has. `max_items` bounds the work, since an
+        unbounded scan of a large table is rarely what was wanted.
+        """
+        yielded = 0
+        start_key: Item | None = kwargs.pop("start_key", None)
+        while True:
+            page = self.scan(limit=page_size, start_key=start_key, **kwargs)
+            for item in page.items:
+                yield item
+                yielded += 1
+                if max_items is not None and yielded >= max_items:
+                    return
+            if not page.has_more:
+                return
+            start_key = page.last_evaluated_key
+
+    def batch_get(
+        self,
+        keys: Sequence[Key],
+        *,
+        consistent: bool = False,
+        projection: str | None = None,
+        max_attempts: int = UNPROCESSED_RETRY_ATTEMPTS,
+    ) -> list[Item]:
+        """Fetch many items by primary key, chunked, retried with backoff, and capped.
+
+        `BatchGetItem` takes at most `BATCH_GET_LIMIT` keys and may return some of them
+        under `UnprocessedKeys` rather than failing, which is DynamoDB shedding load. Those
+        keys are retried with exponential backoff, and after `max_attempts` the call raises
+        `UnprocessedItems` rather than looping: under sustained throttling the same keys can
+        come back unprocessed forever, so an uncapped loop is a hang, not a retry.
+
+        Order is not preserved and a key with no item is simply absent from the result, the
+        same way `get` answers `None`.
+
+        Raises:
+            ValueError: When `max_attempts` is below one.
+            UnprocessedItems: When keys were still unprocessed after the last attempt.
+        """
+        if max_attempts < 1:
+            raise ValueError(f"max_attempts must be at least 1, got {max_attempts}.")
+        if not keys:
+            return []
+
+        import time
+
+        client = _resource(self._region_name, self._endpoint_url).meta.client
+        found: list[Item] = []
+        for chunk in _chunks([dict(key) for key in keys], BATCH_GET_LIMIT):
+            request: dict[str, Any] = {self.table_name: {"Keys": chunk, "ConsistentRead": consistent}}
+            if projection is not None:
+                request[self.table_name]["ProjectionExpression"] = projection
+
+            for attempt in range(max_attempts):
+                response = client.batch_get_item(RequestItems=request)
+                found.extend(dict(item) for item in response.get("Responses", {}).get(self.table_name, []))
+
+                unprocessed: dict[str, Any] = dict(response.get("UnprocessedKeys", {}))
+                pending = list(unprocessed.get(self.table_name, {}).get("Keys", []))
+                if not pending:
+                    break
+                if attempt == max_attempts - 1:
+                    raise UnprocessedItems(self.table_name, len(pending), max_attempts)
+                time.sleep(UNPROCESSED_RETRY_BASE_DELAY * (2**attempt))
+                request = dict(unprocessed)
+        return found
+
+    def put_action(self, item: Item, *, condition: Any | None = None) -> dict[str, Any]:
+        """A `TransactWriteItems` Put action for `item`, for `transact_write`."""
+        action: dict[str, Any] = {"TableName": self.table_name, "Item": encode_numbers(item)}
+        if condition is not None:
+            _apply_condition(action, condition)
+        return {"Put": action}
+
+    def delete_action(self, key: Key, *, condition: Any | None = None) -> dict[str, Any]:
+        """A `TransactWriteItems` Delete action for `key`, for `transact_write`."""
+        action: dict[str, Any] = {"TableName": self.table_name, "Key": dict(key)}
+        if condition is not None:
+            _apply_condition(action, condition)
+        return {"Delete": action}
+
+    def update_action(
+        self,
+        key: Key,
+        *,
+        update_expression: str,
+        expression_values: Mapping[str, Any] | None = None,
+        expression_names: Mapping[str, str] | None = None,
+        condition: Any | None = None,
+    ) -> dict[str, Any]:
+        """A `TransactWriteItems` Update action for `key`, for `transact_write`."""
+        action: dict[str, Any] = {
+            "TableName": self.table_name,
+            "Key": dict(key),
+            "UpdateExpression": update_expression,
+        }
+        if expression_values:
+            action["ExpressionAttributeValues"] = encode_numbers(dict(expression_values))
+        if expression_names:
+            action["ExpressionAttributeNames"] = dict(expression_names)
+        if condition is not None:
+            _apply_condition(action, condition)
+        return {"Update": action}
+
+    def condition_check(self, key: Key, *, condition: Any) -> dict[str, Any]:
+        """A `TransactWriteItems` ConditionCheck on `key`, for `transact_write`.
+
+        The action that asserts something about an item the transaction does not write,
+        which is how a uniqueness reservation is held across a multi-item write.
+        """
+        action: dict[str, Any] = {"TableName": self.table_name, "Key": dict(key)}
+        _apply_condition(action, condition)
+        return {"ConditionCheck": action}
+
+    def transact_write(
+        self,
+        actions: Sequence[Mapping[str, Any]],
+        *,
+        client_request_token: str | None = None,
+    ) -> None:
+        """Run `actions` as one transaction against this repository's client configuration.
+
+        The same call as the module-level `transact_write`, reached from a repository so the
+        region and endpoint match the table's. Actions may name other tables.
+        """
+        transact_write(
+            actions,
+            region_name=self._region_name,
+            endpoint_url=self._endpoint_url,
+            client_request_token=client_request_token,
+        )
