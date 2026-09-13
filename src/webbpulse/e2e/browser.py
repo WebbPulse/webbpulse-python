@@ -8,7 +8,7 @@ carrying the staging gate cookies so the CloudFront function admits the request.
 
 Everything is the synchronous Playwright API, because the suite around it is synchronous
 and a mixed event loop under pytest costs more than it buys. A failing test leaves a
-`trace.zip` and a screenshot under `E2E_BROWSER_ARTIFACTS`, named after the node id, which
+`trace.zip` and a screenshot under `E2E_BROWSER_ARTIFACTS_DIR`, named after the node id, which
 is the difference between a red CI job and a reproducible one.
 
 Importing this module does not import Playwright; the fixtures do, and skip with a clear

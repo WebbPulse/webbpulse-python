@@ -217,7 +217,7 @@ class E2EEnvironment:
             gate_cookie_domain=gate_values["E2E_GATE_COOKIE_DOMAIN"],
             browser_name=browser_name,
             headless=_truthy(source.get("E2E_HEADLESS", "true")),
-            browser_artifacts_dir=source.get("E2E_BROWSER_ARTIFACTS", "").strip(),
+            browser_artifacts_dir=source.get("E2E_BROWSER_ARTIFACTS_DIR", "").strip(),
             browser_timeout_ms=_positive_int(source.get("E2E_BROWSER_TIMEOUT_MS", ""), DEFAULT_BROWSER_TIMEOUT_MS),
             mint_enabled=mint_enabled,
             kms_key_id=source.get("E2E_KMS_KEY_ID", "").strip(),

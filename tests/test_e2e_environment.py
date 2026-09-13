@@ -212,7 +212,7 @@ class TestBrowserSettings:
 
     def test_the_artifacts_directory_is_read(self) -> None:
         """`e2e.yml` uploads this path, so a product may point it somewhere else."""
-        env = E2EEnvironment.from_environ({**COMPLETE, "E2E_BROWSER_ARTIFACTS": "artifacts/browser"})
+        env = E2EEnvironment.from_environ({**COMPLETE, "E2E_BROWSER_ARTIFACTS_DIR": "artifacts/browser"})
         assert env.browser_artifacts_dir == "artifacts/browser"
 
     def test_an_absent_artifacts_directory_is_empty_so_the_default_applies(self) -> None:
