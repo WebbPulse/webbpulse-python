@@ -11,7 +11,7 @@ import re
 
 import pytest
 
-from webbpulse.e2e import E2EEnvironment, MissingEnvironment
+from webbpulse.e2e import E2E_PREFIX, E2EEnvironment, MissingEnvironment
 
 COMPLETE = {
     "E2E_ENVIRONMENT": "staging",
@@ -122,3 +122,18 @@ class TestMissingVariables:
         """The message says where the variables come from, so the fix is one read away."""
         with pytest.raises(MissingEnvironment, match=re.escape("docs/e2e.md")):
             E2EEnvironment.from_environ({})
+
+
+class TestExports:
+    """Tests for the names a product's conftest is documented to import."""
+
+    def test_the_resource_prefix_constant_is_exported(self) -> None:
+        """`docs/e2e.md` has the cleanup hook import this to sweep by prefix."""
+        from webbpulse import e2e
+
+        assert E2E_PREFIX == "e2e-"
+        assert "E2E_PREFIX" in e2e.__all__
+
+    def test_a_run_prefix_starts_with_the_shared_prefix(self) -> None:
+        """The start sweep matches by the shared prefix, so a run prefix must carry it."""
+        assert E2EEnvironment.from_environ(COMPLETE).resource_prefix.startswith(E2E_PREFIX)

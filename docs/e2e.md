@@ -88,6 +88,8 @@ Two files under `e2e/`. The conftest:
 # e2e/conftest.py
 import pytest
 
+from webbpulse.e2e import E2E_PREFIX
+
 from app.main import build_app
 
 pytest_plugins = ["webbpulse.e2e"]
@@ -113,7 +115,7 @@ def cors_request_headers():
 def pytest_e2e_cleanup(env, phase, created):
     """Sweep stale e2e resources at the start and this run's at the end."""
     if phase == "start":
-        return sweep_older_than_an_hour(prefix=env.resource_prefix.rsplit("-", 2)[0] + "-")
+        return sweep_older_than_an_hour(prefix=E2E_PREFIX)
     return delete_all(created)
 ```
 

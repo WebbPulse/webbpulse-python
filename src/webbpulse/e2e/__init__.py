@@ -31,6 +31,8 @@ from .gateway import Operation, Route, fetch_routes, operations_from_openapi
 from .identity import IdentitySession, login, mint
 
 __all__ = [
+    "E2E_PREFIX",
+    "GATE_HEADER",
     "E2EEnvironment",
     "MissingEnvironment",
     "pytest_addhooks",
