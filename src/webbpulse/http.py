@@ -10,6 +10,7 @@ from __future__ import annotations
 import inspect
 import json
 import logging
+import time
 import uuid
 from collections.abc import Awaitable, Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
@@ -23,7 +24,7 @@ from starlette.exceptions import HTTPException as StarletteHTTPException
 from starlette.middleware.base import BaseHTTPMiddleware, RequestResponseEndpoint
 from starlette.responses import Response
 
-from webbpulse.log_context import request_id_var, set_request_id, set_user_id
+from webbpulse.log_context import current_context, request_id_var, set_request_id, set_user_id
 
 if TYPE_CHECKING:  # pragma: no cover
     from webbpulse.config import BaseServiceSettings
@@ -44,6 +45,7 @@ __all__ = [
     "ErrorSpec",
     "ExceptionMap",
     "RequestIdMiddleware",
+    "RequestLoggingMiddleware",
     "bind_user_id",
     "client_ip",
     "create_app",
@@ -81,6 +83,8 @@ DEFAULT_CORS_ALLOW_HEADERS: Final = (
 )
 
 _REQUEST_ID_STATE: Final = "webbpulse_request_id"
+
+_USER_ID_STATE: Final = "webbpulse_user_id"
 
 _STATUS_ERROR_CODES: Final[Mapping[int, str]] = {
     400: "BAD_REQUEST",
@@ -140,16 +144,22 @@ def request_id(request: Request) -> str:
     return value if isinstance(value, str) else "-"
 
 
-async def bind_user_id(user_id: object) -> str:
+async def bind_user_id(user_id: object, request: Request | None = None) -> str:
     """Bind the user id for the rest of the request and return the cleaned string.
 
     Being a coroutine is the point: it runs in the request's own context, unlike the same
     binding made from a sync dependency. Await it; never call it from a `def` dependency.
+
+    Passing `request` also records the id on the request scope, which is what lets the
+    request log report a subject bound inside a route handler.
     """
     set_user_id(user_id)
     from webbpulse.log_context import user_id_var
 
-    return user_id_var.get()
+    cleaned = user_id_var.get()
+    if request is not None:
+        setattr(request.state, _USER_ID_STATE, cleaned)
+    return cleaned
 
 
 def user_id_dependency[UserT](
@@ -165,13 +175,13 @@ def user_id_dependency[UserT](
     or a missing id binds nothing rather than failing the request.
     """
 
-    async def dependency(resolved: Any = Depends(get_user)) -> UserT:
+    async def dependency(request: Request, resolved: Any = Depends(get_user)) -> UserT:
         """Resolve the wrapped dependency, bind its user id, and return it unchanged."""
         user: UserT = resolved
         if user is not None:
             value = extract(user) if extract is not None else getattr(user, attribute, None)
             if value is not None:
-                await bind_user_id(value)
+                await bind_user_id(value, request)
         return user
 
     dependency.__name__ = getattr(get_user, "__name__", "user_id_dependency")
@@ -208,6 +218,85 @@ class RequestIdMiddleware(BaseHTTPMiddleware):
             request_id_var.reset(token)
         response.headers[REQUEST_ID_HEADER] = rid
         return response
+
+
+class RequestLoggingMiddleware:
+    """Emit one structured log line per HTTP request, after the response is decided.
+
+    Pure ASGI rather than `BaseHTTPMiddleware` on purpose: `call_next` runs the application
+    in a child task, whose context a `BaseHTTPMiddleware` cannot read back, so a user id
+    bound by `user_id_dependency` would never reach the line. Only the method, the route
+    template or path, the status, the duration and the bound context are logged; a body, a
+    header, a token and a query string are never touched.
+    """
+
+    def __init__(self, app: Any, *, logger: logging.Logger | None = None) -> None:
+        """Wrap `app`, logging to `logger` or to this module's logger."""
+        self.app = app
+        self._logger = logger if logger is not None else _log
+
+    async def __call__(self, scope: Any, receive: Any, send: Any) -> None:
+        """Time the request and log its outcome, whether it returns or raises."""
+        if scope.get("type") != "http":
+            await self.app(scope, receive, send)
+            return
+
+        started = time.perf_counter()
+        status: dict[str, int | None] = {"code": None}
+
+        async def send_wrapper(message: Any) -> None:
+            """Capture the response status as the response starts."""
+            if message.get("type") == "http.response.start":
+                status["code"] = message.get("status")
+            await send(message)
+
+        try:
+            await self.app(scope, receive, send_wrapper)
+        except Exception:
+            self._emit(scope, status["code"] or 500, started)
+            raise
+        else:
+            self._emit(scope, status["code"], started)
+
+    def _emit(self, scope: Any, status_code: int | None, started: float) -> None:
+        """Write the line, merging the bound request and user ids."""
+        extra: dict[str, Any] = {
+            "http_method": scope.get("method"),
+            "http_path": _route_path(scope),
+            "http_status": status_code,
+            "duration_ms": round((time.perf_counter() - started) * 1000, 2),
+        }
+        extra.update(current_context())
+        extra.setdefault("request_id", request_id_var.get())
+        subject = _scope_user_id(scope)
+        if subject is not None:
+            extra["user_id"] = subject
+        self._logger.info("request", extra=extra)
+
+
+def _route_path(scope: Mapping[str, Any]) -> str | None:
+    """The matched route template, falling back to the raw path.
+
+    The template is preferred so an id in the path does not give every request its own
+    distinct value, which would make the lines impossible to aggregate.
+    """
+    route = scope.get("route")
+    template = getattr(route, "path", None)
+    if isinstance(template, str) and template:
+        root = scope.get("root_path") or ""
+        return f"{root}{template}" if isinstance(root, str) else template
+    path = scope.get("path")
+    return path if isinstance(path, str) else None
+
+
+def _scope_user_id(scope: Mapping[str, Any]) -> str | None:
+    """The subject recorded on the request scope by `bind_user_id`, when there is one."""
+    state = scope.get("state")
+    if isinstance(state, Mapping):
+        value = state.get(_USER_ID_STATE)
+        if isinstance(value, str) and value and value != "-":
+            return value
+    return None
 
 
 def health_router(*, service: str, version: str, checks: Mapping[str, Any] | None = None) -> APIRouter:
@@ -899,6 +988,7 @@ def create_app(
     router_prefix: str = "",
     include_health: bool = True,
     instrument: bool = True,
+    request_log: bool = True,
     error_codes: bool = False,
     validation_details: bool = False,
     error_envelope: ErrorEnvelope | None = None,
@@ -909,7 +999,9 @@ def create_app(
 ) -> FastAPI:
     """Build one domain's FastAPI application.
 
-    Adds CORS, the request id middleware, the structured error handlers and `GET /health`.
+    Adds CORS, the request id middleware, the request log, the structured error handlers
+    and `GET /health`. Set `request_log=False` where the API Gateway access log is the only
+    per-request record a service wants.
     CORS origins come from `settings` or `cors_allow_origins`, and must be exact when
     credentials are allowed. `cors_allow_headers` replaces `DEFAULT_CORS_ALLOW_HEADERS`,
     which covers the request id and retry attempt headers the API clients send.
@@ -936,6 +1028,8 @@ def create_app(
 
     app = FastAPI(title=title, version=version, **fastapi_kwargs)
 
+    if request_log:
+        app.add_middleware(RequestLoggingMiddleware)
     app.add_middleware(RequestIdMiddleware)
     if origins:
         app.add_middleware(
