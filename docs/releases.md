@@ -5,14 +5,15 @@ the package is in [migration-notes.md](migration-notes.md). Back to the [README]
 
 ## CI and releases
 
-`.github/workflows/ci.yml` calls `WebbPulse/.github/.github/workflows/python-ci.yml@v1` on
+`.github/workflows/ci.yml` calls `WebbPulse/.github/.github/workflows/python-ci.yml@v3` on
 every push and pull request, overriding the inputs that assume a backend service: this
-package sits at the repository root and installs from `pyproject.toml`. A second job in the
-same file runs mypy, because the reusable workflow has no type checking step and this
-package ships `py.typed`, so its annotations are part of its contract.
+package sits at the repository root. The workflow installs with `uv sync --locked` from the
+committed `uv.lock` and runs mypy in its own typecheck job, because this package ships
+`py.typed`, so its annotations are part of its contract. No CodeArtifact inputs are passed:
+this package has no private dependencies of its own.
 
 `.github/workflows/publish.yml` calls
-`WebbPulse/.github/.github/workflows/codeartifact-publish-python.yml@v1` on `v*` tags,
+`WebbPulse/.github/.github/workflows/codeartifact-publish-python.yml@v3` on `v*` tags,
 publishing to CodeArtifact domain `webbpulse`, repository `python`, in `us-west-2`. That
 workflow is idempotent: it looks the version up first and skips with a notice rather than
 failing, so re-running an already released tag stays green.

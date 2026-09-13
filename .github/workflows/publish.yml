@@ -11,7 +11,7 @@ permissions:
 jobs:
   publish:
     name: Publish the package to CodeArtifact
-    uses: WebbPulse/.github/.github/workflows/codeartifact-publish-python.yml@v1
+    uses: WebbPulse/.github/.github/workflows/codeartifact-publish-python.yml@v3
     permissions:
       contents: read
       id-token: write

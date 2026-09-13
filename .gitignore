@@ -10,4 +10,3 @@ dist/
 .mypy_cache/
 .coverage
 htmlcov/
-uv.lock
