@@ -20,15 +20,15 @@ aws codeartifact login --tool pip \
 pip install "webbpulse[fastapi,dynamodb,otel]"
 ```
 
-For local work on the package itself:
+For local work on the package itself, uv owns the environment from `pyproject.toml` and the
+committed `uv.lock`, and CI runs these same commands:
 
 ```bash
-python3.13 -m venv .venv
-.venv/bin/pip install -e ".[aws-otel,dynamodb,fastapi,identity,oauth,otel,passkeys,security,testing]" \
-  mypy ruff pytest-cov "boto3-stubs[dynamodb,kms,secretsmanager]" botocore-stubs
-.venv/bin/ruff check . && .venv/bin/ruff format --check .
-.venv/bin/mypy
-.venv/bin/pytest
+uv sync --locked
+source .venv/bin/activate
+ruff check src tests && ruff format --check src tests
+mypy
+python -m pytest -n auto --cov=webbpulse
 ```
 
 The base install carries only `pydantic` and `pydantic-settings`. Everything else is opt-in:
