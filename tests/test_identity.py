@@ -10,7 +10,6 @@ from typing import Any
 import pytest
 
 from webbpulse.identity import (
-    DIGEST_MESSAGE_TYPE,
     JWS_ALGORITHM,
     KMS_SIGNING_ALGORITHM,
     KmsSigner,
@@ -22,21 +21,16 @@ from webbpulse.identity import (
     mint_test_token,
     public_jwk_from_kms,
 )
+from webbpulse.testing import FakeKms
 
 cryptography = pytest.importorskip("cryptography")
 
-from cryptography.hazmat.primitives import hashes, serialization  # noqa: E402
-from cryptography.hazmat.primitives.asymmetric import padding, rsa  # noqa: E402
+from cryptography.hazmat.primitives import serialization  # noqa: E402
+from cryptography.hazmat.primitives.asymmetric import rsa  # noqa: E402
 
 KEY_ID = "arn:aws:kms:us-west-2:111122223333:key/11111111-2222-3333-4444-555555555555"
 ISSUER = "https://api.staging.example.com"
 AUDIENCE = "webbpulse-staging"
-
-
-@pytest.fixture(scope="module")
-def rsa_key() -> rsa.RSAPrivateKey:
-    """One 2048-bit key for the module. Generation is slow enough to be worth sharing."""
-    return rsa.generate_private_key(public_exponent=65537, key_size=2048)
 
 
 @pytest.fixture(scope="module")
@@ -46,56 +40,6 @@ def der_spki(rsa_key: rsa.RSAPrivateKey) -> bytes:
         encoding=serialization.Encoding.DER,
         format=serialization.PublicFormat.SubjectPublicKeyInfo,
     )
-
-
-class FakeKms:
-    """A KMS client that signs for real, with the private key held locally.
-
-    It signs the digest it is given without re-hashing it and returns the raw
-    PKCS #1 signature octet string, matching the documented KMS contract.
-    """
-
-    def __init__(self, key: rsa.RSAPrivateKey, der: bytes, *, key_spec: str = "RSA_2048"):
-        """Hold the signing key, its DER SPKI and the key spec to report."""
-        self._key = key
-        self._der = der
-        self._key_spec = key_spec
-        self.sign_calls: list[dict[str, Any]] = []
-
-    def get_public_key(self, *, KeyId: str) -> dict[str, Any]:
-        """Return a `kms:GetPublicKey` shaped response for the local key."""
-        return {
-            "KeyId": KeyId,
-            "PublicKey": self._der,
-            "KeySpec": self._key_spec,
-            "KeyUsage": "SIGN_VERIFY",
-            "SigningAlgorithms": [KMS_SIGNING_ALGORITHM],
-        }
-
-    def sign(self, *, KeyId: str, Message: bytes, MessageType: str, SigningAlgorithm: str) -> dict[str, Any]:
-        """Record the call and return a real PKCS #1 v1.5 signature over the digest."""
-        self.sign_calls.append(
-            {
-                "KeyId": KeyId,
-                "Message": Message,
-                "MessageType": MessageType,
-                "SigningAlgorithm": SigningAlgorithm,
-            }
-        )
-        assert MessageType == DIGEST_MESSAGE_TYPE
-        assert SigningAlgorithm == KMS_SIGNING_ALGORITHM
-        signature = self._key.sign(
-            Message,
-            padding.PKCS1v15(),
-            cryptography.hazmat.primitives.asymmetric.utils.Prehashed(hashes.SHA256()),
-        )
-        return {"KeyId": KeyId, "Signature": signature, "SigningAlgorithm": SigningAlgorithm}
-
-
-@pytest.fixture
-def fake_kms(rsa_key: rsa.RSAPrivateKey, der_spki: bytes) -> FakeKms:
-    """Return a fresh locally signing KMS stand-in for one test."""
-    return FakeKms(rsa_key, der_spki)
 
 
 def test_pyjwt_verifies_a_kms_shaped_token_against_the_jwk(fake_kms: FakeKms) -> None:

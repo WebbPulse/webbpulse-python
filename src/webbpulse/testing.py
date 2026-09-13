@@ -1,15 +1,17 @@
 """Pytest fixtures for services built on this package.
 
 Enable them with `pytest_plugins = ["webbpulse.testing"]`. They cover a moto-backed
-DynamoDB table and a `TestClient` whose requests carry a realistic API Gateway request
-context. Import only from tests; it needs the `testing` extra.
+DynamoDB table, a `TestClient` whose requests carry a realistic API Gateway request
+context, and a locally signing KMS stand-in. Import only from tests; it needs the
+`testing` extra, and `FakeKms` additionally needs `cryptography`, which the `identity`
+extra brings in.
 """
 
 from __future__ import annotations
 
 import json
 import os
-from collections.abc import Iterator, Mapping
+from collections.abc import Collection, Iterator, Mapping
 from typing import TYPE_CHECKING, Any
 
 import pytest
@@ -20,11 +22,14 @@ if TYPE_CHECKING:  # pragma: no cover
     from mypy_boto3_dynamodb.service_resource import Table
 
 __all__ = [
+    "FakeKms",
     "aws_credentials",
     "create_table",
     "dynamodb_resource",
+    "fake_kms",
     "make_request_context_headers",
     "rate_limit_table",
+    "rsa_key",
     "test_client",
 ]
 
@@ -186,3 +191,141 @@ def test_client() -> Iterator[Any]:
     yield factory
     for client in clients:
         client.close()
+
+
+class FakeKms:
+    """A stand-in for the KMS client the identity token service signs with.
+
+    It signs for real with private keys held in the process, so a token it mints verifies
+    against the JWKs built from the same keys and a test can assert on the whole chain
+    rather than on a stubbed signature. It implements the two calls the token service makes,
+    `get_public_key` and `sign`, with KMS's own keyword-only argument spelling.
+
+    Signing is over the digest the caller passes, without re-hashing it, which is what
+    `MessageType="DIGEST"` means in the KMS contract, and the signature is the raw PKCS #1
+    v1.5 octet string KMS returns.
+    """
+
+    def __init__(
+        self,
+        keys: Any,
+        der: bytes | None = None,
+        *,
+        key_spec: str = "RSA_2048",
+        failing: Collection[str] = (),
+    ) -> None:
+        """Hold the signing keys and what to report about them.
+
+        Args:
+            keys: One `RSAPrivateKey`, or a mapping of key id to `RSAPrivateKey` for a test
+                that rotates or serves several. A single key answers for every key id asked
+                for, which is what a single-key test wants.
+            der: The DER SubjectPublicKeyInfo to report for a single key. Derived from the
+                key when omitted; pass it only to report a public key that does not match
+                what the fake signs with.
+            key_spec: The `KeySpec` to report. `RSA_2048` matches `KMS_KEY_SPEC`.
+            failing: Key ids whose `get_public_key` raises, for exercising the token
+                service's handling of a signing key that has gone away.
+
+        Raises:
+            ValueError: When `der` is passed alongside a mapping of keys, where it could
+                only apply to one of them.
+        """
+        if isinstance(keys, Mapping):
+            if der is not None:
+                raise ValueError("der applies to a single key; with a key mapping the DER is derived per key.")
+            self._keys: dict[str, Any] = dict(keys)
+            self._single: Any | None = None
+        else:
+            self._keys = {}
+            self._single = keys
+        self._der = der
+        self._key_spec = key_spec
+        self._failing = frozenset(failing)
+        self.get_public_key_calls: list[str] = []
+        self.sign_calls: list[dict[str, Any]] = []
+
+    def _key_for(self, key_id: str) -> Any:
+        """The private key serving `key_id`, or raise `KeyError` for an unknown one."""
+        if self._single is not None:
+            return self._single
+        return self._keys[key_id]
+
+    def der_for(self, key_id: str) -> bytes:
+        """The DER SubjectPublicKeyInfo this fake reports for `key_id`.
+
+        Useful for asserting on a `kid`, which `kid_for_der` derives from exactly these
+        bytes.
+        """
+        if self._single is not None and self._der is not None:
+            return self._der
+        from cryptography.hazmat.primitives import serialization
+
+        public_bytes: bytes = (
+            self._key_for(key_id)
+            .public_key()
+            .public_bytes(
+                encoding=serialization.Encoding.DER,
+                format=serialization.PublicFormat.SubjectPublicKeyInfo,
+            )
+        )
+        return public_bytes
+
+    def get_public_key(self, *, KeyId: str) -> dict[str, Any]:
+        """Answer the `kms:GetPublicKey` shape for one key, recording the call.
+
+        Raises `RuntimeError` naming the key when it is in `failing`, standing in for the
+        `NotFoundException` a deleted key produces.
+        """
+        self.get_public_key_calls.append(KeyId)
+        if KeyId in self._failing:
+            raise RuntimeError(f"NotFoundException: key {KeyId} does not exist")
+
+        from webbpulse.identity import KMS_SIGNING_ALGORITHM
+
+        return {
+            "KeyId": KeyId,
+            "PublicKey": self.der_for(KeyId),
+            "KeySpec": self._key_spec,
+            "KeyUsage": "SIGN_VERIFY",
+            "SigningAlgorithms": [KMS_SIGNING_ALGORITHM],
+        }
+
+    def sign(self, *, KeyId: str, Message: bytes, MessageType: str, SigningAlgorithm: str) -> dict[str, Any]:
+        """Sign the prehashed message the way KMS would, recording the call.
+
+        The arguments are recorded on `sign_calls` before signing, so a test can assert the
+        token service asked for `DIGEST` and `RSASSA_PKCS1_V1_5_SHA_256` rather than
+        trusting that it did.
+        """
+        from cryptography.hazmat.primitives import hashes
+        from cryptography.hazmat.primitives.asymmetric import padding, utils
+
+        self.sign_calls.append(
+            {
+                "KeyId": KeyId,
+                "Message": Message,
+                "MessageType": MessageType,
+                "SigningAlgorithm": SigningAlgorithm,
+            }
+        )
+        signature = self._key_for(KeyId).sign(Message, padding.PKCS1v15(), utils.Prehashed(hashes.SHA256()))
+        return {"KeyId": KeyId, "Signature": signature, "SigningAlgorithm": SigningAlgorithm}
+
+
+@pytest.fixture
+def fake_kms(rsa_key: Any) -> FakeKms:
+    """A locally signing KMS stand-in for one test, over the module's shared RSA key.
+
+    Depends on `rsa_key`, so a module wanting several keys builds `FakeKms` directly with a
+    mapping rather than through this fixture.
+    """
+    return FakeKms(rsa_key)
+
+
+@pytest.fixture(scope="module")
+def rsa_key() -> Any:
+    """One 2048-bit RSA key for the module. Generation is slow enough to be worth sharing."""
+    from cryptography.hazmat.primitives.asymmetric import rsa
+
+    return rsa.generate_private_key(public_exponent=65537, key_size=2048)
