@@ -559,9 +559,9 @@ class IdentityFlows:
 
         Requires the current password, because a token proves the session and not the person.
         `keep_family_id` spares the caller's own family. `family_ids` names the families to
-        revoke, for the same reason `logout_all` takes them: a store with no user index
-        cannot enumerate them, and then nothing but the named families is revoked. Returns
-        the number of records revoked.
+        revoke, for the same reason `logout_all` takes them: a store whose table carries no
+        user index cannot enumerate them, and then nothing but the named families is revoked.
+        Returns the number of records revoked.
         """
         credential = self._stores.require_credentials().get(user_id, PASSWORD_CREDENTIAL_TYPE)
         presented = normalise_password(current_password)
@@ -845,8 +845,8 @@ class IdentityFlows:
     ) -> int:
         """Revoke every family for a user. The sign-out-everywhere button.
 
-        See `SessionService.revoke_all_for_user` for why the family ids may have to come
-        from the caller: `refresh-tokens` carries no user index by design. `presented` is a
+        See `SessionService.revoke_all_for_user` for when the family ids have to come from
+        the caller, which is a store whose table carries no user index. `presented` is a
         refresh token whose own family is resolved through the store and revoked too.
         """
         targets = list(family_ids) if family_ids is not None else None

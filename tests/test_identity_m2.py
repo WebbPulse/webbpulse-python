@@ -1521,3 +1521,188 @@ def test_family_of_resolves_a_presented_refresh_token(sessions: SessionService) 
     assert sessions.family_of(issued.token) == issued.family_id
     assert sessions.family_of("not-a-token") == ""
     assert sessions.family_of("") == ""
+
+
+def _create_refresh_tokens_table(resource: Any, name: str, *, user_index: bool = True) -> Any:
+    """Create the `refresh-tokens` table as the identity Terraform module shapes it.
+
+    `user_index=False` reproduces a table provisioned before v2.16.0 of the module, which
+    carries the family index alone.
+    """
+    attributes = [
+        {"AttributeName": "token_hash", "AttributeType": "S"},
+        {"AttributeName": "family_id", "AttributeType": "S"},
+        {"AttributeName": "generation", "AttributeType": "N"},
+    ]
+    indexes: list[dict[str, Any]] = [
+        {
+            "IndexName": "family_id-generation-index",
+            "KeySchema": [
+                {"AttributeName": "family_id", "KeyType": "HASH"},
+                {"AttributeName": "generation", "KeyType": "RANGE"},
+            ],
+            "Projection": {"ProjectionType": "ALL"},
+        }
+    ]
+    if user_index:
+        attributes.append({"AttributeName": "user_id", "AttributeType": "S"})
+        indexes.append(
+            {
+                "IndexName": "user_id-family_id-index",
+                "KeySchema": [
+                    {"AttributeName": "user_id", "KeyType": "HASH"},
+                    {"AttributeName": "family_id", "KeyType": "RANGE"},
+                ],
+                "Projection": {"ProjectionType": "KEYS_ONLY"},
+            }
+        )
+
+    table = resource.create_table(
+        TableName=name,
+        KeySchema=[{"AttributeName": "token_hash", "KeyType": "HASH"}],
+        AttributeDefinitions=attributes,
+        GlobalSecondaryIndexes=indexes,
+        BillingMode="PAY_PER_REQUEST",
+    )
+    table.wait_until_exists()
+    return table
+
+
+@pytest.fixture
+def dynamo_refresh_store(dynamodb_resource: Any) -> Any:
+    """A `DynamoRefreshTokenStore` over a moto-backed table carrying the user index."""
+    from webbpulse.dynamodb import Repository
+    from webbpulse.identity.storage import DynamoRefreshTokenStore
+
+    _create_refresh_tokens_table(dynamodb_resource, "refresh-tokens")
+    return DynamoRefreshTokenStore(Repository("refresh-tokens", prefix="", region_name="us-west-2"))
+
+
+def _seed_family(store: Any, *, user_id: str, family_id: str, generations: int = 1) -> list[str]:
+    """Write `generations` records of one family and return their token hashes."""
+    from webbpulse.identity.storage import RefreshTokenRecord
+
+    hashes = []
+    for generation in range(generations):
+        token_hash = f"{family_id}-gen{generation}"
+        store.put(
+            RefreshTokenRecord(
+                token_hash=token_hash,
+                family_id=family_id,
+                user_id=user_id,
+                generation=generation,
+                created_at="2026-09-13T00:00:00Z",
+                expires_at=4_102_444_800,
+            )
+        )
+        hashes.append(token_hash)
+    return hashes
+
+
+def test_revoke_all_for_user_revokes_every_family_through_the_user_index(dynamo_refresh_store: Any) -> None:
+    """Sign out everywhere revokes every generation of every family the user holds."""
+    _seed_family(dynamo_refresh_store, user_id=USER_ID, family_id="fam-a", generations=2)
+    _seed_family(dynamo_refresh_store, user_id=USER_ID, family_id="fam-b", generations=3)
+
+    assert dynamo_refresh_store.revoke_all_for_user(USER_ID) == 5
+    assert all(dynamo_refresh_store.get(h).revoked for h in ("fam-a-gen0", "fam-a-gen1", "fam-b-gen2"))
+
+
+def test_revoke_all_for_user_spares_the_excepted_family(dynamo_refresh_store: Any) -> None:
+    """A password change spares the family it was made from, which just re-proved the password."""
+    _seed_family(dynamo_refresh_store, user_id=USER_ID, family_id="here", generations=2)
+    _seed_family(dynamo_refresh_store, user_id=USER_ID, family_id="elsewhere", generations=2)
+
+    assert dynamo_refresh_store.revoke_all_for_user(USER_ID, except_family_id="here") == 2
+    assert not dynamo_refresh_store.get("here-gen0").revoked
+    assert not dynamo_refresh_store.get("here-gen1").revoked
+    assert dynamo_refresh_store.get("elsewhere-gen0").revoked
+    assert dynamo_refresh_store.get("elsewhere-gen1").revoked
+
+
+def test_revoke_all_for_user_leaves_another_user_alone(dynamo_refresh_store: Any) -> None:
+    """The index query is scoped to one user, so nobody else is signed out."""
+    _seed_family(dynamo_refresh_store, user_id=USER_ID, family_id="mine")
+    _seed_family(dynamo_refresh_store, user_id="other-user", family_id="theirs")
+
+    assert dynamo_refresh_store.revoke_all_for_user(USER_ID) == 1
+    assert not dynamo_refresh_store.get("theirs-gen0").revoked
+
+
+def test_revoke_all_for_user_counts_only_what_it_changed(dynamo_refresh_store: Any) -> None:
+    """An already-revoked record is not counted twice, which a KEYS_ONLY read cannot see."""
+    _seed_family(dynamo_refresh_store, user_id=USER_ID, family_id="fam", generations=3)
+    assert dynamo_refresh_store.revoke_all_for_user(USER_ID) == 3
+
+    assert dynamo_refresh_store.revoke_all_for_user(USER_ID) == 0
+
+
+def test_revoke_all_for_user_pages_through_a_large_result(dynamo_refresh_store: Any) -> None:
+    """The query follows LastEvaluatedKey, so a user with many families is fully revoked."""
+    for index in range(60):
+        _seed_family(dynamo_refresh_store, user_id=USER_ID, family_id=f"fam-{index:03d}")
+
+    assert dynamo_refresh_store.revoke_all_for_user(USER_ID) == 60
+    assert dynamo_refresh_store.get("fam-059-gen0").revoked
+
+
+def test_revoke_all_for_user_returns_zero_for_a_user_with_no_sessions(dynamo_refresh_store: Any) -> None:
+    """A user who never signed in revokes nothing and does not fail."""
+    assert dynamo_refresh_store.revoke_all_for_user("nobody") == 0
+
+
+def test_the_store_reads_the_index_name_from_the_environment(
+    dynamodb_resource: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """`IDENTITY_REFRESH_USER_INDEX` names the index, which is what the module sets."""
+    from webbpulse.dynamodb import Repository
+    from webbpulse.identity.storage import REFRESH_USER_INDEX_ENV, DynamoRefreshTokenStore
+
+    _create_refresh_tokens_table(dynamodb_resource, "refresh-tokens")
+    monkeypatch.setenv(REFRESH_USER_INDEX_ENV, "user_id-family_id-index")
+    store = DynamoRefreshTokenStore(Repository("refresh-tokens", prefix="", region_name="us-west-2"))
+    _seed_family(store, user_id=USER_ID, family_id="fam")
+
+    assert store.revoke_all_for_user(USER_ID) == 1
+
+
+def test_a_store_built_with_no_index_still_raises_not_implemented(dynamodb_resource: Any) -> None:
+    """A table provisioned before the index exists keeps the graceful path.
+
+    `SessionService.revoke_all_for_user` turns this into nothing revoked and a warning,
+    rather than a 500 on a password change.
+    """
+    from webbpulse.dynamodb import Repository
+    from webbpulse.identity.storage import DynamoRefreshTokenStore
+
+    _create_refresh_tokens_table(dynamodb_resource, "refresh-tokens", user_index=False)
+    store = DynamoRefreshTokenStore(Repository("refresh-tokens", prefix="", region_name="us-west-2"), user_index="")
+
+    with pytest.raises(NotImplementedError):
+        store.revoke_all_for_user(USER_ID)
+
+
+def test_the_session_service_reports_nothing_revoked_for_a_store_with_no_index(
+    dynamodb_resource: Any, caplog: pytest.LogCaptureFixture
+) -> None:
+    """The graceful path survives: no index means a warning and zero, never an exception."""
+    from webbpulse.dynamodb import Repository
+    from webbpulse.identity.storage import DynamoRefreshTokenStore
+
+    _create_refresh_tokens_table(dynamodb_resource, "refresh-tokens", user_index=False)
+    store = DynamoRefreshTokenStore(Repository("refresh-tokens", prefix="", region_name="us-west-2"), user_index="")
+    sessions = SessionService(make_settings(), store)
+
+    with caplog.at_level("WARNING"):
+        assert sessions.revoke_all_for_user(USER_ID) == 0
+
+    assert any(record.__dict__.get("event") == "session.revoke_all_unsupported" for record in caplog.records)
+
+
+def test_the_session_service_revokes_through_the_index_when_there_is_one(dynamo_refresh_store: Any) -> None:
+    """With an index the service no longer needs the caller to supply the family ids."""
+    _seed_family(dynamo_refresh_store, user_id=USER_ID, family_id="fam-a")
+    _seed_family(dynamo_refresh_store, user_id=USER_ID, family_id="fam-b")
+    sessions = SessionService(make_settings(), dynamo_refresh_store)
+
+    assert sessions.revoke_all_for_user(USER_ID) == 2

@@ -324,10 +324,10 @@ class SessionService:
     ) -> int:
         """Revoke every family for a user: sign out everywhere.
 
-        `refresh-tokens` carries no user index, so a caller that knows the `family_ids` takes
-        the cheap path. Passing none falls through to the store, and a store that cannot
-        enumerate a user's families reports nothing revoked rather than failing the call:
-        other sessions stay signed in until the session service carries the family list.
+        A caller that already knows the `family_ids` takes the cheap path and revokes each
+        one directly. Passing none falls through to the store, which queries the user index on
+        `refresh-tokens`. A store built against a table with no such index reports nothing
+        revoked rather than failing the call, and those other sessions stay signed in.
         """
         if family_ids is not None:
             return sum(

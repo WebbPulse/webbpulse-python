@@ -5,6 +5,44 @@ Notable changes to the `webbpulse` package. The version here is the one in
 
 This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## 0.26.0
+
+Restores the security property that 0.25.2 could only degrade gracefully: a password change
+or a password reset signs every other device out again.
+
+### `refresh-tokens` has a user index, and the store uses it
+
+0.25.2 stopped `change_password` answering 500, but it did so by reporting nothing revoked.
+The user's other sessions kept working with the old password, which is the behaviour a
+password change exists to prevent. v2.16.0 of the `identity` Terraform module adds
+`user_id-family_id-index` to `refresh-tokens`, and `DynamoRefreshTokenStore.revoke_all_for_user`
+now queries it rather than raising.
+
+The query pages through every family the user holds, skips `except_family_id` so a password
+change spares the session it was made from, and revokes each record with the same point write
+`revoke_family` makes. The index projects `KEYS_ONLY`, which carries `token_hash`, `user_id`
+and `family_id` and nothing else, so the hot rotation path pays for nothing it does not use.
+
+Because a `KEYS_ONLY` row cannot say whether a record is already revoked, the revoking write
+now carries that test as a condition. The returned count is how many records the call
+changed, not how many it saw, and a concurrent revoke is no longer double counted.
+
+### The index name comes from the environment
+
+`DynamoRefreshTokenStore` reads `IDENTITY_REFRESH_USER_INDEX`, which the identity module sets
+from v2.16.0, and falls back to `REFRESH_USER_INDEX` (`user_id-family_id-index`). Both are
+exported from `webbpulse.identity`.
+
+Passing `user_index=""` declares a table with no such index, and then `revoke_all_for_user`
+raises `NotImplementedError` exactly as before. `SessionService.revoke_all_for_user` still
+catches it, logs `session.revoke_all_unsupported` and returns 0, so a product whose table
+predates the index keeps working unchanged.
+
+**Upgrading:** apply the module at v2.16.0 first and let the index backfill report `ACTIVE`
+before deploying this version. DynamoDB builds the index asynchronously and a query against
+it returns partial results until then, which would revoke some of a user's sessions and not
+others.
+
 ## 0.25.2
 
 Fixes a 500 on `POST /api/auth/password`. Changing a password on the DynamoDB-backed

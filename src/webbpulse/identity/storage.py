@@ -9,6 +9,7 @@ from __future__ import annotations
 import dataclasses
 import hashlib
 import hmac
+import os
 import secrets
 from abc import ABC, abstractmethod
 from collections.abc import Iterable, Mapping
@@ -30,6 +31,8 @@ __all__ = [
     "RECOVERY_CODES_TABLE",
     "REFRESH_FAMILY_INDEX",
     "REFRESH_TOKENS_TABLE",
+    "REFRESH_USER_INDEX",
+    "REFRESH_USER_INDEX_ENV",
     "TOTP_FACTORS_TABLE",
     "USERS_TABLE",
     "WEBAUTHN_CHALLENGES_TABLE",
@@ -80,6 +83,10 @@ PASSKEYS_TABLE: Final = "passkeys"
 WEBAUTHN_CHALLENGES_TABLE: Final = "webauthn-challenges"
 
 REFRESH_FAMILY_INDEX: Final = "family_id-generation-index"
+
+REFRESH_USER_INDEX: Final = "user_id-family_id-index"
+
+REFRESH_USER_INDEX_ENV: Final = "IDENTITY_REFRESH_USER_INDEX"
 
 PASSKEY_CREDENTIAL_INDEX: Final = "credential_id-index"
 
@@ -835,9 +842,19 @@ class DynamoRefreshTokenStore(RefreshTokenStore):
     Anything else races, and the reuse detection never fires.
     """
 
-    def __init__(self, repository: Repository) -> None:
-        """Bind this store to the repository holding its table."""
+    def __init__(self, repository: Repository, *, user_index: str | None = None) -> None:
+        """Bind this store to the repository holding its table.
+
+        `user_index` names the index keyed by `user_id` that `revoke_all_for_user` queries.
+        It defaults to the `IDENTITY_REFRESH_USER_INDEX` environment variable, which the
+        identity Terraform module sets, and falls back to `REFRESH_USER_INDEX`. Passing the
+        empty string declares that the table carries no such index, which makes
+        `revoke_all_for_user` raise `NotImplementedError` as it did before the index existed.
+        """
         self._repo = repository
+        self._user_index = (
+            os.environ.get(REFRESH_USER_INDEX_ENV, REFRESH_USER_INDEX) if user_index is None else user_index
+        )
 
     def get(self, token_hash: str) -> RefreshTokenRecord | None:
         """The record for a presented token, expired ones included."""
@@ -901,25 +918,56 @@ class DynamoRefreshTokenStore(RefreshTokenStore):
         )
 
     def revoke_all_for_user(self, user_id: str, *, except_family_id: str = "") -> int:
-        """Revoke every family for a user. What a password reset and "sign out everywhere" call."""
-        raise NotImplementedError(
-            "revoke_all_for_user needs the caller's family ids: `refresh-tokens` carries no "
-            "user index, because indexing the cold path would cost a write on every "
-            "rotation of the hot one. Revoke each family with revoke_family instead. M2 "
-            "adds the family list to the session service that owns it."
+        """Revoke every family for a user. What a password reset and "sign out everywhere" call.
+
+        Queries the user index and pages through it, sparing `except_family_id`. The index
+        projects `KEYS_ONLY`, so a row carries the three key attributes and nothing else; the
+        revoking write is a point update on `token_hash` exactly as `revoke_family` makes, and
+        the already-revoked skip costs a read the projection cannot serve. Raises
+        `NotImplementedError` when the store was built with no index, which
+        `SessionService.revoke_all_for_user` reports as nothing revoked.
+        """
+        from boto3.dynamodb.conditions import Key
+
+        if not self._user_index:
+            raise NotImplementedError(
+                "revoke_all_for_user needs a user index on `refresh-tokens`, and this store "
+                f"was built with none. Set {REFRESH_USER_INDEX_ENV} to the index name, or "
+                "pass the caller's family ids so each is revoked with revoke_family."
+            )
+
+        return self._revoke(
+            item
+            for item in self._repo.iter_query(Key("user_id").eq(user_id), index_name=self._user_index)
+            if item.get("family_id") != except_family_id
         )
 
     def _revoke(self, items: Iterable[Mapping[str, Any]]) -> int:
-        """Mark each item revoked, skipping ones already revoked. Returns how many changed."""
+        """Mark each item revoked, skipping ones already revoked. Returns how many changed.
+
+        A row read from a `KEYS_ONLY` index carries no `revoked` attribute, so the skip cannot
+        be decided from the item alone. The write carries the same test as a condition, and a
+        `ConditionalCheckFailedException` means another caller got there first and is not
+        counted. The count is therefore how many this call changed, not how many it saw.
+        """
+        from boto3.dynamodb.conditions import Attr
+        from botocore.exceptions import ClientError
+
         count = 0
         for item in items:
             if item.get("revoked"):
                 continue
-            self._repo.update(
-                {"token_hash": item["token_hash"]},
-                update_expression="SET revoked = :true",
-                expression_values={":true": True},
-            )
+            try:
+                self._repo.update(
+                    {"token_hash": item["token_hash"]},
+                    update_expression="SET revoked = :true",
+                    expression_values={":true": True},
+                    condition=Attr("revoked").not_exists() | Attr("revoked").eq(False),
+                )
+            except ClientError as exc:
+                if exc.response.get("Error", {}).get("Code") == "ConditionalCheckFailedException":
+                    continue
+                raise
             count += 1
         return count
 
