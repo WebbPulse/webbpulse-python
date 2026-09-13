@@ -31,21 +31,39 @@ from typing import Any
 import pytest
 
 from .access_log import AccessLogLookup
+from .browser import ROOT_SELECTORS, BrowserFailure, ConsoleErrors, FailedRequests, browser_contract, sign_in
 from .client import E2EClient, RateLimitExhausted
 from .frontend import fetch_bundle, missing_allowed_headers, shell_looks_like_an_app
 from .gateway import Operation, Route, matching_route, resolve, route_key_is_expressible
 from .identity import JWKS_PATH, decode_claims, logout, refresh
+from .journeys import (
+    Click,
+    ExpectText,
+    ExpectUrl,
+    ExpectVisible,
+    Fill,
+    Goto,
+    Journey,
+    LoginForm,
+    Record,
+    RouteSpec,
+    expand,
+    url_matches,
+)
 
 __all__ = [
+    "TestBrowser",
     "TestCoverage",
     "TestFrontend",
     "TestHygiene",
     "TestIdentity",
     "TestReachability",
     "TestRouteCut",
+    "journey_id",
     "operation_id",
     "pytest_generate_tests",
     "route_id",
+    "route_spec_id",
 ]
 
 ABSENT_ID = "e2e-obviously-absent-id"
@@ -61,6 +79,19 @@ def route_id(route: Route) -> str:
 def operation_id(operation: Operation) -> str:
     """A junit-legible id for one OpenAPI operation."""
     return operation.label
+
+
+def route_spec_id(spec: RouteSpec) -> str:
+    """A junit-legible id for one declared front-end route."""
+    return spec.label
+
+
+def journey_id(journey: Journey) -> str:
+    """A junit-legible id for one declared product journey."""
+    return journey.label
+
+
+MAX_NAVIGATIONS = 5
 
 
 def _probe_path(route: Route) -> str:
@@ -95,6 +126,11 @@ def pytest_generate_tests(metafunc: pytest.Metafunc) -> None:
     operation becomes its own junit case, so a failure names the route key or the operation
     instead of the first assertion that tripped.
     """
+    browser_names = ("declared_route", "protected_route", "guest_only_route", "journey")
+    if any(name in metafunc.fixturenames for name in browser_names):
+        _parametrise_browser_cases(metafunc)
+    if not any(name in metafunc.fixturenames for name in ("live_route", "operation")):
+        return
     inputs = collection_inputs(metafunc.config)
     if "live_route" in metafunc.fixturenames:
         routes = inputs.routes
@@ -102,6 +138,38 @@ def pytest_generate_tests(metafunc: pytest.Metafunc) -> None:
     if "operation" in metafunc.fixturenames:
         operations = inputs.operations
         metafunc.parametrize("operation", operations, ids=[operation_id(op) for op in operations])
+
+
+def _parametrise_browser_cases(metafunc: pytest.Metafunc) -> None:
+    """Parametrise the browser cases from the three product hooks, gathered once.
+
+    An empty declaration parametrises with nothing and marks the case skipped rather than
+    leaving an unparametrised fixture behind, which would error as a missing fixture and
+    read as a broken plugin rather than as a product that declared no routes.
+    """
+    from . import E2EEnvironment
+
+    contract = browser_contract(metafunc.config, E2EEnvironment.from_environ())
+    declared: dict[str, tuple[RouteSpec, ...] | tuple[Journey, ...]] = {
+        "declared_route": contract.routes,
+        "protected_route": tuple(spec for spec in contract.routes if spec.access == "protected"),
+        "guest_only_route": tuple(spec for spec in contract.routes if spec.access == "guest-only"),
+        "journey": contract.journeys,
+    }
+    reasons = {
+        "declared_route": "pytest_e2e_routes declared no routes",
+        "protected_route": "pytest_e2e_routes declared no protected routes",
+        "guest_only_route": "pytest_e2e_routes declared no guest-only routes",
+        "journey": "pytest_e2e_journeys declared no journeys",
+    }
+    for name, values in declared.items():
+        if name not in metafunc.fixturenames:
+            continue
+        if not values:
+            metafunc.parametrize(name, [pytest.param(None, marks=pytest.mark.skip(reason=reasons[name]))])
+            continue
+        ids = [value.label for value in values]
+        metafunc.parametrize(name, list(values), ids=ids)
 
 
 class CollectionInputs:
@@ -554,6 +622,244 @@ class TestHygiene:
     def test_created_resources_are_tracked(self, created_resources: list[Any]) -> None:
         """The `created_resources` list exists for products to append to."""
         assert isinstance(created_resources, list)
+
+
+class TestBrowser:
+    """Group 7: the deployed SPA driven the way a person drives it.
+
+    Everything above proves the API answers and the shell downloads. None of it proves the
+    app renders, that a route guard sends an anonymous visitor to the login page rather
+    than unmounting it, or that signing in through the real form still works. Those are
+    exactly the failures that ship green, because a blank page is a 200.
+
+    Every case here skips with a reason when the product declares no contract for it, so a
+    product adopting the plugin gets the API groups immediately and the browser groups as
+    it adds the hooks.
+    """
+
+    def test_sign_in_and_out_through_the_ui(
+        self,
+        request: pytest.FixtureRequest,
+        page: Any,
+        login_form: LoginForm,
+        e2e_env: Any,
+        console_errors: ConsoleErrors,
+    ) -> None:
+        """Signing in shows the signed-in marker, signing out takes it away, and the guard returns.
+
+        The reload at the end is the part worth having: an app that clears its in-memory
+        session on sign-out but leaves a token in storage looks signed out until the next
+        page load, which is when a person discovers they never were.
+        """
+        sign_in(page, login_form, e2e_env)
+        assert page.locator(login_form.signed_in_marker).is_visible(), (
+            f"{login_form.signed_in_marker} is not visible after signing in as the durable e2e user"
+        )
+
+        page.click(login_form.sign_out)
+        page.wait_for_selector(login_form.signed_out_marker, state="visible", timeout=e2e_env.browser_timeout_ms)
+        assert not console_errors, f"signing in and out logged console errors: {console_errors.summary()}"
+
+        declared = browser_contract(request.config, e2e_env).routes
+        protected = _first_with_access(declared, "protected")
+        if protected is None:
+            pytest.skip("no protected route is declared, so there is no guard to reload against")
+        page.goto(protected.path, wait_until="domcontentloaded")
+        page.wait_for_timeout(500)
+        assert _path_of(page.url) != protected.path, (
+            f"after signing out, reloading {protected.path} still rendered it rather than "
+            f"redirecting to {login_form.anonymous_redirect}. A session cleared in memory "
+            "but left in storage reads as signed out until the next page load."
+        )
+
+    def test_protected_routes_redirect_anonymous_visitors(
+        self,
+        protected_route: RouteSpec,
+        page: Any,
+        login_form: LoginForm,
+        e2e_env: Any,
+    ) -> None:
+        """An anonymous visit to a protected route lands on the login path, with no loop."""
+        landing = _settle(page, protected_route.path, e2e_env)
+        assert landing.startswith(login_form.anonymous_redirect), (
+            f"an anonymous visit to {protected_route.path} settled on {landing}, not on "
+            f"{login_form.anonymous_redirect}. A guard that renders the protected route to "
+            "an anonymous visitor is the whole reason this case exists."
+        )
+
+    def test_guest_only_routes_redirect_signed_in_users(
+        self,
+        guest_only_route: RouteSpec,
+        signed_in_page: Any,
+        login_form: LoginForm,
+        e2e_env: Any,
+    ) -> None:
+        """A signed-in visit to a guest-only route lands on the signed-in landing path."""
+        landing = _settle(signed_in_page, guest_only_route.path, e2e_env)
+        assert landing.startswith(login_form.guest_redirect), (
+            f"a signed-in visit to {guest_only_route.path} settled on {landing}, not on "
+            f"{login_form.guest_redirect}. A guest guard that waits on a loading flag "
+            "before redirecting shows the login form to someone already signed in."
+        )
+
+    def test_declared_routes_render_clean(
+        self,
+        declared_route: RouteSpec,
+        request: pytest.FixtureRequest,
+        e2e_env: Any,
+        console_errors: ConsoleErrors,
+        failed_requests: FailedRequests,
+    ) -> None:
+        """Every declared route paints children, logs no console error and makes no failed API call.
+
+        A protected route is visited signed in; everything else anonymously, with the 401
+        and 403 an anonymous visit is meant to provoke exempted rather than counted.
+        """
+        signed_in = declared_route.access == "protected"
+        if signed_in:
+            page = request.getfixturevalue("signed_in_page")
+        else:
+            page = request.getfixturevalue("page")
+            failed_requests.ignore_guard_statuses = True
+        console_errors.clear()
+        failed_requests.clear()
+
+        page.goto(declared_route.path, wait_until="domcontentloaded")
+        page.wait_for_timeout(500)
+
+        root = _root_locator(page, declared_route)
+        assert root is not None, (
+            f"{declared_route.path} rendered no mount point matching any of "
+            f"{', '.join(ROOT_SELECTORS)}, so there is nothing on the page to assert about"
+        )
+        assert root.locator("*").count() > 0, (
+            f"{declared_route.path} answered with an empty mount point. A 200 carrying an "
+            "empty root is the shipped blank page, and no server-side probe can see it."
+        )
+        assert not console_errors, f"{declared_route.path} logged console errors: {console_errors.summary()}"
+        assert not failed_requests, f"{declared_route.path} made API calls that failed: {failed_requests.summary()}"
+
+    def test_product_journeys(
+        self,
+        journey: Journey,
+        request: pytest.FixtureRequest,
+        e2e_env: Any,
+        created_resources: list[Any],
+        console_errors: ConsoleErrors,
+    ) -> None:
+        """Run one declared journey's steps against the real UI.
+
+        A mutating journey records what it created as it goes, so the cleanup hook deletes
+        it even when a later step fails. The `Journey` constructor already refuses a
+        mutating journey with no `Record` step, which makes that a collection-time refusal
+        rather than a leak discovered afterwards.
+        """
+        page = request.getfixturevalue("signed_in_page" if journey.signed_in else "page")
+        console_errors.clear()
+        for index, step in enumerate(journey.steps):
+            _run_step(page, step, e2e_env, created_resources, f"{journey.name} step {index + 1}")
+        assert not console_errors, f"journey {journey.name} logged console errors: {console_errors.summary()}"
+
+
+def _run_step(page: Any, step: Any, env: Any, created: list[Any], where: str) -> None:
+    """Execute one journey step, naming the journey and the step index on a failure."""
+    timeout = env.browser_timeout_ms
+    if isinstance(step, Goto):
+        page.goto(expand(step.path, env.run_id), wait_until="domcontentloaded")
+    elif isinstance(step, Click):
+        page.click(step.locator, timeout=timeout)
+    elif isinstance(step, Fill):
+        page.fill(step.locator, expand(step.value, env.run_id), timeout=timeout)
+    elif isinstance(step, ExpectVisible):
+        _expect_visible(page, step.locator, timeout, where)
+    elif isinstance(step, ExpectText):
+        _expect_text(page, step, env, timeout, where)
+    elif isinstance(step, ExpectUrl):
+        _expect_url(page, step, env, timeout, where)
+    elif isinstance(step, Record):
+        created.append(expand(step.resource, env.run_id) if isinstance(step.resource, str) else step.resource)
+    else:
+        raise BrowserFailure(f"{where} is {type(step).__name__}, which is not a journey step")
+
+
+def _expect_visible(page: Any, locator: str, timeout: int, where: str) -> None:
+    """Wait for one locator to become visible, failing with the journey's own name."""
+    try:
+        page.wait_for_selector(locator, state="visible", timeout=timeout)
+    except Exception as error:
+        raise BrowserFailure(f"{where}: {locator} never became visible ({type(error).__name__})") from None
+
+
+def _expect_text(page: Any, step: Any, env: Any, timeout: int, where: str) -> None:
+    """Wait for one locator to contain the expected text."""
+    wanted = expand(step.text, env.run_id)
+    deadline = timeout
+    try:
+        page.wait_for_selector(step.locator, state="visible", timeout=deadline)
+        actual = page.locator(step.locator).inner_text()
+    except Exception as error:
+        raise BrowserFailure(f"{where}: {step.locator} never became visible ({type(error).__name__})") from None
+    assert wanted in actual, f"{where}: {step.locator} reads {actual[:200]!r}, which does not contain {wanted!r}"
+
+
+def _expect_url(page: Any, step: Any, env: Any, timeout: int, where: str) -> None:
+    """Wait until the current URL matches the expected pattern."""
+    pattern = expand(step.pattern, env.run_id)
+    waited = 0
+    while waited < timeout:
+        if url_matches(pattern, page.url):
+            return
+        page.wait_for_timeout(250)
+        waited += 250
+    raise BrowserFailure(f"{where}: the URL settled on {page.url}, which does not match {pattern!r}")
+
+
+def _settle(page: Any, path: str, env: Any) -> str:
+    """Visit a path, follow the guard's redirects and return the path it settled on.
+
+    Navigations are counted and capped, because a pair of guards that each redirect to the
+    other loops until the runner times out, and a timeout says nothing about which guard
+    is wrong.
+    """
+    page.goto(path, wait_until="domcontentloaded")
+    seen = [_path_of(page.url)]
+    for _ in range(MAX_NAVIGATIONS):
+        page.wait_for_timeout(400)
+        current = _path_of(page.url)
+        if current == seen[-1]:
+            return current
+        seen.append(current)
+    raise BrowserFailure(
+        f"visiting {path} never settled: the app navigated more than {MAX_NAVIGATIONS} "
+        f"times, through {' -> '.join(seen)}. That is a redirect loop between two guards, "
+        "not a slow page."
+    )
+
+
+def _path_of(url: str) -> str:
+    """The path and query of a URL, which is what a declared route is written as."""
+    from urllib.parse import urlsplit
+
+    parts = urlsplit(url)
+    return parts.path or "/"
+
+
+def _root_locator(page: Any, spec: RouteSpec) -> Any:
+    """The mount point to assert children under, honouring a route's own override."""
+    candidates = (spec.root_locator,) if spec.root_locator else ROOT_SELECTORS
+    for selector in candidates:
+        locator = page.locator(selector).first
+        if locator.count() > 0:
+            return locator
+    return None
+
+
+def _first_with_access(specs: Sequence[RouteSpec], access: str) -> RouteSpec | None:
+    """The first declared route at a given access level, or None."""
+    for spec in specs:
+        if spec.access == access:
+            return spec
+    return None
 
 
 def _decoded(token: str) -> tuple[Mapping[str, Any], Mapping[str, Any]]:

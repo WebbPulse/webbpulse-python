@@ -5,6 +5,40 @@ Notable changes to the `webbpulse` package. The version here is the one in
 
 This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## 0.30.0
+
+Adds the browser layer to `webbpulse.e2e`, so the post-deploy suite exercises the deployed UI
+and not only the API behind it.
+
+`webbpulse.e2e.gate` signs the staging web gate's CloudFront cookies. `mint_gate_cookies`
+reads the RSA key from SSM with decryption and builds the same custom policy the gate's login
+Lambda builds, byte for byte, because the CloudFront viewer function regex-matches the decoded
+policy. The `gate_cookies` fixture yields them for the session, or None when no gate is
+configured, and the `http` fixture now carries them so the frontend checks reach the origin
+through the gate rather than bouncing off it. The policy and the signature are kept out of the
+dataclass repr, so a failure report cannot leak a live session.
+
+`webbpulse.e2e.browser` supplies the `playwright`, `browser`, `context`, `page`,
+`console_errors`, `failed_requests`, `login_form` and `signed_in_page` fixtures. The context
+carries the gate cookies and the web base URL and records a trace; a failing test writes that
+trace and a screenshot into `E2E_BROWSER_ARTIFACTS_DIR`, and a passing one writes nothing. A
+machine with no browser binary skips the group with a reason instead of erroring.
+
+Three optional hooks declare the product's UI contract: `pytest_e2e_login_form`,
+`pytest_e2e_routes` and `pytest_e2e_journeys`, returning `LoginForm`, `RouteSpec` and
+`Journey` values. `TestBrowser` parametrises them at collection, one route or one journey per
+junit case: sign in and out through the UI, every protected route bounces an anonymous
+visitor, every guest-only route bounces a signed-in one, every declared route paints with no
+console error and no failed API call, and every declared journey runs. A journey that sets
+`mutates=True` must carry a `Record` step, and the refusal happens at construction, so a
+journey that would leak a resource fails collection rather than the stage.
+
+New configuration: `E2E_GATE_SIGNING_KEY_SSM_PARAMETER`, `E2E_GATE_KEY_PAIR_ID` and
+`E2E_GATE_COOKIE_DOMAIN`, which are set together or not at all, plus `E2E_BROWSER`,
+`E2E_HEADLESS`, `E2E_BROWSER_ARTIFACTS_DIR` and `E2E_BROWSER_TIMEOUT_MS`.
+
+The `e2e` extra gains `playwright` and `cryptography`.
+
 ## 0.29.0
 
 Hoists the scaffolding the products had each written for themselves, and replaces the CI

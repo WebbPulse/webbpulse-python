@@ -14,8 +14,8 @@ e2e = ["webbpulse[e2e]"]
 
 ## What it checks
 
-The generic suite runs in six groups, each parametrised so one route or one operation is one
-junit case:
+The generic suite runs in seven groups, each parametrised so one route, one operation or one
+journey is one junit case:
 
 | Group | Asks |
 | --- | --- |
@@ -23,7 +23,8 @@ junit case:
 | `TestCoverage` | Every OpenAPI operation resolves to a live route, carries no trailing slash, and lands on a route whose authorizer matches its security requirement |
 | `TestReachability` | Every operation is answered by the API rather than by the gate, the limiter or a catch-all. A mutation with no path parameter is probed anonymously only, so the run never signs its own user out |
 | `TestIdentity` | Login returns an RS256 token carrying this environment's issuer and audience, refresh and logout work, the JWKS is reachable without the gate header, and a minted token with the wrong audience or an expired one is rejected |
-| `TestFrontend` | The web origin serves the app shell, an unknown path renders it too, the bundle references this environment's API and no legacy route name, and the CORS preflight allows the headers the shared client sends |
+| `TestFrontend` | The web origin serves the app shell, an unknown path renders it too, the bundle references this environment's API and no legacy route name, and the CORS preflight allows the headers the shared client sends. It goes through the staging gate on signed cookies, not the origin header |
+| `TestBrowser` | A real browser signs in and out through the UI, every protected route bounces an anonymous visitor, every guest-only route bounces a signed-in one, every declared route paints with no console error and no failed API call, and every declared journey runs |
 | `TestHygiene` | Names carry the run prefix, the cleanup hook is registered, and created resources are tracked |
 
 Two of those deserve their reasons stated, because both have shipped as green before.
@@ -57,12 +58,27 @@ names every variable that is unset, rather than failing each test with a connect
 | `E2E_MINT_ENABLED` | Set to enable the `minted_token` fixture. Unset elsewhere, and `mint_test_token` refuses production independently |
 | `E2E_KMS_KEY_ID`, `E2E_ISSUER`, `E2E_AUDIENCE` | Required only when minting is enabled |
 | `E2E_LEGACY_ROUTE_NAMES` | Comma separated paths that must no longer appear in the deployed bundle |
+| `E2E_GATE_SIGNING_KEY_SSM_PARAMETER` | The SSM SecureString holding the gate's CloudFront signing key. Set all three gate variables or none |
+| `E2E_GATE_KEY_PAIR_ID` | The CloudFront public key id the gate trusts |
+| `E2E_GATE_COOKIE_DOMAIN` | The domain the signed cookies are scoped to, such as `staging.example.com` |
+| `E2E_BROWSER` | `chromium`, `firefox` or `webkit`. Defaults to `chromium` |
+| `E2E_HEADLESS` | Set to `0` or `false` to watch the run. Defaults to headless |
+| `E2E_BROWSER_ARTIFACTS_DIR` | Where a failure writes its trace and screenshot. Defaults to `e2e-browser-artifacts` |
+| `E2E_BROWSER_TIMEOUT_MS` | Per-action timeout. Defaults to 15000 |
 
 Staging sits behind an access gate: a CloudFront viewer function plus a REQUEST authorizer
 admitting only requests carrying `x-origin-verify`. The `gate_headers` fixture reads that
 value from SSM with decryption and puts it in a header, and nothing prints it. A staging run
 with the parameter unset fails there rather than answering 401 to every probe, because the
 gate's 401 reads exactly like a broken route.
+
+The web origin has its own gate, and it does not read a header. A CloudFront viewer-request
+function admits a request only when it carries valid CloudFront signed cookies, so the plugin
+signs its own: it reads the RSA key from `E2E_GATE_SIGNING_KEY_SSM_PARAMETER` with decryption
+and produces the same custom policy the login Lambda produces, byte for byte, since the
+function regex-matches the decoded policy. The cookies last an hour, are attached to both the
+`http` client and every browser context, and are never printed: the policy and signature are
+kept out of the dataclass repr, so a pytest failure report cannot leak a live session.
 
 ## Fixtures
 
@@ -80,6 +96,12 @@ gate's 401 reads exactly like a broken route.
 | `http` | A plain client for the web origin, carrying no API gate header |
 | `cors_request_headers` | The header names the shared TypeScript client sends |
 | `created_resources` | A list this run appends to, handed to the cleanup hook at the end |
+| `gate_cookies` | The signed CloudFront cookies for the staging web origin, or None when no gate is configured |
+| `playwright`, `browser` | Session scoped. Skipped with a reason when the browser binary is absent |
+| `context`, `page` | Per test. The context carries the gate cookies and the web base URL, and traces |
+| `console_errors`, `failed_requests` | What the page logged and which API calls failed, for the render assertions |
+| `login_form` | The product's `LoginForm`, from `pytest_e2e_login_form` |
+| `signed_in_page` | A page already signed in as the durable e2e user |
 
 ## Enabling it in a product
 
@@ -138,6 +160,80 @@ previous run that died mid-way leaves behind. At `end` it is handed everything t
 appended to `created_resources`. Return a falsy value when the sweep was clean or a short
 description of what could not be deleted; a description is surfaced as a warning and never
 fails the suite, because a leftover must not cost the result of the tests that already ran.
+
+## The browser suite
+
+`TestBrowser` drives a real browser against the deployed web origin. A product opts in by
+implementing three hooks, all optional; implement none and the whole group skips with a reason
+naming the hook it would have needed.
+
+```python
+# e2e/conftest.py, alongside the cleanup hook above
+from webbpulse.e2e import (
+    Click,
+    ExpectText,
+    ExpectUrl,
+    ExpectVisible,
+    Fill,
+    Goto,
+    Journey,
+    LoginForm,
+    Record,
+    RouteSpec,
+)
+
+
+def pytest_e2e_login_form(env):
+    """Where the login form lives and which elements prove the state changed."""
+    return LoginForm(path="/login", signed_in_marker="[data-testid=account-menu]")
+
+
+def pytest_e2e_routes(env):
+    """Every route the app serves, and who is allowed to see it."""
+    return [
+        RouteSpec(path="/", access="public"),
+        RouteSpec(path="/login", access="guest-only"),
+        RouteSpec(path="/garage", access="protected"),
+        RouteSpec(path="/garage/new", access="protected"),
+    ]
+
+
+def pytest_e2e_journeys(env):
+    """Short flows through the real UI."""
+    return [
+        Journey(
+            name="browse the garage",
+            steps=[Goto("/garage"), ExpectVisible("[data-testid=garage-list]")],
+        ),
+        Journey(
+            name="create a build",
+            steps=[
+                Goto("/garage/new"),
+                Fill("[data-testid=build-name]", "e2e-{run_id}-build"),
+                Click("[data-testid=build-save]"),
+                ExpectUrl("/garage/"),
+                ExpectText("[data-testid=build-title]", "e2e-{run_id}-build"),
+                Record("e2e-{run_id}-build"),
+            ],
+            mutates=True,
+        ),
+    ]
+```
+
+The locator defaults follow one convention: `data-testid` attributes named `login-email`,
+`login-password`, `login-submit` and `sign-out`. A product that adds those four needs to
+declare only the path and the signed-in marker.
+
+`{run_id}` is the only placeholder, and it expands to this run's id, so every name a journey
+creates carries the `e2e-` prefix the start-of-session sweep looks for.
+
+Browser journeys may mutate in both environments, which is why `mutates=True` requires at
+least one `Record` step. The refusal happens at construction, so a journey that would leak
+fails collection rather than the stage. Whatever a `Record` carries reaches
+`created_resources`, and the product's own `pytest_e2e_cleanup` deletes it.
+
+A failing browser case writes a Playwright trace and a screenshot into
+`E2E_BROWSER_ARTIFACTS_DIR`, named after the test. A passing one writes nothing.
 
 ## Running it locally against staging
 

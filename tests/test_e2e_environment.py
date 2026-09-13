@@ -137,3 +137,94 @@ class TestExports:
     def test_a_run_prefix_starts_with_the_shared_prefix(self) -> None:
         """The start sweep matches by the shared prefix, so a run prefix must carry it."""
         assert E2EEnvironment.from_environ(COMPLETE).resource_prefix.startswith(E2E_PREFIX)
+
+
+WEB_GATE = {
+    "E2E_GATE_SIGNING_KEY_SSM_PARAMETER": "/example/access-gate/signing-private-key",
+    "E2E_GATE_KEY_PAIR_ID": "K1EXAMPLE",
+    "E2E_GATE_COOKIE_DOMAIN": "staging.example.invalid",
+}
+
+
+class TestWebGate:
+    """Tests for the three staging web gate variables, which are all set or all empty."""
+
+    def test_all_three_land_on_their_fields(self) -> None:
+        """The signer needs the parameter name, the key pair id and the cookie domain."""
+        env = E2EEnvironment.from_environ({**COMPLETE, **WEB_GATE})
+        assert env.gate_signing_key_ssm_parameter == WEB_GATE["E2E_GATE_SIGNING_KEY_SSM_PARAMETER"]
+        assert env.gate_key_pair_id == "K1EXAMPLE"
+        assert env.gate_cookie_domain == "staging.example.invalid"
+        assert env.has_web_gate
+
+    def test_all_three_empty_means_no_web_gate(self) -> None:
+        """Production has no gate, and so does any stage that is not behind one."""
+        assert not E2EEnvironment.from_environ(COMPLETE).has_web_gate
+
+    @pytest.mark.parametrize("dropped", sorted(WEB_GATE))
+    def test_a_partial_set_is_refused(self, dropped: str) -> None:
+        """Two of three mints nothing, so the browser cases would meet the hosted UI."""
+        partial = {key: value for key, value in WEB_GATE.items() if key != dropped}
+        with pytest.raises(MissingEnvironment, match=re.escape(dropped)):
+            E2EEnvironment.from_environ({**COMPLETE, **partial})
+
+    def test_the_refusal_names_what_was_set_as_well(self) -> None:
+        """Naming both halves is what turns the message into the fix."""
+        with pytest.raises(MissingEnvironment) as error:
+            E2EEnvironment.from_environ({**COMPLETE, "E2E_GATE_KEY_PAIR_ID": "K1EXAMPLE"})
+        assert "E2E_GATE_KEY_PAIR_ID" in str(error.value)
+        assert "E2E_GATE_COOKIE_DOMAIN" in str(error.value)
+
+    def test_a_blank_gate_variable_counts_as_unset(self) -> None:
+        """An unset workflow input arrives as an empty string, not as an absent key."""
+        assert not E2EEnvironment.from_environ({**COMPLETE, "E2E_GATE_COOKIE_DOMAIN": "   "}).has_web_gate
+
+
+class TestBrowserSettings:
+    """Tests for the browser variables the Playwright fixtures read."""
+
+    def test_chromium_is_the_default(self) -> None:
+        """The browser CI installs, and the one every product is tested against."""
+        assert E2EEnvironment.from_environ(COMPLETE).browser_name == "chromium"
+
+    @pytest.mark.parametrize("name", ["chromium", "firefox", "webkit"])
+    def test_each_supported_engine_is_accepted(self, name: str) -> None:
+        """The three engines Playwright ships."""
+        assert E2EEnvironment.from_environ({**COMPLETE, "E2E_BROWSER": name}).browser_name == name
+
+    def test_the_engine_name_is_case_insensitive(self) -> None:
+        """A workflow input spelled `Chromium` is the same request."""
+        assert E2EEnvironment.from_environ({**COMPLETE, "E2E_BROWSER": "Chromium"}).browser_name == "chromium"
+
+    def test_an_unknown_engine_is_refused(self) -> None:
+        """A typo would otherwise fail inside a session fixture with an attribute error."""
+        with pytest.raises(MissingEnvironment, match="E2E_BROWSER"):
+            E2EEnvironment.from_environ({**COMPLETE, "E2E_BROWSER": "netscape"})
+
+    def test_headless_defaults_to_true(self) -> None:
+        """CI has no display, so headed is the deliberate local choice."""
+        assert E2EEnvironment.from_environ(COMPLETE).headless
+
+    @pytest.mark.parametrize("flag", ["0", "false", "no", ""])
+    def test_headless_can_be_turned_off(self, flag: str) -> None:
+        """Watching a failing journey in a real window is how it gets diagnosed."""
+        assert not E2EEnvironment.from_environ({**COMPLETE, "E2E_HEADLESS": flag}).headless
+
+    def test_the_artifacts_directory_is_read(self) -> None:
+        """`e2e.yml` uploads this path, so a product may point it somewhere else."""
+        env = E2EEnvironment.from_environ({**COMPLETE, "E2E_BROWSER_ARTIFACTS": "artifacts/browser"})
+        assert env.browser_artifacts_dir == "artifacts/browser"
+
+    def test_an_absent_artifacts_directory_is_empty_so_the_default_applies(self) -> None:
+        """The fixture falls back to `e2e-browser-artifacts` under the working directory."""
+        assert E2EEnvironment.from_environ(COMPLETE).browser_artifacts_dir == ""
+
+    def test_the_timeout_has_a_default_and_is_overridable(self) -> None:
+        """A slow stage gets more patience without a code change."""
+        assert E2EEnvironment.from_environ(COMPLETE).browser_timeout_ms == 15000
+        assert E2EEnvironment.from_environ({**COMPLETE, "E2E_BROWSER_TIMEOUT_MS": "30000"}).browser_timeout_ms == 30000
+
+    @pytest.mark.parametrize("value", ["nonsense", "0", "-5", ""])
+    def test_an_unusable_timeout_falls_back_to_the_default(self, value: str) -> None:
+        """A zero or negative timeout would make every wait fail instantly."""
+        assert E2EEnvironment.from_environ({**COMPLETE, "E2E_BROWSER_TIMEOUT_MS": value}).browser_timeout_ms == 15000

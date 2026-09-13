@@ -27,16 +27,42 @@ import pytest
 
 from .access_log import AccessLogLookup
 from .client import DEFAULT_PER_MINUTE, E2EClient
+from .gate import GateCookies
 from .gateway import Operation, Route, fetch_routes, operations_from_openapi
 from .identity import IdentitySession, login, mint
+from .journeys import (
+    Click,
+    ExpectText,
+    ExpectUrl,
+    ExpectVisible,
+    Fill,
+    Goto,
+    Journey,
+    LoginForm,
+    Record,
+    RouteSpec,
+)
 
 __all__ = [
     "E2E_PREFIX",
     "GATE_HEADER",
+    "Click",
     "E2EEnvironment",
+    "ExpectText",
+    "ExpectUrl",
+    "ExpectVisible",
+    "Fill",
+    "GateCookies",
+    "Goto",
+    "Journey",
+    "LoginForm",
     "MissingEnvironment",
+    "Record",
+    "RouteSpec",
     "pytest_addhooks",
 ]
+
+pytest_plugins = ["webbpulse.e2e.gate", "webbpulse.e2e.browser"]
 
 _REQUIRED = (
     "E2E_ENVIRONMENT",
@@ -51,6 +77,15 @@ _REQUIRED = (
 )
 
 _MINT_REQUIRED = ("E2E_KMS_KEY_ID", "E2E_ISSUER", "E2E_AUDIENCE")
+
+_WEB_GATE = (
+    "E2E_GATE_SIGNING_KEY_SSM_PARAMETER",
+    "E2E_GATE_KEY_PAIR_ID",
+    "E2E_GATE_COOKIE_DOMAIN",
+)
+
+BROWSER_NAMES = ("chromium", "firefox", "webkit")
+DEFAULT_BROWSER_TIMEOUT_MS = 15000
 
 GATE_HEADER = "x-origin-verify"
 E2E_PREFIX = "e2e-"
@@ -71,12 +106,23 @@ def _truthy(value: str) -> bool:
     return value.strip().lower() in ("1", "true", "yes", "on")
 
 
+def _positive_int(value: str, default: int) -> int:
+    """One variable read as a positive integer, falling back when absent or unparseable."""
+    try:
+        parsed = int(value.strip())
+    except (AttributeError, ValueError):
+        return default
+    return parsed if parsed > 0 else default
+
+
 @dataclass(frozen=True)
 class E2EEnvironment:
     """Everything the suite needs about the environment under test, from `E2E_*`.
 
     `gate_ssm_parameter` is empty in production, which has no gate. `legacy_route_names` is
-    the list of strings that must not appear in the deployed bundle.
+    the list of strings that must not appear in the deployed bundle. The three
+    `gate_signing_key_ssm_parameter`, `gate_key_pair_id` and `gate_cookie_domain` fields
+    describe the staging web gate and are all set together or all empty.
     """
 
     environment: str
@@ -89,6 +135,13 @@ class E2EEnvironment:
     user_password: str = field(repr=False)
     run_id: str
     gate_ssm_parameter: str = ""
+    gate_signing_key_ssm_parameter: str = ""
+    gate_key_pair_id: str = ""
+    gate_cookie_domain: str = ""
+    browser_name: str = "chromium"
+    headless: bool = True
+    browser_artifacts_dir: str = ""
+    browser_timeout_ms: int = DEFAULT_BROWSER_TIMEOUT_MS
     mint_enabled: bool = False
     kms_key_id: str = ""
     issuer: str = ""
@@ -99,6 +152,11 @@ class E2EEnvironment:
     def is_production(self) -> bool:
         """Whether this is the production stage, which has no gate and refuses minting."""
         return self.environment.lower() == "production"
+
+    @property
+    def has_web_gate(self) -> bool:
+        """Whether this environment sits behind the CloudFront web gate."""
+        return bool(self.gate_signing_key_ssm_parameter)
 
     @property
     def resource_prefix(self) -> str:
@@ -124,6 +182,23 @@ class E2EEnvironment:
                 "workflow sets them from its inputs; locally, see docs/e2e.md."
             )
 
+        gate_values = {name: source.get(name, "").strip() for name in _WEB_GATE}
+        set_names = sorted(name for name, value in gate_values.items() if value)
+        if set_names and len(set_names) != len(_WEB_GATE):
+            raise MissingEnvironment(
+                "The staging web gate variables must be set together or left entirely "
+                f"empty. Set: {', '.join(set_names)}. Unset or empty: "
+                f"{', '.join(sorted(set(_WEB_GATE) - set(set_names)))}. A partial set mints "
+                "no session, so every browser case would be answered by the gate's redirect "
+                "to the hosted UI rather than by the app."
+            )
+
+        browser_name = source.get("E2E_BROWSER", "").strip().lower() or "chromium"
+        if browser_name not in BROWSER_NAMES:
+            raise MissingEnvironment(
+                f"E2E_BROWSER is {browser_name!r}, which is not one of {', '.join(BROWSER_NAMES)}."
+            )
+
         raw_legacy = source.get("E2E_LEGACY_ROUTE_NAMES", "")
         legacy = tuple(name.strip() for name in raw_legacy.split(",") if name.strip())
         return cls(
@@ -137,6 +212,13 @@ class E2EEnvironment:
             user_password=source["E2E_USER_PASSWORD"],
             run_id=source["E2E_RUN_ID"].strip(),
             gate_ssm_parameter=source.get("E2E_GATE_SSM_PARAMETER", "").strip(),
+            gate_signing_key_ssm_parameter=gate_values["E2E_GATE_SIGNING_KEY_SSM_PARAMETER"],
+            gate_key_pair_id=gate_values["E2E_GATE_KEY_PAIR_ID"],
+            gate_cookie_domain=gate_values["E2E_GATE_COOKIE_DOMAIN"],
+            browser_name=browser_name,
+            headless=_truthy(source.get("E2E_HEADLESS", "true")),
+            browser_artifacts_dir=source.get("E2E_BROWSER_ARTIFACTS", "").strip(),
+            browser_timeout_ms=_positive_int(source.get("E2E_BROWSER_TIMEOUT_MS", ""), DEFAULT_BROWSER_TIMEOUT_MS),
             mint_enabled=mint_enabled,
             kms_key_id=source.get("E2E_KMS_KEY_ID", "").strip(),
             issuer=source.get("E2E_ISSUER", "").strip().rstrip("/"),
@@ -319,11 +401,17 @@ def cors_request_headers() -> tuple[str, ...]:
 
 
 @pytest.fixture(scope="session")
-def http(e2e_env: E2EEnvironment) -> Iterator[Any]:
-    """A plain httpx client for the web origin, which carries no API gate header."""
+def http(e2e_env: E2EEnvironment, gate_cookies: GateCookies | None) -> Iterator[Any]:
+    """A plain httpx client for the web origin, carrying the gate cookies where there are any.
+
+    Without them a staging fetch of the shell follows the gate's 302 to the Cognito hosted
+    UI and the shell assertions read as a broken deploy. The cookie values are handed to
+    httpx and never printed.
+    """
     import httpx
 
-    client = httpx.Client(timeout=30.0, follow_redirects=True)
+    cookies = dict(gate_cookies.as_httpx_cookies()) if gate_cookies is not None else {}
+    client = httpx.Client(timeout=30.0, follow_redirects=True, cookies=cookies)
     try:
         yield client
     finally:
