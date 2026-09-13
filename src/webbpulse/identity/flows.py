@@ -553,11 +553,15 @@ class IdentityFlows:
         new_password: str,
         ip: str = "",
         keep_family_id: str = "",
+        family_ids: list[str] | None = None,
     ) -> int:
         """Change a signed-in user's password and revoke their other sessions.
 
         Requires the current password, because a token proves the session and not the person.
-        `keep_family_id` spares the caller's own family. Returns the number of records revoked.
+        `keep_family_id` spares the caller's own family. `family_ids` names the families to
+        revoke, for the same reason `logout_all` takes them: a store with no user index
+        cannot enumerate them, and then nothing but the named families is revoked. Returns
+        the number of records revoked.
         """
         credential = self._stores.require_credentials().get(user_id, PASSWORD_CREDENTIAL_TYPE)
         presented = normalise_password(current_password)
@@ -586,7 +590,7 @@ class IdentityFlows:
             )
         )
 
-        revoked = self._revoke_families(user_id, keep_family_id=keep_family_id)
+        revoked = self._revoke_families(user_id, keep_family_id=keep_family_id, family_ids=family_ids)
         _log.info(
             "Password changed.",
             extra={

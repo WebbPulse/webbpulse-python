@@ -909,6 +909,121 @@ def test_change_password_on_an_account_with_no_credential_still_costs_a_bcrypt_r
         flows.change_password(user_id=USER_ID, current_password=PASSWORD, new_password=OTHER_PASSWORD)
 
 
+class NoUserIndexRefreshTokenStore(InMemoryRefreshTokenStore):
+    """An in-memory store shaped like the DynamoDB one: no user index to enumerate."""
+
+    def revoke_all_for_user(self, user_id: str, *, except_family_id: str = "") -> int:
+        """Raise the way `DynamoRefreshTokenStore` does, having no user index."""
+        raise NotImplementedError(
+            "revoke_all_for_user needs the caller's family ids: `refresh-tokens` carries no user index"
+        )
+
+
+@pytest.fixture
+def no_index_stores() -> IdentityStores:
+    """Return stores whose refresh token store cannot enumerate a user's families."""
+    return IdentityStores(
+        credentials=InMemoryCredentialStore(),
+        refresh_tokens=NoUserIndexRefreshTokenStore(),
+    )
+
+
+def test_change_password_succeeds_when_the_store_cannot_enumerate_families(
+    kms: FakeKms,
+    hooks: FakeHooks,
+    no_index_stores: IdentityStores,
+    attempts: InMemoryLoginAttemptStore,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A store with no user index revokes nothing and logs, rather than failing the change."""
+    settings = make_settings()
+    flows = IdentityFlows(settings, hooks, no_index_stores, TokenService(settings, kms), attempts=attempts)
+    seed_account(hooks, no_index_stores)
+    here = flows.login(email=EMAIL, password=PASSWORD)
+
+    with caplog.at_level("WARNING"):
+        revoked = flows.change_password(
+            user_id=USER_ID,
+            current_password=PASSWORD,
+            new_password=OTHER_PASSWORD,
+            keep_family_id=here.family_id,
+        )
+
+    assert revoked == 0
+    assert any(record.__dict__.get("event") == "session.revoke_all_unsupported" for record in caplog.records)
+    assert flows.refresh(here.refresh_token).access_token
+    assert flows.login(email=EMAIL, password=OTHER_PASSWORD).access_token
+
+
+def test_change_password_route_answers_changed_on_a_store_with_no_user_index(
+    kms: FakeKms,
+    hooks: FakeHooks,
+    no_index_stores: IdentityStores,
+    attempts: InMemoryLoginAttemptStore,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """The route answers `{"changed": true}` rather than 500, and keeps the caller signed in."""
+    from webbpulse.http import register_error_handlers
+
+    settings = make_settings()
+    app = FastAPI()
+    register_error_handlers(app, error_codes=True)
+    app.include_router(
+        build_identity_router(
+            settings,
+            hooks,
+            no_index_stores,
+            kms_client=kms,
+            attempts=attempts,
+            limiter_enabled=False,
+        )
+    )
+    seed_account(hooks, no_index_stores)
+
+    with TestClient(app, base_url="https://api.example.com") as client:
+        login = client.post("/api/auth/login", json={"email": EMAIL, "password": PASSWORD})
+        access = login.json()["access_token"]
+
+        with caplog.at_level("WARNING"):
+            changed = client.post(
+                "/api/auth/password",
+                json={"current_password": PASSWORD, "new_password": OTHER_PASSWORD},
+                headers={"Authorization": f"Bearer {access}"},
+            )
+
+        assert changed.status_code == 200
+        assert changed.json() == {"changed": True}
+        assert any(record.__dict__.get("event") == "session.revoke_all_unsupported" for record in caplog.records)
+        assert client.post("/api/auth/refresh").status_code == 200
+
+
+def test_change_password_revokes_the_named_families_on_a_store_with_no_user_index(
+    kms: FakeKms,
+    hooks: FakeHooks,
+    no_index_stores: IdentityStores,
+    attempts: InMemoryLoginAttemptStore,
+) -> None:
+    """Passing `family_ids` revokes those families and still spares `keep_family_id`."""
+    settings = make_settings()
+    flows = IdentityFlows(settings, hooks, no_index_stores, TokenService(settings, kms), attempts=attempts)
+    seed_account(hooks, no_index_stores)
+    elsewhere = flows.login(email=EMAIL, password=PASSWORD)
+    here = flows.login(email=EMAIL, password=PASSWORD)
+
+    revoked = flows.change_password(
+        user_id=USER_ID,
+        current_password=PASSWORD,
+        new_password=OTHER_PASSWORD,
+        keep_family_id=here.family_id,
+        family_ids=[elsewhere.family_id, here.family_id],
+    )
+
+    assert revoked == 1
+    with pytest.raises(LoginRejected):
+        flows.refresh(elsewhere.refresh_token)
+    assert flows.refresh(here.refresh_token).access_token
+
+
 @pytest.fixture
 def client(
     kms: FakeKms,
