@@ -65,7 +65,7 @@ its dev dependencies.
 | `webbpulse.security` | `hash_password`, `verify_password`, `needs_rehash`, `create_token`, `decode_token`, `bearer_claims` | [security.md](docs/security.md) |
 | `webbpulse.identity` | App-managed identity: password, session, email link, TOTP, OAuth and passkey flows, plus a KMS-backed `TokenService` and a JWKS | [identity.md](docs/identity.md), [the standard](docs/identity-standard.md) |
 | `webbpulse.lambda_entry` | `run_uvicorn`, `is_lambda`, `resolve_port`: the AWS Lambda Web Adapter entrypoint, with no Mangum and no handler | [packaging.md](docs/packaging.md) |
-| `webbpulse.testing` | Pytest fixtures: `test_client`, `create_table`, `rate_limit_table`, `make_request_context_headers` | [packaging.md](docs/packaging.md) |
+| `webbpulse.testing` | Pytest fixtures: `test_client`, `create_table`, `rate_limit_table`, `make_request_context_headers`, `FakeKms` | [packaging.md](docs/packaging.md) |
 | `webbpulse.ci` | Domain discovery for the per-domain pytest matrix in the organisation's reusable `python-ci.yml` | [configuration.md](docs/configuration.md) |
 
 ## Wiring a FastAPI domain Lambda
