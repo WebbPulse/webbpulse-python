@@ -2537,6 +2537,11 @@ dynamodb = [
     { name = "boto3" },
     { name = "botocore" },
 ]
+e2e = [
+    { name = "boto3" },
+    { name = "httpx" },
+    { name = "pytest" },
+]
 fastapi = [
     { name = "fastapi" },
     { name = "starlette" },
@@ -2585,10 +2590,12 @@ requires-dist = [
     { name = "aws-opentelemetry-distro", marker = "extra == 'aws-otel'", specifier = ">=0.10" },
     { name = "bcrypt", marker = "extra == 'security'", specifier = ">=4.1" },
     { name = "boto3", marker = "extra == 'dynamodb'", specifier = ">=1.35" },
+    { name = "boto3", marker = "extra == 'e2e'", specifier = ">=1.35" },
     { name = "botocore", marker = "extra == 'aws-otel'", specifier = ">=1.35" },
     { name = "botocore", marker = "extra == 'dynamodb'", specifier = ">=1.35" },
     { name = "fastapi", marker = "extra == 'fastapi'", specifier = ">=0.115" },
     { name = "fastapi", marker = "extra == 'identity'", specifier = ">=0.115" },
+    { name = "httpx", marker = "extra == 'e2e'", specifier = ">=0.27" },
     { name = "httpx", marker = "extra == 'oauth'", specifier = ">=0.27" },
     { name = "httpx2", marker = "extra == 'testing'", specifier = ">=2" },
     { name = "moto", extras = ["dynamodb", "secretsmanager"], marker = "extra == 'testing'", specifier = ">=5" },
@@ -2601,12 +2608,13 @@ requires-dist = [
     { name = "pydantic-settings", specifier = ">=2.6,<3" },
     { name = "pyjwt", marker = "extra == 'security'", specifier = ">=2.10,<3" },
     { name = "pyjwt", extras = ["crypto"], marker = "extra == 'identity'", specifier = ">=2.9" },
+    { name = "pytest", marker = "extra == 'e2e'", specifier = ">=8" },
     { name = "pytest", marker = "extra == 'testing'", specifier = ">=8" },
     { name = "starlette", marker = "extra == 'fastapi'", specifier = ">=0.40" },
     { name = "uvicorn", marker = "extra == 'fastapi'", specifier = ">=0.32" },
     { name = "webauthn", marker = "extra == 'passkeys'", specifier = ">=2.7,<4" },
 ]
-provides-extras = ["aws-otel", "dynamodb", "fastapi", "identity", "oauth", "otel", "passkeys", "security", "testing"]
+provides-extras = ["aws-otel", "dynamodb", "e2e", "fastapi", "identity", "oauth", "otel", "passkeys", "security", "testing"]
 
 [package.metadata.requires-dev]
 dev = [
