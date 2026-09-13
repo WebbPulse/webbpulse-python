@@ -7,6 +7,8 @@ variable at once.
 
 from __future__ import annotations
 
+import re
+
 import pytest
 
 from webbpulse.e2e import E2EEnvironment, MissingEnvironment
@@ -118,5 +120,5 @@ class TestMissingVariables:
 
     def test_the_error_points_at_the_documentation(self) -> None:
         """The message says where the variables come from, so the fix is one read away."""
-        with pytest.raises(MissingEnvironment, match="docs/e2e.md"):
+        with pytest.raises(MissingEnvironment, match=re.escape("docs/e2e.md")):
             E2EEnvironment.from_environ({})

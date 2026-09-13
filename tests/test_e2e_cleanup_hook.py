@@ -37,6 +37,7 @@ def _isolate_the_environment(monkeypatch: pytest.MonkeyPatch) -> None:
     for name in E2E_NAMES:
         monkeypatch.delenv(name, raising=False)
 
+
 ENVIRONMENT = """
 import os
 
@@ -127,9 +128,7 @@ class TestFailureHandling:
 
     def test_a_reported_leftover_warns_and_does_not_fail(self, pytester: pytest.Pytester) -> None:
         """A leftover is worth knowing about and never worth losing a green run over."""
-        pytester.makeconftest(
-            conftest_with('    return "3 buckets left" if phase == "end" else ""\n')
-        )
+        pytester.makeconftest(conftest_with('    return "3 buckets left" if phase == "end" else ""\n'))
         pytester.makepyfile(test_one="def test_nothing(e2e_env): pass")
         result = pytester.runpytest_inprocess("-p", "no:cacheprovider", "-W", "default")
         result.assert_outcomes(passed=1)
@@ -137,9 +136,7 @@ class TestFailureHandling:
 
     def test_a_raising_hook_does_not_fail_the_run(self, pytester: pytest.Pytester) -> None:
         """A cleanup that throws is reported, not propagated over the tests' own result."""
-        pytester.makeconftest(
-            conftest_with('    raise RuntimeError("delete refused")\n')
-        )
+        pytester.makeconftest(conftest_with('    raise RuntimeError("delete refused")\n'))
         pytester.makepyfile(test_one="def test_nothing(e2e_env): pass")
         result = pytester.runpytest_inprocess("-p", "no:cacheprovider", "-W", "default")
         result.assert_outcomes(passed=1)

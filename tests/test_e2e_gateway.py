@@ -168,14 +168,12 @@ class TestOperationsFromOpenapi:
 
     def test_non_operation_keys_are_ignored(self) -> None:
         """`parameters` and `summary` siblings are not mistaken for operations."""
-        document = {
-            "paths": {"/api/parts": {"parameters": [], "summary": "x", "get": {"responses": {"200": {}}}}}
-        }
+        document = {"paths": {"/api/parts": {"parameters": [], "summary": "x", "get": {"responses": {"200": {}}}}}}
         assert len(operations_from_openapi(document)) == 1
 
     def test_path_parameters_are_listed_in_order(self) -> None:
         """`path_parameters` names every placeholder the path carries."""
-        document = {"paths": {"/api/a/{x}/b/{y}": {"get": {"responses": {"200": {}}}}}}
+        document: dict[str, Any] = {"paths": {"/api/a/{x}/b/{y}": {"get": {"responses": {"200": {}}}}}}
         assert operations_from_openapi(document)[0].path_parameters == ("x", "y")
 
 
