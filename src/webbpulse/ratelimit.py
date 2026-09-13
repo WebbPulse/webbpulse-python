@@ -473,13 +473,17 @@ def rate_limit(
 
 
 def default_renderer(decision: RateLimitDecision) -> Response:
-    """The package's own 429: the detailed error envelope plus the RateLimit headers."""
+    """The package's own 429: the detailed error envelope plus the RateLimit headers.
+
+    The sentence comes from `webbpulse.messages.rate_limited`, carrying the same
+    `reset_after` the `Retry-After` header does so the copy names a real number.
+    """
     from starlette.responses import JSONResponse
 
     headers = {**rate_limit_headers(decision), "Retry-After": str(decision.reset_after)}
     return JSONResponse(
         status_code=429,
-        content={"detail": "Too many requests. Try again later."},
+        content={"detail": rate_limited(retry_after=decision.reset_after)},
         headers=headers,
     )
 

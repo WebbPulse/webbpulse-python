@@ -807,7 +807,9 @@ def test_the_default_renderer_emits_the_envelope_and_retry_after(rate_limit_tabl
     rejected = client.post("/api/auth/login")
 
     assert rejected.status_code == 429
-    assert rejected.json() == {"detail": "Too many requests. Try again later."}
+    assert rejected.json() == {"detail": rate_limited(retry_after=int(rejected.headers["Retry-After"]))}, (
+        "the default 429 sentence comes from webbpulse.messages, naming the wait the header carries"
+    )
     assert rejected.headers["Retry-After"].isdigit()
     assert rejected.headers["X-RateLimit-Remaining"] == "0"
 

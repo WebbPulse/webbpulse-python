@@ -157,6 +157,7 @@ The `X-RateLimit-*` triple is emitted alongside because that is what most client
 parse; the draft mentions it only as a survey of existing practice.
 
 The middleware's 429 body comes from `renderer`, defaulting to `default_renderer`, which
-emits `{"detail": ...}` plus `Retry-After` and the headers above. Pass a product's own
-renderer to keep an envelope its live clients already parse; a renderer owns the whole
-refusal, headers included.
+emits `{"detail": ...}` plus `Retry-After` and the headers above. Its sentence comes from
+`webbpulse.messages.rate_limited`, carrying the same wait the header does, so every refusal
+in the package words itself once. Pass a product's own renderer to keep an envelope its live
+clients already parse; a renderer owns the whole refusal, headers included.
