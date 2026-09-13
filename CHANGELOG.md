@@ -5,6 +5,54 @@ Notable changes to the `webbpulse` package. The version here is the one in
 
 This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## 0.29.0
+
+Hoists the scaffolding the products had each written for themselves, and replaces the CI
+domain matrix helper with a post-deploy end to end plugin.
+
+`webbpulse.events` is the stream and queue consumer primitive. `register_stream_consumer`
+mounts the adapter's pass-through route on a router, `stream_consumer_app` is the
+entrypoint-shaped wrapper with root routes and error handlers and nothing else, and
+`event_records`, `record_id` and `batch_item_failures` read and answer the
+`ReportBatchItemFailures` envelope. The gateway guard is on by default and refuses with a
+404. `identity.events` is rewritten on the primitive with every public name kept.
+
+`webbpulse.messages` is the refusal copy catalogue. `STATUS_MESSAGES` is the table the
+error handlers already rendered, made public, and `refusal`, `forbidden`, `unauthenticated`,
+`not_found`, `conflict`, `validation_failed` and `rate_limited` build a sentence from a
+safe default. The one rendered change: the rate limiter's 429 now says "Try again shortly."
+rather than "Try again later.", matching the status table.
+
+`webbpulse.ratelimit` can now express what the product limiters do. `LimitClass` and
+`classify` name a cap and window per request class, `rate_limit_middleware` binds the whole
+app with one counter row per class, `RateLimiter` gains `anchor` (clock aligned by default,
+`first_request` for a lockout), `count_attribute` and `clear`, and a `renderer` owns the
+429 body so each product keeps its own envelope. A failed-open response carries no
+RateLimit headers.
+
+`webbpulse.identity.claims` reads the staging gate shape as well as the native authorizer
+shape: `GATE_CLAIMS_KEY`, `gate_claims`, `identity_claims`, `identity_subject` and
+`subject_dependency`, with an absent authorizer answering `None` rather than raising.
+
+`webbpulse.testing.FakeKms` is the one reconciled fake, taking one key or a mapping and a
+`failing` set of key ids, with `fake_kms` and `rsa_key` fixtures.
+
+`webbpulse.dynamodb` gains `scan` and `iter_scan`, `batch_get` with a capped retry of
+`UnprocessedKeys` that raises `UnprocessedItems` when exhausted, and `transact_write` with
+`put_action`, `delete_action`, `update_action` and `condition_check`.
+
+`webbpulse.security` gains the one-secret-per-service wrapper: `app_secrets`,
+`flatten_secret`, `load_app_secrets`, `apply_app_secrets` and `reset_secret_cache`, over a
+new `config.read_json_secret`. Key names are logged, values never.
+
+`webbpulse.e2e` is a pytest plugin and generic suite run against a deployed stage: route
+cut, coverage, reachability, identity, frontend and hygiene, with the access log confirming
+which route key served each probe and a paced client under the per-IP limiter. It ships as
+the `e2e` extra and is driven by the organisation's reusable `e2e.yml` workflow.
+
+Removed: `webbpulse.ci`. The reusable `python-ci.yml` v3 discovers domains itself, so the
+helper had no caller left. CI and publishing run through the v3 uv workflows.
+
 ## 0.28.1
 
 Fixes the stream route refusing the pass-through it exists for. The AWS Lambda Web Adapter
