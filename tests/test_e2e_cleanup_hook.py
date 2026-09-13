@@ -162,3 +162,43 @@ class TestEnvironmentRefusal:
         result = pytester.runpytest_inprocess("-p", "no:cacheprovider")
         result.assert_outcomes(errors=1)
         result.stdout.fnmatch_lines(["*E2E_API_BASE_URL*"])
+
+
+class TestSuiteReExport:
+    """Tests for what `from webbpulse.e2e.suite import *` actually brings across."""
+
+    def test_the_parametrisation_hook_is_exported(self) -> None:
+        """`pytest_generate_tests` must cross the star import, or every case collapses.
+
+        A product's `test_shared.py` is one star import. `__all__` governs what that brings
+        over, so a hook left out of it is simply absent from the module pytest collects: the
+        route and operation cases silently lose their parametrisation and then error on a
+        missing `live_route` fixture, which reads as a broken plugin rather than a missing
+        export.
+        """
+        from webbpulse.e2e import suite
+
+        assert "pytest_generate_tests" in suite.__all__
+
+    def test_a_star_import_lands_the_hook_and_the_groups(self) -> None:
+        """The re-export a product writes yields the hook and all six groups."""
+        namespace: dict[str, object] = {}
+        exec("from webbpulse.e2e.suite import *", namespace)
+        assert callable(namespace["pytest_generate_tests"])
+        groups = (
+            "TestRouteCut",
+            "TestCoverage",
+            "TestReachability",
+            "TestIdentity",
+            "TestFrontend",
+            "TestHygiene",
+        )
+        for group in groups:
+            assert group in namespace
+
+    def test_every_name_in_all_actually_exists(self) -> None:
+        """An `__all__` entry with no attribute behind it makes the star import raise."""
+        from webbpulse.e2e import suite
+
+        for name in suite.__all__:
+            assert hasattr(suite, name), name

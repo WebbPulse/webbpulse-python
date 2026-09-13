@@ -44,6 +44,7 @@ __all__ = [
     "TestReachability",
     "TestRouteCut",
     "operation_id",
+    "pytest_generate_tests",
     "route_id",
 ]
 
