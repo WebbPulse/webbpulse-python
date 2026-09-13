@@ -8,6 +8,7 @@ result. That makes a stream handler an ordinary route: this module mounts one, a
 
 from __future__ import annotations
 
+import json
 import logging
 import os
 from collections.abc import Mapping
@@ -57,8 +58,6 @@ USERS_KEY_ATTRIBUTE_ENV: Final = "IDENTITY_USERS_KEY_ATTRIBUTE"
 
 REMOVE_EVENT_NAME: Final = "REMOVE"
 
-_GATEWAY_REQUEST_ID_HEADER: Final = "x-amzn-requestid"
-
 
 def events_path() -> str:
     """The path the stream route mounts at, absolute and without a trailing slash.
@@ -86,14 +85,21 @@ def users_key_attribute() -> str:
 def arrived_through_api_gateway(request: Any) -> bool:
     """Whether this request reached the function through API Gateway rather than the adapter's pass-through.
 
-    A pass-through invocation carries no gateway request context and no gateway request id,
-    because there was no HTTP request at the edge to describe. Either header being present
-    means an HTTP caller reached the route, and the route is not for them.
+    The adapter stamps `x-amzn-request-context` on every invocation it forwards. Behind API
+    Gateway it is the gateway's request context, a JSON object; on a pass-through it is the
+    literal `null`, because there was no HTTP request at the edge to describe. Only a JSON
+    object counts, so a bare request id header, which the runtime adds to both, proves nothing.
     """
     from webbpulse.http import REQUEST_CONTEXT_HEADER
 
-    headers = request.headers
-    return any((headers.get(name) or "").strip() for name in (REQUEST_CONTEXT_HEADER, _GATEWAY_REQUEST_ID_HEADER))
+    raw = (request.headers.get(REQUEST_CONTEXT_HEADER) or "").strip()
+    if not raw:
+        return False
+    try:
+        context = json.loads(raw)
+    except ValueError:
+        return True
+    return isinstance(context, Mapping) and bool(context)
 
 
 def _user_id_from_record(record: Mapping[str, Any], *, key_attribute: str) -> str:

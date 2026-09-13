@@ -112,8 +112,9 @@ a non-HTTP invocation as a JSON body to its pass-through path and returns the re
 the function's result, so the stream handler is an ordinary route. The route handles only
 `REMOVE` records, calls `purge_user` for each, and answers with the
 `ReportBatchItemFailures` shape so the event source mapping retries only the records that
-raised. It takes no auth, and returns 404 to any request carrying an API Gateway request
-context or request id, so it is reachable only through the pass-through.
+raised. It takes no auth, and returns 404 to any request whose `x-amzn-request-context`
+header is a JSON object, which is what the adapter stamps behind API Gateway; a pass-through
+carries the literal `null` there, so the route is reachable only through the pass-through.
 
 | Variable | Default | What it sets |
 | --- | --- | --- |
