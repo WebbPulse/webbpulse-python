@@ -66,7 +66,7 @@ its dev dependencies.
 | `webbpulse.identity` | App-managed identity: password, session, email link, TOTP, OAuth and passkey flows, plus a KMS-backed `TokenService` and a JWKS | [identity.md](docs/identity.md), [the standard](docs/identity-standard.md) |
 | `webbpulse.lambda_entry` | `run_uvicorn`, `is_lambda`, `resolve_port`: the AWS Lambda Web Adapter entrypoint, with no Mangum and no handler | [packaging.md](docs/packaging.md) |
 | `webbpulse.testing` | Pytest fixtures: `test_client`, `create_table`, `rate_limit_table`, `make_request_context_headers`, `FakeKms` | [packaging.md](docs/packaging.md) |
-| `webbpulse.ci` | Domain discovery for the per-domain pytest matrix in the organisation's reusable `python-ci.yml` | [configuration.md](docs/configuration.md) |
+| `webbpulse.e2e` | A pytest plugin and generic post-deploy suite: route cut, coverage, reachability, identity, frontend and hygiene against a real stage | [e2e.md](docs/e2e.md) |
 
 ## Wiring a FastAPI domain Lambda
 
@@ -272,8 +272,9 @@ app.include_router(build_identity_router(settings, hooks, stores, tokens=tokens)
 | [docs/tracing.md](docs/tracing.md) | Tracing setup |
 | [docs/tracing-sampling.md](docs/tracing-sampling.md) | The tail sampler and the Lambda flush |
 | [docs/security.md](docs/security.md) | Password hashing and JWTs |
-| [docs/configuration.md](docs/configuration.md) | Settings, secrets and the CI domain matrix |
+| [docs/configuration.md](docs/configuration.md) | Settings and secrets |
 | [docs/packaging.md](docs/packaging.md) | The Web Adapter entrypoint, the Dockerfile and the test fixtures |
+| [docs/e2e.md](docs/e2e.md) | The post-deploy end to end plugin: env vars, fixtures and product wiring |
 | [docs/releases.md](docs/releases.md) | CI, publishing and cutting a release |
 | [docs/migration-notes.md](docs/migration-notes.md) | What each consuming app replaced on adoption |
 | [CHANGELOG.md](CHANGELOG.md) | Release history |
