@@ -274,7 +274,15 @@ class TestReachability:
         self._assert_reachable(operation, anon, "anonymously")
 
     def test_authenticated_call_is_answered_by_the_api(self, operation: Operation, api: E2EClient) -> None:
-        """Calling an operation as the durable e2e user reaches the API."""
+        """Calling an operation as the durable e2e user reaches the API.
+
+        A bare mutation is skipped here: with no path parameter to fill with an absent id,
+        the call would execute for real as the durable user, and `POST /api/auth/logout`
+        would end the session every later case depends on. The anonymous probe above has
+        already proven that such a route reaches the API.
+        """
+        if operation.is_bare_mutation:
+            pytest.skip(f"{operation.label} would execute a real state change as the durable e2e user")
         self._assert_reachable(operation, api, "as the e2e user")
 
     def _assert_reachable(self, operation: Operation, client: E2EClient, who: str) -> None:

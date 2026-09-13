@@ -83,6 +83,16 @@ class Operation:
         )
 
     @property
+    def is_bare_mutation(self) -> bool:
+        """Whether calling this operation as a real user would change that user's state.
+
+        A non-GET operation with no path parameter has nothing to point at an absent id, so
+        an authenticated probe of it executes for real: `POST /api/auth/logout` signs the
+        durable user out mid-run. Such operations are probed anonymously only.
+        """
+        return self.method not in ("GET", "HEAD", "OPTIONS") and not self.path_parameters
+
+    @property
     def label(self) -> str:
         """A stable id for pytest parametrisation, so junit output reads well."""
         return f"{self.method} {self.path}"

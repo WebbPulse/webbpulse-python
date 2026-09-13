@@ -266,3 +266,22 @@ class TestFetchRoutes:
     def test_an_empty_api_yields_no_routes(self) -> None:
         """An API with no routes yields an empty tuple for the fixture to refuse on."""
         assert fetch_routes(FakeApiGateway([{"Items": []}]), "api123") == ()
+
+
+class TestBareMutation:
+    """`Operation.is_bare_mutation` names the calls an authenticated probe must not make."""
+
+    def test_a_parameterless_post_is_a_bare_mutation(self) -> None:
+        """Logout has no id to point at an absent record, so a real call would sign out."""
+        operation = Operation("POST", "/api/auth/logout", "logout", True, (200,))
+        assert operation.is_bare_mutation
+
+    def test_a_parameterised_delete_is_not(self) -> None:
+        """A templated path is filled with an absent id, so the call cannot land."""
+        operation = Operation("DELETE", "/api/build-lists/{build_list_id}", "delete", True, (204,))
+        assert not operation.is_bare_mutation
+
+    def test_a_get_is_never_a_bare_mutation(self) -> None:
+        """Reads change nothing, whatever their path."""
+        operation = Operation("GET", "/api/users/me", "me", True, (200,))
+        assert not operation.is_bare_mutation

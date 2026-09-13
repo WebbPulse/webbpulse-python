@@ -4,11 +4,12 @@ The post-deploy suite every product runs against a real stage. The plugin suppli
 fixtures and the generic tests; the product supplies its OpenAPI document and its cleanup.
 Back to the [README](../README.md).
 
-Install it with the `e2e` extra, which adds `httpx`, `boto3` and `pytest`:
+Install it with the `e2e` extra, which adds `httpx`, `boto3` and `pytest`. The reusable
+`e2e.yml` workflow installs the `e2e` dependency group alone, so declare it as its own group:
 
 ```toml
 [dependency-groups]
-dev = ["webbpulse[e2e]"]
+e2e = ["webbpulse[e2e]"]
 ```
 
 ## What it checks
@@ -20,7 +21,7 @@ junit case:
 | --- | --- |
 | `TestRouteCut` | Every live route key is expressible, has an integration, and the access log confirms which key served the probe |
 | `TestCoverage` | Every OpenAPI operation resolves to a live route, carries no trailing slash, and lands on a route whose authorizer matches its security requirement |
-| `TestReachability` | Every operation is answered by the API rather than by the gate, the limiter or a catch-all |
+| `TestReachability` | Every operation is answered by the API rather than by the gate, the limiter or a catch-all. A mutation with no path parameter is probed anonymously only, so the run never signs its own user out |
 | `TestIdentity` | Login returns an RS256 token carrying this environment's issuer and audience, refresh and logout work, the JWKS is reachable without the gate header, and a minted token with the wrong audience or an expired one is rejected |
 | `TestFrontend` | The web origin serves the app shell, an unknown path renders it too, the bundle references this environment's API and no legacy route name, and the CORS preflight allows the headers the shared client sends |
 | `TestHygiene` | Names carry the run prefix, the cleanup hook is registered, and created resources are tracked |
