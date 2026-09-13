@@ -61,7 +61,7 @@ its dev dependencies.
 | `webbpulse.events` | `stream_consumer_app`, `register_stream_consumer`, `events_path`: the one route a DynamoDB Streams or SQS consumer serves behind the Web Adapter | [events.md](docs/events.md) |
 | `webbpulse.messages` | `STATUS_MESSAGES`, `refusal`, `forbidden`, `unauthenticated`, `rate_limited`: the user-facing sentence each refusal renders | [error-handlers.md](docs/error-handlers.md) |
 | `webbpulse.dynamodb` | `Repository`, `Page`, `table_name`, `ttl_at`, `ttl_in`, `encode_numbers`, and the `DynamoError` family | [data-access.md](docs/data-access.md) |
-| `webbpulse.ratelimit` | `rate_limit`, a per-route fixed window limiter on one DynamoDB table, failing open | [data-access.md](docs/data-access.md) |
+| `webbpulse.ratelimit` | `rate_limit`, `rate_limit_middleware`, `LimitClass`, `classify`, a fixed window limiter on one DynamoDB table, failing open | [data-access.md](docs/data-access.md) |
 | `webbpulse.security` | `hash_password`, `verify_password`, `needs_rehash`, `create_token`, `decode_token`, `bearer_claims` | [security.md](docs/security.md) |
 | `webbpulse.identity` | App-managed identity: password, session, email link, TOTP, OAuth and passkey flows, plus a KMS-backed `TokenService` and a JWKS | [identity.md](docs/identity.md), [the standard](docs/identity-standard.md) |
 | `webbpulse.lambda_entry` | `run_uvicorn`, `is_lambda`, `resolve_port`: the AWS Lambda Web Adapter entrypoint, with no Mangum and no handler | [packaging.md](docs/packaging.md) |
