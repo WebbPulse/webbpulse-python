@@ -16,6 +16,7 @@ if TYPE_CHECKING:  # pragma: no cover
     from fastapi import Request
 
 __all__ = [
+    "GATE_CLAIMS_KEY",
     "AuthorizerClaims",
     "ClaimsUnavailable",
     "MissingRequestContext",
@@ -23,7 +24,11 @@ __all__ = [
     "UnparseableRequestContext",
     "authorizer_claims",
     "coerce_claims",
+    "gate_claims",
+    "identity_claims",
+    "identity_subject",
     "read_authorizer_claims",
+    "subject_dependency",
 ]
 
 _log = logging.getLogger(__name__)
@@ -37,6 +42,13 @@ ARRAY_CLAIMS: Final[frozenset[str]] = frozenset({"amr", "roles", "groups", "aud"
 SCOPES_KEY: Final = "scopes"
 
 _REFUSED_ENVIRONMENTS: Final[frozenset[str]] = frozenset({"production", "prod"})
+
+GATE_CLAIMS_KEY: Final = "jwt.claims"
+"""The single `authorizer.lambda` context key the staging access gate publishes.
+
+It holds every claim as one JSON string. The literal dot mirrors the native authorizer's
+`authorizer.jwt.claims` as closely as a Lambda authorizer's flat context map can.
+"""
 
 
 class ClaimsUnavailable(Exception):
@@ -106,6 +118,13 @@ class AuthorizerClaims(Mapping[str, Any]):
     def __repr__(self) -> str:
         """Render `sub` only, so a log line never spills an email or a scope list."""
         return f"AuthorizerClaims(sub={self._coerced.get('sub')!r})"
+
+
+def _request_context_header() -> str:
+    """The header the Lambda Web Adapter injects, imported late to keep FastAPI optional."""
+    from webbpulse.http import REQUEST_CONTEXT_HEADER
+
+    return REQUEST_CONTEXT_HEADER
 
 
 def _coerce_int(value: Any) -> Any:
@@ -180,12 +199,11 @@ def read_authorizer_claims(request: Request) -> AuthorizerClaims:
     Raises one of the three `ClaimsUnavailable` types instead of failing closed, so a parse
     fault is never mistaken for an anonymous caller.
     """
-    from webbpulse.http import REQUEST_CONTEXT_HEADER
-
-    raw = request.headers.get(REQUEST_CONTEXT_HEADER)
+    header = _request_context_header()
+    raw = request.headers.get(header)
     if raw is None or not raw.strip():
         raise MissingRequestContext(
-            f"No {REQUEST_CONTEXT_HEADER} header on this request. Behind API Gateway the "
+            f"No {header} header on this request. Behind API Gateway the "
             "Lambda Web Adapter always injects it, so this is a deployment fault rather "
             "than an anonymous caller."
         )
@@ -193,13 +211,13 @@ def read_authorizer_claims(request: Request) -> AuthorizerClaims:
         context = json.loads(raw)
     except ValueError as exc:
         raise UnparseableRequestContext(
-            f"The {REQUEST_CONTEXT_HEADER} header is not JSON. The Lambda Web Adapter "
+            f"The {header} header is not JSON. The Lambda Web Adapter "
             "sends it as a plain JSON string and never base64 encodes it, so this is a "
             "bug in the chain that produced the header rather than a bad token."
         ) from exc
     if not isinstance(context, Mapping):
         raise UnparseableRequestContext(
-            f"The {REQUEST_CONTEXT_HEADER} header parsed as {type(context).__name__} rather than a JSON object."
+            f"The {header} header parsed as {type(context).__name__} rather than a JSON object."
         )
 
     authorizer = context.get("authorizer")
@@ -288,4 +306,110 @@ def authorizer_claims(
 
     dependency.__name__ = "authorizer_claims"
     dependency.__doc__ = "The verified JWT claims for this request, read from the API Gateway authorizer."
+    return dependency
+
+
+def gate_claims(request: Request) -> dict[str, Any] | None:
+    """The staging access gate's claims for this request, or `None`.
+
+    A REQUEST authorizer publishes a flat string context under `authorizer.lambda`, so the
+    gate encodes every claim into one `GATE_CLAIMS_KEY` value with `JSON.stringify`. Every
+    failure answers `None` rather than raising, because reaching this at all already means
+    the native reader found nothing; a value the gate wrote that will not parse is warned
+    about, since that means the two sides disagree about the encoding rather than that the
+    token was bad.
+    """
+    header = _request_context_header()
+    raw = request.headers.get(header)
+    if raw is None or not raw.strip():
+        return None
+    try:
+        context = json.loads(raw)
+    except ValueError:
+        _log.debug("The %s header is not JSON.", header)
+        return None
+    if not isinstance(context, Mapping):
+        return None
+
+    authorizer = context.get("authorizer")
+    if not isinstance(authorizer, Mapping):
+        return None
+    lambda_context = authorizer.get("lambda")
+    if not isinstance(lambda_context, Mapping):
+        return None
+    encoded = lambda_context.get(GATE_CLAIMS_KEY)
+    if not isinstance(encoded, str) or not encoded.strip():
+        return None
+    try:
+        claims = json.loads(encoded)
+    except ValueError:
+        _log.warning(
+            "The staging access gate published a %r context value that is not JSON. The gate "
+            "writes it with JSON.stringify, so this means the two sides disagree about the "
+            "encoding rather than that the token was bad.",
+            GATE_CLAIMS_KEY,
+        )
+        return None
+    if not isinstance(claims, Mapping):
+        return None
+    return dict(claims)
+
+
+def identity_claims(request: Request) -> AuthorizerClaims | None:
+    """The verified claims for this request in whichever shape arrived, or `None`.
+
+    Tries the native JWT authorizer's `authorizer.jwt.claims` first and the staging gate's
+    `authorizer.lambda` context second, coercing both through `coerce_claims`. `None` means
+    no authorizer ran, which is not the same as a refused request: use this where a route
+    tolerates an unauthenticated caller, and `authorizer_claims` where it does not.
+    """
+    try:
+        return read_authorizer_claims(request)
+    except ClaimsUnavailable:
+        pass
+    gate = gate_claims(request)
+    if gate is None:
+        return None
+    return AuthorizerClaims(gate)
+
+
+def identity_subject(request: Request) -> str:
+    """The verified `sub` an authorizer put on this request, or `""` for none.
+
+    `sub` is the product's own user id as a string, so a token maps to a row by id with no
+    link table between them. `""` rather than `None`, so a caller can branch on truthiness
+    without distinguishing an absent `sub` from an absent authorizer.
+    """
+    claims = identity_claims(request)
+    if claims is None:
+        return ""
+    return str(claims.get("sub", "") or "")
+
+
+def subject_dependency(*, required: bool = True) -> Any:
+    """Build the FastAPI dependency returning this request's verified subject.
+
+    Args:
+        required: When true, an absent subject raises a 401 carrying the same fixed detail
+            and `WWW-Authenticate` challenge `authorizer_claims` uses. When false, an absent
+            subject returns `""` and the route decides.
+
+    Returns:
+        An `async def` dependency suitable for `Depends`.
+    """
+    from fastapi import HTTPException
+
+    async def dependency(request: Request) -> str:
+        """Return the verified subject, or raise a 401 when one is required."""
+        subject = identity_subject(request)
+        if not subject and required:
+            raise HTTPException(
+                status_code=401,
+                detail="Not authenticated.",
+                headers={"WWW-Authenticate": "Bearer"},
+            )
+        return subject
+
+    dependency.__name__ = "identity_subject"
+    dependency.__doc__ = "The verified `sub` for this request, from whichever authorizer ran."
     return dependency

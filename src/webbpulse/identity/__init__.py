@@ -9,6 +9,7 @@ from __future__ import annotations
 from webbpulse.identity.claims import (
     ARRAY_CLAIMS,
     BOOLEAN_CLAIMS,
+    GATE_CLAIMS_KEY,
     INTEGER_CLAIMS,
     AuthorizerClaims,
     ClaimsUnavailable,
@@ -17,7 +18,11 @@ from webbpulse.identity.claims import (
     UnparseableRequestContext,
     authorizer_claims,
     coerce_claims,
+    gate_claims,
+    identity_claims,
+    identity_subject,
     read_authorizer_claims,
+    subject_dependency,
 )
 from webbpulse.identity.crypto import (
     TOTP_ENCRYPTION_PURPOSE,
@@ -301,6 +306,7 @@ __all__ = [
     "DISCOVERY_CACHE_CONTROL",
     "DISCOVERY_PATH",
     "EVENTS_PATH_ENV",
+    "GATE_CLAIMS_KEY",
     "GITHUB_PROVIDER",
     "GOOGLE_PROVIDER",
     "HEALTH_PATH",
@@ -487,10 +493,13 @@ __all__ = [
     "encryption_context",
     "equalise_password_timing",
     "events_path",
+    "gate_claims",
     "hash_recovery_code",
     "hash_token",
+    "identity_claims",
     "identity_prefix",
     "identity_router",
+    "identity_subject",
     "ip_key",
     "is_expired",
     "kid_for_der",
@@ -513,5 +522,6 @@ __all__ = [
     "render_password_reset",
     "render_registration_notice",
     "render_verification",
+    "subject_dependency",
     "users_key_attribute",
 ]
