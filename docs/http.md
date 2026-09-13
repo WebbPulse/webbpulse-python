@@ -7,8 +7,8 @@ DynamoDB and for a service's own exception types are in
 ## `webbpulse.http`
 
 `create_app` builds one domain's FastAPI application, adding, in the order a request
-traverses them: CORS, the request id middleware, the structured error handlers, and a
-`GET /health` route.
+traverses them: CORS, the request id middleware, the request log, the structured error
+handlers, and a `GET /health` route.
 
 ```python
 from webbpulse.http import create_app
@@ -40,6 +40,27 @@ can be a password or a token.
 `user_id` onto its log lines without hitting the sync-dependency trap. See
 [the warning in logging-and-metrics.md](logging-and-metrics.md#do-not-call-set_user_id-from-a-sync-def-fastapi-dependency),
 which is the shape to read before wiring authentication.
+
+### The request log
+
+`create_app` installs `RequestLoggingMiddleware`, which emits one INFO line per request,
+named `request`, on the `webbpulse.http` logger:
+
+```json
+{"message": "request", "http_method": "GET", "http_path": "/items/{item_id}",
+ "http_status": 200, "duration_ms": 12.4, "request_id": "...", "user_id": "..."}
+```
+
+`http_path` is the matched route template, not the raw path, so an id in a path segment does
+not give every request its own distinct value. `user_id` appears only once a subject is
+bound, which `user_id_dependency` does. A request that raises is logged too, before the
+exception propagates.
+
+Nothing that can carry a secret is logged: no body, no header, no token and no query string.
+
+The API Gateway access log records the same request at the edge. This line is the in-process
+view, with the route template, the handler's own duration and the authenticated subject.
+Pass `request_log=False` where the gateway access log is the only record a service wants.
 
 ### Carrying more than the four fields
 

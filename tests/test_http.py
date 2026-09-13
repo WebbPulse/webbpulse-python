@@ -1233,3 +1233,111 @@ def test_user_id_dependency_takes_the_wrapped_callables_name() -> None:
 def test_user_id_dependency_carries_the_wrapped_callables_docstring() -> None:
     """The wrapper carries the wrapped callable's docstring."""
     assert user_id_dependency(_resolve_user).__doc__ == inspect.getdoc(_resolve_user)
+
+
+def _request_lines(records: list[logging.LogRecord]) -> list[logging.LogRecord]:
+    """The records the request log emitted, ignoring everything else on the logger."""
+    return [record for record in records if record.getMessage() == "request"]
+
+
+def _field(record: logging.LogRecord, name: str) -> Any:
+    """Read one `extra=` field off a record, which is untyped on `LogRecord`."""
+    return getattr(record, name)
+
+
+def test_the_request_log_emits_one_line_per_request(caplog: pytest.LogCaptureFixture) -> None:
+    """A served request logs its method, route template, status and duration."""
+    app = create_app(service_name="probe", version="1.0.0")
+    with caplog.at_level(logging.INFO, logger="webbpulse.http"), TestClient(app) as client:
+        client.get("/health")
+
+    lines = _request_lines(caplog.records)
+    assert len(lines) == 1
+    line = lines[0]
+    assert _field(line, "http_method") == "GET"
+    assert _field(line, "http_path") == "/health"
+    assert _field(line, "http_status") == 200
+    assert isinstance(_field(line, "duration_ms"), float)
+
+
+def test_the_request_log_carries_the_request_id(caplog: pytest.LogCaptureFixture) -> None:
+    """The line joins to the caller's report through the id the middleware bound."""
+    app = create_app(service_name="probe", version="1.0.0")
+    with caplog.at_level(logging.INFO, logger="webbpulse.http"), TestClient(app) as client:
+        response = client.get("/health", headers={REQUEST_ID_HEADER: "rid-from-the-caller"})
+
+    assert response.headers[REQUEST_ID_HEADER] == "rid-from-the-caller"
+    assert _field(_request_lines(caplog.records)[0], "request_id") == "rid-from-the-caller"
+
+
+def test_the_request_log_reports_the_route_template_not_the_path(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """An id in a path segment must not give every request a distinct `http_path`."""
+    router = APIRouter()
+
+    @router.get("/items/{item_id}")
+    async def read_item(item_id: str) -> dict[str, str]:
+        """Echo the path parameter back."""
+        return {"id": item_id}
+
+    app = create_app([router], service_name="probe", version="1.0.0")
+    with caplog.at_level(logging.INFO, logger="webbpulse.http"), TestClient(app) as client:
+        client.get("/items/abc")
+
+    assert _field(_request_lines(caplog.records)[0], "http_path") == "/items/{item_id}"
+
+
+def test_the_request_log_never_records_the_query_string(caplog: pytest.LogCaptureFixture) -> None:
+    """A query string can carry a token, so no logged field may contain one."""
+    app = create_app(service_name="probe", version="1.0.0")
+    with caplog.at_level(logging.INFO, logger="webbpulse.http"), TestClient(app) as client:
+        client.get("/health?token=super-secret")
+
+    line = _request_lines(caplog.records)[0]
+    assert "super-secret" not in json.dumps(line.__dict__, default=str)
+
+
+def test_the_request_log_reports_the_authenticated_subject(caplog: pytest.LogCaptureFixture) -> None:
+    """A subject bound inside the handler still reaches the line."""
+    router = APIRouter()
+    dependency = user_id_dependency(lambda: {"id": "user-77"}, extract=lambda user: user["id"])
+
+    @router.get("/me")
+    async def me(user: dict[str, str] = Depends(dependency)) -> dict[str, str]:
+        """Return the resolved user."""
+        return user
+
+    app = create_app([router], service_name="probe", version="1.0.0")
+    with caplog.at_level(logging.INFO, logger="webbpulse.http"), TestClient(app) as client:
+        client.get("/me")
+
+    assert _field(_request_lines(caplog.records)[0], "user_id") == "user-77"
+
+
+def test_the_request_log_records_a_request_that_raised(caplog: pytest.LogCaptureFixture) -> None:
+    """A handler that raises is logged as a 500 rather than going unrecorded."""
+    router = APIRouter()
+
+    @router.get("/boom")
+    async def boom() -> None:
+        """Fail the request."""
+        raise RuntimeError("nope")
+
+    app = create_app([router], service_name="probe", version="1.0.0")
+    with (
+        caplog.at_level(logging.INFO, logger="webbpulse.http"),
+        TestClient(app, raise_server_exceptions=False) as client,
+    ):
+        assert client.get("/boom").status_code == 500
+
+    assert _field(_request_lines(caplog.records)[0], "http_status") == 500
+
+
+def test_the_request_log_can_be_turned_off(caplog: pytest.LogCaptureFixture) -> None:
+    """`request_log=False` leaves the gateway access log as the only record."""
+    app = create_app(service_name="probe", version="1.0.0", request_log=False)
+    with caplog.at_level(logging.INFO, logger="webbpulse.http"), TestClient(app) as client:
+        client.get("/health")
+
+    assert _request_lines(caplog.records) == []

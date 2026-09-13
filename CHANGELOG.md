@@ -5,6 +5,32 @@ Notable changes to the `webbpulse` package. The version here is the one in
 
 This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## 0.27.0
+
+Restores an application level request log. `create_app` installs `RequestLoggingMiddleware`,
+which emits one INFO line named `request` per HTTP request, carrying the method, the matched
+route template, the status, the duration in milliseconds, the request id and, when one is
+bound, the authenticated subject.
+
+The API Gateway access log already records the same request at the edge. This line is the
+in-process view: it sees the route template rather than the raw path, the handler's own
+duration, and the subject the gateway never learns.
+
+Nothing that can carry a secret is logged: no body, no header, no token and no query string.
+The path is the matched template, so an id in a path segment does not give every request a
+distinct value.
+
+The middleware is pure ASGI rather than a `BaseHTTPMiddleware`, because `call_next` runs the
+application in a child task whose context a `BaseHTTPMiddleware` cannot read back, and a user
+id bound by `user_id_dependency` would never have reached the line.
+
+Pass `request_log=False` to `create_app` where the gateway access log is the only per-request
+record a service wants.
+
+`bind_user_id` takes an optional `request`, and records the cleaned id on the request scope as
+well as the context variable. `user_id_dependency` now passes it, which is what lets the log
+line report a subject bound inside a route handler. Both remain backwards compatible.
+
 ## 0.26.0
 
 Restores the security property that 0.25.2 could only degrade gracefully: a password change
