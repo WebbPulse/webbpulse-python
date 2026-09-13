@@ -90,6 +90,17 @@ pytest_plugins = ["webbpulse.testing"]
 | `rate_limit_table` | The `rate-limits` table shaped exactly as Terraform creates it |
 | `test_client(app, source_ip=...)` | A `TestClient` whose requests carry a realistic API Gateway request context |
 | `make_request_context_headers(...)` | That header on its own, in either payload shape |
+| `rsa_key` | A module-scoped 2048-bit RSA key, so a suite generates one rather than one per test |
+| `fake_kms` | A `FakeKms` holding `rsa_key`, ready to drive a `KmsSigner` |
+
+`FakeKms` is the KMS stand-in the identity tests run on, exported for a service's own. It
+answers `get_public_key` and `sign` in the shapes the real client returns and signs for
+real, so a token minted through it verifies against its JWK. It holds either one key, which
+answers for any key id, or a mapping of key id to key for a rotation test. It records
+`get_public_key_calls` and `sign_calls`, takes a `failing` set of key ids that raise the way
+a deleted key does, reports a `key_spec`, and `der_for(key_id)` returns exactly the bytes
+`kid_for_der` hashes. `MessageType="DIGEST"` is honoured: the message is signed as the
+digest it already is, never hashed again.
 
 `test_client` is the one worth knowing about. Without the injected context header a
 `TestClient` request has no API Gateway context at all, so `client_ip` falls back to the

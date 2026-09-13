@@ -1,6 +1,7 @@
 # Data access and rate limiting
 
-The DynamoDB repository base and the shared rate limiter. Back to the
+The DynamoDB repository base, the application secrets wrapper and the shared rate limiter.
+Back to the
 [README](../README.md).
 
 ## `webbpulse.dynamodb`
@@ -42,6 +43,88 @@ body should carry: the table and key, the condition expression, the cancellation
 since a cancellation caused by a failed condition is an ordinary lost race and every other
 cause is a real fault. `webbpulse.http.install_dynamodb_error_handlers` renders all three,
 and [error-handlers.md](error-handlers.md#the-packages-own-dynamodb-exception-types) has the mapping.
+
+### Scanning
+
+`scan` returns the same `Page` as `query`, and `iter_scan` follows `LastEvaluatedKey` the
+way `iter_query` does, so neither caller hand-rolls the paging loop:
+
+```python
+for item in repo.iter_scan(FilterExpression=Attr("state").eq("open"), max_items=500):
+    ...
+```
+
+`max_items` stops the walk once that many items have been yielded, which is what makes an
+unbounded scan safe to expose. A parallel scan passes `segment` and `total_segments`; giving
+one without the other is a `ValueError` rather than a silently partial result.
+
+### Batch reads
+
+`batch_get(keys)` reads up to `BATCH_GET_LIMIT` (100) keys per request and chunks anything
+larger. DynamoDB load-sheds by returning `UnprocessedKeys` instead of failing, so the
+outstanding keys are retried with exponential backoff from `UNPROCESSED_RETRY_BASE_DELAY`,
+and only the outstanding ones are resent. The retry count is capped at
+`UNPROCESSED_RETRY_ATTEMPTS` (5, overridable per call with `max_attempts`); once it is
+exhausted the call raises `UnprocessedItems` carrying the table, the number of keys still
+outstanding and the attempts made. A `while UnprocessedKeys:` loop with no cap is a hang
+under sustained throttling, not a slow success, which is why the cap is not optional.
+
+Results come back in no particular order, and a key with no item is simply absent rather
+than being an error, because a batch read is a lookup and not an assertion.
+
+### Transactions
+
+`transact_write(actions)` applies up to `TRANSACT_WRITE_LIMIT` (100) actions as one
+all-or-nothing `TransactWriteItems`. `put_action`, `delete_action`, `update_action` and
+`condition_check` build the actions, each optionally taking a `condition`:
+
+```python
+repo.transact_write(
+    [
+        repo.put_action(item, condition=Attr("pk").not_exists()),
+        repo.condition_check({"pk": "quota#acct-1"}, condition=Attr("used").lt(100)),
+    ],
+    client_request_token=request_id,
+)
+```
+
+A `boto3.dynamodb.conditions` object is rendered into an expression string with its
+placeholder maps **inside** the action. That matters: handing a condition object straight to
+the low-level client makes boto3 hoist `ExpressionAttributeNames` and
+`ExpressionAttributeValues` to the top of the request, which the API rejects. A condition
+that is already a string is passed through.
+
+An empty action list is a no-op, so a caller that assembled actions conditionally need not
+check. `client_request_token` makes a retry idempotent for ten minutes. A cancellation
+raises `TransactionCanceled` with its `CancellationReasons`, and
+`conditional_check_failed` separates the ordinary lost race from a real fault.
+
+## `webbpulse.security` application secrets
+
+One JSON secret per service per environment, named by `APP_SECRETS_ARN`, read once per
+process and flattened to a map of strings:
+
+```python
+from webbpulse.security import apply_app_secrets
+
+settings = Settings()
+apply_app_secrets(settings)
+```
+
+`app_secrets()` returns the flat map. `flatten_secret` keeps a string as it is and JSON
+encodes anything else, so a list or an object survives a round trip through an environment
+variable; a `null` is dropped, which is how a secret marks a key absent. `load_app_secrets`
+exports every key into `os.environ` (`override=False` lets a locally set value win).
+`apply_app_secrets` does that and also assigns each key that matches a settings field,
+validated against the field's annotation first, so a malformed secret fails at startup
+rather than at the first use of the value. Field matching is case-insensitive, and a key
+with no matching field reaches the environment only, since a secret may carry values other
+consumers read.
+
+Nothing is fetched at import, so a function touching no secret needs no
+`secretsmanager:GetSecretValue` grant. Key names are logged at INFO, which is what makes a
+missing one diagnosable; values never are. `reset_secret_cache()` clears this cache and the
+parsed one in `webbpulse.config` together, since one is derived from the other.
 
 ## `webbpulse.ratelimit`
 
