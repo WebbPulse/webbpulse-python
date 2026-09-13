@@ -22,6 +22,7 @@ __all__ = [
     "Environment",
     "SecretNotJsonObjectError",
     "load_json_secret",
+    "read_json_secret",
     "reset_secret_cache",
     "split_csv",
 ]
@@ -178,14 +179,13 @@ def _secrets_client(region_name: str | None) -> SecretsManagerClient:
     return client
 
 
-@lru_cache(maxsize=8)
-def load_json_secret(arn: str, region_name: str | None = None) -> dict[str, Any]:
-    """Fetch one Secrets Manager secret and parse its value as a JSON object.
+def read_json_secret(arn: str, client: Any) -> dict[str, Any]:
+    """Fetch `arn` through `client` and parse its value as a JSON object, uncached.
 
-    Cached per `(arn, region_name)` for the life of the process. Raises
+    The uncached half of `load_json_secret`, for a caller holding its own client. Raises
     `SecretNotJsonObjectError` when the value is not a JSON object.
     """
-    response = _secrets_client(region_name).get_secret_value(SecretId=arn)
+    response = client.get_secret_value(SecretId=arn)
     raw = response.get("SecretString")
     if raw is None:
         raise SecretNotJsonObjectError(f"Secret {arn} holds binary data, not a JSON object.")
@@ -198,6 +198,16 @@ def load_json_secret(arn: str, region_name: str | None = None) -> dict[str, Any]
     if not isinstance(parsed, dict):
         raise SecretNotJsonObjectError(f"Secret {arn} parsed as {type(parsed).__name__}, expected a JSON object.")
     return parsed
+
+
+@lru_cache(maxsize=8)
+def load_json_secret(arn: str, region_name: str | None = None) -> dict[str, Any]:
+    """Fetch one Secrets Manager secret and parse its value as a JSON object.
+
+    Cached per `(arn, region_name)` for the life of the process. Raises
+    `SecretNotJsonObjectError` when the value is not a JSON object.
+    """
+    return read_json_secret(arn, _secrets_client(region_name))
 
 
 def reset_secret_cache() -> None:

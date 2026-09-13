@@ -7,6 +7,9 @@ than read from the token header. What the claims mean is left to the caller.
 
 from __future__ import annotations
 
+import json
+import logging
+import os
 from collections.abc import Iterable, Mapping, Sequence
 from datetime import UTC, datetime, timedelta
 from typing import Any, Final
@@ -18,11 +21,16 @@ __all__ = [
     "ExpiredToken",
     "InvalidToken",
     "TokenError",
+    "app_secrets",
+    "apply_app_secrets",
     "bearer_claims",
     "create_token",
     "decode_token",
+    "flatten_secret",
     "hash_password",
+    "load_app_secrets",
     "needs_rehash",
+    "reset_secret_cache",
     "verify_password",
 ]
 
@@ -31,6 +39,10 @@ BCRYPT_MAX_BYTES: Final = 72
 DEFAULT_ROUNDS: int = 12
 
 DEFAULT_ALGORITHM: Final = "HS256"
+
+_secrets_log = logging.getLogger(__name__)
+
+_SECRET_CACHE: dict[str, dict[str, str]] = {}
 
 type Claims = dict[str, Any]
 
@@ -234,3 +246,132 @@ def bearer_claims(
             return None
 
     return dependency
+
+
+def flatten_secret(payload: Mapping[str, Any]) -> dict[str, str]:
+    """Flatten a parsed JSON secret to the string map settings and the environment want.
+
+    A non-string value is JSON encoded rather than stringified, so a list or an object
+    survives a round trip through an environment variable. A `null` is dropped, which is
+    how a secret says a key is absent without removing it from the document.
+    """
+    return {
+        name: value if isinstance(value, str) else json.dumps(value)
+        for name, value in payload.items()
+        if value is not None
+    }
+
+
+def app_secrets(
+    secret_arn: str | None = None,
+    *,
+    client: Any = None,
+    region_name: str | None = None,
+) -> dict[str, str]:
+    """The service's one JSON secret as a flat map of strings, cached per ARN.
+
+    Nothing runs at import and nothing is fetched until a caller asks, so a function that
+    touches no secret needs no `secretsmanager:GetSecretValue` grant. No value is ever
+    logged; the key names are, since knowing which keys arrived is what makes a missing one
+    diagnosable.
+
+    Args:
+        secret_arn: The secret to read, defaulting to the `APP_SECRETS_ARN` environment
+            variable. An empty ARN returns `{}`, which is the normal local and test path
+            rather than an error.
+        client: A Secrets Manager client to read through, for tests. A supplied client
+            bypasses the shared cache in `webbpulse.config` entirely, so an injected stub
+            cannot leak into a later real call.
+        region_name: Region for the shared client. Ignored when `client` is given.
+
+    Raises:
+        SecretNotJsonObjectError: When the secret holds binary data, is not valid JSON, or
+            parses as something other than an object.
+    """
+    from webbpulse.config import APP_SECRETS_ARN_ENV, load_json_secret, read_json_secret
+
+    arn = secret_arn if secret_arn is not None else os.environ.get(APP_SECRETS_ARN_ENV, "")
+    if not arn:
+        return {}
+
+    if client is None:
+        cached = _SECRET_CACHE.get(arn)
+        if cached is not None:
+            return dict(cached)
+
+    try:
+        payload = read_json_secret(arn, client) if client is not None else load_json_secret(arn, region_name)
+    except Exception:
+        _secrets_log.exception("Failed to read application secrets from %s", arn)
+        raise
+
+    values = flatten_secret(payload)
+    _secrets_log.info("Loaded %d application secrets from %s: %s", len(values), arn, ", ".join(sorted(values)))
+    if client is None:
+        _SECRET_CACHE[arn] = values
+    return dict(values)
+
+
+def load_app_secrets(
+    secret_arn: str | None = None,
+    *,
+    client: Any = None,
+    region_name: str | None = None,
+    override: bool = True,
+) -> dict[str, str]:
+    """Read the secret and export every key into `os.environ`, returning what was applied.
+
+    For a consumer or a script that reads its configuration straight from the environment.
+    A service using `BaseServiceSettings` should prefer `apply_app_secrets`, which validates
+    each value against the field that will hold it.
+
+    `override=False` leaves an existing environment variable alone, so a value set for a
+    local run wins over the deployed secret.
+    """
+    applied = app_secrets(secret_arn, client=client, region_name=region_name)
+    for name, value in applied.items():
+        if override or name not in os.environ:
+            os.environ[name] = value
+    return applied
+
+
+def apply_app_secrets(
+    settings: Any,
+    secret_arn: str | None = None,
+    *,
+    client: Any = None,
+    region_name: str | None = None,
+) -> dict[str, str]:
+    """Export the secret into the environment and set the matching fields on `settings`.
+
+    A key with no field of that name on the settings model reaches the environment and
+    nothing else, so a secret may carry values for other consumers. Each value that does
+    match a field is validated against that field's annotation before being assigned, so a
+    malformed secret fails here rather than at the first use of the value.
+
+    Matching is case-insensitive, since pydantic-settings resolves environment variables
+    that way and a secret written in either case should behave the same.
+    """
+    from pydantic import TypeAdapter
+
+    applied = load_app_secrets(secret_arn, client=client, region_name=region_name)
+    fields = getattr(type(settings), "model_fields", {})
+    by_lower = {name.lower(): name for name in fields}
+    for name, value in applied.items():
+        field_name = by_lower.get(name.lower())
+        if field_name is None:
+            continue
+        setattr(settings, field_name, TypeAdapter(fields[field_name].annotation).validate_python(value))
+    return applied
+
+
+def reset_secret_cache() -> None:
+    """Drop the flattened secrets here and the parsed ones in `webbpulse.config`.
+
+    Both halves: this map is derived from the shared parse, so clearing only one would
+    refill it from the other's stale copy.
+    """
+    from webbpulse.config import reset_secret_cache as reset_shared
+
+    _SECRET_CACHE.clear()
+    reset_shared()
