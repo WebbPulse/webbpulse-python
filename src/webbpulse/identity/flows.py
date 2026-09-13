@@ -38,7 +38,7 @@ from webbpulse.identity.passwords import (
 from webbpulse.identity.sessions import SessionService
 
 if TYPE_CHECKING:  # pragma: no cover
-    from collections.abc import Mapping, Sequence
+    from collections.abc import Callable, Mapping, Sequence
 
     from webbpulse.identity.email import EmailMessage, EmailSender
     from webbpulse.identity.hooks import IdentityHooks
@@ -55,6 +55,7 @@ __all__ = [
     "IdentityFlows",
     "LoginRejected",
     "MfaChallengeRequired",
+    "PurgeResult",
     "RateLimited",
 ]
 
@@ -132,6 +133,54 @@ class AuthResult:
     refresh_token: str
     family_id: str
     extra: Mapping[str, Any] = field(default_factory=dict)
+
+
+@dataclass(frozen=True, slots=True)
+class PurgeResult:
+    """How many rows each identity table gave up for one purged user.
+
+    `unsupported` names the tables whose store could not enumerate the user's rows, which
+    is a table with no user index rather than a failure. Every row in such a table carries
+    a TTL, so nothing is left behind permanently.
+    """
+
+    user_id: str
+    refresh_tokens: int = 0
+    credentials: int = 0
+    passkeys: int = 0
+    totp_factors: int = 0
+    recovery_codes: int = 0
+    oauth_links: int = 0
+    identity_tokens: int = 0
+    webauthn_challenges: int = 0
+    unsupported: tuple[str, ...] = ()
+
+    @property
+    def total(self) -> int:
+        """Every row this purge deleted, across every table."""
+        return (
+            self.refresh_tokens
+            + self.credentials
+            + self.passkeys
+            + self.totp_factors
+            + self.recovery_codes
+            + self.oauth_links
+            + self.identity_tokens
+            + self.webauthn_challenges
+        )
+
+    def counts(self) -> dict[str, int]:
+        """The per-table counts, for the structured log line."""
+        return {
+            "refresh_tokens": self.refresh_tokens,
+            "credentials": self.credentials,
+            "passkeys": self.passkeys,
+            "totp_factors": self.totp_factors,
+            "recovery_codes": self.recovery_codes,
+            "oauth_links": self.oauth_links,
+            "identity_tokens": self.identity_tokens,
+            "webauthn_challenges": self.webauthn_challenges,
+        }
 
 
 class IdentityFlows:
@@ -865,6 +914,105 @@ class IdentityFlows:
             },
         )
         return revoked
+
+    def purge_user(self, user_id: str) -> PurgeResult:
+        """Delete every identity row for a user the product has already deleted.
+
+        The asynchronous half of account deletion: the product's `users` Lambda hard-deletes
+        the users row, and this runs from that table's stream. Deletes rather than revokes,
+        since nothing is left to replay a token against. Idempotent, so the stream's
+        at-least-once delivery and any retry of a partially applied purge both converge; a
+        user with no rows succeeds with zero counts.
+
+        A store whose table carries no user index raises `NotImplementedError`, which is
+        recorded in `unsupported` rather than failing the purge: every such table has a TTL
+        that reclaims the rows within a day. Any other error propagates, so the stream
+        retries that record.
+        """
+        cleaned = user_id.strip()
+        if not cleaned:
+            raise ValueError("purge_user needs a user id, and was given an empty one.")
+
+        unsupported: list[str] = []
+
+        def counted(table: str, delete: Callable[[], int]) -> int:
+            """Run one table's delete, recording an unsupported table instead of failing."""
+            try:
+                return delete()
+            except NotImplementedError:
+                unsupported.append(table)
+                _log.warning(
+                    "A table could not be purged because its store cannot enumerate a user's rows.",
+                    extra={"event": "identity.purge_unsupported", "user_id": cleaned, "table": table},
+                )
+                return 0
+
+        stores = self._stores
+        result = PurgeResult(
+            user_id=cleaned,
+            refresh_tokens=counted(
+                "refresh_tokens",
+                lambda: stores.require_refresh_tokens().delete_all_for_user(cleaned),
+            ),
+            credentials=(
+                counted("credentials", lambda: stores.require_credentials().delete_all_for_user(cleaned))
+                if stores.credentials is not None
+                else 0
+            ),
+            passkeys=(
+                counted("passkeys", lambda: stores.require_passkeys().delete_all_for_user(cleaned))
+                if stores.passkeys is not None
+                else 0
+            ),
+            totp_factors=(self._purge_totp_factor(cleaned) if stores.totp_factors is not None else 0),
+            recovery_codes=(
+                counted("recovery_codes", lambda: stores.require_recovery_codes().delete_for_user(cleaned))
+                if stores.recovery_codes is not None
+                else 0
+            ),
+            oauth_links=(
+                counted("oauth_links", lambda: stores.require_oauth_links().delete_all_for_user(cleaned))
+                if stores.oauth_links is not None
+                else 0
+            ),
+            identity_tokens=(
+                counted("identity_tokens", lambda: stores.require_identity_tokens().delete_all_for_user(cleaned))
+                if stores.identity_tokens is not None
+                else 0
+            ),
+            webauthn_challenges=(
+                counted(
+                    "webauthn_challenges",
+                    lambda: stores.require_webauthn_challenges().delete_all_for_user(cleaned),
+                )
+                if stores.webauthn_challenges is not None
+                else 0
+            ),
+            unsupported=tuple(unsupported),
+        )
+
+        _log.info(
+            "Purged every identity row for a deleted user.",
+            extra={
+                "event": "identity.user_purged",
+                "user_id": cleaned,
+                "total_rows": result.total,
+                "unsupported_tables": list(result.unsupported),
+                **result.counts(),
+            },
+        )
+        return result
+
+    def _purge_totp_factor(self, user_id: str) -> int:
+        """Delete the user's TOTP factor, returning 1 when there was one and 0 otherwise.
+
+        `TotpFactorStore.delete` is already idempotent and returns nothing, so the count
+        comes from the read that precedes it.
+        """
+        store = self._stores.require_totp_factors()
+        present = store.get(user_id) is not None
+        store.delete(user_id)
+        return 1 if present else 0
 
     def _require_email(self) -> None:
         """Raise a 503 unless a sender and an `identity-tokens` store are both present."""

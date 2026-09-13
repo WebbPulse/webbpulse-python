@@ -50,6 +50,8 @@ from cryptography.hazmat.primitives.asymmetric import padding, rsa, utils  # noq
 from fastapi import FastAPI  # noqa: E402
 from fastapi.testclient import TestClient  # noqa: E402
 
+EVENTS_PATH = "/events"
+
 KEY_A = "arn:aws:kms:us-west-2:111122223333:key/aaaaaaaa-1111-1111-1111-aaaaaaaaaaaa"
 ISSUER = "https://api.staging.example.com/api/auth"
 AUDIENCE = "webbpulse-staging"
@@ -1071,6 +1073,7 @@ def test_the_flows_mount_when_hooks_and_stores_are_supplied(
     router = build_identity_router(make_settings(), hooks, stores, kms_client=kms)
     paths = {route.path for route in router.routes}  # type: ignore[attr-defined]
     assert paths == {
+        EVENTS_PATH,
         "/api/auth/.well-known/openid-configuration",
         "/api/auth/.well-known/jwks.json",
         "/api/auth/health",
@@ -1088,11 +1091,16 @@ def test_the_flows_mount_when_hooks_and_stores_are_supplied(
 def test_an_origin_issuer_mounts_every_route_at_the_origin(
     kms: FakeKms, hooks: FakeHooks, stores: IdentityStores
 ) -> None:
-    """An issuer with no path mounts every route at the origin."""
+    """An issuer with no path mounts every route at the origin.
+
+    The stream pass-through route is the one exception: its path is the adapter's, not the
+    issuer's, so it sits at `/events` whatever the issuer is.
+    """
     settings = make_settings(issuer="https://identity.example.com")
     router = build_identity_router(settings, hooks, stores, kms_client=kms)
     paths = {route.path for route in router.routes}  # type: ignore[attr-defined]
     assert paths == {
+        EVENTS_PATH,
         "/.well-known/openid-configuration",
         "/.well-known/jwks.json",
         "/health",
@@ -1147,7 +1155,11 @@ def test_the_advertised_jwks_uri_resolves_to_the_served_jwks(issuer: str, kms: F
 def test_the_flow_routes_sit_under_the_same_prefix_as_the_documents(
     issuer: str, prefix: str, kms: FakeKms, hooks: FakeHooks, stores: IdentityStores
 ) -> None:
-    """Flow routes and document routes share the prefix derived from the issuer."""
+    """Flow routes and document routes share the prefix derived from the issuer.
+
+    The stream pass-through route is excluded: the adapter posts to a fixed absolute path,
+    so it cannot move under the issuer's prefix.
+    """
     settings = make_settings(issuer=issuer)
     router = build_identity_router(settings, hooks, stores, kms_client=kms)
     paths = {route.path for route in router.routes}  # type: ignore[attr-defined]
@@ -1156,7 +1168,7 @@ def test_the_flow_routes_sit_under_the_same_prefix_as_the_documents(
     assert f"{prefix}/login" in paths
     assert f"{prefix}/refresh" in paths
     assert f"{prefix}/.well-known/jwks.json" in paths
-    assert all(path.startswith(prefix) for path in paths)
+    assert all(path.startswith(prefix) for path in paths - {EVENTS_PATH})
 
 
 def test_the_flow_prefix_matches_the_cookie_path() -> None:

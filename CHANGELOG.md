@@ -5,6 +5,46 @@ Notable changes to the `webbpulse` package. The version here is the one in
 
 This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## 0.28.0
+
+Adds the asynchronous half of account deletion. `IdentityFlows.purge_user` deletes every
+identity row for one user: refresh token families, credentials, passkeys, the TOTP factor,
+recovery codes, OAuth links, outstanding identity tokens and WebAuthn challenges. It returns
+a `PurgeResult` carrying a count per table, and logs one `identity.user_purged` event. It is
+idempotent, so a user with no rows succeeds with zero counts and a retry of a partially
+applied purge converges.
+
+Refresh tokens are deleted rather than revoked. A purge is not a logout: nothing is left to
+replay a token against, and a revoked row would outlive the user it belonged to.
+
+Every store that could not already delete by user gained `delete_all_for_user`, abstract, in
+memory and on DynamoDB. `Repository.delete_many` batches the deletes for the tables holding
+many rows per user, and `DynamoRecoveryCodeStore.delete_for_user` now uses it instead of a
+row at a time.
+
+The `identity-tokens` and `webauthn-challenges` tables carry no user index, so their DynamoDB
+stores raise `NotImplementedError` rather than scanning. `purge_user` records those in
+`PurgeResult.unsupported` instead of failing, and both tables carry a TTL, so nothing is
+retained permanently.
+
+`build_identity_router` mounts a DynamoDB Streams route wherever the flows mount. Identity
+Lambdas run behind the AWS Lambda Web Adapter, which posts a non-HTTP invocation as a JSON
+body to its pass-through path and returns the response body as the function's result, so the
+stream handler is an ordinary route rather than a second entrypoint. It handles only `REMOVE`
+records, reads the user id from `dynamodb.Keys`, and answers with the `ReportBatchItemFailures`
+shape so the event source mapping retries only the records that raised.
+
+The route takes no auth and returns 404 to any request carrying an API Gateway request context
+or request id, so it is reachable only through the adapter's pass-through. It sits at an
+absolute path outside the issuer prefix, because that is where the adapter posts.
+
+`IDENTITY_EVENTS_PATH` sets the path, falling back to the adapter's own
+`AWS_LWA_PASS_THROUGH_PATH` and then to `/events`. `IDENTITY_USERS_KEY_ATTRIBUTE` names the
+users table key attribute holding the user id, defaulting to `id`.
+
+Adopters must enable the users table DynamoDB stream and an event source mapping to the
+identity Lambda with `ReportBatchItemFailures`, or the purge never runs.
+
 ## 0.27.0
 
 Restores an application level request log. `create_app` installs `RequestLoggingMiddleware`,

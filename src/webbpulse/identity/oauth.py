@@ -338,6 +338,14 @@ class OAuthLinkStore(ABC):
         must not both succeed. Returns `False` when the key already exists.
         """
 
+    @abstractmethod
+    def delete_all_for_user(self, user_id: str) -> int:
+        """Remove every link a user holds, returning how many rows went.
+
+        The account deletion purge, which unlinks unconditionally rather than asking
+        `has_other_sign_in_method` as `unlink` does. Idempotent: a user with none returns zero.
+        """
+
 
 class InMemoryOAuthStateStore(OAuthStateStore):
     """Dict-backed `OAuthStateStore`, with the same single-use and expiry semantics."""
@@ -387,6 +395,13 @@ class InMemoryOAuthLinkStore(OAuthLinkStore):
             return False
         self._items[record.provider_subject] = record
         return True
+
+    def delete_all_for_user(self, user_id: str) -> int:
+        """Remove every link a user holds, returning how many rows went."""
+        keys = [key for key, record in self._items.items() if record.user_id == user_id]
+        for key in keys:
+            del self._items[key]
+        return len(keys)
 
 
 class DynamoOAuthStateStore(OAuthStateStore):
@@ -486,6 +501,24 @@ class DynamoOAuthLinkStore(OAuthLinkStore):
                 return False
             raise
         return True
+
+    def delete_all_for_user(self, user_id: str) -> int:
+        """Remove every link a user holds, returning how many rows went.
+
+        Enumerates through the `user_id-index` GSI, whose read may be slightly stale, and
+        batches the deletes.
+        """
+        from boto3.dynamodb.conditions import Key as KeyCondition
+
+        keys = [
+            {"provider_subject": str(item["provider_subject"])}
+            for item in self._repo.iter_query(
+                KeyCondition("user_id").eq(user_id),
+                index_name=OAUTH_LINK_USER_INDEX,
+                projection="provider_subject",
+            )
+        ]
+        return self._repo.delete_many(keys)
 
 
 def _link_to_item(record: OAuthLinkRecord) -> dict[str, Any]:

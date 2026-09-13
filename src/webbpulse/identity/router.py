@@ -282,6 +282,10 @@ def _mount_flows(
         kms_client=kms_client,
     )
 
+    from webbpulse.identity.events import register_user_purge_events
+
+    register_user_purge_events(router, flows)
+
     def limits(*specs: tuple[str, tuple[int, int], str]) -> list[Any]:
         """Build the rate limit dependencies for one route, or none when disabled."""
         if not limiter_enabled:

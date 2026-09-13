@@ -365,3 +365,16 @@ class Repository:
         with self.table.batch_writer() as batch:
             for item in items:
                 batch.put_item(Item=encode_numbers(item))
+
+    def delete_many(self, keys: Sequence[Key]) -> int:
+        """Delete many items through a batch writer, returning how many were requested.
+
+        BatchWriteItem has no conditional form and reports nothing about what existed, so the
+        count is the number of keys sent rather than the number of rows that were there.
+        """
+        if not keys:
+            return 0
+        with self.table.batch_writer() as batch:
+            for key in keys:
+                batch.delete_item(Key=dict(key))
+        return len(keys)

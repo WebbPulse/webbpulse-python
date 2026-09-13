@@ -268,6 +268,14 @@ class CredentialStore(ABC):
     def delete(self, user_id: str, credential_type: str) -> None:
         """Remove a credential. Idempotent: removing an absent one is not an error."""
 
+    @abstractmethod
+    def delete_all_for_user(self, user_id: str) -> int:
+        """Remove every credential a user holds, returning how many rows went.
+
+        For the account deletion purge, where no credential type survives. Idempotent: a
+        user with none returns zero.
+        """
+
 
 class RefreshTokenStore(ABC):
     """The `refresh-tokens` table: hash `token_hash`, GSI on the family, TTL `expires_at`."""
@@ -314,6 +322,16 @@ class RefreshTokenStore(ABC):
         revoked, so callers must pass `family_ids` to revoke anything on such a store.
         """
 
+    @abstractmethod
+    def delete_all_for_user(self, user_id: str) -> int:
+        """Delete every refresh row a user holds, returning how many rows went.
+
+        The account deletion purge, and the one caller that deletes rather than revokes: a
+        revoked row still has to answer a replay, and a purged user has nothing left to
+        replay against. An implementation that cannot enumerate a user's rows raises
+        `NotImplementedError`, exactly as `revoke_all_for_user` does.
+        """
+
 
 class IdentityTokenStore(ABC):
     """The `identity-tokens` table: hash `token_hash`, TTL `expires_at`, single use."""
@@ -333,6 +351,14 @@ class IdentityTokenStore(ABC):
     @abstractmethod
     def revoke_for_user(self, user_id: str, purpose: IdentityTokenPurpose) -> int:
         """Invalidate outstanding links of a purpose for a user, as issuing a new one does."""
+
+    @abstractmethod
+    def delete_all_for_user(self, user_id: str) -> int:
+        """Delete every outstanding link for a user, of any purpose, returning how many went.
+
+        The account deletion purge. An implementation whose table carries no user index
+        raises `NotImplementedError`, which `purge_user` reports as nothing deleted.
+        """
 
 
 class TotpFactorStore(ABC):
@@ -450,6 +476,13 @@ class PasskeyStore(ABC):
     def rename(self, user_id: str, credential_id: str, *, name: str) -> bool:
         """Set the label on one passkey, returning `False` if it was not there."""
 
+    @abstractmethod
+    def delete_all_for_user(self, user_id: str) -> int:
+        """Remove every passkey a user holds, returning how many rows went.
+
+        The account deletion purge. Idempotent: a user with no passkeys returns zero.
+        """
+
 
 class WebAuthnChallengeStore(ABC):
     """The `webauthn-challenges` table: hash `challenge_id`, TTL `expires_at`, single use.
@@ -468,6 +501,15 @@ class WebAuthnChallengeStore(ABC):
 
         Deletes rather than marks, because a spent challenge has nothing to audit and its
         only property is that it does not work twice. Expiry is checked here, not by the TTL.
+        """
+
+    @abstractmethod
+    def delete_all_for_user(self, user_id: str) -> int:
+        """Delete every outstanding challenge carrying this user id, returning how many went.
+
+        A login challenge for a discoverable credential carries no user id and is therefore
+        out of reach here; the TTL reclaims it within five minutes either way. An
+        implementation whose table carries no user index raises `NotImplementedError`.
         """
 
 
@@ -565,6 +607,13 @@ class InMemoryCredentialStore(CredentialStore):
         """Remove a credential. Idempotent: removing an absent one is not an error."""
         self._items.pop((user_id, credential_type), None)
 
+    def delete_all_for_user(self, user_id: str) -> int:
+        """Remove every credential a user holds, returning how many rows went."""
+        keys = [key for key in self._items if key[0] == user_id]
+        for key in keys:
+            del self._items[key]
+        return len(keys)
+
 
 class InMemoryRefreshTokenStore(RefreshTokenStore):
     """Dict-backed `RefreshTokenStore` with the same atomicity and expiry semantics.
@@ -619,6 +668,13 @@ class InMemoryRefreshTokenStore(RefreshTokenStore):
                 count += 1
         return count
 
+    def delete_all_for_user(self, user_id: str) -> int:
+        """Delete every refresh row a user holds, returning how many rows went."""
+        hashes = [token_hash for token_hash, record in self._items.items() if record.user_id == user_id]
+        for token_hash in hashes:
+            del self._items[token_hash]
+        return len(hashes)
+
 
 class InMemoryIdentityTokenStore(IdentityTokenStore):
     """Dict-backed `IdentityTokenStore`."""
@@ -652,6 +708,13 @@ class InMemoryIdentityTokenStore(IdentityTokenStore):
                 self._items[token_hash] = dataclasses.replace(record, consumed_at=marker)
                 count += 1
         return count
+
+    def delete_all_for_user(self, user_id: str) -> int:
+        """Delete every outstanding link for a user, of any purpose, returning how many went."""
+        hashes = [token_hash for token_hash, record in self._items.items() if record.user_id == user_id]
+        for token_hash in hashes:
+            del self._items[token_hash]
+        return len(hashes)
 
 
 class InMemoryTotpFactorStore(TotpFactorStore):
@@ -778,6 +841,13 @@ class InMemoryPasskeyStore(PasskeyStore):
         self._items[(user_id, credential_id)] = dataclasses.replace(existing, name=name)
         return True
 
+    def delete_all_for_user(self, user_id: str) -> int:
+        """Remove every passkey a user holds, returning how many rows went."""
+        keys = [key for key in self._items if key[0] == user_id]
+        for key in keys:
+            del self._items[key]
+        return len(keys)
+
 
 class InMemoryWebAuthnChallengeStore(WebAuthnChallengeStore):
     """Dict-backed `WebAuthnChallengeStore`, deleting on consumption as the real one does."""
@@ -796,6 +866,15 @@ class InMemoryWebAuthnChallengeStore(WebAuthnChallengeStore):
         if existing is None or is_expired(existing.expires_at):
             return None
         return existing
+
+    def delete_all_for_user(self, user_id: str) -> int:
+        """Delete every outstanding challenge carrying this user id, returning how many went."""
+        if not user_id:
+            return 0
+        ids = [challenge_id for challenge_id, record in self._items.items() if record.user_id == user_id]
+        for challenge_id in ids:
+            del self._items[challenge_id]
+        return len(ids)
 
 
 class DynamoCredentialStore(CredentialStore):
@@ -833,6 +912,22 @@ class DynamoCredentialStore(CredentialStore):
     def delete(self, user_id: str, credential_type: str) -> None:
         """Remove a credential. Idempotent: removing an absent one is not an error."""
         self._repo.delete({"user_id": user_id, "credential_type": credential_type})
+
+    def delete_all_for_user(self, user_id: str) -> int:
+        """Remove every credential a user holds, returning how many rows went.
+
+        The partition is the user, so the enumeration is one query on the primary key with
+        no index, and the deletes go out as a batch.
+        """
+        from boto3.dynamodb.conditions import Key as KeyCondition
+
+        keys = [
+            {"user_id": user_id, "credential_type": str(item["credential_type"])}
+            for item in self._repo.iter_query(
+                KeyCondition("user_id").eq(user_id), consistent=True, projection="credential_type"
+            )
+        ]
+        return self._repo.delete_many(keys)
 
 
 class DynamoRefreshTokenStore(RefreshTokenStore):
@@ -942,6 +1037,27 @@ class DynamoRefreshTokenStore(RefreshTokenStore):
             if item.get("family_id") != except_family_id
         )
 
+    def delete_all_for_user(self, user_id: str) -> int:
+        """Delete every refresh row a user holds, returning how many rows went.
+
+        Queries the same user index `revoke_all_for_user` uses, whose `KEYS_ONLY` projection
+        already carries `token_hash`, and batches the deletes. Raises `NotImplementedError`
+        when the store was built with no index, which `purge_user` reports as nothing deleted.
+        """
+        from boto3.dynamodb.conditions import Key
+
+        if not self._user_index:
+            raise NotImplementedError(
+                "delete_all_for_user needs a user index on `refresh-tokens`, and this store "
+                f"was built with none. Set {REFRESH_USER_INDEX_ENV} to the index name."
+            )
+
+        keys = [
+            {"token_hash": str(item["token_hash"])}
+            for item in self._repo.iter_query(Key("user_id").eq(user_id), index_name=self._user_index)
+        ]
+        return self._repo.delete_many(keys)
+
     def _revoke(self, items: Iterable[Mapping[str, Any]]) -> int:
         """Mark each item revoked, skipping ones already revoked. Returns how many changed.
 
@@ -1025,6 +1141,18 @@ class DynamoIdentityTokenStore(IdentityTokenStore):
             "not carry: the hot path is the token hash and outstanding links expire on "
             "their own within an hour or a day. M3 decides whether the index is worth it "
             "when it implements the reset flow."
+        )
+
+    def delete_all_for_user(self, user_id: str) -> int:
+        """Not available: `identity-tokens` carries no user index, so a user's rows cannot be found.
+
+        `purge_user` reports this as nothing deleted and logs it. The rows expire on their
+        own within a day, which is why the table has never carried the index.
+        """
+        raise NotImplementedError(
+            "delete_all_for_user needs a user index on `identity-tokens`, which the table "
+            "does not carry. Every row has a TTL of at most a day, so a purged user's "
+            "outstanding links expire without one."
         )
 
 
@@ -1161,9 +1289,7 @@ class DynamoRecoveryCodeStore(RecoveryCodeStore):
                 KeyCondition("user_id").eq(user_id), consistent=True, projection="code_hash"
             )
         ]
-        for code_hash in hashes:
-            self._repo.delete({"user_id": user_id, "code_hash": code_hash})
-        return len(hashes)
+        return self._repo.delete_many([{"user_id": user_id, "code_hash": code_hash} for code_hash in hashes])
 
 
 class DynamoPasskeyStore(PasskeyStore):
@@ -1272,6 +1398,22 @@ class DynamoPasskeyStore(PasskeyStore):
             raise
         return True
 
+    def delete_all_for_user(self, user_id: str) -> int:
+        """Remove every passkey a user holds, returning how many rows went.
+
+        The user is the partition, so the enumeration is one query on the primary key and
+        the deletes go out as a batch.
+        """
+        from boto3.dynamodb.conditions import Key as KeyCondition
+
+        keys = [
+            {"user_id": user_id, "credential_id": str(item["credential_id"])}
+            for item in self._repo.iter_query(
+                KeyCondition("user_id").eq(user_id), consistent=True, projection="credential_id"
+            )
+        ]
+        return self._repo.delete_many(keys)
+
 
 class DynamoWebAuthnChallengeStore(WebAuthnChallengeStore):
     """`WebAuthnChallengeStore` over a `webbpulse.dynamodb.Repository`.
@@ -1305,6 +1447,18 @@ class DynamoWebAuthnChallengeStore(WebAuthnChallengeStore):
             return None
         record = _webauthn_challenge_from_item(attributes)
         return None if is_expired(record.expires_at) else record
+
+    def delete_all_for_user(self, user_id: str) -> int:
+        """Not available: `webauthn-challenges` carries no user index.
+
+        `purge_user` reports this as nothing deleted and logs it. Every row has a five
+        minute TTL, which is why the table has never carried the index.
+        """
+        raise NotImplementedError(
+            "delete_all_for_user needs a user index on `webauthn-challenges`, which the "
+            "table does not carry. Every row expires within five minutes, so a purged "
+            "user's outstanding challenges go without one."
+        )
 
 
 def _credential_from_item(item: Mapping[str, Any]) -> CredentialRecord:
