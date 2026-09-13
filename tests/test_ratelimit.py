@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+from collections.abc import Sequence
 from typing import Any
 
 import pytest
@@ -11,10 +12,13 @@ from fastapi import Depends, FastAPI, Request
 
 from webbpulse.messages import rate_limited
 from webbpulse.ratelimit import (
+    LimitClass,
     RateLimitDecision,
     RateLimiter,
+    classify,
     rate_limit,
     rate_limit_headers,
+    rate_limit_middleware,
 )
 
 
@@ -385,3 +389,564 @@ def test_the_dependency_does_not_block_the_event_loop(limiter: RateLimiter, test
         "the DynamoDB call must run in a worker thread, not on the thread running the route"
     )
     assert loop_thread == threading.get_ident()
+
+
+def test_limit_class_matches_everything_when_unconstrained() -> None:
+    """A class with neither methods nor prefixes is the catch-all."""
+    catch_all = LimitClass(name="default", limit=10, window_seconds=60)
+
+    assert catch_all.matches("POST", "/anything") is True
+    assert catch_all.matches("GET", "/") is True
+
+
+def test_limit_class_matches_on_method() -> None:
+    """`methods` restricts a class to those verbs, case-insensitively."""
+    reads = LimitClass(name="get", limit=10, window_seconds=60, methods=("GET",))
+
+    assert reads.matches("get", "/api/cars") is True
+    assert reads.matches("POST", "/api/cars") is False
+
+
+def test_limit_class_matches_a_prefix_subtree_not_a_sibling() -> None:
+    """`path_prefixes` matches the prefix itself and its subtree, never a sibling."""
+    auth = LimitClass(name="auth", limit=5, window_seconds=60, path_prefixes=("/api/auth",))
+
+    assert auth.matches("POST", "/api/auth") is True
+    assert auth.matches("POST", "/api/auth/login") is True
+    assert auth.matches("POST", "/api/authors") is False, "a prefix must not match a sibling path"
+
+
+def test_limit_class_exempt_paths_fall_through() -> None:
+    """A path in `exempt_paths` does not match its class, so classification continues."""
+    auth = LimitClass(
+        name="auth",
+        limit=5,
+        window_seconds=60,
+        path_prefixes=("/api/auth",),
+        exempt_paths=("/api/auth/refresh",),
+    )
+
+    assert auth.matches("POST", "/api/auth/login") is True
+    assert auth.matches("POST", "/api/auth/refresh") is False
+
+
+def test_limit_class_ignores_a_trailing_slash() -> None:
+    """`/api/auth/` classifies as `/api/auth` does."""
+    auth = LimitClass(name="auth", limit=5, window_seconds=60, path_prefixes=("/api/auth",))
+
+    assert auth.matches("POST", "/api/auth/") is True
+
+
+def _carmodpicker_classes() -> list[LimitClass]:
+    """CarModPicker's four classes, in the order its limiter classifies them."""
+    return [
+        LimitClass(name="get", limit=60, window_seconds=60, methods=("GET",)),
+        LimitClass(
+            name="auth",
+            limit=5,
+            window_seconds=60,
+            path_prefixes=("/api/auth",),
+            exempt_paths=("/api/auth/refresh", "/api/auth/logout"),
+        ),
+        LimitClass(name="admin", limit=20, window_seconds=60, path_prefixes=("/api/admin",)),
+        LimitClass(name="default", limit=30, window_seconds=60),
+    ]
+
+
+@pytest.mark.parametrize(
+    ("method", "path", "expected"),
+    [
+        ("GET", "/api/cars", "get"),
+        ("GET", "/api/auth/login", "get"),
+        ("POST", "/api/auth/login", "auth"),
+        ("POST", "/api/auth/refresh", "default"),
+        ("POST", "/api/auth/logout", "default"),
+        ("DELETE", "/api/admin/users/1", "admin"),
+        ("POST", "/api/cars", "default"),
+    ],
+)
+def test_classify_reproduces_the_product_class_split(method: str, path: str, expected: str) -> None:
+    """`classify` picks the first matching class, reproducing CarModPicker's split.
+
+    A GET is always the read class, even under `/api/auth`, because the read class is first.
+    """
+    assert classify(method, path, _carmodpicker_classes()).name == expected
+
+
+def test_classify_raises_without_a_catch_all() -> None:
+    """A request matching no class raises rather than going silently uncounted."""
+    classes = [LimitClass(name="get", limit=10, window_seconds=60, methods=("GET",))]
+
+    with pytest.raises(LookupError, match="catch-all"):
+        classify("POST", "/api/cars", classes)
+
+
+def test_clear_forgets_a_first_request_counter(rate_limit_table: Any) -> None:
+    """`clear` drops the counter, so the next attempt starts a new window at 1."""
+    assert rate_limit_table is not None
+    limiter = RateLimiter(
+        namespace="login", anchor="first_request", count_attribute="failures", prefix="", region_name="us-west-2"
+    )
+
+    for _ in range(3):
+        limiter.check("198.51.100.40", limit=3, window_seconds=900, now=1_000.0)
+    assert limiter.check("198.51.100.40", limit=3, window_seconds=900, now=1_001.0).allowed is False
+
+    limiter.clear("198.51.100.40")
+
+    fresh = limiter.check("198.51.100.40", limit=3, window_seconds=900, now=1_002.0)
+    assert fresh.allowed is True, "a cleared identity starts a new window"
+    assert fresh.remaining == 2
+
+
+def test_clear_forgets_a_clock_anchored_counter(limiter: RateLimiter) -> None:
+    """`clear` on a clock-anchored limiter needs the window to name the row."""
+    for _ in range(3):
+        limiter.check("198.51.100.41", limit=3, window_seconds=60, now=1_000.0)
+
+    limiter.clear("198.51.100.41", window_seconds=60, now=1_000.0)
+
+    assert limiter.get({"pk": "default#198.51.100.41#960"}) is None
+    assert limiter.check("198.51.100.41", limit=3, window_seconds=60, now=1_000.0).remaining == 2
+
+
+def test_clear_without_a_window_is_a_logged_no_op(limiter: RateLimiter, caplog: pytest.LogCaptureFixture) -> None:
+    """Clearing a clock-anchored limiter without `window_seconds` warns and changes nothing."""
+    limiter.check("198.51.100.42", limit=3, window_seconds=60, now=1_000.0)
+
+    with caplog.at_level(logging.WARNING, logger="webbpulse.ratelimit"):
+        limiter.clear("198.51.100.42")
+
+    assert limiter.get({"pk": "default#198.51.100.42#960"}) is not None, "the counter must survive a no-op clear"
+    assert any("window_seconds" in record.message for record in caplog.records)
+
+
+def test_clear_swallows_and_logs_a_backend_failure(
+    limiter: RateLimiter, caplog: pytest.LogCaptureFixture, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A failing `clear` logs `rate_limit_failed_open` rather than raising into the route."""
+
+    def explode(*args: Any, **kwargs: Any) -> Any:
+        """Raise in place of the DynamoDB delete."""
+        raise RuntimeError("table gone")
+
+    monkeypatch.setattr(limiter, "delete", explode)
+
+    with caplog.at_level(logging.WARNING, logger="webbpulse.ratelimit"):
+        limiter.clear("198.51.100.43", window_seconds=60, now=1_000.0)
+
+    records = [r for r in caplog.records if getattr(r, "rate_limit_failed_open", None) is True]
+    assert len(records) == 1, "a failed clear must be visible to an alarm"
+    assert getattr(records[0], "rate_limit_operation", None) == "clear"
+
+
+@pytest.fixture
+def login_limiter(rate_limit_table: Any) -> RateLimiter:
+    """Portfolio's login lockout: a first-request window counting failures only."""
+    assert rate_limit_table is not None
+    return RateLimiter(
+        namespace="login", anchor="first_request", count_attribute="failures", prefix="", region_name="us-west-2"
+    )
+
+
+def test_first_request_anchor_opens_the_window_on_the_first_call(login_limiter: RateLimiter) -> None:
+    """The window runs `window_seconds` from the first counted request, not from the clock."""
+    first = login_limiter.check("198.51.100.44", limit=5, window_seconds=900, now=1_000.0)
+
+    assert first.allowed is True
+    assert first.reset_after == 900, "the window opens on this request, so a full window remains"
+
+
+def test_first_request_anchor_does_not_extend_on_later_calls(login_limiter: RateLimiter) -> None:
+    """A later request inside the window counts but does not push the window out."""
+    login_limiter.check("198.51.100.45", limit=5, window_seconds=900, now=1_000.0)
+
+    later = login_limiter.check("198.51.100.45", limit=5, window_seconds=900, now=1_300.0)
+
+    assert later.remaining == 3
+    assert later.reset_after == 600, "the window still ends at 1900, so 600 seconds remain"
+
+
+def test_first_request_anchor_rolls_over_once_the_window_passes(login_limiter: RateLimiter) -> None:
+    """Past the window the row is replaced, which opens a new window at a count of 1."""
+    for _ in range(5):
+        login_limiter.check("198.51.100.46", limit=5, window_seconds=900, now=1_000.0)
+    assert login_limiter.check("198.51.100.46", limit=5, window_seconds=900, now=1_100.0).allowed is False
+
+    rolled = login_limiter.check("198.51.100.46", limit=5, window_seconds=900, now=2_000.0)
+
+    assert rolled.allowed is True, "the window has passed, so the lockout is over"
+    assert rolled.remaining == 4, "the new window starts at a count of 1"
+
+
+def test_first_request_anchor_uses_the_named_count_attribute(login_limiter: RateLimiter) -> None:
+    """`count_attribute` names the counter, so Portfolio's rows keep saying `failures`."""
+    login_limiter.check("198.51.100.47", limit=5, window_seconds=900, now=1_000.0)
+
+    item = login_limiter.get({"pk": "login#198.51.100.47"})
+    assert item is not None
+    assert int(item["failures"]) == 1
+    assert int(item["expires_at"]) == 1900
+
+
+def test_first_request_anchor_fails_open(
+    login_limiter: RateLimiter, caplog: pytest.LogCaptureFixture, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A backend failure in the first-request path fails open and logs, as the clock one does."""
+
+    def explode(*args: Any, **kwargs: Any) -> Any:
+        """Raise in place of the DynamoDB update."""
+        raise RuntimeError("no table")
+
+    monkeypatch.setattr(login_limiter, "update", explode)
+
+    with caplog.at_level(logging.WARNING, logger="webbpulse.ratelimit"):
+        decision = login_limiter.check("198.51.100.48", limit=5, window_seconds=900, now=1_000.0)
+
+    assert decision.allowed is True
+    assert decision.failed_open is True
+    assert any(getattr(r, "rate_limit_failed_open", None) is True for r in caplog.records)
+
+
+def test_first_request_anchor_fails_open_when_the_replacing_put_fails(
+    login_limiter: RateLimiter, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A failing rollover `put` fails open rather than raising into the caller."""
+    conditional = ClientError(
+        {"Error": {"Code": "ConditionalCheckFailedException", "Message": "stale"}},
+        "UpdateItem",
+    )
+
+    def refuse(*args: Any, **kwargs: Any) -> Any:
+        """Raise the conditional failure that drives the rollover path."""
+        raise conditional
+
+    def explode(*args: Any, **kwargs: Any) -> Any:
+        """Raise in place of the replacing put."""
+        raise RuntimeError("put refused")
+
+    monkeypatch.setattr(login_limiter, "update", refuse)
+    monkeypatch.setattr(login_limiter, "put", explode)
+
+    decision = login_limiter.check("198.51.100.49", limit=5, window_seconds=900, now=1_000.0)
+
+    assert decision.allowed is True
+    assert decision.failed_open is True
+
+
+def test_a_non_conditional_client_error_fails_open(login_limiter: RateLimiter, monkeypatch: pytest.MonkeyPatch) -> None:
+    """A ClientError that is not the conditional failure fails open, never rolls the window."""
+    throttled = ClientError(
+        {"Error": {"Code": "ProvisionedThroughputExceededException", "Message": "slow down"}},
+        "UpdateItem",
+    )
+
+    def explode(*args: Any, **kwargs: Any) -> Any:
+        """Raise a throttling error in place of the DynamoDB update."""
+        raise throttled
+
+    monkeypatch.setattr(login_limiter, "update", explode)
+
+    decision = login_limiter.check("198.51.100.50", limit=5, window_seconds=900, now=1_000.0)
+
+    assert decision.failed_open is True
+
+
+def test_the_login_lockout_counts_failures_only(login_limiter: RateLimiter) -> None:
+    """The lockout shape Portfolio runs: count on failure, clear on success.
+
+    A success clears the counter, so a user who mistypes twice and then succeeds is never
+    locked out by those two failures.
+    """
+    for _ in range(2):
+        login_limiter.check("198.51.100.51", limit=3, window_seconds=900, now=1_000.0)
+
+    login_limiter.clear("198.51.100.51")
+
+    for _ in range(3):
+        assert login_limiter.check("198.51.100.51", limit=3, window_seconds=900, now=1_010.0).allowed is True
+    assert login_limiter.check("198.51.100.51", limit=3, window_seconds=900, now=1_010.0).allowed is False
+
+
+def _middleware_app(
+    limiter_classes: Sequence[LimitClass],
+    **kwargs: Any,
+) -> FastAPI:
+    """An app whose whole surface is guarded by the rate limit middleware."""
+    app = FastAPI()
+    kwargs.setdefault("prefix", "")
+    kwargs.setdefault("region_name", "us-west-2")
+    app.middleware("http")(rate_limit_middleware(list(limiter_classes), **kwargs))
+
+    @app.get("/api/cars")
+    async def cars() -> dict[str, bool]:
+        """A read route, in the GET class."""
+        return {"ok": True}
+
+    @app.post("/api/auth/login")
+    async def login() -> dict[str, bool]:
+        """A credential route, in the auth class."""
+        return {"ok": True}
+
+    @app.post("/api/auth/refresh")
+    async def refresh() -> dict[str, bool]:
+        """A route exempted from the auth class, so it falls to the default one."""
+        return {"ok": True}
+
+    @app.post("/api/admin/users")
+    async def admin() -> dict[str, bool]:
+        """An admin route, in the admin class."""
+        return {"ok": True}
+
+    @app.get("/health")
+    async def health() -> dict[str, bool]:
+        """An exempt health check."""
+        return {"ok": True}
+
+    return app
+
+
+def test_middleware_allows_up_to_the_class_limit_then_refuses(rate_limit_table: Any, test_client: Any) -> None:
+    """The middleware counts every request against its class and answers 429 once spent."""
+    assert rate_limit_table is not None
+    classes = [
+        LimitClass(name="auth", limit=2, window_seconds=60, path_prefixes=("/api/auth",)),
+        LimitClass(name="default", limit=50, window_seconds=60),
+    ]
+    client = test_client(_middleware_app(classes), source_ip="198.51.100.60")
+
+    assert client.post("/api/auth/login").status_code == 200
+    assert client.post("/api/auth/login").status_code == 200
+    assert client.post("/api/auth/login").status_code == 429, "the third request exceeds a limit of 2"
+
+
+def test_middleware_classes_are_independent_counters(rate_limit_table: Any, test_client: Any) -> None:
+    """Spending the auth class leaves the read class untouched."""
+    assert rate_limit_table is not None
+    classes = [
+        LimitClass(name="get", limit=50, window_seconds=60, methods=("GET",)),
+        LimitClass(name="auth", limit=1, window_seconds=60, path_prefixes=("/api/auth",)),
+        LimitClass(name="default", limit=50, window_seconds=60),
+    ]
+    client = test_client(_middleware_app(classes), source_ip="198.51.100.61")
+
+    client.post("/api/auth/login")
+    assert client.post("/api/auth/login").status_code == 429
+
+    assert client.get("/api/cars").status_code == 200, "a read must not spend the credential allowance"
+
+
+def test_middleware_routes_an_exempt_path_to_the_next_class(rate_limit_table: Any, test_client: Any) -> None:
+    """A class's `exempt_paths` entry falls through to the following class."""
+    assert rate_limit_table is not None
+    classes = [
+        LimitClass(
+            name="auth",
+            limit=1,
+            window_seconds=60,
+            path_prefixes=("/api/auth",),
+            exempt_paths=("/api/auth/refresh",),
+        ),
+        LimitClass(name="default", limit=50, window_seconds=60),
+    ]
+    client = test_client(_middleware_app(classes), source_ip="198.51.100.62")
+
+    client.post("/api/auth/login")
+    assert client.post("/api/auth/login").status_code == 429
+
+    assert client.post("/api/auth/refresh").status_code == 200, "refresh is counted in the default class"
+
+
+def test_middleware_skips_exempt_paths_and_methods(rate_limit_table: Any, test_client: Any) -> None:
+    """An exempt path and an exempt method are never counted at all."""
+    assert rate_limit_table is not None
+    classes = [LimitClass(name="default", limit=1, window_seconds=60)]
+    client = test_client(_middleware_app(classes, exempt_paths=("/health",)), source_ip="198.51.100.63")
+
+    for _ in range(5):
+        assert client.get("/health").status_code == 200, "an exempt path never spends the allowance"
+
+    assert client.options("/api/cars").status_code in {200, 405}
+    assert client.get("/api/cars").status_code == 200, "neither the health checks nor the preflight counted"
+
+
+def test_middleware_exempt_prefixes_match_a_subtree(rate_limit_table: Any, test_client: Any) -> None:
+    """`exempt_prefixes` exempts a subtree, where `exempt_paths` exempts one path exactly."""
+    assert rate_limit_table is not None
+    classes = [LimitClass(name="default", limit=1, window_seconds=60)]
+    app = _middleware_app(classes, exempt_paths=("/",), exempt_prefixes=("/api/admin",))
+    client = test_client(app, source_ip="198.51.100.64")
+
+    for _ in range(4):
+        assert client.post("/api/admin/users").status_code == 200
+
+    assert client.post("/api/auth/login").status_code == 200, "only the admin subtree was exempt"
+
+
+def test_middleware_adds_the_headers_to_an_allowed_response(rate_limit_table: Any, test_client: Any) -> None:
+    """An allowed response carries the RateLimit headers, named for its class."""
+    assert rate_limit_table is not None
+    classes = [LimitClass(name="auth", limit=5, window_seconds=60, path_prefixes=("/api/auth",))]
+    client = test_client(_middleware_app(classes), source_ip="198.51.100.65")
+
+    response = client.post("/api/auth/login")
+
+    assert response.status_code == 200
+    assert response.headers["X-RateLimit-Limit"] == "5"
+    assert response.headers["X-RateLimit-Remaining"] == "4"
+    assert response.headers["RateLimit-Policy"] == '"auth";q=5;w=60'
+
+
+def test_the_default_renderer_emits_the_envelope_and_retry_after(rate_limit_table: Any, test_client: Any) -> None:
+    """Without a renderer the 429 is the package's envelope plus Retry-After."""
+    assert rate_limit_table is not None
+    classes = [LimitClass(name="default", limit=1, window_seconds=60)]
+    client = test_client(_middleware_app(classes), source_ip="198.51.100.66")
+
+    client.post("/api/auth/login")
+    rejected = client.post("/api/auth/login")
+
+    assert rejected.status_code == 429
+    assert rejected.json() == {"detail": rate_limited(retry_after=int(rejected.headers["Retry-After"]))}, (
+        "the default 429 sentence comes from webbpulse.messages, naming the wait the header carries"
+    )
+    assert rejected.headers["Retry-After"].isdigit()
+    assert rejected.headers["X-RateLimit-Remaining"] == "0"
+
+
+def test_a_renderer_replaces_the_429_body(rate_limit_table: Any, test_client: Any) -> None:
+    """A product renderer keeps the envelope its live clients already parse."""
+    assert rate_limit_table is not None
+
+    def carmodpicker_429(decision: RateLimitDecision) -> Any:
+        """CarModPicker's current 429 body and headers, unchanged."""
+        from fastapi.responses import JSONResponse
+
+        retry_after = decision.reset_after or 60
+        return JSONResponse(
+            status_code=429,
+            content={
+                "detail": "Too many requests",
+                "message": "Rate limit exceeded",
+                "retry_after": retry_after,
+            },
+            headers={"Retry-After": str(retry_after), "X-RateLimit-Remaining-Minute": "0"},
+        )
+
+    classes = [LimitClass(name="default", limit=1, window_seconds=60)]
+    client = test_client(_middleware_app(classes, renderer=carmodpicker_429), source_ip="198.51.100.67")
+
+    client.post("/api/auth/login")
+    rejected = client.post("/api/auth/login")
+
+    assert rejected.status_code == 429
+    assert rejected.json() == {
+        "detail": "Too many requests",
+        "message": "Rate limit exceeded",
+        "retry_after": rejected.json()["retry_after"],
+    }
+    assert rejected.headers["X-RateLimit-Remaining-Minute"] == "0"
+    assert "RateLimit-Policy" not in rejected.headers, "a renderer owns the whole refusal"
+
+
+def test_middleware_identifies_callers_by_source_ip(rate_limit_table: Any, test_client: Any) -> None:
+    """Two source IPs get separate counters, from the API Gateway request context."""
+    assert rate_limit_table is not None
+    classes = [LimitClass(name="default", limit=1, window_seconds=60)]
+    app = _middleware_app(classes)
+    first = test_client(app, source_ip="198.51.100.68")
+    second = test_client(app, source_ip="198.51.100.69")
+
+    first.post("/api/auth/login")
+    assert first.post("/api/auth/login").status_code == 429
+
+    assert second.post("/api/auth/login").status_code == 200, "a different IP gets its own counter"
+
+
+def test_middleware_accepts_a_custom_identity_function(rate_limit_table: Any, test_client: Any) -> None:
+    """`identity_fn` keys the counter on whatever the product identifies callers by."""
+    assert rate_limit_table is not None
+    classes = [LimitClass(name="default", limit=1, window_seconds=60)]
+    app = _middleware_app(
+        classes,
+        identity_fn=lambda request: request.headers.get("x-user", "anonymous"),
+    )
+    client = test_client(app, source_ip="198.51.100.70")
+
+    assert client.post("/api/auth/login", headers={"x-user": "alice"}).status_code == 200
+    assert client.post("/api/auth/login", headers={"x-user": "alice"}).status_code == 429
+    assert client.post("/api/auth/login", headers={"x-user": "bob"}).status_code == 200
+
+
+def test_middleware_fails_open_without_a_table(dynamodb_resource: Any, test_client: Any, caplog: Any) -> None:
+    """With no rate limits table the middleware serves every request and logs the fail-open."""
+    assert dynamodb_resource is not None
+    classes = [LimitClass(name="default", limit=1, window_seconds=60)]
+    client = test_client(_middleware_app(classes), source_ip="198.51.100.71")
+
+    with caplog.at_level(logging.WARNING, logger="webbpulse.ratelimit"):
+        responses = [client.post("/api/auth/login") for _ in range(3)]
+
+    assert [r.status_code for r in responses] == [200, 200, 200], "a limiter outage costs availability nothing"
+    assert any(getattr(r, "rate_limit_failed_open", None) is True for r in caplog.records)
+
+
+def test_a_failed_open_response_advertises_no_quota(dynamodb_resource: Any, test_client: Any) -> None:
+    """A failed-open response carries no RateLimit headers, rather than a full quota."""
+    assert dynamodb_resource is not None
+    classes = [LimitClass(name="default", limit=1, window_seconds=60)]
+    client = test_client(_middleware_app(classes), source_ip="198.51.100.72")
+
+    response = client.post("/api/auth/login")
+
+    assert response.status_code == 200
+    assert "X-RateLimit-Limit" not in response.headers, (
+        "a limiter that is not counting must not advertise a quota it is not enforcing"
+    )
+
+
+def test_middleware_can_be_switched_off(rate_limit_table: Any, test_client: Any) -> None:
+    """`enabled` is consulted per request, so a product can gate on its own settings flag."""
+    assert rate_limit_table is not None
+    classes = [LimitClass(name="default", limit=1, window_seconds=60)]
+    switch = {"on": False}
+    app = _middleware_app(classes, enabled=lambda: switch["on"])
+    client = test_client(app, source_ip="198.51.100.73")
+
+    for _ in range(4):
+        assert client.post("/api/auth/login").status_code == 200
+
+    switch["on"] = True
+    client.post("/api/auth/login")
+    assert client.post("/api/auth/login").status_code == 429
+
+
+def test_middleware_uses_the_first_request_anchor_when_asked(rate_limit_table: Any, test_client: Any) -> None:
+    """`anchor="first_request"` builds first-request limiters for every class."""
+    assert rate_limit_table is not None
+    classes = [LimitClass(name="default", limit=1, window_seconds=900)]
+    client = test_client(_middleware_app(classes, anchor="first_request"), source_ip="198.51.100.74")
+
+    assert client.post("/api/auth/login").status_code == 200
+    rejected = client.post("/api/auth/login")
+
+    assert rejected.status_code == 429
+    assert int(rejected.headers["Retry-After"]) > 60, "a first-request window runs its full length from now"
+
+
+def test_middleware_needs_at_least_one_class() -> None:
+    """An empty class list is a configuration error, refused when the middleware is built."""
+    with pytest.raises(ValueError, match="at least one LimitClass"):
+        rate_limit_middleware([])
+
+
+def test_middleware_serves_a_request_matching_no_class(rate_limit_table: Any, test_client: Any) -> None:
+    """With no catch-all a request matching nothing is served rather than refused."""
+    assert rate_limit_table is not None
+    classes = [LimitClass(name="get", limit=1, window_seconds=60, methods=("GET",))]
+    client = test_client(_middleware_app(classes), source_ip="198.51.100.75")
+
+    assert client.post("/api/auth/login").status_code == 200, "an unclassified request is not counted"
+
+    client.get("/api/cars")
+    assert client.get("/api/cars").status_code == 429, "the class that does match still counts"
