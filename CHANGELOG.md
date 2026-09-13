@@ -31,6 +31,11 @@ record a service wants.
 well as the context variable. `user_id_dependency` now passes it, which is what lets the log
 line report a subject bound inside a route handler. Both remain backwards compatible.
 
+OpenAPI advertises the error envelope the handlers actually render. `ErrorResponse` and
+`ValidationErrorDetail` model the `"detailed"` shape, and `error_envelope_responses` builds the
+`responses` mapping `create_app` passes to FastAPI, replacing the default `HTTPValidationError`
+on the documented statuses.
+
 ## 0.26.0
 
 Restores the security property that 0.25.2 could only degrade gracefully: a password change
