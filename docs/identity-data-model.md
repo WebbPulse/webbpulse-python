@@ -28,7 +28,7 @@ Names are the logical constants in `webbpulse.identity.storage`, `.oauth` and `.
 | `totp-factors` (`TOTP_FACTORS_TABLE`) | `user_id` | none | none |
 | `recovery-codes` (`RECOVERY_CODES_TABLE`) | `user_id` / `code_hash` | none | **never** |
 | `oauth-links` (`OAUTH_LINKS_TABLE`) | `id` | `user_id-index` (`OAUTH_LINK_USER_INDEX`) | none |
-| `refresh-tokens` (`REFRESH_TOKENS_TABLE`) | `token_hash` | `family_id-generation-index` (`REFRESH_FAMILY_INDEX`) | `expires_at` |
+| `refresh-tokens` (`REFRESH_TOKENS_TABLE`) | `token_hash` | `family_id-generation-index` (`REFRESH_FAMILY_INDEX`), `user_id-family_id-index` (`REFRESH_USER_INDEX`) | `expires_at` |
 | `identity-tokens` (`IDENTITY_TOKENS_TABLE`) | `token_hash` | none | `expires_at` |
 | `webauthn-challenges` (`WEBAUTHN_CHALLENGES_TABLE`) | `challenge_id` | none | `expires_at` |
 | `oauth-states` (`OAUTH_STATES_TABLE`) | `state` | none | `expires_at` |
@@ -53,8 +53,12 @@ Attributes beyond the keys:
   `linked_at`.
 - **`refresh-tokens`**: `family_id`, `user_id`, `generation`, `consumed_at`, `successor_hash`,
   `revoked`, `device` (a coarse user-agent class, **never a fingerprint**), `ip_first_seen`,
-  `created_at`, `expires_at`. Keying on the hash makes validation one `GetItem`; the GSI
-  supports family revocation.
+  `created_at`, `expires_at`. Keying on the hash makes validation one `GetItem`;
+  `family_id-generation-index` supports family revocation and `user_id-family_id-index`
+  supports signing one user out everywhere, which is what a password change and a password
+  reset do. The user index projects `KEYS_ONLY` and its name is read from
+  `IDENTITY_REFRESH_USER_INDEX`; a table provisioned without it makes
+  `revoke_all_for_user` raise, which `SessionService` reports as nothing revoked.
 - **`identity-tokens`** (verification and reset): `purpose`, `user_id`, `created_at`,
   `consumed_at`, `expires_at`.
 - **`webauthn-challenges`**: `user_id` (absent for a discoverable-credential login),
