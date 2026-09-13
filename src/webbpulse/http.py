@@ -20,6 +20,7 @@ from fastapi import APIRouter, Depends, FastAPI, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
+from pydantic import BaseModel, Field
 from starlette.exceptions import HTTPException as StarletteHTTPException
 from starlette.middleware.base import BaseHTTPMiddleware, RequestResponseEndpoint
 from starlette.responses import Response
@@ -31,6 +32,7 @@ if TYPE_CHECKING:  # pragma: no cover
 
 __all__ = [
     "DEFAULT_CORS_ALLOW_HEADERS",
+    "DEFAULT_ERROR_STATUSES",
     "DYNAMODB_ERROR_MESSAGES",
     "DYNAMODB_RETRY_AFTER_SECONDS",
     "LAMBDA_CONTEXT_HEADER",
@@ -42,15 +44,18 @@ __all__ = [
     "ErrorContext",
     "ErrorEnvelope",
     "ErrorRenderer",
+    "ErrorResponse",
     "ErrorSpec",
     "ExceptionMap",
     "RequestIdMiddleware",
     "RequestLoggingMiddleware",
+    "ValidationErrorDetail",
     "bind_user_id",
     "client_ip",
     "create_app",
     "detailed_error_body",
     "error_body",
+    "error_envelope_responses",
     "health_router",
     "install_dynamodb_error_handlers",
     "install_dynamodb_handlers",
@@ -372,6 +377,31 @@ def detailed_error_body(
     return body
 
 
+class ValidationErrorDetail(BaseModel):
+    """One offending field in a 422, carrying its location and reason but never its input."""
+
+    field: str = Field(description="Dotted path to the offending field, or `_root` for the body itself.")
+    message: str = Field(description="Why the value was rejected.")
+    type: str = Field(description="The pydantic error type, such as `missing` or `string_type`.")
+
+
+class ErrorResponse(BaseModel):
+    """The `"detailed"` error envelope every handler renders, and what OpenAPI advertises.
+
+    `details` is present only on a 422, where it holds one entry per offending field.
+    """
+
+    success: bool = Field(default=False, description="Always `false` on an error response.")
+    status: int = Field(description="The HTTP status code, repeated in the body.")
+    message: str = Field(description="A human readable summary safe to surface to a caller.")
+    request_id: str = Field(description="The request id, echoed in the `X-Request-ID` header.")
+    error_code: str = Field(description="A stable machine readable code, such as `NOT_FOUND`.")
+    details: list[ValidationErrorDetail] | None = Field(
+        default=None,
+        description="Per-field validation failures. Present only on a 422.",
+    )
+
+
 def _status_error_code(status_code: int) -> str:
     """The stable `error_code` string for an HTTP status."""
     fallback = "HTTP_ERROR" if status_code < 500 else "INTERNAL_ERROR"
@@ -443,6 +473,37 @@ def resolve_error_envelope(envelope: ErrorEnvelope | None) -> ErrorRenderer:
     if callable(envelope):
         return envelope
     raise ValueError(f"error_envelope must be one of {_ENVELOPE_SHAPES} or a callable, got {envelope!r}.")
+
+
+_ENVELOPE_STATUS_DESCRIPTIONS: Final = {
+    400: "Bad request.",
+    401: "Authentication required.",
+    403: "Not permitted.",
+    404: "Resource not found.",
+    409: "Conflict with the current state.",
+    422: "Request validation failed.",
+    429: "Rate limit exceeded.",
+    500: "Internal server error.",
+}
+
+DEFAULT_ERROR_STATUSES: Final = (422,)
+
+
+def error_envelope_responses(
+    statuses: Iterable[int] = DEFAULT_ERROR_STATUSES,
+) -> dict[int | str, dict[str, Any]]:
+    """Build the OpenAPI `responses` mapping that advertises `ErrorResponse` for each status.
+
+    Passed as `responses` to `FastAPI(...)` so every operation documents the envelope the
+    handlers actually render, in place of FastAPI's default `HTTPValidationError`.
+    """
+    return {
+        status_code: {
+            "model": ErrorResponse,
+            "description": _ENVELOPE_STATUS_DESCRIPTIONS.get(status_code, "Request failed."),
+        }
+        for status_code in statuses
+    }
 
 
 def _renders_codes(renderer: ErrorRenderer, *, error_codes: bool) -> bool:
@@ -1025,6 +1086,9 @@ def create_app(
         raise ValueError("CORS cannot allow credentials with a wildcard origin. List the exact origins.")
 
     allow_headers = list(cors_allow_headers) if cors_allow_headers is not None else list(DEFAULT_CORS_ALLOW_HEADERS)
+
+    if resolve_error_envelope(error_envelope) is _render_detailed:
+        fastapi_kwargs.setdefault("responses", error_envelope_responses())
 
     app = FastAPI(title=title, version=version, **fastapi_kwargs)
 

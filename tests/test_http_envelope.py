@@ -7,6 +7,7 @@ changing a single byte any caller already reads.
 
 from __future__ import annotations
 
+import json
 from collections.abc import Mapping
 from dataclasses import FrozenInstanceError
 from typing import Any, ClassVar
@@ -21,6 +22,7 @@ from webbpulse.http import (
     DYNAMODB_ERROR_MESSAGES,
     DynamoDBErrorHandlerOptions,
     ErrorContext,
+    ErrorResponse,
     create_app,
     detailed_error_body,
     install_dynamodb_error_handlers,
@@ -690,3 +692,110 @@ def test_a_mapped_server_fault_is_still_sanitised_in_the_detailed_shape() -> Non
             "error_code": "SERVICE_UNAVAILABLE",
         },
     )
+
+
+def _openapi_app() -> FastAPI:
+    """An app whose routes validate a body and a path param, so 422s are reachable."""
+    router = APIRouter()
+
+    @router.post("/things")
+    async def create_thing(payload: _Payload) -> dict[str, str]:
+        """Accept a body pydantic has to validate."""
+        return {"ok": "yes"}
+
+    @router.get("/things/{thing_id}")
+    async def read_thing(thing_id: int) -> dict[str, str]:
+        """Accept a path param pydantic has to coerce."""
+        return {"ok": "yes"}
+
+    return create_app([router], error_envelope="detailed", instrument=False)
+
+
+def test_the_detailed_openapi_advertises_the_envelope_and_not_httpvalidationerror() -> None:
+    """The generated schema documents what the handlers render, so a contract file matches."""
+    spec = _openapi_app().openapi()
+    schemas = spec["components"]["schemas"]
+
+    assert "ErrorResponse" in schemas
+    assert "ValidationErrorDetail" in schemas
+    assert "HTTPValidationError" not in schemas
+    assert "ValidationError" not in schemas
+    assert "HTTPValidationError" not in json.dumps(spec)
+
+
+@pytest.mark.parametrize(
+    ("path", "method"),
+    [("/things", "post"), ("/things/{thing_id}", "get")],
+)
+def test_every_operation_points_its_422_at_the_envelope(path: str, method: str) -> None:
+    """Both a validated body and a validated path param document the envelope."""
+    spec = _openapi_app().openapi()
+    schema = spec["paths"][path][method]["responses"]["422"]["content"]["application/json"]["schema"]
+
+    assert schema == {"$ref": "#/components/schemas/ErrorResponse"}
+
+
+def test_the_envelope_schema_carries_every_field_the_handlers_render() -> None:
+    """The advertised properties are the ones `detailed_error_body` actually emits."""
+    schemas = _openapi_app().openapi()["components"]["schemas"]
+    properties = schemas["ErrorResponse"]["properties"]
+
+    assert set(properties) == {"success", "status", "message", "request_id", "error_code", "details"}
+    assert set(schemas["ValidationErrorDetail"]["properties"]) == {"field", "message", "type"}
+
+
+def test_the_advertised_schema_validates_a_real_422_body() -> None:
+    """A live validation error parses as the model OpenAPI advertises for it."""
+    response = TestClient(_openapi_app()).post("/things", json={"name": "only a name"})
+
+    assert response.status_code == 422
+    parsed = ErrorResponse.model_validate(response.json())
+    assert parsed.error_code == "VALIDATION_ERROR"
+    assert parsed.details is not None
+    assert [detail.field for detail in parsed.details] == ["count"]
+
+
+def test_the_advertised_schema_validates_a_non_validation_error_body() -> None:
+    """The same model covers the unmatched route 404, where `details` is absent."""
+    response = TestClient(_openapi_app()).get("/no-such-route")
+
+    assert response.status_code == 404
+    parsed = ErrorResponse.model_validate(response.json())
+    assert parsed.error_code == "NOT_FOUND"
+    assert parsed.details is None
+
+
+def test_the_default_envelope_leaves_the_openapi_schema_untouched() -> None:
+    """Opting out keeps FastAPI's own 422 shape, so an existing consumer is unaffected."""
+    router = APIRouter()
+
+    @router.post("/things")
+    async def create_thing(payload: _Payload) -> dict[str, str]:
+        """Accept a body pydantic has to validate."""
+        return {"ok": "yes"}
+
+    schemas = create_app([router], instrument=False).openapi()["components"]["schemas"]
+
+    assert "HTTPValidationError" in schemas
+    assert "ErrorResponse" not in schemas
+
+
+def test_an_explicit_responses_argument_still_wins() -> None:
+    """A consumer passing its own `responses` is not overridden by the envelope default."""
+    router = APIRouter()
+
+    @router.post("/things")
+    async def create_thing(payload: _Payload) -> dict[str, str]:
+        """Accept a body pydantic has to validate."""
+        return {"ok": "yes"}
+
+    app = create_app(
+        [router],
+        error_envelope="detailed",
+        instrument=False,
+        responses={422: {"description": "Mine", "model": _Payload}},
+    )
+    documented = app.openapi()["paths"]["/things"]["post"]["responses"]["422"]
+
+    assert documented["description"] == "Mine"
+    assert documented["content"]["application/json"]["schema"] == {"$ref": "#/components/schemas/_Payload"}
