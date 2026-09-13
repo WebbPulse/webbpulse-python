@@ -441,6 +441,7 @@ def _mount_flows(
                 ),
             )
         ip, _ = context(request)
+        session_id = _session_from_request(request, tokens)
         try:
             await run_sync(
                 lambda: flows.change_password(
@@ -448,7 +449,8 @@ def _mount_flows(
                     current_password=str(payload.get("current_password", "")),
                     new_password=str(payload.get("new_password", "")),
                     ip=ip,
-                    keep_family_id=_session_from_request(request, tokens),
+                    keep_family_id=session_id,
+                    family_ids=_string_list(payload.get("family_ids")),
                 )
             )
         except PasswordRejected as exc:

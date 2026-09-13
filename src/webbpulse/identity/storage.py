@@ -301,6 +301,10 @@ class RefreshTokenStore(ABC):
 
         A password change spares the session it was made from, which has just re-proved the
         password. A reset passes nothing, because that session might be the attacker's.
+
+        An implementation that cannot enumerate a user's families raises `NotImplementedError`
+        rather than guessing. `SessionService.revoke_all_for_user` treats that as nothing
+        revoked, so callers must pass `family_ids` to revoke anything on such a store.
         """
 
 

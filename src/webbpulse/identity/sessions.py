@@ -325,14 +325,26 @@ class SessionService:
         """Revoke every family for a user: sign out everywhere.
 
         `refresh-tokens` carries no user index, so a caller that knows the `family_ids` takes
-        the cheap path. Passing none falls through to the store, which raises rather than
-        scanning when it cannot answer exactly.
+        the cheap path. Passing none falls through to the store, and a store that cannot
+        enumerate a user's families reports nothing revoked rather than failing the call:
+        other sessions stay signed in until the session service carries the family list.
         """
         if family_ids is not None:
             return sum(
                 self._store.revoke_family(family_id) for family_id in family_ids if family_id != except_family_id
             )
-        return self._store.revoke_all_for_user(user_id, except_family_id=except_family_id)
+        try:
+            return self._store.revoke_all_for_user(user_id, except_family_id=except_family_id)
+        except NotImplementedError:
+            _log.warning(
+                "This store cannot enumerate a user's families, so no other session was revoked.",
+                extra={
+                    "event": "session.revoke_all_unsupported",
+                    "user_id": user_id,
+                    "except_family_id": except_family_id,
+                },
+            )
+            return 0
 
     def _family_started_at(self, record: RefreshTokenRecord) -> datetime:
         """Read when the family began, for the absolute cap.

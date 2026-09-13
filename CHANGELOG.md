@@ -5,6 +5,36 @@ Notable changes to the `webbpulse` package. The version here is the one in
 
 This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## 0.25.2
+
+Fixes a 500 on `POST /api/auth/password`. Changing a password on the DynamoDB-backed
+identity Lambda rehashed the password, then raised `NotImplementedError` while revoking the
+user's other sessions, so a request that had already succeeded answered 500.
+
+### A store that cannot enumerate now reports nothing revoked
+
+`refresh-tokens` is keyed by token hash and carries no user index, because indexing the cold
+path would cost a write on every rotation of the hot one, so `DynamoRefreshTokenStore.revoke_all_for_user`
+raises rather than scanning. `logout_all` and `confirm_password_reset` both pass `family_ids`
+and never reach it; `change_password` passed only `keep_family_id` and did.
+
+`SessionService.revoke_all_for_user` now catches that `NotImplementedError`, logs a warning
+under the event `session.revoke_all_unsupported` and returns 0. The store's contract is
+unchanged: it still refuses to guess, and the docstring now says that a caller wanting anything
+revoked on such a store has to pass `family_ids`. The in-memory store, which does have the
+index, is untouched and still revokes everything.
+
+### Change-password passes what it knows
+
+`IdentityFlows.change_password` takes `family_ids` the way `logout_all` already did, and the
+route forwards an optional `family_ids` array from the body alongside the `sid` it reads from
+the verified claims.
+
+**Behaviour change.** On DynamoDB, a password change no longer signs other devices out unless
+the caller names their families. It succeeds and answers `{"changed": true}`; the caller's own
+session is kept, as before. Sign-out-everywhere is unaffected, and a user who wants other
+sessions gone should use it.
+
 ## 0.25.1
 
 Quietens the span exporter's teardown logging, stops the tracer provider being shut down
