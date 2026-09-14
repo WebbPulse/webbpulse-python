@@ -29,6 +29,13 @@ from webbpulse.config import rate_limits_apply
 
 from .access_log import AccessLogLookup
 from .client import DEFAULT_PER_MINUTE, E2EClient
+from .ephemeral import (
+    CREATE_PATH,
+    Credentials,
+    EphemeralUser,
+    create_ephemeral_user,
+    delete_ephemeral_user,
+)
 from .gate import GateCookies
 from .gateway import (
     Authorizer,
@@ -52,14 +59,19 @@ from .journeys import (
     Record,
     RouteSpec,
 )
+from .xdist import SHARED_STATE_GROUP, apply_groups, worker_id
 
 __all__ = [
+    "CREATE_PATH",
     "E2E_PREFIX",
     "GATE_HEADER",
     "READ_ONLY_REASON",
+    "SHARED_STATE_GROUP",
     "WRITES_MARKER",
     "Click",
+    "Credentials",
     "E2EEnvironment",
+    "EphemeralUser",
     "ExpectText",
     "ExpectUrl",
     "ExpectVisible",
@@ -139,6 +151,10 @@ class E2EEnvironment:
     the list of strings that must not appear in the deployed bundle. The three
     `gate_signing_key_ssm_parameter`, `gate_key_pair_id` and `gate_cookie_domain` fields
     describe the staging web gate and are all set together or all empty.
+
+    `rate_limit_per_minute` is only the fallback the pacer uses for answers that carry no
+    `X-RateLimit-Remaining-Minute` header, and it is read from `E2E_RATE_LIMIT_PER_MINUTE`.
+    It is ignored entirely where the target does not rate limit.
     """
 
     environment: str
@@ -164,6 +180,7 @@ class E2EEnvironment:
     issuer: str = ""
     audience: str = ""
     legacy_route_names: tuple[str, ...] = ()
+    rate_limit_per_minute: int = DEFAULT_PER_MINUTE
 
     @property
     def signs_in(self) -> bool:
@@ -263,6 +280,7 @@ class E2EEnvironment:
             issuer=source.get("E2E_ISSUER", "").strip().rstrip("/"),
             audience=source.get("E2E_AUDIENCE", "").strip(),
             legacy_route_names=legacy,
+            rate_limit_per_minute=_positive_int(source.get("E2E_RATE_LIMIT_PER_MINUTE", ""), DEFAULT_PER_MINUTE),
         )
 
 
@@ -287,16 +305,25 @@ def pytest_configure(config: pytest.Config) -> None:
         f"{WRITES_MARKER}: this case signs in as the e2e user, writes, or mutates state. "
         "Skipped when E2E_READ_ONLY is set.",
     )
+    config.addinivalue_line(
+        "markers",
+        "xdist_group(name): pytest-xdist `--dist loadgroup` scheduling group. Registered "
+        "here so `--strict-markers` accepts it whether or not xdist is installed.",
+    )
 
 
 def pytest_collection_modifyitems(config: pytest.Config, items: list[pytest.Item]) -> None:
-    """Skip every case marked `e2e_writes` when the run is read-only.
+    """Group the shared-state cases for xdist, then skip the mutating ones when read-only.
+
+    The grouping runs on every collection, distributed or not: an `xdist_group` marker is
+    inert without xdist, so one pass serves both.
 
     One place rather than a conditional in each case, so a product that marks a new mutating
     test gets the production skip for free and cannot accidentally ship one that runs there.
     The environment is read directly rather than through the `e2e_env` fixture because
     collection happens before any fixture runs.
     """
+    apply_groups(items)
     if not _read_only_from_environ():
         return
     skip = pytest.mark.skip(reason=READ_ONLY_REASON)
@@ -353,7 +380,7 @@ def anon(e2e_env: E2EEnvironment, gate_headers: Mapping[str, str]) -> Iterator[E
     client = E2EClient(
         base_url=e2e_env.api_base_url,
         gate_headers=gate_headers,
-        per_minute=DEFAULT_PER_MINUTE if e2e_env.rate_limited else 0,
+        per_minute=e2e_env.rate_limit_per_minute if e2e_env.rate_limited else 0,
     )
     try:
         yield client
@@ -362,8 +389,90 @@ def anon(e2e_env: E2EEnvironment, gate_headers: Mapping[str, str]) -> Iterator[E
 
 
 @pytest.fixture(scope="session")
-def user_session(e2e_env: E2EEnvironment, anon: E2EClient) -> IdentitySession:
-    """The durable e2e user, signed in through the real login route.
+def admin_mint_token(e2e_env: E2EEnvironment, boto3_session: Any) -> str:
+    """A minted token carrying the admin role, or empty when this run cannot mint.
+
+    The key that signs it is the staging KMS key the e2e workflow alone may use, so holding
+    this token is the whole authorisation for creating and deleting an ephemeral user.
+    Returns the empty string rather than skipping, because the caller falls back to the
+    durable user instead of failing.
+
+    The subject is this run's own id rather than a real user: the ephemeral routes read only
+    the `roles` claim, so no subject has to resolve to a stored row.
+    """
+    if not e2e_env.mint_enabled or e2e_env.read_only:
+        return ""
+    try:
+        return mint(
+            kms_client=boto3_session.client("kms"),
+            key_id=e2e_env.kms_key_id,
+            environment=e2e_env.environment,
+            issuer=e2e_env.issuer,
+            audience=e2e_env.audience,
+            subject=f"{E2E_PREFIX}{e2e_env.run_id}-admin",
+            expires_in=3600,
+            extra_claims={"roles": ["admin"]},
+        )
+    except Exception:
+        return ""
+
+
+@pytest.fixture(scope="session")
+def ephemeral_user(
+    request: pytest.FixtureRequest,
+    e2e_env: E2EEnvironment,
+    anon: E2EClient,
+    admin_mint_token: str,
+) -> Iterator[EphemeralUser | None]:
+    """This run's own login user, created at session start and deleted at session end.
+
+    None whenever the run cannot have one: a read-only run signs in as nobody, and a run
+    that cannot mint holds no admin token to authorise the route with. None is also what a
+    deployment that does not offer the route gives back, and every caller then falls back to
+    the durable user.
+
+    Under xdist each worker holds its own session, so each creates and deletes a user of its
+    own. The run id is suffixed with the worker id to keep the addresses apart; one worker
+    per user means a worker that dies takes only its own user with it, and no lock file or
+    cross-worker handshake is needed.
+
+    Deletion failures are warnings rather than failures. The account carries the sweepable
+    `e2e-` prefix, so the next run's start sweep collects anything left behind.
+    """
+    if e2e_env.read_only or not admin_mint_token:
+        yield None
+        return
+    run_id = f"{e2e_env.run_id}-{worker_id(request.config)}"
+    user = create_ephemeral_user(anon, run_id=run_id, admin_token=admin_mint_token)
+    try:
+        yield user
+    finally:
+        if user is not None and not delete_ephemeral_user(anon, user, admin_token=admin_mint_token):
+            request.config.issue_config_time_warning(
+                UserWarning(
+                    f"The ephemeral e2e user {user.user_id} could not be deleted. It carries "
+                    "the e2e- prefix, so the next run's start sweep will collect it."
+                ),
+                stacklevel=2,
+            )
+
+
+@pytest.fixture(scope="session")
+def credentials(e2e_env: E2EEnvironment, ephemeral_user: EphemeralUser | None) -> Credentials:
+    """The credentials this run signs in with: its own user where it has one.
+
+    The single place that decides between the ephemeral user and the durable one, so every
+    caller, the API login and the browser form alike, follows the same choice without
+    knowing which it got.
+    """
+    if ephemeral_user is not None:
+        return ephemeral_user.credentials
+    return Credentials(email=e2e_env.user_email, password=e2e_env.user_password)
+
+
+@pytest.fixture(scope="session")
+def user_session(e2e_env: E2EEnvironment, anon: E2EClient, credentials: Credentials) -> IdentitySession:
+    """This run's login user, signed in through the real login route.
 
     Skips in read-only mode rather than attempting a login with no credential. The marker
     already skips every case the plugin ships that would reach here, so this is the backstop
@@ -371,7 +480,7 @@ def user_session(e2e_env: E2EEnvironment, anon: E2EClient) -> IdentitySession:
     """
     if not e2e_env.signs_in:
         pytest.skip(READ_ONLY_REASON)
-    return login(anon, e2e_env.user_email, e2e_env.user_password)
+    return login(anon, credentials.email, credentials.password)
 
 
 @pytest.fixture(scope="session")

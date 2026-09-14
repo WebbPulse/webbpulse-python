@@ -106,6 +106,7 @@ names every variable that is unset, rather than failing each test with a connect
 | `E2E_GATE_SSM_PARAMETER` | The SSM SecureString holding the staging gate value. Required outside production |
 | `E2E_MINT_ENABLED` | Set to enable the `minted_token` fixture. Unset elsewhere, and `mint_test_token` refuses production independently |
 | `E2E_KMS_KEY_ID`, `E2E_ISSUER`, `E2E_AUDIENCE` | Required only when minting is enabled |
+| `E2E_RATE_LIMIT_PER_MINUTE` | The pacing fallback for answers carrying no `X-RateLimit-Remaining-Minute` header. Defaults to 10, and is ignored where the target does not rate limit |
 | `E2E_LEGACY_ROUTE_NAMES` | Comma separated paths that must no longer appear in the deployed bundle |
 | `E2E_GATE_SIGNING_KEY_SSM_PARAMETER` | The SSM SecureString holding the gate's CloudFront signing key. Set all three gate variables or none |
 | `E2E_GATE_KEY_PAIR_ID` | The CloudFront public key id the gate trusts |
@@ -218,7 +219,9 @@ gateway refusal from an app refusal carrying the same status.
 | `e2e_env` | The parsed `E2EEnvironment`, including `resource_prefix`, `is_production` and `rate_limited` |
 | `gate_headers` | The `x-origin-verify` header, or an empty mapping in production |
 | `anon` | A client carrying the gate header and no identity, paced everywhere but staging. It serves `get`, `post`, `put`, `patch`, `delete` and `options`, each through the same `request` path, so pacing, the 429 retry and the request record apply to every verb |
-| `user_session` | The durable user signed in through the real login route. Skips in read-only mode |
+| `ephemeral_user` | This run's own login user, created at session start and deleted at the end, or None where the route is not offered |
+| `credentials` | The email and password the suite signs in with: this run's ephemeral user where there is one, the durable user otherwise. The password is kept out of the repr |
+| `user_session` | The run's user signed in through the real login route. Skips in read-only mode |
 | `api` | The authenticated client, sharing the anonymous client's pacer |
 | `minted_subject` | The `sub` claim of the durable e2e user's access token, which is the subject a minted token has to name to resolve to a stored user |
 | `minted_token` | Mints a token through KMS with no login, defaulting to `minted_subject` and taking an explicit `subject=` override. Skips unless `E2E_MINT_ENABLED` is set, and in read-only mode, where there is no user to mint for |
@@ -235,7 +238,7 @@ gateway refusal from an app refusal carrying the same status.
 | `context`, `page` | Per test. The context carries the gate cookies and the web base URL, and traces |
 | `console_errors`, `failed_requests` | What the page logged and which API calls failed, for the render assertions. Both exempt the 401 and 403 an anonymous visit provokes, on the same rule |
 | `login_form` | The product's `LoginForm`, from `pytest_e2e_login_form` |
-| `signed_in_page` | A page already signed in as the durable e2e user |
+| `signed_in_page` | A page already signed in as this run's e2e user |
 
 ## Enabling it in a product
 
@@ -407,5 +410,61 @@ uv run pytest e2e -v
 it with `WithDecryption=True` through the session's own credentials, so the value never
 reaches the shell's history, its environment or the terminal.
 
-Run it serially. `-n auto` would put several workers on one IP and against one bucket, so the
-limiter would answer the run rather than the routes.
+The recommended invocation is `-n auto --dist loadgroup`, which is covered in the next
+section.
+
+## Running it in parallel
+
+```bash
+uv run pytest e2e -n auto --dist loadgroup
+```
+
+The route cut and reachability cases are independent read-only probes, one route each, and
+there are hundreds of them. Everything else either signs in as the session user and mutates
+it or drives one Playwright page, and those have to stay on one worker and in one order.
+
+`--dist loadgroup` sends every test carrying the same `xdist_group` to the same worker. The
+plugin marks the shared-state cases into one group during collection and leaves the probes
+unmarked, so the scheduler spreads the probes and holds the rest together. Grouping is by
+owning test class: `TestIdentity`, `TestBrowser` and `TestHygiene` are grouped, and
+`TestRouteCut`, `TestCoverage`, `TestReachability` and `TestFrontend` are not. A product's own
+case joins the group by carrying the `e2e_writes` marker, so it needs to name no group.
+
+The marker is applied whether or not xdist is installed, since it is inert in a serial run.
+
+Session fixtures under xdist run per worker rather than per run. That is safe here by
+construction rather than by locking: each worker creates its own ephemeral user keyed on its
+own worker id and deletes that one, and each opens its own access log window. The window scan
+is unfiltered, so two workers reading overlapping windows cost one extra CloudWatch read
+rather than a wrong answer. Nothing is created once per run, so there is no lock file.
+
+Pacing is per worker, so a rate-limited target is hit by every worker at once against one
+per-IP bucket. Against production, keep `-n` small or run serially.
+
+## Ephemeral login users
+
+The profile, social link and sign-in journeys all mutate whichever account they run as, so a
+single durable user forced every run to serialise behind a per-branch concurrency group. When
+minting is available, the plugin instead creates a fresh login user at session start and
+deletes it at the end, and runs can then overlap.
+
+The address is `e2e-<run id>-<worker id>@e2e.invalid`, on the domain RFC 2606 reserves so no
+mail can reach a real inbox. The password is generated per run, lives in memory for the
+session, reaches only the login call and the browser's `fill`, and is kept out of the
+`Credentials` repr so no failure report can render it.
+
+The durable user stays the fallback. Where the route is not offered, the plugin uses
+`E2E_USER_EMAIL` and `E2E_USER_PASSWORD` exactly as before, and a read-only run signs in as
+nobody. `credentials` is the fixture to depend on: it yields whichever user this run has.
+
+The routes are `POST /api/auth/e2e/users` and `DELETE /api/auth/e2e/users/{user_id}`, and a
+product mounts them by setting `IDENTITY_EPHEMERAL_USERS_ENABLED=true`. They are gated twice.
+The flag is off by default and set only in staging, and the router additionally refuses to
+mount them when the environment is a production one whatever the flag says, so a misconfigured
+production deployment has no route to reach rather than a route that answers 403. The caller
+must present a token carrying `admin` in its `roles` claim, which in staging means a
+KMS-minted token the e2e workflow alone can produce.
+
+Delete removes only the product's users row. The identity rows are the users-table stream
+purge's to remove, so every run exercises the same deletion path production uses. A product
+enabling the flag implements the `delete_user` hook.

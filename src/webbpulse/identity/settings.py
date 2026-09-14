@@ -81,6 +81,15 @@ class IdentitySettings(BaseSettings):
         ),
     )
     mfa_required_for_roles: list[str] = Field(default_factory=list)
+    ephemeral_users_enabled: bool = Field(
+        default=False,
+        description=(
+            "Mount the admin-only ephemeral e2e user routes. Off by default and set only in "
+            "staging: the routes create and delete a verified account without a password "
+            "policy prompt or an email round trip, which production must never offer. The "
+            "router refuses to mount them in production even when this is true."
+        ),
+    )
 
     access_token_ttl: timedelta = Field(
         default=timedelta(minutes=10),

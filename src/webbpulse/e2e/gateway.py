@@ -18,6 +18,7 @@ __all__ = [
     "ABSENT_ID",
     "GATE_AUTHORIZER_SUFFIX",
     "GREEDY",
+    "IDENTITY_PREFIX",
     "LITERAL",
     "VARIABLE",
     "Authorizer",
@@ -29,6 +30,7 @@ __all__ = [
     "gate_authorizer_ids",
     "identity_authorization_is_observable",
     "matching_route",
+    "native_identity_mode",
     "operations_from_openapi",
     "probe_method",
     "probe_path",
@@ -42,6 +44,8 @@ VARIABLE = 1
 GREEDY = 0
 
 GATE_AUTHORIZER_SUFFIX = "-access-gate-origin-verify"
+
+IDENTITY_PREFIX = "/api/auth"
 
 ABSENT_ID = "e2e-obviously-absent-id"
 
@@ -79,6 +83,17 @@ class Route:
         `route_requires_identity` to ask the question the coverage assertion means.
         """
         return bool(self.authorizer_id) or self.authorization_type in ("JWT", "CUSTOM", "AWS_IAM")
+
+    @property
+    def is_coarse(self) -> bool:
+        """Whether this route key covers many operations rather than naming one.
+
+        An `ANY` method or a greedy `{proxy+}` tail both mean the gateway forwards a whole
+        family of paths to one integration, so the route carries no per operation opinion
+        about authentication and its authorizer slot cannot be compared to one operation's
+        `requires_auth`.
+        """
+        return self.method == "ANY" or self.path.endswith("{proxy+}")
 
 
 @dataclass(frozen=True)
@@ -160,6 +175,19 @@ def identity_authorization_is_observable(routes: Iterable[Route], gate_ids: froz
     require a token. The caller skips rather than failing in that case.
     """
     return any(route_requires_identity(route, gate_ids) for route in routes)
+
+
+def native_identity_mode(routes: Iterable[Route]) -> bool:
+    """Whether the API is deployed in native JWT mode, read from the route table itself.
+
+    In native mode the products publish coarse `ANY /api/<prefix>` and `{proxy+}` routes and
+    verify the token in process with the JwksVerifier, so those routes carry no gateway
+    authorizer at all. In gate mode every operation gets its own route and its own
+    authorizer. The presence of a coarse route carrying no identity authorizer is therefore
+    the mode, and reading it here avoids a new environment variable the reusable workflow
+    would have to learn.
+    """
+    return any(route.is_coarse for route in routes)
 
 
 @dataclass(frozen=True)

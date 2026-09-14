@@ -49,11 +49,13 @@ from .client import E2EClient, RateLimitExhausted
 from .frontend import fetch_bundle, missing_allowed_headers, shell_looks_like_an_app
 from .gateway import (
     ABSENT_ID,
+    IDENTITY_PREFIX,
     Operation,
     Route,
     concrete_path,
     identity_authorization_is_observable,
     matching_route,
+    native_identity_mode,
     probe_method,
     probe_path,
     resolve,
@@ -467,6 +469,12 @@ class TestCoverage:
         The access gate is not identity: it admits any caller presenting the `x-origin-verify`
         header or the signed gate cookies, and the http-api module attaches it to every route
         it creates, public ones included. Only a non-gate authorizer counts here.
+
+        The equality holds only in gate mode, where every operation has its own route and so
+        its own authorizer slot. In native mode the products publish coarse `ANY` and
+        `{proxy+}` routes and verify the token in process, so a coarse route carries no per
+        operation opinion to compare against and the reachability group is what proves a
+        protected operation refuses an anonymous caller.
         """
         route = matching_route(operation, gateway_routes)
         if route is None:
@@ -479,11 +487,44 @@ class TestCoverage:
                 "say which operations require a token, so there is nothing structural to check."
             )
         requires_identity = route_requires_identity(route, gate_authorizers)
+        if native_identity_mode(gateway_routes):
+            self._assert_native_mode_authorizer(operation, route, requires_identity)
+            return
         assert requires_identity == operation.requires_auth, (
             f"{operation.label} declares requires_auth={operation.requires_auth} but resolves "
             f"to {route.route_key!r}, which requires_identity={requires_identity}. A "
             "protected operation behind an unflagged route is served with no claims; an open "
             "one behind an authorizer is unreachable."
+        )
+
+    @staticmethod
+    def _assert_native_mode_authorizer(operation: Operation, route: Route, requires_identity: bool) -> None:
+        """The weaker structural claim that native JWT mode can actually support.
+
+        A coarse route says nothing about one operation, so it is skipped. A per route
+        authorizer in front of an operation declaring `requires_auth` false is accepted under
+        the identity prefix, where the authorizer is the optional identity one: those routes
+        read a token when it is there and still answer an anonymous caller. Anywhere else
+        that pairing is still a real finding, because it makes a public operation unreachable.
+        """
+        if route.is_coarse:
+            pytest.skip(
+                f"{route.route_key!r} is a coarse native mode route serving a whole family of "
+                "paths, so it carries no authorizer opinion about one operation. The "
+                "reachability group proves whether this operation refuses an anonymous caller."
+            )
+        if requires_identity and not operation.requires_auth:
+            assert operation.path.startswith(IDENTITY_PREFIX), (
+                f"{operation.label} declares requires_auth=False but resolves to "
+                f"{route.route_key!r}, which carries an identity authorizer. Outside "
+                f"{IDENTITY_PREFIX} there is no optional identity authorizer, so this "
+                "operation is unreachable to the anonymous callers it claims to serve."
+            )
+            return
+        assert requires_identity == operation.requires_auth, (
+            f"{operation.label} declares requires_auth={operation.requires_auth} but resolves "
+            f"to {route.route_key!r}, which requires_identity={requires_identity}. A "
+            "protected operation behind an unflagged route is served with no claims."
         )
 
 
@@ -973,6 +1014,7 @@ class TestBrowser:
         page: Any,
         login_form: LoginForm,
         e2e_env: Any,
+        credentials: Any,
         console_errors: ConsoleErrors,
     ) -> None:
         """Signing in shows the signed-in marker, signing out takes it away, and a reload keeps it away.
@@ -985,9 +1027,9 @@ class TestBrowser:
         login form in place leaves the path untouched, so requiring a change would fail every
         run against a correct app.
         """
-        sign_in(page, login_form, e2e_env)
+        sign_in(page, login_form, e2e_env, credentials)
         assert page.locator(login_form.signed_in_marker).is_visible(), (
-            f"{login_form.signed_in_marker} is not visible after signing in as the durable e2e user"
+            f"{login_form.signed_in_marker} is not visible after signing in as the e2e user"
         )
 
         sign_out(page, login_form, e2e_env)

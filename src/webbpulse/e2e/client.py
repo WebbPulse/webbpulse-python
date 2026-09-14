@@ -79,12 +79,20 @@ def retry_delay(headers: Mapping[str, str], attempt: int) -> float:
 class Pacer:
     """Keeps calls under the per-IP minute limit instead of tripping it.
 
-    Pacing is driven by the `X-RateLimit-Remaining-Minute` header the app sets on every
-    answer rather than by a fixed sleep. The limiter is in-memory per execution
-    environment, so the remaining count is the only honest read on how much budget this
-    instance has left; when the header is missing the pacer falls back to its own count of
-    calls in the current window. A `per_minute` of zero means the target does not limit at
-    all, which is the staging convention, and then no call ever waits.
+    The `X-RateLimit-Remaining-Minute` header the app sets on every answer it handles is
+    the budget, and it is authoritative: the products limit per route class, so a GET
+    class allowing 200 a minute and an auth class allowing 10 share no single number the
+    suite could guess. Whenever the last answer carried the header, the remaining count it
+    advertised decides whether the next call waits, and the local `per_minute` fallback is
+    not consulted at all.
+
+    The fallback counts only answers that arrived without the header. Those come from the
+    gateway, the access gate or the authorizer, which answer before the application runs
+    and so spend none of the app limiter's budget; counting them against it is what made a
+    sweep of mostly-401 probes pace itself as if every one had cost a token.
+
+    A `per_minute` of zero means the target does not limit at all, which is the staging
+    convention, and then no call ever waits.
     """
 
     def __init__(
@@ -101,6 +109,7 @@ class Pacer:
         self._calls_in_window = 0
         self._remaining: int | None = None
         self.slept_seconds = 0.0
+        self.unmetered_calls = 0
 
     def _wait(self, seconds: float) -> None:
         """Sleep for `seconds` and record it, ignoring a non-positive delay."""
@@ -110,7 +119,13 @@ class Pacer:
         self.slept_seconds += seconds
 
     def before_call(self) -> None:
-        """Block until this instance has budget for one more call."""
+        """Block until this instance has budget for one more call.
+
+        The advertised remaining count wins outright when the last metered answer carried
+        one. Taking the lower of it and the local count, which is what this did before,
+        meant a fallback of ten throttled a route class advertising a hundred and ninety
+        left, and no header could ever raise the budget.
+        """
         if self._per_minute <= 0:
             return
         now = self._clock()
@@ -120,34 +135,45 @@ class Pacer:
 
         elapsed = now - self._window_start
         if elapsed >= MINUTE_WINDOW:
-            self._window_start = now
-            self._calls_in_window = 0
-            self._remaining = None
+            self._start_window(now)
             return
 
-        budget_left = self._per_minute - PACING_RESERVE - self._calls_in_window
         if self._remaining is not None:
-            budget_left = min(budget_left, self._remaining - PACING_RESERVE)
+            budget_left = self._remaining - PACING_RESERVE
+        else:
+            budget_left = self._per_minute - PACING_RESERVE - self._calls_in_window
         if budget_left > 0:
             return
 
         self._wait(MINUTE_WINDOW - elapsed)
-        self._window_start = self._clock()
+        self._start_window(self._clock())
+
+    def _start_window(self, now: float) -> None:
+        """Begin a fresh minute window with the spent budget forgotten."""
+        self._window_start = now
         self._calls_in_window = 0
         self._remaining = None
 
     def after_call(self, headers: Mapping[str, str]) -> None:
-        """Record one spent call and the quota the response advertised."""
+        """Record what this answer said about the budget, if it said anything.
+
+        An answer without the header never reached the application, so it spent none of the
+        app limiter's budget and is not counted against it. A previously advertised
+        remaining count is kept rather than cleared, because an unmetered answer is no
+        evidence that the metered budget moved.
+        """
+        advertised = _header_int(headers, "x-ratelimit-remaining-minute")
+        if advertised is None:
+            self.unmetered_calls += 1
+            return
         self._calls_in_window += 1
-        self._remaining = _header_int(headers, "x-ratelimit-remaining-minute")
+        self._remaining = advertised
 
     def wait_out_429(self, headers: Mapping[str, str], attempt: int) -> float:
         """Sleep off a 429 and reset the window, returning the seconds waited."""
         delay = retry_delay(headers, attempt)
         self._wait(delay)
-        self._window_start = self._clock()
-        self._calls_in_window = 0
-        self._remaining = None
+        self._start_window(self._clock())
         return delay
 
 

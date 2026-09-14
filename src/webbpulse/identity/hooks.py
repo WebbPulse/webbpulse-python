@@ -101,6 +101,15 @@ class IdentityHooks(Protocol):
         """
         ...
 
+    def delete_user(self, user_id: str) -> bool:
+        """Hard-delete the product's users row, returning whether one was there.
+
+        Only the users row: the identity rows are the stream purge's to remove, and doing
+        them here would leave the production deletion path untested. Needed only by a
+        product that enables `ephemeral_users_enabled`.
+        """
+        ...
+
     def user_repository(self) -> object:
         """The product's own users table, as a `webbpulse.dynamodb.Repository`.
 
@@ -159,6 +168,14 @@ class BaseIdentityHooks:
     def mark_email_verified(self, user_id: str) -> None:
         """Refuse: the product must implement this hook."""
         raise self._not_implemented("mark_email_verified")
+
+    def delete_user(self, user_id: str) -> bool:
+        """Refuse: a product that enables ephemeral users must implement this hook.
+
+        Raises rather than returning False, because a silent no-op would leave every run's
+        user behind while reporting a clean teardown.
+        """
+        raise self._not_implemented("delete_user")
 
     def user_repository(self) -> object:
         """Refuse: the product must implement this hook."""
