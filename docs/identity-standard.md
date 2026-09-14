@@ -51,7 +51,8 @@ only to the product's own first party frontend); no SCIM, directory sync or ente
 `webbpulse.identity` is a flat module package: `settings.py` (`IdentitySettings`), `hooks.py`
 (`IdentityHooks`, `BaseIdentityHooks`), `router.py` (`build_identity_router`,
 `identity_prefix`, route path constants), `oauth_routes.py`, `passkey_routes.py`, `flows.py`
-(`IdentityFlows`), `service.py` (`TokenService`), `tokens.py` (`KmsSigner`, `build_jwks`,
+(`IdentityFlows`), `service.py` (`TokenService`), `verifier.py` (`JwksVerifier`,
+`discovery_jwks_uri`), `tokens.py` (`KmsSigner`, `build_jwks`,
 `build_discovery_document`, `kid_for_der`), `sessions.py` (`SessionService`), `passwords.py`,
 `mfa.py` (`MfaService`), `totp.py`, `passkeys.py` (`PasskeyService`), `oauth.py`
 (`OAuthService`), `verification.py` (`LinkService`), `crypto.py` (`EnvelopeCipher`,

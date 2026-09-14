@@ -46,6 +46,7 @@ app.include_router(build_identity_router(settings, hooks, stores, tokens=tokens)
 | `EnvelopeCipher` | Sealing a TOTP seed under a per-secret KMS data key with a per-user encryption context |
 | `EmailSender` | Sending mail, with an SES v2 implementation and a recording one for tests |
 | `TokenService` | Minting, local verification, JWKS, discovery, rotation across keys |
+| `JwksVerifier` | Verifying an access token against the issuer's published JWKS, with no KMS grant |
 | `authorizer_claims` | Reading and coercing what the authorizer put on the request |
 | `CredentialStore` and friends | Storage interfaces, with DynamoDB and in-memory implementations |
 
