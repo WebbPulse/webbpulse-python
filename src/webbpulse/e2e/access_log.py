@@ -149,7 +149,6 @@ class AccessLogLookup:
         self._cache: dict[str, AccessLogEntry] = {}
         self._window_start_ms: int | None = None
         self._last_scan_at: float | None = None
-        self._first_missed_at: float | None = None
 
     @property
     def log_group(self) -> str:
@@ -255,7 +254,9 @@ class AccessLogLookup:
         The loop also stops as soon as a scan that began after the request can be shown to
         have completed without it. Delivery lag is a reason to wait again; a window already
         read past that point is evidence the entry is not coming, and waiting the rest of
-        the budget cannot turn that into a hit.
+        the budget cannot turn that into a hit. The settle clock starts at this lookup's
+        own first miss, never at another id's, so a late entry asked for after an earlier
+        miss still gets its full grace.
 
         None means "not delivered inside the budget", not "the request did not happen". The
         caller decides whether that is a failure, which it is for a route cut assertion and
@@ -268,29 +269,20 @@ class AccessLogLookup:
             return cached
 
         deadline = self._clock() + self._wait_seconds
+        first_missed_at: float | None = None
         while True:
             started_at = self._clock()
             entry = self._read(request_id, start_time_ms)
             if entry is not None:
                 return entry
-            if self._settled_without(request_id, started_at):
+            if first_missed_at is None:
+                first_missed_at = started_at
+            elif started_at - first_missed_at >= self._settle_seconds:
                 return None
             remaining = deadline - self._clock()
             if remaining <= 0:
                 return None
             self._sleep(min(self._poll_seconds, remaining))
-
-    def _settled_without(self, request_id: str, started_at: float) -> bool:
-        """Whether a read that began at `started_at` proves this id is not merely late.
-
-        True once a scan begun after the entry's own delivery grace period has finished
-        without it. Until that grace has passed a miss is indistinguishable from lag, so the
-        loop keeps waiting.
-        """
-        if self._first_missed_at is None:
-            self._first_missed_at = started_at
-            return False
-        return started_at - self._first_missed_at >= self._settle_seconds
 
     def _read(self, request_id: str, start_time_ms: int | None) -> AccessLogEntry | None:
         """One attempt at an id, always a real read rather than a throttled no-op.

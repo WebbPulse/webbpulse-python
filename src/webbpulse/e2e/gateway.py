@@ -187,7 +187,7 @@ def native_identity_mode(routes: Iterable[Route]) -> bool:
     the mode, and reading it here avoids a new environment variable the reusable workflow
     would have to learn.
     """
-    return any(route.is_coarse for route in routes)
+    return any(route.is_coarse and not route.has_authorizer for route in routes)
 
 
 @dataclass(frozen=True)

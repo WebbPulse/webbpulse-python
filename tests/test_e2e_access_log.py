@@ -538,3 +538,42 @@ class TestFilteredFallback:
         lookup = AccessLogLookup(client, LOG_GROUP, wait_seconds=0.0)
         lookup.scan_window()
         assert lookup.cached_ids == frozenset({"req-1", "req-2"})
+
+
+class TestSettleIsPerLookup:
+    """The settle clock belongs to one `find` call, not to the lookup as a whole."""
+
+    def test_a_late_entry_asked_for_after_an_earlier_miss_still_gets_its_grace(self) -> None:
+        """A lookup that begins long after another id's first miss is not given up on at once."""
+        clock = Clock()
+        delivered = {
+            "events": [
+                {
+                    "message": json.dumps(
+                        {
+                            "requestId": "req-late",
+                            "routeKey": "GET /late",
+                            "status": "200",
+                            "integrationLatency": "1",
+                        }
+                    ),
+                    "timestamp": 1_000,
+                }
+            ]
+        }
+        pages = [{"events": []} for _ in range(8)] + [delivered] + [{"events": []} for _ in range(10)]
+        client = FakeLogs(pages)
+        lookup = AccessLogLookup(
+            client,
+            LOG_GROUP,
+            wait_seconds=600.0,
+            poll_seconds=5.0,
+            settle_seconds=20.0,
+            sleeper=clock.sleep,
+            clock=clock,
+        )
+        assert lookup.find("req-never-delivered") is None
+        assert clock.now >= 20.0
+        entry = lookup.find("req-late")
+        assert entry is not None
+        assert entry.route_key == "GET /late"
