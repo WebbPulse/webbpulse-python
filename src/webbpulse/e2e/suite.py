@@ -36,7 +36,15 @@ import pytest
 from webbpulse.http import ROUTE_KEY_HEADER
 
 from .access_log import AccessLogLookup
-from .browser import ROOT_SELECTORS, BrowserFailure, ConsoleErrors, FailedRequests, browser_contract, sign_in
+from .browser import (
+    ROOT_SELECTORS,
+    BrowserFailure,
+    ConsoleErrors,
+    FailedRequests,
+    browser_contract,
+    sign_in,
+    sign_out,
+)
 from .client import E2EClient, RateLimitExhausted
 from .frontend import fetch_bundle, missing_allowed_headers, shell_looks_like_an_app
 from .gateway import (
@@ -982,8 +990,7 @@ class TestBrowser:
             f"{login_form.signed_in_marker} is not visible after signing in as the durable e2e user"
         )
 
-        page.click(login_form.sign_out)
-        page.wait_for_selector(login_form.signed_out_marker, state="visible", timeout=e2e_env.browser_timeout_ms)
+        sign_out(page, login_form, e2e_env)
         assert page.locator(login_form.signed_in_marker).count() == 0, (
             f"{login_form.signed_in_marker} is still on the page after signing out, so the session was never cleared."
         )
