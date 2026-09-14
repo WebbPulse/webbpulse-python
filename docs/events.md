@@ -15,9 +15,11 @@ ordinary `POST` route and the `ReportBatchItemFailures` envelope is its response
 ```python
 from webbpulse.events import stream_consumer_app
 
+
 def handle(record):
     """Recompute one part's vote total."""
     repositories().parts.recount(record["dynamodb"]["Keys"]["id"]["S"])
+
 
 app = stream_consumer_app(handle, title="Catalog votes stream consumer")
 ```
