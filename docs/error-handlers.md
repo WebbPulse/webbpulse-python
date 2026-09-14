@@ -97,9 +97,9 @@ status instead of three for 403 and four for 429:
 ```python
 from webbpulse import messages
 
-messages.forbidden("delete", "this user")   # "Not authorized to delete this user."
-messages.unauthenticated()                  # "Authentication is required."
-messages.rate_limited(retry_after=30)       # "Too many requests. Try again in 30 seconds."
+messages.forbidden("delete", "this user")  # "Not authorized to delete this user."
+messages.unauthenticated()  # "Authentication is required."
+messages.rate_limited(retry_after=30)  # "Too many requests. Try again in 30 seconds."
 messages.refusal(404, subject="that part")  # "Could not find that part."
 ```
 
