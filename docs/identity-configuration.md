@@ -21,6 +21,8 @@ permanently.
 | `audience` | required | The `aud` claim |
 | `signing_key_arns` | required | KMS RSA_2048 signing keys, active first |
 | `data_key_arn` | `""` | Symmetric KMS key for TOTP seed encryption |
+| `signer` | `"kms"` | Which client signs. `local` picks `LocalSigner` and is refused in production |
+| `local_signer_seed` | `""` | The seed `LocalSigner` derives its keys from; empty takes `DEFAULT_LOCAL_SEED` |
 | `passwords_enabled` | `True` | |
 | `registration_enabled` | `True` | |
 | `email_verification_required` | `True` | |
@@ -54,7 +56,23 @@ permanently.
 | `oauth_redirect_uris` | `[]` | Exact-match allow-list; empty means `<issuer>/oauth/callback` |
 
 Derived: `active_signing_key_arn`, `previous_signing_key_arns`, `discovery_url`, `jwks_url`,
-`cookie_kwargs()` for `Response.set_cookie`.
+`local_signer_seed_value`, `cookie_kwargs()` for `Response.set_cookie`.
+
+**`signer` picks the signing client, and `signing_client(settings)` builds it.** `kms` is
+`boto3.client("kms")` and is what every deployed environment uses. `local` is
+`LocalSigner`, an in-process RSA PKCS #1 v1.5 SHA-256 signer whose key is derived from
+`local_signer_seed`, so `kid` is the same across restarts and a token issued before a
+restart still verifies. It is refused in production twice over, at settings validation and
+in the constructor, the way `mint_test_token` is: its private half lives in the process.
+A composition root that wants either without branching calls `signing_client(settings)`
+and passes the result straight to `TokenService`.
+
+```python
+from webbpulse.identity import IdentitySettings, TokenService, signing_client
+
+settings = IdentitySettings()
+tokens = TokenService(settings, signing_client(settings))
+```
 
 **`rp_id` cannot be changed later.** It is hashed into every credential and immutable for its
 life; the browser refuses a ceremony whose RP ID is not a registrable domain suffix of the

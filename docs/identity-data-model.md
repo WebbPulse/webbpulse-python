@@ -24,10 +24,10 @@ Names are the logical constants in `webbpulse.identity.storage`, `.oauth` and `.
 |---|---|---|---|
 | `users` (`USERS_TABLE`) | `id` | `email_lower-index`, `username_lower-index` | **never** |
 | `credentials` (`CREDENTIALS_TABLE`) | `user_id` / `credential_type` | none | none |
-| `passkeys` (`PASSKEYS_TABLE`) | `id` | `credential_id-index` (`PASSKEY_CREDENTIAL_INDEX`) | none |
+| `passkeys` (`PASSKEYS_TABLE`) | `user_id` / `credential_id` | `credential_id-index` (`PASSKEY_CREDENTIAL_INDEX`) | none |
 | `totp-factors` (`TOTP_FACTORS_TABLE`) | `user_id` | none | none |
 | `recovery-codes` (`RECOVERY_CODES_TABLE`) | `user_id` / `code_hash` | none | **never** |
-| `oauth-links` (`OAUTH_LINKS_TABLE`) | `id` | `user_id-index` (`OAUTH_LINK_USER_INDEX`) | none |
+| `oauth-links` (`OAUTH_LINKS_TABLE`) | `provider_subject` | `user_id-index` (`OAUTH_LINK_USER_INDEX`) | none |
 | `refresh-tokens` (`REFRESH_TOKENS_TABLE`) | `token_hash` | `family_id-generation-index` (`REFRESH_FAMILY_INDEX`), `user_id-family_id-index` (`REFRESH_USER_INDEX`) | `expires_at` |
 | `identity-tokens` (`IDENTITY_TOKENS_TABLE`) | `token_hash` | none | `expires_at` |
 | `webauthn-challenges` (`WEBAUTHN_CHALLENGES_TABLE`) | `challenge_id` | none | `expires_at` |
@@ -69,6 +69,29 @@ Attributes beyond the keys:
   `ip`, `user_agent`, `expires_at` (`ATTEMPT_TTL` = 30 days). Feeds lockout (5.1) and audit.
 
 The limiter's own `rate-limits` table is reused unchanged.
+
+`webbpulse.identity.storage.TABLES` is these ten tables as `TableSpec` values, matching
+the `tables` default in `platform-modules/aws//modules/identity` exactly. Each carries
+`create_table_request(prefix)`, the boto3 `create_table` keyword mapping under that
+environment's prefix, and `time_to_live_request(prefix)`, which is `None` for a table with
+no TTL. Billing is always `PAY_PER_REQUEST`. A local bootstrap walks it rather than
+hand-writing the shapes per repo, so a key schema cannot drift from what Terraform
+provisions; `users` is not among them, because it belongs to the product's own domain.
+`tests/test_identity_tables.py` pins every name, key, index and TTL against a literal copy
+of the module.
+
+```python
+import boto3
+
+from webbpulse.identity import TABLES
+
+client = boto3.client("dynamodb", endpoint_url="http://127.0.0.1:8001")
+for spec in TABLES:
+    client.create_table(**spec.create_table_request("webbpulse-local"))
+    ttl = spec.time_to_live_request("webbpulse-local")
+    if ttl is not None:
+        client.update_time_to_live(**ttl)
+```
 
 ### 4.3 Every TTL, in one place
 

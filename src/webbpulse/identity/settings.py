@@ -13,9 +13,11 @@ from urllib.parse import urlparse
 from pydantic import Field, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
-__all__ = ["MAX_ACCESS_TOKEN_TTL", "MAX_SIGNING_KEYS", "IdentitySettings", "OAuthProvider"]
+__all__ = ["MAX_ACCESS_TOKEN_TTL", "MAX_SIGNING_KEYS", "IdentitySettings", "OAuthProvider", "SignerKind"]
 
 OAuthProvider = Literal["google", "github"]
+
+SignerKind = Literal["kms", "local"]
 
 _DEFAULT_OAUTH_PROVIDERS: Final[list[OAuthProvider]] = ["google", "github"]
 
@@ -24,6 +26,8 @@ MAX_ACCESS_TOKEN_TTL: Final = timedelta(hours=1)
 MAX_SIGNING_KEYS: Final = 4
 
 _PLAINTEXT_ISSUER_ENVIRONMENTS: Final[frozenset[str]] = frozenset({"local", "test"})
+
+_LOCAL_SIGNER_REFUSED_ENVIRONMENTS: Final[frozenset[str]] = frozenset({"production", "prod"})
 
 
 class IdentitySettings(BaseSettings):
@@ -64,6 +68,21 @@ class IdentitySettings(BaseSettings):
     data_key_arn: str = Field(
         default="",
         description=("Symmetric KMS key for TOTP seed envelope encryption. Unused until M4 and optional until then."),
+    )
+    signer: SignerKind = Field(
+        default="kms",
+        description=(
+            "Which client signs access tokens. `kms` is every deployed environment. `local` "
+            "is the in-process `LocalSigner`, for a local stack with no AWS credentials, and "
+            "is refused in production."
+        ),
+    )
+    local_signer_seed: str = Field(
+        default="",
+        description=(
+            "The seed `LocalSigner` derives its keys from, so `kid` is stable across "
+            "restarts. Empty takes `DEFAULT_LOCAL_SEED`. Read only when `signer` is `local`."
+        ),
     )
 
     passwords_enabled: bool = True
@@ -198,6 +217,21 @@ class IdentitySettings(BaseSettings):
             raise ValueError(f"issuer must have no query string or fragment, got {self.issuer!r}.")
         return self
 
+    @model_validator(mode="after")
+    def _check_signer(self) -> IdentitySettings:
+        """Refuse the local signer in production, whatever the switch says.
+
+        Mirrors `mint_test_token`: the local signer's private half lives in the process, so
+        one editing mistake must not be enough to put it in front of real users.
+        """
+        if self.signer == "local" and self.environment.strip().lower() in _LOCAL_SIGNER_REFUSED_ENVIRONMENTS:
+            raise ValueError(
+                f"signer='local' is refused in environment {self.environment!r}. The local "
+                "signer holds its private key in the process and derives it from a seed, so "
+                "anybody holding the seed can mint a token for every user."
+            )
+        return self
+
     @field_validator("signing_key_arns")
     @classmethod
     def _check_signing_keys(cls, value: list[str]) -> list[str]:
@@ -278,6 +312,13 @@ class IdentitySettings(BaseSettings):
         if self.refresh_reuse_grace < timedelta(0):
             raise ValueError("refresh_reuse_grace cannot be negative; zero disables the grace.")
         return self
+
+    @property
+    def local_signer_seed_value(self) -> str:
+        """The seed to build a `LocalSigner` with, defaulting when none was configured."""
+        from webbpulse.identity.local_signer import DEFAULT_LOCAL_SEED
+
+        return self.local_signer_seed or DEFAULT_LOCAL_SEED
 
     @property
     def active_signing_key_arn(self) -> str:
