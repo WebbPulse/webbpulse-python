@@ -5,6 +5,38 @@ Notable changes to the `webbpulse` package. The version here is the one in
 
 This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## 0.30.2
+
+Fixes two more `webbpulse.e2e` bugs, found by running the suite against CarModPicker
+staging. Neither is a product defect.
+
+The two page collectors now agree about the same HTTP event. `FailedRequests` already
+ignored the 401 or 403 an anonymous visit is meant to provoke, but `ConsoleErrors` recorded
+every `console.error` unconditionally, and the shared `@webbpulse/api-client` calls
+`POST /api/auth/refresh` on load, which anonymously returns 401 and which the browser logs
+as a resource-load console error. Every public route failed the "renders clean" check on a
+healthy app. `ConsoleErrors` now carries the same `ignore_guard_statuses` flag on the same
+status set and the same anonymous versus signed-in rule, and ignores a console message only
+when it reads as a resource-load report naming 401 or 403 for a URL under this product's API
+base. The URL is read from the message's `location` when it carries one and from the message
+text otherwise. Chromium's, Firefox's and WebKit's phrasings are all matched. Any other
+console error, including a 404, a 500 and every uncaught page error, still fails the route.
+New `resource_load_status` and `message_location_url` in `webbpulse.e2e.browser`.
+
+The minted-token probe no longer picks a route with no handler for the probed method.
+0.30.1 replaced `_first_authorized_route` with `_first_identity_route`, but that still
+returned a bare `Route` the callers turned into a method with `_probe_method`, so the
+CarModPicker shape of `ANY /api/admin/db-ops` in the route table with only
+`POST /api/admin/db-ops` in the OpenAPI document was still wrong: the fallback looked for
+`GET /api/admin/db-ops` among the declared operations, did not find it, and skipped. The
+probe now resolves to a `ProbeTarget` carrying the matched operation's own method and path,
+so the request reaches the auth dependency rather than a FastAPI 404, and an operation that
+resolves to a `{proxy+}` key is probed at its own concrete path. Candidates are ordered
+safest first: a GET, HEAD or OPTIONS, then a mutation with a path parameter pointed at an
+absent id. A mutation with no path parameter is never a candidate, because the accepted-token
+probe carries an admin token and the request would execute for real, and the logout path is
+never one because probing it would end the run's own session.
+
 ## 0.30.1
 
 Fixes four `webbpulse.e2e` bugs the first full run against the Portfolio staging deployment

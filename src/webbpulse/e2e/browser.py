@@ -19,7 +19,7 @@ from __future__ import annotations
 
 import os
 import re
-from collections.abc import Generator, Iterator, Sequence
+from collections.abc import Generator, Iterator, Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -36,12 +36,32 @@ __all__ = [
     "FailedRequests",
     "artifact_name",
     "browser_is_available",
+    "message_location_url",
+    "resource_load_status",
 ]
 
 DEFAULT_ARTIFACTS_DIR = "e2e-browser-artifacts"
 ROOT_SELECTORS = ("#root", "#app", "main", "body")
 GUARD_STATUSES = (401, 403)
 _UNSAFE = re.compile(r"[^A-Za-z0-9._-]+")
+_RESOURCE_LOAD_PREFIX = re.compile(r"\b(?:Failed to load resource|HTTP load failed|NS_ERROR_|was loaded over)\b")
+_RESOURCE_LOAD_STATUS = re.compile(r"\bstatus(?: of|:)? (\d{3})\b")
+_URL_IN_TEXT = re.compile(r"https?://[^\s'\"()<>]+")
+
+
+def resource_load_status(text: str) -> int | None:
+    """The HTTP status a browser's resource-load console error names, or None.
+
+    Chromium and WebKit both log `Failed to load resource: the server responded with a
+    status of 401 ()`, WebKit also logs `HTTP load failed with status 403`, and Firefox
+    phrases the same event as `... with a status 401 for <url>`. The message must read as a
+    resource-load report and then name a three digit status, so a render error that merely
+    mentions a number is never mistaken for one.
+    """
+    if not _RESOURCE_LOAD_PREFIX.search(text):
+        return None
+    found = _RESOURCE_LOAD_STATUS.search(text)
+    return int(found.group(1)) if found else None
 
 
 class BrowserFailure(AssertionError):
@@ -93,13 +113,44 @@ class ConsoleErrors:
 
     A React render error is an uncaught exception and a blank page; the API suite cannot
     see either, and the browser suite only sees them if something is listening.
+
+    `ignore_guard_statuses` mirrors the flag of the same name on `FailedRequests`, and is
+    set by the same cases for the same reason. The two collectors see one HTTP event twice:
+    the response listener sees the 401 an anonymous visit is meant to provoke, and the
+    console listener sees the resource-load error the browser logs for it. Ignoring the
+    first while counting the second fails every public route on a healthy app, because the
+    shared `@webbpulse/api-client` calls `POST /api/auth/refresh` on load and anonymously
+    that correctly answers 401. So the exemption covers both, on the same status set and the
+    same anonymous versus signed-in rule. Every other console error still counts.
     """
 
+    api_base_url: str = ""
+    ignore_guard_statuses: bool = False
     messages: list[str] = field(default_factory=list)
 
-    def record(self, message: str) -> None:
-        """Record one console error or page error."""
+    def record(self, message: str, url: str | None = None) -> None:
+        """Record one console error or page error, honouring the guard-status exemption."""
+        if self.is_ignored_guard_error(message, url):
+            return
         self.messages.append(message)
+
+    def is_ignored_guard_error(self, message: str, url: str | None = None) -> bool:
+        """Whether a console message is the resource-load error an exempt failed request made.
+
+        The message must name a guard status in a resource-load error, and the URL it carries
+        must be one `FailedRequests` would have scoped to this product's API. A console
+        message that carries no URL at all is judged on the text alone, because a browser
+        that reports the status without a location still reports the same event.
+        """
+        if not self.ignore_guard_statuses:
+            return False
+        status = resource_load_status(message)
+        if status is None or status not in GUARD_STATUSES:
+            return False
+        target = url if url else _url_in(message)
+        if target is None:
+            return True
+        return bool(self.api_base_url) and target.startswith(self.api_base_url)
 
     def clear(self) -> None:
         """Forget everything recorded so far, between navigations in one test."""
@@ -263,20 +314,47 @@ def page(context: Any, console_errors: Any, failed_requests: Any) -> Iterator[An
 
 def _attach_listeners(page: Any, console_errors: ConsoleErrors, failed_requests: FailedRequests) -> None:
     """Wire the console, page error and response listeners onto one page."""
-    page.on(
-        "console",
-        lambda message: (
-            console_errors.record(f"console.{message.type}: {message.text}") if message.type == "error" else None
-        ),
-    )
+    page.on("console", lambda message: _record_console(console_errors, message))
     page.on("pageerror", lambda error: console_errors.record(f"pageerror: {error}"))
     page.on("response", lambda response: failed_requests.record(response.url, response.status))
 
 
+def _record_console(console_errors: ConsoleErrors, message: Any) -> None:
+    """Hand one console error to the collector, with the URL the message carries.
+
+    A resource-load error names the failing URL in `location`, which is where the collector
+    can scope it to this product's API rather than to a font host that happens to 401.
+    """
+    if getattr(message, "type", None) != "error":
+        return
+    text = str(getattr(message, "text", ""))
+    console_errors.record(f"console.error: {text}", message_location_url(message))
+
+
+def message_location_url(message: Any) -> str | None:
+    """The URL a Playwright console message's `location` names, or None when it carries none.
+
+    `location` is a mapping in the sync API and absent on messages a browser reports without
+    one, so both shapes and neither are tolerated.
+    """
+    location = getattr(message, "location", None)
+    if isinstance(location, Mapping):
+        url = location.get("url")
+        return str(url) if url else None
+    url = getattr(location, "url", None)
+    return str(url) if url else None
+
+
+def _url_in(text: str) -> str | None:
+    """The first absolute http URL a console message's text names, or None."""
+    found = _URL_IN_TEXT.search(text)
+    return found.group(0) if found else None
+
+
 @pytest.fixture
-def console_errors() -> ConsoleErrors:
+def console_errors(e2e_env: Any) -> ConsoleErrors:
     """Collector for console errors and uncaught page errors on the test's page."""
-    return ConsoleErrors()
+    return ConsoleErrors(api_base_url=e2e_env.api_base_url)
 
 
 @pytest.fixture

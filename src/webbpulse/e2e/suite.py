@@ -26,6 +26,7 @@ The six groups, in the order they build on each other:
 from __future__ import annotations
 
 from collections.abc import Callable, Mapping, Sequence
+from dataclasses import dataclass
 from typing import Any
 
 import pytest
@@ -103,13 +104,18 @@ MAX_NAVIGATIONS = 5
 
 
 def _probe_path(route: Route) -> str:
-    """A concrete path that resolves to this route and to no more specific one.
+    """A concrete path that resolves to this route and to no more specific one."""
+    return _concrete_path(route.path)
+
+
+def _concrete_path(template: str) -> str:
+    """A path template with every variable filled with the absent-id marker.
 
     Variables are filled with a marker rather than a plausible id so the request is a
     lookup that misses, which every handler answers without writing anything.
     """
     segments = []
-    for segment in route.path.strip("/").split("/"):
+    for segment in template.strip("/").split("/"):
         if segment == "{proxy+}" or (segment.startswith("{") and segment.endswith("}")):
             segments.append(ABSENT_ID)
         else:
@@ -381,7 +387,7 @@ class TestReachability:
 
     def _assert_reachable(self, operation: Operation, client: E2EClient, who: str) -> None:
         """One reachability probe, with the distinction between the failure modes named."""
-        path = _concrete_path(operation)
+        path = _concrete_path(operation.path)
         try:
             response = client.request(operation.method, path, json={} if operation.method != "GET" else None)
         except RateLimitExhausted as error:
@@ -408,15 +414,6 @@ class TestReachability:
                 f"{operation.label} called {who} answered {response.status_code}, which its "
                 f"own spec does not declare. The spec declares {operation.expected_statuses}."
             )
-
-
-def _concrete_path(operation: Operation) -> str:
-    """The operation path with every placeholder filled with an obviously absent id."""
-    segments = [
-        ABSENT_ID if segment.startswith("{") and segment.endswith("}") else segment
-        for segment in operation.path.strip("/").split("/")
-    ]
-    return "/" + "/".join(segment for segment in segments if segment)
 
 
 def _looks_like_a_gateway_404(response: Any) -> bool:
@@ -489,11 +486,11 @@ class TestIdentity:
         openapi_operations: Sequence[Operation],
     ) -> None:
         """Staging only: a KMS-minted token is accepted on a route that requires identity."""
-        route = _first_identity_route(gateway_routes, gate_authorizers, openapi_operations)
+        probe = _first_identity_probe(gateway_routes, gate_authorizers, openapi_operations)
         token = minted_token({"roles": ["admin"]})
-        response = anon.with_token(token).request(_probe_method(route), _probe_path(route))
+        response = anon.with_token(token).request(probe.method, probe.path)
         assert response.status_code not in (401, 403), (
-            f"a minted token was rejected with {response.status_code} on {route.route_key}, so "
+            f"a minted token was rejected with {response.status_code} on {probe.route_key}, so "
             "the authorizer does not accept a token this environment's own key signed."
         )
 
@@ -506,12 +503,12 @@ class TestIdentity:
         openapi_operations: Sequence[Operation],
     ) -> None:
         """Staging only: a token for another audience is refused by the authorizer."""
-        route = _first_identity_route(gateway_routes, gate_authorizers, openapi_operations)
+        probe = _first_identity_probe(gateway_routes, gate_authorizers, openapi_operations)
         token = minted_token(audience="https://e2e.invalid/not-this-audience")
-        response = anon.with_token(token).request(_probe_method(route), _probe_path(route))
+        response = anon.with_token(token).request(probe.method, probe.path)
         assert response.status_code in (401, 403), (
             f"a token minted for another audience answered {response.status_code} on "
-            f"{route.route_key}. The authorizer is not checking `aud`."
+            f"{probe.route_key}. The authorizer is not checking `aud`."
         )
 
     def test_expired_minted_token_is_rejected(
@@ -525,11 +522,11 @@ class TestIdentity:
         """Staging only: a token whose `exp` has passed is refused by the authorizer."""
         import time
 
-        route = _first_identity_route(gateway_routes, gate_authorizers, openapi_operations)
+        probe = _first_identity_probe(gateway_routes, gate_authorizers, openapi_operations)
         token = minted_token(expires_in=1, now=int(time.time()) - 3600)
-        response = anon.with_token(token).request(_probe_method(route), _probe_path(route))
+        response = anon.with_token(token).request(probe.method, probe.path)
         assert response.status_code in (401, 403), (
-            f"an expired token answered {response.status_code} on {route.route_key}. The "
+            f"an expired token answered {response.status_code} on {probe.route_key}. The "
             "authorizer is not checking `exp`."
         )
 
@@ -543,7 +540,7 @@ def _first_authorized_route(routes: Sequence[Route]) -> Route:
     """One live route that sits behind any authorizer, for a probe that needs a real path.
 
     Structural, so on a gated staging API this is simply the first route. Callers asserting
-    something about identity want `_first_identity_route` instead.
+    something about identity want `_first_identity_probe` instead.
     """
     for route in sorted(routes, key=lambda item: item.route_key):
         if route.has_authorizer and "{proxy+}" not in route.path:
@@ -551,33 +548,93 @@ def _first_authorized_route(routes: Sequence[Route]) -> Route:
     pytest.skip("no live route carries an authorizer, so there is nothing to present a minted token to")
 
 
-def _first_identity_route(
+@dataclass(frozen=True)
+class ProbeTarget:
+    """A concrete method and path to present a minted token to, and the key that serves it.
+
+    The method matters as much as the path. A route key of `ANY /api/admin/db-ops` is served
+    by a router that defines only POST, so probing it with GET is answered 404 by FastAPI
+    before any auth dependency runs and a probe expecting 401 fails on a healthy app.
+    """
+
+    method: str
+    path: str
+    route_key: str
+
+
+SAFE_METHODS = ("GET", "HEAD", "OPTIONS")
+UNSAFE_PROBE_PATHS = ("/api/auth/logout",)
+
+
+def _operation_probe_rank(operation: Operation) -> tuple[int, str]:
+    """Sort key ordering probe candidates safest first.
+
+    A GET is the best probe: it carries no body, changes nothing, and every app serves one
+    for a resource it also protects. A HEAD or OPTIONS is as safe and rarer. A mutation that
+    takes a path parameter comes last, because the probe points it at an absent id and the
+    handler answers the miss without writing. A mutation with no path parameter is never a
+    candidate: the accepted-token probe carries an admin token, so the request would execute
+    for real, and on CarModPicker the first such operation is `POST /api/admin/db-ops/cars/delete-all`.
+    """
+    rank = 0 if operation.method in SAFE_METHODS else 1
+    return (rank, operation.label)
+
+
+def _identity_probe_from_routes(routes: Sequence[Route], gate_ids: frozenset[str]) -> ProbeTarget | None:
+    """The first live route carrying a non-gate authorizer, as a probe target, or None.
+
+    The authorizer runs before the integration, so here the method only has to be one the
+    gateway routes: an `ANY` key accepts every method and a concrete key names its own.
+    """
+    for route in sorted(routes, key=lambda item: item.route_key):
+        if route_requires_identity(route, gate_ids) and "{proxy+}" not in route.path:
+            return ProbeTarget(method=_probe_method(route), path=_probe_path(route), route_key=route.route_key)
+    return None
+
+
+def _identity_probe_from_operations(routes: Sequence[Route], operations: Sequence[Operation]) -> ProbeTarget | None:
+    """A declared operation that requires auth and maps to a live route, as a probe target, or None.
+
+    Used where the gate is the only authorizer and verifies the identity token itself, so the
+    route table cannot say which routes need one. The operation's own method and concrete
+    path are what the probe sends, because the route key it resolves to may be an `ANY` or
+    `{proxy+}` key whose router defines only some methods, and a method with no handler is
+    answered 404 before the auth dependency runs. Candidates are ordered safest first by
+    `_operation_probe_rank`; a bare mutation is never one because an accepted admin token
+    would run it for real, and the logout path is never one because the probe would end the
+    run's own session.
+    """
+    candidates = [
+        operation
+        for operation in operations
+        if operation.requires_auth and not operation.is_bare_mutation and operation.path not in UNSAFE_PROBE_PATHS
+    ]
+    for operation in sorted(candidates, key=_operation_probe_rank):
+        route = matching_route(operation, routes)
+        if route is None:
+            continue
+        return ProbeTarget(method=operation.method, path=_concrete_path(operation.path), route_key=route.route_key)
+    return None
+
+
+def _first_identity_probe(
     routes: Sequence[Route],
     gate_ids: frozenset[str],
     operations: Sequence[Operation],
-) -> Route:
-    """One live route that actually requires an identity token, for the minted-token probes.
+) -> ProbeTarget:
+    """A method and path that actually requires an identity token, for the minted-token probes.
 
     A route carrying only the access gate's authorizer is not one: the gate admits any
     caller presenting the origin-verify header, so an expired or wrong-audience token
     reaches the integration and is answered 200, and the probe asserting a 401 fails on a
     healthy API. Where no route carries a non-gate authorizer the gate verifies the identity
     token itself, and the route table cannot say which routes those are, so the operation
-    list the app declares is used instead.
+    list the app declares is used instead, and the operation's own method is sent so the
+    request reaches a handler rather than a 404.
     """
-    ordered = sorted(routes, key=lambda item: item.route_key)
-    for route in ordered:
-        if route_requires_identity(route, gate_ids) and "{proxy+}" not in route.path:
-            return route
-
-    protected = {
-        operation.label for operation in operations if operation.requires_auth and not operation.is_bare_mutation
-    }
-    for route in ordered:
-        if "{proxy+}" in route.path:
-            continue
-        if f"{_probe_method(route)} {route.path}" in protected:
-            return route
+    found = _identity_probe_from_routes(routes, gate_ids) or _identity_probe_from_operations(routes, operations)
+    if found is not None:
+        return found
 
     pytest.skip(
         "no live route requires an identity token: every authorizer on this API is the "
@@ -786,7 +843,10 @@ class TestBrowser:
         """Every declared route paints children, logs no console error and makes no failed API call.
 
         A protected route is visited signed in; everything else anonymously, with the 401
-        and 403 an anonymous visit is meant to provoke exempted rather than counted.
+        and 403 an anonymous visit is meant to provoke exempted rather than counted, in both
+        collectors. The browser logs a resource-load console error for the same response the
+        request listener sees, so exempting one without the other fails every public route on
+        a healthy app.
         """
         signed_in = declared_route.access == "protected"
         if signed_in:
@@ -794,6 +854,7 @@ class TestBrowser:
         else:
             page = request.getfixturevalue("page")
             failed_requests.ignore_guard_statuses = True
+            console_errors.ignore_guard_statuses = True
         console_errors.clear()
         failed_requests.clear()
 
