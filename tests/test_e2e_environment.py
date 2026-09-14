@@ -228,3 +228,81 @@ class TestBrowserSettings:
     def test_an_unusable_timeout_falls_back_to_the_default(self, value: str) -> None:
         """A zero or negative timeout would make every wait fail instantly."""
         assert E2EEnvironment.from_environ({**COMPLETE, "E2E_BROWSER_TIMEOUT_MS": value}).browser_timeout_ms == 15000
+
+
+PRODUCTION_READ_ONLY = {
+    "E2E_ENVIRONMENT": "production",
+    "E2E_API_BASE_URL": "https://api.example.invalid",
+    "E2E_WEB_BASE_URL": "https://www.example.invalid",
+    "E2E_AWS_REGION": "us-west-2",
+    "E2E_API_ID": "prod123",
+    "E2E_ACCESS_LOG_GROUP": "/aws/apigateway/example-production-api",
+    "E2E_RUN_ID": "1234567890",
+    "E2E_READ_ONLY": "true",
+}
+
+
+class TestReadOnly:
+    """Tests for the anonymous read-only mode a production run uses.
+
+    Production has no durable e2e user, so `e2e.yml` exports `E2E_READ_ONLY=true` there and
+    leaves the two user variables empty.
+    """
+
+    def test_read_only_needs_no_user_credential(self) -> None:
+        """This is the whole point: production has no e2e user to name."""
+        env = E2EEnvironment.from_environ(PRODUCTION_READ_ONLY)
+        assert env.read_only
+        assert env.user_email == ""
+        assert env.user_password == ""
+
+    def test_read_only_still_needs_the_other_variables(self) -> None:
+        """Relaxing the credential must not relax the API id or the log group."""
+        incomplete = {name: value for name, value in PRODUCTION_READ_ONLY.items() if name != "E2E_API_ID"}
+        with pytest.raises(MissingEnvironment) as caught:
+            E2EEnvironment.from_environ(incomplete)
+        assert "E2E_API_ID" in str(caught.value)
+
+    def test_a_normal_run_still_requires_the_credential(self) -> None:
+        """Staging signs in, so a missing password must still refuse at collection."""
+        incomplete = {name: value for name, value in COMPLETE.items() if name != "E2E_USER_PASSWORD"}
+        with pytest.raises(MissingEnvironment) as caught:
+            E2EEnvironment.from_environ(incomplete)
+        assert "E2E_USER_PASSWORD" in str(caught.value)
+
+    @pytest.mark.parametrize("flag", ["1", "true", "TRUE", "yes", "on"])
+    def test_read_only_accepts_the_usual_spellings(self, flag: str) -> None:
+        """The same truthiness every other flag in this file uses."""
+        assert E2EEnvironment.from_environ({**PRODUCTION_READ_ONLY, "E2E_READ_ONLY": flag}).read_only
+
+    @pytest.mark.parametrize("flag", ["", "0", "false", "no"])
+    def test_an_unset_flag_leaves_the_run_signing_in(self, flag: str) -> None:
+        """Staging must not fall into read-only mode by accident."""
+        env = E2EEnvironment.from_environ({**COMPLETE, "E2E_READ_ONLY": flag})
+        assert not env.read_only
+        assert env.signs_in
+
+    def test_signs_in_is_false_in_read_only_mode(self) -> None:
+        """The fixtures ask this rather than the raw flag."""
+        assert not E2EEnvironment.from_environ(PRODUCTION_READ_ONLY).signs_in
+
+    def test_read_only_is_independent_of_the_stage_name(self) -> None:
+        """The flag decides, not the environment name, so the mode is testable in staging."""
+        env = E2EEnvironment.from_environ({**COMPLETE, "E2E_READ_ONLY": "true"})
+        assert env.read_only
+        assert not env.is_production
+
+    def test_minting_stays_governed_by_its_own_flag(self) -> None:
+        """Read-only does not turn minting on, and does not turn it off either."""
+        assert not E2EEnvironment.from_environ(PRODUCTION_READ_ONLY).mint_enabled
+        enabled = E2EEnvironment.from_environ(
+            {
+                **PRODUCTION_READ_ONLY,
+                "E2E_MINT_ENABLED": "true",
+                "E2E_KMS_KEY_ID": "key",
+                "E2E_ISSUER": "https://issuer.invalid",
+                "E2E_AUDIENCE": "aud",
+            }
+        )
+        assert enabled.mint_enabled
+        assert enabled.read_only

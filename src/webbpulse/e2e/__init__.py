@@ -54,6 +54,8 @@ from .journeys import (
 __all__ = [
     "E2E_PREFIX",
     "GATE_HEADER",
+    "READ_ONLY_REASON",
+    "WRITES_MARKER",
     "Click",
     "E2EEnvironment",
     "ExpectText",
@@ -79,10 +81,10 @@ _REQUIRED = (
     "E2E_AWS_REGION",
     "E2E_API_ID",
     "E2E_ACCESS_LOG_GROUP",
-    "E2E_USER_EMAIL",
-    "E2E_USER_PASSWORD",
     "E2E_RUN_ID",
 )
+
+_USER_REQUIRED = ("E2E_USER_EMAIL", "E2E_USER_PASSWORD")
 
 _MINT_REQUIRED = ("E2E_KMS_KEY_ID", "E2E_ISSUER", "E2E_AUDIENCE")
 
@@ -127,6 +129,10 @@ def _positive_int(value: str, default: int) -> int:
 class E2EEnvironment:
     """Everything the suite needs about the environment under test, from `E2E_*`.
 
+    `read_only` is set from `E2E_READ_ONLY` and is what a production run uses: production has
+    no durable e2e user, so `user_email` and `user_password` are empty there and every case
+    that would sign in, write or mutate is skipped with one reason.
+
     `gate_ssm_parameter` is empty in production, which has no gate. `legacy_route_names` is
     the list of strings that must not appear in the deployed bundle. The three
     `gate_signing_key_ssm_parameter`, `gate_key_pair_id` and `gate_cookie_domain` fields
@@ -150,11 +156,21 @@ class E2EEnvironment:
     headless: bool = True
     browser_artifacts_dir: str = ""
     browser_timeout_ms: int = DEFAULT_BROWSER_TIMEOUT_MS
+    read_only: bool = False
     mint_enabled: bool = False
     kms_key_id: str = ""
     issuer: str = ""
     audience: str = ""
     legacy_route_names: tuple[str, ...] = ()
+
+    @property
+    def signs_in(self) -> bool:
+        """Whether this run may sign in as the durable e2e user.
+
+        False in read-only mode, which is what a production run is: production has no e2e
+        user, so there is no credential to sign in with and nothing that needs one can run.
+        """
+        return not self.read_only
 
     @property
     def is_production(self) -> bool:
@@ -179,7 +195,10 @@ class E2EEnvironment:
         that is wired wrong is usually wired wrong in more than one place.
         """
         source = os.environ if environ is None else environ
+        read_only = _truthy(source.get("E2E_READ_ONLY", ""))
         missing = [name for name in _REQUIRED if not source.get(name, "").strip()]
+        if not read_only:
+            missing.extend(name for name in _USER_REQUIRED if not source.get(name, "").strip())
         mint_enabled = _truthy(source.get("E2E_MINT_ENABLED", ""))
         if mint_enabled:
             missing.extend(name for name in _MINT_REQUIRED if not source.get(name, "").strip())
@@ -216,8 +235,8 @@ class E2EEnvironment:
             aws_region=source["E2E_AWS_REGION"].strip(),
             api_id=source["E2E_API_ID"].strip(),
             access_log_group=source["E2E_ACCESS_LOG_GROUP"].strip(),
-            user_email=source["E2E_USER_EMAIL"].strip(),
-            user_password=source["E2E_USER_PASSWORD"],
+            user_email=source.get("E2E_USER_EMAIL", "").strip(),
+            user_password=source.get("E2E_USER_PASSWORD", ""),
             run_id=source["E2E_RUN_ID"].strip(),
             gate_ssm_parameter=source.get("E2E_GATE_SSM_PARAMETER", "").strip(),
             gate_signing_key_ssm_parameter=gate_values["E2E_GATE_SIGNING_KEY_SSM_PARAMETER"],
@@ -227,6 +246,7 @@ class E2EEnvironment:
             headless=_truthy(source.get("E2E_HEADLESS", "true")),
             browser_artifacts_dir=source.get("E2E_BROWSER_ARTIFACTS_DIR", "").strip(),
             browser_timeout_ms=_positive_int(source.get("E2E_BROWSER_TIMEOUT_MS", ""), DEFAULT_BROWSER_TIMEOUT_MS),
+            read_only=read_only,
             mint_enabled=mint_enabled,
             kms_key_id=source.get("E2E_KMS_KEY_ID", "").strip(),
             issuer=source.get("E2E_ISSUER", "").strip().rstrip("/"),
@@ -235,11 +255,48 @@ class E2EEnvironment:
         )
 
 
+WRITES_MARKER = "e2e_writes"
+READ_ONLY_REASON = (
+    "E2E_READ_ONLY is set, so this run is an anonymous read-only smoke. This case signs in "
+    "as the durable e2e user, writes, or mutates state, and production has no e2e user."
+)
+
+
 def pytest_addhooks(pluginmanager: Any) -> None:
     """Register this plugin's own hook specifications."""
     from . import hookspecs
 
     pluginmanager.add_hookspecs(hookspecs)
+
+
+def pytest_configure(config: pytest.Config) -> None:
+    """Register the `e2e_writes` marker, so `--strict-markers` accepts it."""
+    config.addinivalue_line(
+        "markers",
+        f"{WRITES_MARKER}: this case signs in as the e2e user, writes, or mutates state. "
+        "Skipped when E2E_READ_ONLY is set.",
+    )
+
+
+def pytest_collection_modifyitems(config: pytest.Config, items: list[pytest.Item]) -> None:
+    """Skip every case marked `e2e_writes` when the run is read-only.
+
+    One place rather than a conditional in each case, so a product that marks a new mutating
+    test gets the production skip for free and cannot accidentally ship one that runs there.
+    The environment is read directly rather than through the `e2e_env` fixture because
+    collection happens before any fixture runs.
+    """
+    if not _read_only_from_environ():
+        return
+    skip = pytest.mark.skip(reason=READ_ONLY_REASON)
+    for item in items:
+        if item.get_closest_marker(WRITES_MARKER) is not None:
+            item.add_marker(skip)
+
+
+def _read_only_from_environ() -> bool:
+    """Whether `E2E_READ_ONLY` is set, readable at collection with no fixture."""
+    return _truthy(os.environ.get("E2E_READ_ONLY", ""))
 
 
 @pytest.fixture(scope="session")
@@ -295,7 +352,14 @@ def anon(e2e_env: E2EEnvironment, gate_headers: Mapping[str, str]) -> Iterator[E
 
 @pytest.fixture(scope="session")
 def user_session(e2e_env: E2EEnvironment, anon: E2EClient) -> IdentitySession:
-    """The durable e2e user, signed in through the real login route."""
+    """The durable e2e user, signed in through the real login route.
+
+    Skips in read-only mode rather than attempting a login with no credential. The marker
+    already skips every case the plugin ships that would reach here, so this is the backstop
+    that catches a product case which forgot the marker: it can only skip, never sign in.
+    """
+    if not e2e_env.signs_in:
+        pytest.skip(READ_ONLY_REASON)
     return login(anon, e2e_env.user_email, e2e_env.user_password)
 
 
@@ -469,7 +533,14 @@ def e2e_hygiene(
     A hook that raises is reported as a warning rather than failing the suite: a leftover is
     worth knowing about and is never a reason to lose the result of the tests that already
     ran.
+
+    In read-only mode the hook is not invoked at all, in either phase. The run creates
+    nothing, so there is nothing of its own to delete, and the start sweep deletes resources,
+    which is exactly what a read-only run must not do.
     """
+    if e2e_env.read_only:
+        yield
+        return
     hook = request.config.hook.pytest_e2e_cleanup
     _warn_on_leftovers(request, _call_cleanup(hook, e2e_env, "start", []), "start")
     yield

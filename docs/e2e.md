@@ -69,8 +69,9 @@ names every variable that is unset, rather than failing each test with a connect
 | `E2E_AWS_REGION` | The region holding the API, the log group and the KMS key |
 | `E2E_API_ID` | The HTTP API id, for `apigatewayv2 get-routes` |
 | `E2E_ACCESS_LOG_GROUP` | The access log group the route assertions correlate against |
-| `E2E_USER_EMAIL` | The durable e2e user, which signs in through the real login route |
-| `E2E_USER_PASSWORD` | That user's password. Never printed, and kept out of the dataclass repr |
+| `E2E_USER_EMAIL` | The durable e2e user, which signs in through the real login route. Not required when `E2E_READ_ONLY` is set |
+| `E2E_USER_PASSWORD` | That user's password. Never printed, and kept out of the dataclass repr. Not required when `E2E_READ_ONLY` is set |
+| `E2E_READ_ONLY` | Set to run the anonymous read-only smoke, which is what production runs. See below |
 | `E2E_RUN_ID` | This run's id, which becomes the `e2e-<run id>-` resource prefix |
 | `E2E_GATE_SSM_PARAMETER` | The SSM SecureString holding the staging gate value. Required outside production |
 | `E2E_MINT_ENABLED` | Set to enable the `minted_token` fixture. Unset elsewhere, and `mint_test_token` refuses production independently |
@@ -112,6 +113,59 @@ function regex-matches the decoded policy. The cookies last an hour, are attache
 `http` client and every browser context, and are never printed: the policy and signature are
 kept out of the dataclass repr, so a pytest failure report cannot leak a live session.
 
+## Read-only mode
+
+The full suite runs against staging. After a production deploy only an anonymous read-only
+smoke runs, because production has no durable e2e user. `e2e.yml` v3.5.0 exports
+`E2E_READ_ONLY=true` for production and leaves `E2E_USER_EMAIL` and `E2E_USER_PASSWORD`
+empty, and the plugin does not require those two when the flag is set. Every other variable
+is still required, so a workflow wired wrong is still refused at collection. The flag is
+independent of `E2E_ENVIRONMENT`, so the mode can be exercised against staging.
+
+`E2EEnvironment` exposes `read_only`, and a `signs_in` property the fixtures ask rather than
+the raw flag.
+
+The mode is enforced in one place. A case that signs in, writes or mutates carries the
+`e2e_writes` marker, and a single collection hook skips every marked case with one shared
+reason when the flag is set. Mark your own mutating cases with it:
+
+```python
+import pytest
+
+
+@pytest.mark.e2e_writes
+def test_creating_a_build_writes_a_row(api):
+    """Runs against staging, skipped after a production deploy."""
+```
+
+That is the whole contract. A product cannot ship a mutating case that runs in production by
+forgetting a per-test conditional, because there is no per-test conditional to forget. As a
+backstop, the `user_session` fixture skips rather than attempting a login with no credential,
+so even an unmarked case that asks for a session can only skip.
+
+The browser cases are skipped per parameter rather than per test, because the render case
+covers a protected route and every public one in the same test. A read-only run keeps the
+public route parameters and skips the protected ones, and skips a journey that declares
+`signed_in=True` or `mutates=True` while keeping the rest.
+
+`pytest_e2e_cleanup` is not invoked at all, in either phase. The run creates nothing of its
+own, and the start phase deletes stale resources, which is what a read-only run must not do.
+
+What still runs anonymously:
+
+| Still runs | Skipped |
+| --- | --- |
+| The route cut, every live route probed and correlated in the access log | Every case that signs in as the durable e2e user |
+| Gateway coverage, every operation resolving to a live route | The authenticated reachability probe |
+| Anonymous reachability, including a protected operation answering 401 or 403 | Sign in and out through the UI, and the guest-only redirect check |
+| Frontend hygiene: the shell, the catch-all, the bundle and the preflight | Login, refresh and logout, and the token shape assertions |
+| Protected routes redirecting an anonymous visitor | Every declared protected route's render case |
+| Every declared public route rendering clean | Every journey with `signed_in=True` or `mutates=True` |
+| Journeys declaring neither `signed_in` nor `mutates` | The cleanup hook, in both phases |
+
+Minting is unchanged and stays governed by `E2E_MINT_ENABLED` alone. Production does not set
+it, and `mint_test_token` refuses production independently of the flag.
+
 ## Fixtures
 
 | Fixture | Gives |
@@ -119,9 +173,9 @@ kept out of the dataclass repr, so a pytest failure report cannot leak a live se
 | `e2e_env` | The parsed `E2EEnvironment`, including `resource_prefix` and `is_production` |
 | `gate_headers` | The `x-origin-verify` header, or an empty mapping in production |
 | `anon` | A paced client carrying the gate header and no identity |
-| `user_session` | The durable user signed in through the real login route |
+| `user_session` | The durable user signed in through the real login route. Skips in read-only mode |
 | `api` | The authenticated client, sharing the anonymous client's pacer |
-| `minted_token` | Mints a token through KMS with no login. Skips unless `E2E_MINT_ENABLED` is set |
+| `minted_token` | Mints a token through KMS with no login. Skips unless `E2E_MINT_ENABLED` is set, in read-only mode too |
 | `gateway_routes`, `route_keys` | The live routes, read once per run |
 | `gateway_authorizers`, `gate_authorizers` | The API's authorizers, and the ids of the access gate ones among them |
 | `openapi_document`, `openapi_operations` | The product's document and its operations |
