@@ -87,6 +87,7 @@ __all__ = [
 ]
 
 GATEWAY_404_BODY = "Not Found"
+GATEWAY_DENIAL_BODIES = ("Unauthorized", "Forbidden")
 GATE_STATUSES = (401, 403)
 
 
@@ -540,11 +541,38 @@ def _looks_like_a_gateway_404(response: Any) -> bool:
     The gateway's own 404 is a bare `{"message":"Not Found"}` with no error envelope, which
     is exactly what the shared `webbpulse.http` envelope never produces.
     """
+    return _is_bare_gateway_message(response, GATEWAY_404_BODY)
+
+
+def _looks_like_a_gateway_denial(response: Any) -> bool:
+    """Whether a 401 or 403 came from API Gateway or an authorizer rather than the application.
+
+    Same shape as the gateway's own 404: a bare one-key `{"message": ...}` object carrying
+    `Unauthorized` or `Forbidden`, which the shared `webbpulse.http` error envelope never
+    produces. A secondary signal only, because an authorizer that denies with its own policy
+    can answer an empty body instead.
+    """
+    return any(_is_bare_gateway_message(response, body) for body in GATEWAY_DENIAL_BODIES)
+
+
+def _is_bare_gateway_message(response: Any, body: str) -> bool:
+    """Whether a response is the gateway's bare one-key `{"message": body}` object."""
     try:
         payload = response.json()
     except ValueError:
         return False
-    return isinstance(payload, dict) and set(payload) == {"message"} and payload.get("message") == GATEWAY_404_BODY
+    return isinstance(payload, dict) and set(payload) == {"message"} and payload.get("message") == body
+
+
+def _served_route_key(response: Any) -> str:
+    """The route key the function echoed on a response, or "" where it never reached one.
+
+    `webbpulse.http`'s request-id middleware sets `X-WebbPulse-Route-Key` from the forwarded
+    API Gateway request context on every response the function produces, so its presence is
+    the proof the request got past the gateway and the authorizer.
+    """
+    value = response.headers.get(ROUTE_KEY_HEADER.lower(), "")
+    return str(value) if value else ""
 
 
 class TestIdentity:
@@ -607,22 +635,30 @@ class TestIdentity:
         gate_authorizers: frozenset[str],
         openapi_operations: Sequence[Operation],
     ) -> None:
-        """Staging only: a KMS-minted token is accepted on a route that requires identity.
+        """Staging only: a KMS-minted token gets past the gateway and reaches the function.
 
-        A 403 counts as accepted. The probe is whichever auth-requiring operation the
+        The status is not the assertion. The probe is whichever auth-requiring operation the
         deployed configuration offers first, which on a product with an admin surface is an
-        admin route, and there a 403 means the token was verified and the subject resolved
-        to a real user who simply lacks the role. Only a 401 says the token itself was not
-        accepted, which is the thing under test.
+        admin route, and an app-level 401 or 403 there is still an accepted token: the
+        authorizer verified it and the application then made its own decision about the
+        subject or the role. What separates that from a rejection is where the answer came
+        from, and `X-WebbPulse-Route-Key` says so directly, because the function sets it on
+        every response it produces and a gateway or authorizer denial never carries it.
         """
         probe = _first_identity_probe(gateway_routes, gate_authorizers, openapi_operations)
         token = minted_token({"roles": ["admin"]})
         response = anon.with_token(token).request(probe.method, probe.path)
-        assert response.status_code != 401, (
-            f"a minted token was rejected with 401 on {probe.route_key}, so the API does not "
-            "accept a token this environment's own key signed. A 403 would have been fine: "
-            "it means the token verified and the subject resolved, and only the role check "
-            "refused."
+        served = _served_route_key(response)
+        assert served, (
+            f"a minted token answered {response.status_code} on {probe.route_key} with no "
+            f"{ROUTE_KEY_HEADER} header, so the request never reached the function and the "
+            "gateway or its authorizer refused a token this environment's own key signed. "
+            f"The body began: {response.text[:200]!r}."
+        )
+        assert not _looks_like_a_gateway_denial(response), (
+            f"a minted token answered {response.status_code} on {probe.route_key} carrying "
+            f"{ROUTE_KEY_HEADER}={served!r} but the gateway's own denial body, so the two "
+            f"signals disagree. The body began: {response.text[:200]!r}."
         )
 
     @pytest.mark.e2e_writes
@@ -634,10 +670,13 @@ class TestIdentity:
         gate_authorizers: frozenset[str],
         openapi_operations: Sequence[Operation],
     ) -> None:
-        """Staging only: a token for another audience is refused.
+        """Staging only: a token for another audience is refused before the function runs.
 
-        The subject is the durable e2e user's own, so the only thing wrong with this token
-        is its `aud` and the refusal can only be about that.
+        The subject is the durable e2e user's own, taken from the session's access token, so
+        the only thing wrong with this token is its `aud` and the refusal can only be about
+        that. The refusal must come from the gateway rather than the application, so the
+        absence of `X-WebbPulse-Route-Key` is asserted alongside the status: an app-level 401
+        carrying the same status would mean the authorizer let a wrong-audience token through.
         """
         probe = _first_identity_probe(gateway_routes, gate_authorizers, openapi_operations)
         token = minted_token(audience="https://e2e.invalid/not-this-audience")
@@ -645,6 +684,13 @@ class TestIdentity:
         assert response.status_code in (401, 403), (
             f"a token minted for another audience answered {response.status_code} on "
             f"{probe.route_key}. The API is not checking `aud`."
+        )
+        served = _served_route_key(response)
+        assert not served, (
+            f"a token minted for another audience answered {response.status_code} on "
+            f"{probe.route_key} carrying {ROUTE_KEY_HEADER}={served!r}, so the authorizer "
+            "accepted it and the application refused it for some other reason. `aud` is not "
+            "being checked where it has to be."
         )
 
     @pytest.mark.e2e_writes
@@ -656,16 +702,25 @@ class TestIdentity:
         gate_authorizers: frozenset[str],
         openapi_operations: Sequence[Operation],
     ) -> None:
-        """Staging only: a token whose `exp` has passed is refused.
+        """Staging only: a token whose `exp` has passed is refused before the function runs.
 
-        The subject is the durable e2e user's own, so the only thing wrong with this token
-        is its `exp` and the refusal can only be about that.
+        The subject is the durable e2e user's own, taken from the session's access token, so
+        the only thing wrong with this token is its `exp` and the refusal can only be about
+        that. As with the audience case the refusal must be the gateway's, so the absence of
+        `X-WebbPulse-Route-Key` is asserted alongside the status.
         """
         probe = _first_identity_probe(gateway_routes, gate_authorizers, openapi_operations)
         token = minted_token(expires_in=1, now=int(time.time()) - 3600)
         response = anon.with_token(token).request(probe.method, probe.path)
         assert response.status_code in (401, 403), (
             f"an expired token answered {response.status_code} on {probe.route_key}. The API is not checking `exp`."
+        )
+        served = _served_route_key(response)
+        assert not served, (
+            f"an expired token answered {response.status_code} on {probe.route_key} carrying "
+            f"{ROUTE_KEY_HEADER}={served!r}, so the authorizer accepted it and the "
+            "application refused it for some other reason. `exp` is not being checked where "
+            "it has to be."
         )
 
     @pytest.mark.e2e_writes

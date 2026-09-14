@@ -48,6 +48,7 @@ ROOT_SELECTORS = ("#root", "#app", "main", "body")
 GUARD_STATUSES = (401, 403)
 SESSION_PROBE_PATH = "/api/auth/refresh"
 SESSION_PROBE_STATUS = 401
+REPORT_ONLY_CSP = "report-only content security policy"
 TRACE_REDACTION_MARKER = b"[redacted]"
 _UNSAFE = re.compile(r"[^A-Za-z0-9._-]+")
 _RESOURCE_LOAD_PREFIX = re.compile(r"\b(?:Failed to load resource|HTTP load failed|NS_ERROR_|was loaded over)\b")
@@ -153,7 +154,8 @@ class ConsoleErrors:
 
     The shared auth client's cold-load session probe is exempt separately and
     unconditionally, through `is_session_probe`, because it is correct on a signed-in
-    journey's first load too. Every other console error still counts.
+    journey's first load too. A report-only CSP violation is exempt the same way, through
+    `is_report_only_csp_violation`. Every other console error still counts.
     """
 
     api_base_url: str = ""
@@ -161,12 +163,24 @@ class ConsoleErrors:
     messages: list[str] = field(default_factory=list)
 
     def record(self, message: str, url: str | None = None) -> None:
-        """Record one console error or page error, honouring both exemptions."""
+        """Record one console error or page error, honouring every exemption."""
         if self.is_session_probe_error(message, url):
+            return
+        if self.is_report_only_csp_violation(message):
             return
         if self.is_ignored_guard_error(message, url):
             return
         self.messages.append(message)
+
+    def is_report_only_csp_violation(self, message: str) -> bool:
+        """Whether a console message reports a CSP violation the browser did not act on.
+
+        Unconditional, because a report-only policy is usually a third-party frame's own,
+        such as the AdSense iframe reporting `frame-ancestors` against `www.google.com`, and
+        the app under test can neither cause it nor fix it. An enforced violation names no
+        report-only directive and still counts.
+        """
+        return REPORT_ONLY_CSP in message.casefold()
 
     def is_session_probe_error(self, message: str, url: str | None = None) -> bool:
         """Whether a console message is the resource-load error the session probe made.

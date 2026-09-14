@@ -5,6 +5,41 @@ Notable changes to the `webbpulse` package. The version here is the one in
 
 This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## 0.36.0
+
+Three defects in `webbpulse.e2e` that the CarModPicker staging runs found, all of them cases
+failing on a healthy deployment.
+
+The minted-token cases judge where the answer came from rather than what status it carried.
+On CarModPicker the access-gate authorizer verified a minted token across all ninety-six
+route keys and invoked the integration, and the application then answered 401 because it
+maps `sub` to a stored user id. A case asserting only that the status was not 401 therefore
+failed on an authorizer that was working. All three cases now read `X-WebbPulse-Route-Key`,
+which the shared request-id middleware sets on every response the function produces and
+which a gateway or authorizer denial never carries. The accepted-token case requires it to
+be present, so an app-level 401 or 403 on an admin-only probe passes, and its failure message
+reports the status and the first 200 bytes of the body rather than restating the expectation.
+The wrong-audience and expired cases require it to be absent alongside the 401 or 403, which
+is what separates a gateway refusal from an application refusal carrying the same status.
+The new `_looks_like_a_gateway_denial` recognises the gateway's bare one-key `Unauthorized`
+and `Forbidden` bodies as a secondary signal, sharing its body check with the existing
+`_looks_like_a_gateway_404`.
+
+The default minted subject is now a fixture of its own. `minted_subject` reads the `sub`
+claim off the durable e2e user's access token and `minted_token` defaults to it, with an
+explicit `subject=` still overriding. A session whose token carries no `sub` skips rather
+than minting a token that names no real subject, and the docstrings of the wrong-audience
+and expired cases, which already claimed the subject was the durable user's own, are now
+true of what the fixture does.
+
+`ConsoleErrors.record` drops report-only Content Security Policy violations unconditionally,
+through the new `is_report_only_csp_violation`. The AdSense iframe reports its own
+`frame-ancestors` policy against `www.google.com` and the browser states that it took no
+further action, so the app under test can neither cause it nor fix it, and it failed
+`public:/` on an otherwise clean render. The match is on `report-only Content Security
+Policy`, case insensitively; an enforced violation names no report-only directive and still
+fails the route.
+
 ## 0.35.0
 
 Five defects the first staging runs of the browser layer found, four in `webbpulse.e2e` and

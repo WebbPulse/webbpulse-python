@@ -27,10 +27,14 @@ from webbpulse.e2e.suite import (
     RouteProbe,
     _expect_text,
     _first_identity_probe,
+    _looks_like_a_gateway_404,
+    _looks_like_a_gateway_denial,
+    _served_route_key,
     _settle,
     probe_every_route,
     route_probes,
 )
+from webbpulse.e2e.suite import TestIdentity as IdentityGroup
 from webbpulse.e2e.suite import TestRouteCut as RouteCutGroup
 from webbpulse.http import ROUTE_KEY_HEADER
 
@@ -601,3 +605,154 @@ class TestSettleWaitsForARealRedirect:
         with pytest.raises(BrowserFailure) as caught:
             _settle(page, "/garage", FakeEnvironment())
         assert "redirect loop" in str(caught.value)
+
+
+class TestMintedTokenProof:
+    """Tests for what the minted-token cases read: the route echo header, not the status.
+
+    The defect these cover is an accepted token read as a rejection. On CarModPicker the
+    gate's authorizer verified a minted token and the application then answered 401 because
+    the synthetic subject resolved to no stored user, and a case asserting on the status
+    alone failed on a healthy authorizer.
+    """
+
+    PROBE_PATH = "/api/admin/stats"
+
+    def client(self, status: int, *, served: str = "", body: Any = None) -> E2EClient:
+        """A client whose every request answers one scripted response."""
+        headers = {ROUTE_KEY_HEADER: served} if served else {}
+
+        def handle(request: httpx.Request) -> httpx.Response:
+            """Answer every probe the same way."""
+            return httpx.Response(status, headers=headers, json={} if body is None else body)
+
+        return probe_client(handle)
+
+    def fixtures(self) -> tuple[list[Route], frozenset[str], list[Operation]]:
+        """The route table, gate ids and operations that pick the admin probe."""
+        routes = [identity_protected(f"GET {self.PROBE_PATH}")]
+        return routes, GATE_IDS, [operation("GET", self.PROBE_PATH)]
+
+    def accepted(self, status: int, *, served: str = "", body: Any = None) -> None:
+        """Run the real acceptance case against one scripted response."""
+        routes, gate_ids, operations = self.fixtures()
+        IdentityGroup().test_minted_token_is_accepted_by_the_api(
+            lambda *args, **kwargs: "minted.token.value",
+            self.client(status, served=served, body=body),
+            routes,
+            gate_ids,
+            operations,
+        )
+
+    def rejected(self, status: int, *, served: str = "", body: Any = None) -> None:
+        """Run the real wrong-audience case against one scripted response."""
+        routes, gate_ids, operations = self.fixtures()
+        IdentityGroup().test_minted_token_with_the_wrong_audience_is_rejected(
+            lambda *args, **kwargs: "minted.token.value",
+            self.client(status, served=served, body=body),
+            routes,
+            gate_ids,
+            operations,
+        )
+
+    def expired(self, status: int, *, served: str = "", body: Any = None) -> None:
+        """Run the real expired-token case against one scripted response."""
+        routes, gate_ids, operations = self.fixtures()
+        IdentityGroup().test_expired_minted_token_is_rejected(
+            lambda *args, **kwargs: "minted.token.value",
+            self.client(status, served=served, body=body),
+            routes,
+            gate_ids,
+            operations,
+        )
+
+    def test_an_app_403_with_the_header_is_accepted(self) -> None:
+        """An admin-only probe refusing the role is still proof the token was accepted."""
+        self.accepted(403, served=f"GET {self.PROBE_PATH}")
+
+    def test_an_app_401_with_the_header_is_accepted(self) -> None:
+        """The CarModPicker case: the authorizer passed and the app refused the subject."""
+        self.accepted(401, served=f"GET {self.PROBE_PATH}", body={"error": {"code": "NO_USER"}})
+
+    def test_a_gateway_401_without_the_header_fails_acceptance(self) -> None:
+        """A refusal that never reached the function is the rejection under test."""
+        with pytest.raises(AssertionError, match=ROUTE_KEY_HEADER):
+            self.accepted(401, body={"message": "Unauthorized"})
+
+    def test_the_acceptance_failure_names_the_status_and_the_body(self) -> None:
+        """The message has to say what was seen, not restate what was expected."""
+        with pytest.raises(AssertionError) as caught:
+            self.accepted(403, body={"message": "Forbidden"})
+        assert "403" in str(caught.value)
+        assert "Forbidden" in str(caught.value)
+
+    def test_a_gateway_denial_body_with_a_header_still_fails(self) -> None:
+        """The two signals disagreeing is a failure rather than a silent pass."""
+        with pytest.raises(AssertionError, match="disagree"):
+            self.accepted(403, served=f"GET {self.PROBE_PATH}", body={"message": "Forbidden"})
+
+    def test_a_gateway_refusal_passes_the_rejection_cases(self) -> None:
+        """A wrong-audience or expired token must be refused before the function runs."""
+        self.rejected(401, body={"message": "Unauthorized"})
+        self.expired(403, body={"message": "Forbidden"})
+
+    def test_a_rejection_case_fails_when_the_header_is_present(self) -> None:
+        """An app 401 means the authorizer accepted a token it had to refuse."""
+        with pytest.raises(AssertionError, match=ROUTE_KEY_HEADER):
+            self.rejected(401, served=f"GET {self.PROBE_PATH}")
+
+    def test_the_expired_case_fails_when_the_header_is_present(self) -> None:
+        """The same proof, for the claim the expired case is about."""
+        with pytest.raises(AssertionError, match="`exp` is not being checked"):
+            self.expired(401, served=f"GET {self.PROBE_PATH}")
+
+    def test_a_two_hundred_fails_the_rejection_cases_on_the_status(self) -> None:
+        """The original status assertion is unchanged, only no longer the whole proof."""
+        with pytest.raises(AssertionError, match="not checking `aud`"):
+            self.rejected(200, served=f"GET {self.PROBE_PATH}")
+
+
+class TestGatewayDenialShape:
+    """Tests for telling the gateway's own 401 or 403 body from the app's error envelope."""
+
+    def response(self, status: int, payload: Any) -> Any:
+        """One response carrying a JSON payload."""
+        return httpx.Response(status, json=payload)
+
+    def test_the_gateways_unauthorized_body_is_recognised(self) -> None:
+        """A bare one-key `Unauthorized` object is the gateway's, never the envelope's."""
+        assert _looks_like_a_gateway_denial(self.response(401, {"message": "Unauthorized"}))
+
+    def test_the_gateways_forbidden_body_is_recognised(self) -> None:
+        """The authorizer's deny policy answers the same shape with `Forbidden`."""
+        assert _looks_like_a_gateway_denial(self.response(403, {"message": "Forbidden"}))
+
+    def test_the_app_error_envelope_is_not_a_gateway_denial(self) -> None:
+        """`webbpulse.http` never produces a bare one-key message object."""
+        assert not _looks_like_a_gateway_denial(self.response(401, {"error": {"code": "NO_SESSION"}}))
+
+    def test_a_non_json_body_is_not_a_gateway_denial(self) -> None:
+        """An empty body from a deny policy cannot be classified, so it is not claimed."""
+        assert not _looks_like_a_gateway_denial(httpx.Response(403, content=b""))
+
+    def test_the_gateway_404_helper_still_works(self) -> None:
+        """The 404 classifier is unchanged by sharing its body check."""
+        assert _looks_like_a_gateway_404(self.response(404, {"message": "Not Found"}))
+        assert not _looks_like_a_gateway_404(self.response(404, {"message": "Unauthorized"}))
+
+
+class TestServedRouteKey:
+    """Tests for reading the route echo header off a response."""
+
+    def test_the_header_is_read_case_insensitively(self) -> None:
+        """httpx normalises header names, so the lowercase lookup finds the sent casing."""
+        response = httpx.Response(200, headers={ROUTE_KEY_HEADER: "GET /api/me"}, json={})
+        assert _served_route_key(response) == "GET /api/me"
+
+    def test_an_absent_header_reads_as_empty(self) -> None:
+        """A gateway answer carries none, which is the whole signal."""
+        assert _served_route_key(httpx.Response(401, json={})) == ""
+
+    def test_an_empty_header_reads_as_empty(self) -> None:
+        """The middleware never sets an empty one, and an empty one proves nothing."""
+        assert _served_route_key(httpx.Response(200, headers={ROUTE_KEY_HEADER: ""}, json={})) == ""
