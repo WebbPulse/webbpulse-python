@@ -21,6 +21,7 @@ from webbpulse.e2e.gateway import (
     gate_authorizer_ids,
     identity_authorization_is_observable,
     matching_route,
+    native_identity_mode,
     operations_from_openapi,
     resolve,
     route_key_is_expressible,
@@ -445,3 +446,33 @@ class TestFetchAuthorizers:
         client = FakeApiGateway([{"Items": []}])
         assert fetch_authorizers(client, "api-1") == ()
         assert gate_authorizer_ids(fetch_authorizers(client, "api-1")) == frozenset()
+
+
+class TestNativeIdentityMode:
+    """Tests for reading the identity mode off the route table."""
+
+    def test_a_coarse_route_with_no_authorizer_is_native_mode(self) -> None:
+        """Production publishes `ANY` and `{proxy+}` routes with nothing in front of them."""
+        routes = [
+            route("ANY /api/users"),
+            route("ANY /api/users/{proxy+}"),
+            route("DELETE /api/users/{user_id}", authorizer="jwt1", auth_type="JWT"),
+        ]
+        assert native_identity_mode(routes) is True
+
+    def test_a_coarse_route_behind_the_gate_is_not_native_mode(self) -> None:
+        """Staging publishes the same coarse routes behind the access gate, which is gate mode."""
+        routes = [
+            route("ANY /api/auth", authorizer="gate1", auth_type="CUSTOM"),
+            route("ANY /api/auth/{proxy+}", authorizer="gate1", auth_type="CUSTOM"),
+        ]
+        assert native_identity_mode(routes) is False
+
+    def test_a_table_of_only_per_operation_routes_is_not_native_mode(self) -> None:
+        """No coarse route at all means every operation has its own authorizer slot."""
+        assert (
+            native_identity_mode(
+                [route("GET /api/parts"), route("POST /api/parts", authorizer="jwt1", auth_type="JWT")]
+            )
+            is False
+        )

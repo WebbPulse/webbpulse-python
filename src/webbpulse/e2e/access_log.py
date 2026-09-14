@@ -24,12 +24,19 @@ from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from typing import Any
 
-__all__ = ["AccessLogEntry", "AccessLogLookup", "log_field", "parse_entry"]
+__all__ = [
+    "DEFAULT_SETTLE_SECONDS",
+    "AccessLogEntry",
+    "AccessLogLookup",
+    "log_field",
+    "parse_entry",
+]
 
 UNSET_PLACEHOLDER = "-"
 
 DEFAULT_WAIT_SECONDS = 120.0
 DEFAULT_POLL_SECONDS = 5.0
+DEFAULT_SETTLE_SECONDS = 20.0
 LOOKBACK_MILLISECONDS = 120_000
 WINDOW_MARGIN_MILLISECONDS = 10_000
 SCAN_PAGE_LIMIT = 10_000
@@ -120,15 +127,22 @@ class AccessLogLookup:
         *,
         wait_seconds: float = DEFAULT_WAIT_SECONDS,
         poll_seconds: float = DEFAULT_POLL_SECONDS,
+        settle_seconds: float = DEFAULT_SETTLE_SECONDS,
         sleeper: Callable[[float], None] = time.sleep,
         clock: Callable[[], float] = time.monotonic,
         now_ms: Callable[[], int] = lambda: int(time.time() * 1000),
     ) -> None:
-        """Bind the lookup to one CloudWatch Logs client and access log group."""
+        """Bind the lookup to one CloudWatch Logs client and access log group.
+
+        `settle_seconds` is how long a miss is treated as delivery lag. Past it a scan that
+        still does not carry the id is taken as evidence the entry is not coming, and the
+        lookup gives up rather than spending the rest of `wait_seconds`.
+        """
         self._client = client
         self._log_group = log_group
         self._wait_seconds = wait_seconds
         self._poll_seconds = poll_seconds
+        self._settle_seconds = settle_seconds
         self._sleep = sleeper
         self._clock = clock
         self._now_ms = now_ms
@@ -230,6 +244,20 @@ class AccessLogLookup:
         does the bounded wait begin. A `start_time_ms` names a window this lookup was not
         opened for, so that call takes the per-id filtered read instead of the scan.
 
+        Every iteration forces a real read. The unforced scan is throttled across all
+        callers, so a lookup entering the loop while another case had just scanned spent its
+        whole budget on no-op reads of a stale cache: it slept the poll interval, scanned
+        nothing, and repeated. That is what made two cases cost 61 and 43 seconds while the
+        rest cost milliseconds, and why the two differed at all, since where in the throttle
+        window a case happened to start decided how much budget it burned.
+
+        The loop also stops as soon as a scan that began after the request can be shown to
+        have completed without it. Delivery lag is a reason to wait again; a window already
+        read past that point is evidence the entry is not coming, and waiting the rest of
+        the budget cannot turn that into a hit. The settle clock starts at this lookup's
+        own first miss, never at another id's, so a late entry asked for after an earlier
+        miss still gets its full grace.
+
         None means "not delivered inside the budget", not "the request did not happen". The
         caller decides whether that is a failure, which it is for a route cut assertion and
         is not for a diagnostic.
@@ -241,18 +269,29 @@ class AccessLogLookup:
             return cached
 
         deadline = self._clock() + self._wait_seconds
+        first_missed_at: float | None = None
         while True:
+            started_at = self._clock()
             entry = self._read(request_id, start_time_ms)
             if entry is not None:
                 return entry
+            if first_missed_at is None:
+                first_missed_at = started_at
+            elif started_at - first_missed_at >= self._settle_seconds:
+                return None
             remaining = deadline - self._clock()
             if remaining <= 0:
                 return None
             self._sleep(min(self._poll_seconds, remaining))
 
     def _read(self, request_id: str, start_time_ms: int | None) -> AccessLogEntry | None:
-        """One attempt at an id: the window scan, or the filtered read for an explicit window."""
+        """One attempt at an id, always a real read rather than a throttled no-op.
+
+        The window scan is forced here. Leaving it throttled meant an attempt could return
+        the same stale cache it was handed a moment earlier while still costing the caller a
+        full poll interval of sleep.
+        """
         if start_time_ms is not None:
             return self.read_one(request_id, start_time_ms=start_time_ms)
-        self.scan_window()
+        self.scan_window(force=True)
         return self._cache.get(request_id)

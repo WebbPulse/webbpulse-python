@@ -517,19 +517,23 @@ def login_form(request: pytest.FixtureRequest, e2e_env: Any) -> LoginForm:
 
 
 @pytest.fixture
-def signed_in_page(page: Any, login_form: LoginForm, e2e_env: Any) -> Any:
-    """A page that has signed in as the durable e2e user through the real UI.
+def signed_in_page(page: Any, login_form: LoginForm, e2e_env: Any, credentials: Any) -> Any:
+    """A page that has signed in as this run's e2e user through the real UI.
 
     The real form rather than an injected token, because the thing worth proving is that
     the deployed login page still works, and an injected session proves only that the app
     reads a session it was handed.
     """
-    sign_in(page, login_form, e2e_env)
+    sign_in(page, login_form, e2e_env, credentials)
     return page
 
 
-def sign_in(page: Any, form: LoginForm, env: Any) -> None:
+def sign_in(page: Any, form: LoginForm, env: Any, credentials: Any = None) -> None:
     """Fill and submit the login form, then wait for the signed-in page to have settled.
+
+    Signs in as whoever `credentials` names, which is this run's ephemeral user where one
+    was created and the durable user otherwise. Falling back to the environment's own
+    fields keeps a caller that predates the ephemeral user working.
 
     The password reaches `Locator.fill` and nowhere else. A timeout here is reported as
     the sign-in failing, with no value from the form in the message.
@@ -542,16 +546,18 @@ def sign_in(page: Any, form: LoginForm, env: Any) -> None:
     login form that never left. Waiting for the submit button to detach as well pins the
     navigation down, so a caller is handed a page showing only the signed-in state.
     """
+    email = credentials.email if credentials is not None else env.user_email
+    password = credentials.password if credentials is not None else env.user_password
     page.goto(form.path, wait_until="domcontentloaded")
-    page.fill(form.email, env.user_email)
-    page.fill(form.password, env.user_password)
+    page.fill(form.email, email)
+    page.fill(form.password, password)
     page.click(form.submit)
     try:
         page.wait_for_selector(form.signed_in_marker, state="visible", timeout=env.browser_timeout_ms)
         page.wait_for_selector(form.submit, state="detached", timeout=env.browser_timeout_ms)
     except Exception as error:
         raise BrowserFailure(
-            f"signing in as the durable e2e user through {form.path} never showed "
+            f"signing in as the e2e user through {form.path} never showed "
             f"{form.signed_in_marker}, so the deployed login page does not complete a "
             f"sign-in ({type(error).__name__})"
         ) from None

@@ -50,6 +50,7 @@ if TYPE_CHECKING:  # pragma: no cover
     from webbpulse.identity.verification import LinkService
 
 __all__ = [
+    "EPHEMERAL_VIA",
     "INVALID_CREDENTIALS_MESSAGE",
     "PASSWORD_CREDENTIAL_TYPE",
     "AuthResult",
@@ -67,6 +68,8 @@ INVALID_CREDENTIALS_MESSAGE: Final = "Invalid email or password."
 PASSWORD_CREDENTIAL_TYPE: Final = "password"
 
 REGISTRATION_VIA: Final = "password"
+
+EPHEMERAL_VIA: Final = "e2e-ephemeral"
 
 
 class LoginRejected(Exception):
@@ -915,6 +918,109 @@ class IdentityFlows:
             },
         )
         return revoked
+
+    def create_ephemeral_user(
+        self,
+        *,
+        email: str,
+        password: str,
+        attributes: Mapping[str, Any] | None = None,
+    ) -> dict[str, str]:
+        """Create one already-verified account for a single e2e run, bypassing registration.
+
+        Distinct from `register` on three points, each of which is why the ordinary route
+        cannot serve a test run: the address is marked verified at creation so no mail has
+        to be collected, `email_verification_required` never blocks the caller, and a taken
+        address is an error rather than the silent 200 registration answers with, because a
+        run that quietly reuses somebody else's account would mutate it.
+
+        The password is hashed and handed to the credential store, and is never logged,
+        returned or put in an exception message. Returns the new user's id and email only.
+        """
+        if not self._settings.ephemeral_users_enabled:
+            raise LoginRejected(
+                "Ephemeral e2e users are not enabled in this environment.",
+                error_code="EPHEMERAL_USERS_DISABLED",
+                status_code=403,
+            )
+
+        normalised_email = _normalise_email(email)
+        if not normalised_email:
+            raise LoginRejected(
+                "An email address is required.",
+                error_code="EMAIL_REQUIRED",
+                status_code=400,
+            )
+        checked = check_password(password, breach_check=False)
+
+        if self._hooks.load_user_by_email(normalised_email) is not None:
+            raise LoginRejected(
+                "That address already has an account, so this run would mutate it.",
+                error_code="EPHEMERAL_USER_EXISTS",
+                status_code=409,
+            )
+
+        from webbpulse.security import hash_password
+
+        secret = hash_password(checked)
+        user = self._hooks.create_user(
+            email=normalised_email,
+            attributes=dict(attributes or {}) | {"email_verified": True},
+        )
+        user_id = _user_id(user)
+
+        from webbpulse.identity.storage import CredentialRecord
+
+        self._stores.require_credentials().put(
+            CredentialRecord(
+                user_id=user_id,
+                credential_type=PASSWORD_CREDENTIAL_TYPE,
+                secret=secret,
+                created_at=now_iso(),
+                updated_at=now_iso(),
+            )
+        )
+        self._hooks.on_user_created(user, EPHEMERAL_VIA)
+        _log.info(
+            "Created an ephemeral e2e user.",
+            extra={"event": "identity.ephemeral_user_created", "user_id": user_id},
+        )
+        return {"user_id": user_id, "email": normalised_email}
+
+    def delete_ephemeral_user(self, user_id: str) -> bool:
+        """Delete one ephemeral e2e user through the product's own deletion hook.
+
+        Deleting the product's users row is the whole cleanup: that row's stream carries a
+        REMOVE to `purge_user`, which deletes every identity row keyed on the id. The purge
+        is deliberately not run inline, so the one path that cleans up after a deleted user
+        is the same one production uses and stays exercised.
+
+        Returns whether a row was there to delete, so a retry of an already-cleaned run is
+        a `False` rather than an error.
+        """
+        if not self._settings.ephemeral_users_enabled:
+            raise LoginRejected(
+                "Ephemeral e2e users are not enabled in this environment.",
+                error_code="EPHEMERAL_USERS_DISABLED",
+                status_code=403,
+            )
+        cleaned = user_id.strip()
+        if not cleaned:
+            raise LoginRejected(
+                "A user id is required.",
+                error_code="USER_ID_REQUIRED",
+                status_code=400,
+            )
+        deleted = bool(self._hooks.delete_user(cleaned))
+        _log.info(
+            "Deleted an ephemeral e2e user.",
+            extra={
+                "event": "identity.ephemeral_user_deleted",
+                "user_id": cleaned,
+                "deleted": deleted,
+            },
+        )
+        return deleted
 
     def purge_user(self, user_id: str) -> PurgeResult:
         """Delete every identity row for a user the product has already deleted.

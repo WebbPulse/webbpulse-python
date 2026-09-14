@@ -5,6 +5,75 @@ Notable changes to the `webbpulse` package. The version here is the one in
 
 This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## 0.37.0
+
+Concurrent e2e runs, a parallel suite, and three pacing and correlation defects the
+CarModPicker staging and production runs surfaced.
+
+An e2e run can now create its own login user instead of sharing one durable account. The
+profile, social-link and sign-in journeys all mutate whichever account they run as, so a
+single durable user forced every caller to serialise behind a per-branch concurrency group.
+Where minting is available the plugin now creates a fresh user at session start and deletes
+it at the end, and callers can drop that concurrency group. The address is under the
+RFC 2606 reserved `e2e.invalid` domain so no mail can reach a real inbox, and the generated
+password lives in memory for the session, reaches only the login call and the browser's
+`fill`, and is kept out of the `Credentials` repr. The durable user remains the fallback
+wherever the route is not offered, and a read-only run still signs in as nobody. The new
+`credentials` fixture is what the suite and the browser layer now sign in through, so both
+pick up the ephemeral user transparently.
+
+The routes behind it are `POST /api/auth/e2e/users` and
+`DELETE /api/auth/e2e/users/{user_id}`, mounted only when the new `ephemeral_users_enabled`
+identity setting is true. They are gated twice, because creating a verified account with a
+chosen password and no email round trip is exactly the capability an attacker wants: the
+flag is off by default, and the router refuses to mount the routes in a production
+environment whatever the flag says, so a misconfigured production deployment has no route to
+reach rather than a route that answers 403. The caller must present a token carrying `admin`
+in its `roles` claim. Delete removes only the product's users row and leaves the identity
+rows to the users-table stream purge, so every run exercises the same deletion path
+production uses; a product enabling the flag implements the new `delete_user` hook.
+
+The suite runs under pytest-xdist. The route cut and reachability cases are independent
+read-only probes and are left schedulable, while everything sharing the session user or the
+one Playwright page is marked into a single `xdist_group` during collection, so
+`-n auto --dist loadgroup` parallelises the probes and keeps the rest together and in order.
+Session fixtures are per worker rather than per run, which is safe by construction rather
+than by locking: each worker creates and deletes its own user keyed on its worker id, and
+the access-log window scan is unfiltered, so overlapping windows cost an extra CloudWatch
+read rather than a wrong answer.
+
+Pacing now treats the `X-RateLimit-Remaining-Minute` header as the budget rather than as a
+ceiling on a fixed local count. The products limit per route class, so no single number
+describes a GET class allowing two hundred a minute and an auth class allowing ten; taking
+the lower of the header and a fallback of ten meant the header could only ever lower the
+budget, and a production sweep paced itself into a full window wait every ninth call. A
+production read-only run spent about thirty-six minutes that way while the gateway access
+log showed no request over five seconds and not one 429. Answers arriving without the header
+came from the gateway, the access gate or the authorizer, never reached the application and
+spent none of its limiter's budget, so they are no longer counted against it. The fallback
+is now configurable through `E2E_RATE_LIMIT_PER_MINUTE` and still defaults to ten.
+
+The access-log fallback no longer burns its whole budget on reads that do nothing. The
+window scan is throttled to one CloudWatch read per poll interval across all callers, and
+`find` was using that throttled scan inside its own wait loop, so a lookup entering the loop
+just after another case had scanned slept the poll interval, read nothing, and repeated
+against an unchanged cache. Where in the throttle window a case happened to start decided
+how much of the budget it burned, which is why two CarModPicker route-cut cases cost sixty
+one and forty three seconds while the rest cost milliseconds. Every iteration now forces a
+real read, and the lookup gives up once a scan begun after the delivery grace period has
+finished without the entry, since a window already read past that point is evidence the
+entry is not coming rather than that it is late.
+
+`TestCoverage`'s authorizer assertion is aware of the identity mode it is checking. In
+native JWT mode the products publish coarse `ANY` and `{proxy+}` routes and verify tokens in
+process, so a coarse route carries no per-operation opinion to compare against and the case
+now skips it and leaves the claim to the reachability group. A per-route authorizer in front
+of an operation declaring `requires_auth` false is accepted under the identity prefix, where
+the authorizer is the optional-identity one, and is still a failure anywhere else. Gate mode
+keeps the strict equality. The mode is read from the route table itself rather than from a
+new environment variable. This removes thirty one failures a healthy CarModPicker production
+deployment was producing.
+
 ## 0.36.0
 
 Four defects in `webbpulse.e2e` that the CarModPicker staging runs found, all of them cases

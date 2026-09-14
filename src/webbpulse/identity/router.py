@@ -223,10 +223,16 @@ def _declare_identity_responses(router: APIRouter, prefix: str) -> None:
     Applied once at the end, so a route declared in any of the three modules is covered and
     a route this deployment did not mount is simply absent.
     """
+    from webbpulse.identity.ephemeral_routes import EPHEMERAL_ROUTE_RESPONSES
     from webbpulse.identity.oauth_routes import OAUTH_ROUTE_RESPONSES
     from webbpulse.identity.passkey_routes import PASSKEY_ROUTE_RESPONSES
 
-    for table in (IDENTITY_ROUTE_RESPONSES, OAUTH_ROUTE_RESPONSES, PASSKEY_ROUTE_RESPONSES):
+    for table in (
+        IDENTITY_ROUTE_RESPONSES,
+        OAUTH_ROUTE_RESPONSES,
+        PASSKEY_ROUTE_RESPONSES,
+        EPHEMERAL_ROUTE_RESPONSES,
+    ):
         _declare_route_responses(router, prefix, table)
 
 
@@ -600,6 +606,16 @@ def _mount_flows(
             success_body=success_body,
             set_refresh_cookie=set_refresh_cookie,
         )
+
+    from webbpulse.identity.ephemeral_routes import register_ephemeral_routes
+
+    register_ephemeral_routes(
+        router,
+        prefix=prefix,
+        settings=settings,
+        flows=flows,
+        rejected=rejected,
+    )
 
     if not flows.email_enabled:
         return

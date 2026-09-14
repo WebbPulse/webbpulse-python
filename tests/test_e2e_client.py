@@ -111,15 +111,47 @@ class TestPacer:
         assert clock.slept == []
         assert pacer.slept_seconds == 0
 
-    def test_it_waits_out_the_window_once_the_budget_is_spent(self) -> None:
-        """With the budget spent, the next call waits for the rest of the minute."""
+    def test_it_waits_out_the_window_once_the_fallback_budget_is_spent(self) -> None:
+        """With the fallback budget spent on metered answers, the next call waits.
+
+        The answers carry the header, because only an answer the application handled spends
+        the limiter's budget.
+        """
         clock = Clock()
         pacer = Pacer(per_minute=3, sleeper=clock.sleep, clock=clock)
-        for _ in range(3):
+        for remaining in (2, 1, 0):
             pacer.before_call()
-            pacer.after_call({})
+            pacer.after_call({"x-ratelimit-remaining-minute": str(remaining)})
         pacer.before_call()
         assert clock.slept and clock.slept[0] > 0
+
+    def test_unmetered_answers_never_spend_the_budget(self) -> None:
+        """Answers with no header came from the gateway and cost the app limiter nothing.
+
+        The gateway, the access gate and the authorizer all answer before the application
+        runs. Counting those against the app limiter is what paced a sweep of mostly 401
+        probes as if every one had cost a token.
+        """
+        clock = Clock()
+        pacer = Pacer(per_minute=3, sleeper=clock.sleep, clock=clock)
+        for _ in range(50):
+            pacer.before_call()
+            pacer.after_call({})
+        assert clock.slept == []
+        assert pacer.unmetered_calls == 50
+
+    def test_a_generous_advertised_count_overrides_a_small_fallback(self) -> None:
+        """A route class advertising plenty left is not throttled to the fallback.
+
+        This is the production slowness: a fallback of ten paced the GET class, which allows
+        two hundred a minute, into a full window wait every ninth call.
+        """
+        clock = Clock()
+        pacer = Pacer(per_minute=10, sleeper=clock.sleep, clock=clock)
+        for remaining in range(199, 149, -1):
+            pacer.before_call()
+            pacer.after_call({"x-ratelimit-remaining-minute": str(remaining)})
+        assert clock.slept == []
 
     def test_the_advertised_remaining_count_tightens_the_budget(self) -> None:
         """A low `X-RateLimit-Remaining-Minute` paces sooner than the local count would.

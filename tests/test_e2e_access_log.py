@@ -439,16 +439,60 @@ class TestRescanThrottle:
         lookup.scan_window(force=True)
         assert len(client.calls) == 2
 
-    def test_a_run_of_misses_costs_one_read_between_them(self) -> None:
-        """Several ids missing inside one poll interval share the one scan."""
+    def test_a_run_of_unforced_scans_costs_one_read_between_them(self) -> None:
+        """Several unforced scans inside one poll interval share the one read.
+
+        This is the throttle the bulk probe path relies on. `find` deliberately does not use
+        it: a throttled read inside a wait loop returns the same stale cache while still
+        costing the caller a full poll interval of sleep.
+        """
         clock = Clock()
         client = FakeLogs([{"events": []}])
         lookup = AccessLogLookup(
             client, LOG_GROUP, wait_seconds=0.0, poll_seconds=5.0, sleeper=clock.sleep, clock=clock
         )
-        for index in range(10):
-            assert lookup.find(f"req-{index}") is None
+        for _ in range(10):
+            lookup.scan_window()
         assert len(client.calls) == 1
+
+    def test_a_lookup_never_spends_the_budget_on_a_throttled_no_op(self) -> None:
+        """Every wait loop iteration does a real read rather than re-reading a stale cache.
+
+        The regression this pins: `find` used the throttled scan, so a lookup entering the
+        loop just after another case had scanned slept the poll interval, read nothing, and
+        repeated. Two CarModPicker cases spent 61 and 43 seconds that way.
+        """
+        clock = Clock()
+        client = FakeLogs([{"events": []} for _ in range(20)])
+        lookup = AccessLogLookup(
+            client,
+            LOG_GROUP,
+            wait_seconds=60.0,
+            poll_seconds=5.0,
+            settle_seconds=20.0,
+            sleeper=clock.sleep,
+            clock=clock,
+        )
+        lookup.scan_window()
+        before = len(client.calls)
+        assert lookup.find("req-never-delivered") is None
+        assert len(client.calls) > before
+
+    def test_a_settled_window_gives_up_rather_than_waiting_out_the_budget(self) -> None:
+        """An entry still absent after the settle period is not waited on any longer."""
+        clock = Clock()
+        client = FakeLogs([{"events": []} for _ in range(50)])
+        lookup = AccessLogLookup(
+            client,
+            LOG_GROUP,
+            wait_seconds=600.0,
+            poll_seconds=5.0,
+            settle_seconds=20.0,
+            sleeper=clock.sleep,
+            clock=clock,
+        )
+        assert lookup.find("req-never-delivered") is None
+        assert clock.now < 600.0
 
     def test_a_miss_inside_the_budget_is_still_a_miss(self) -> None:
         """The throttle does not turn a never-delivered entry into anything but None."""
@@ -494,3 +538,44 @@ class TestFilteredFallback:
         lookup = AccessLogLookup(client, LOG_GROUP, wait_seconds=0.0)
         lookup.scan_window()
         assert lookup.cached_ids == frozenset({"req-1", "req-2"})
+
+
+class TestSettleIsPerLookup:
+    """The settle clock belongs to one `find` call, not to the lookup as a whole."""
+
+    def test_a_late_entry_asked_for_after_an_earlier_miss_still_gets_its_grace(self) -> None:
+        """A lookup that begins long after another id's first miss is not given up on at once."""
+        clock = Clock()
+        delivered = {
+            "events": [
+                {
+                    "message": json.dumps(
+                        {
+                            "requestId": "req-late",
+                            "routeKey": "GET /late",
+                            "status": "200",
+                            "integrationLatency": "1",
+                        }
+                    ),
+                    "timestamp": 1_000,
+                }
+            ]
+        }
+        pages: list[dict[str, Any]] = (
+            [{"events": []} for _ in range(8)] + [delivered] + [{"events": []} for _ in range(10)]
+        )
+        client = FakeLogs(pages)
+        lookup = AccessLogLookup(
+            client,
+            LOG_GROUP,
+            wait_seconds=600.0,
+            poll_seconds=5.0,
+            settle_seconds=20.0,
+            sleeper=clock.sleep,
+            clock=clock,
+        )
+        assert lookup.find("req-never-delivered") is None
+        assert clock.now >= 20.0
+        entry = lookup.find("req-late")
+        assert entry is not None
+        assert entry.route_key == "GET /late"
