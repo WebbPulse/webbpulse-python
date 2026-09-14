@@ -561,7 +561,9 @@ class TestSettleIsPerLookup:
                 }
             ]
         }
-        pages = [{"events": []} for _ in range(8)] + [delivered] + [{"events": []} for _ in range(10)]
+        pages: list[dict[str, Any]] = (
+            [{"events": []} for _ in range(8)] + [delivered] + [{"events": []} for _ in range(10)]
+        )
         client = FakeLogs(pages)
         lookup = AccessLogLookup(
             client,

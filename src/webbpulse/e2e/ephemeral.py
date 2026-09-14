@@ -19,16 +19,14 @@ from __future__ import annotations
 import secrets
 import string
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Any, Final
-
-if TYPE_CHECKING:  # pragma: no cover
-    from .client import E2EClient
+from typing import Any, Final, Protocol
 
 __all__ = [
     "CREATE_PATH",
     "PASSWORD_LENGTH",
     "Credentials",
     "EphemeralUser",
+    "TokenClient",
     "create_ephemeral_user",
     "delete_ephemeral_user",
     "ephemeral_email",
@@ -41,6 +39,22 @@ CREATE_PATH: Final = "/api/auth/e2e/users"
 PASSWORD_LENGTH: Final = 32
 
 _ALPHABET: Final = string.ascii_letters + string.digits
+
+
+class TokenClient(Protocol):
+    """The slice of `E2EClient` these helpers use: a bearer-scoped client that posts and requests."""
+
+    def with_token(self, token: str | None) -> TokenClient:
+        """A client sending `token` as the bearer credential."""
+        ...
+
+    def post(self, path: str, *, json: Any = None) -> Any:
+        """POST a JSON body and return the response."""
+        ...
+
+    def request(self, method: str, path: str, *, json: Any = None) -> Any:
+        """Send one request and return the response."""
+        ...
 
 
 def item_path(user_id: str, *, create_path: str = CREATE_PATH) -> str:
@@ -99,7 +113,7 @@ class EphemeralUser:
 
 
 def create_ephemeral_user(
-    client: E2EClient,
+    client: TokenClient,
     *,
     run_id: str,
     admin_token: str,
@@ -149,7 +163,7 @@ def create_ephemeral_user(
     )
 
 
-def delete_ephemeral_user(client: E2EClient, user: EphemeralUser, *, admin_token: str) -> bool:
+def delete_ephemeral_user(client: TokenClient, user: EphemeralUser, *, admin_token: str) -> bool:
     """Delete this run's user, returning whether the route reported it gone.
 
     Never raises: cleanup runs at session teardown, where a raise would replace a completed
@@ -161,4 +175,4 @@ def delete_ephemeral_user(client: E2EClient, user: EphemeralUser, *, admin_token
         response = client.with_token(admin_token).request("DELETE", path)
     except Exception:
         return False
-    return response.status_code == 200
+    return bool(response.status_code == 200)

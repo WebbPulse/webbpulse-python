@@ -20,17 +20,35 @@ answer. Nothing is created once per run, so no lock file is needed.
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Any, Final
-
-if TYPE_CHECKING:  # pragma: no cover
-    import pytest
+from collections.abc import Sequence
+from typing import Any, Final, Protocol
 
 __all__ = [
     "SHARED_STATE_GROUP",
     "SHARED_STATE_PREFIXES",
+    "GroupableItem",
+    "apply_groups",
     "group_for",
     "worker_id",
 ]
+
+
+class GroupableItem(Protocol):
+    """The slice of `pytest.Item` the grouping reads and writes."""
+
+    @property
+    def nodeid(self) -> str:
+        """The item's node id, `path::Class::test`."""
+        ...
+
+    def get_closest_marker(self, name: str) -> Any:
+        """The nearest marker of this name, or None."""
+        ...
+
+    def add_marker(self, marker: Any) -> None:
+        """Attach one marker to this item."""
+        ...
+
 
 SHARED_STATE_GROUP: Final = "webbpulse-e2e-session-user"
 
@@ -51,7 +69,7 @@ def worker_id(config: Any) -> str:
     return str(getattr(config, "workerinput", {}).get("workerid", "") or "master")
 
 
-def group_for(item: pytest.Item) -> str:
+def group_for(item: GroupableItem) -> str:
     """The `xdist_group` this item belongs in, or empty to leave it schedulable.
 
     Membership is by test class, because that is what the shared state follows: the identity
@@ -70,13 +88,13 @@ def group_for(item: pytest.Item) -> str:
     return ""
 
 
-def _owning_classes(item: pytest.Item) -> tuple[str, ...]:
+def _owning_classes(item: GroupableItem) -> tuple[str, ...]:
     """Every class name in this item's own node id, outermost first."""
     parts = item.nodeid.split("::")
     return tuple(part for part in parts[1:-1] if part)
 
 
-def apply_groups(items: list[pytest.Item]) -> int:
+def apply_groups(items: Sequence[GroupableItem]) -> int:
     """Mark every shared-state item with its `xdist_group`, returning how many were marked.
 
     Applied whether or not xdist is installed: the marker is inert in a serial run, so the
