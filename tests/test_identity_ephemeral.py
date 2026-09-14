@@ -358,3 +358,83 @@ class TestCallerIsAdmin:
         from webbpulse.identity.ephemeral_routes import caller_is_admin
 
         assert caller_is_admin(self.request_with({"sub": "s", "roles": "admin"})) is True
+
+
+class TestEphemeralRoutesOverHttp:
+    """The mounted routes answering real requests, which the flow tests alone cannot show.
+
+    The staging CarModPicker deployment answered 422 to every create call because FastAPI
+    read the handler's `request` parameter as a body field; a request through the router is
+    the only test that catches that class of fault.
+    """
+
+    @staticmethod
+    def client(module_key: rsa.RSAPrivateKey, hooks: FakeHooks, **overrides: Any) -> Any:
+        """A test client over an app mounting the router with these settings."""
+        from fastapi import FastAPI
+        from fastapi.testclient import TestClient
+
+        from webbpulse.identity import build_identity_router
+
+        settings = make_settings(ephemeral_users_enabled=True, environment="staging", **overrides)
+        router = build_identity_router(
+            settings,
+            hooks,
+            make_stores(),
+            tokens=TokenService(settings, FakeKms({KEY_A: module_key})),
+        )
+        app = FastAPI()
+        app.include_router(router)
+        return TestClient(app)
+
+    @staticmethod
+    def headers_for(claims: Mapping[str, Any] | None) -> dict[str, str]:
+        """The request context header the Lambda Web Adapter injects behind API Gateway."""
+        import json
+
+        from webbpulse.http import REQUEST_CONTEXT_HEADER
+
+        if claims is None:
+            return {}
+        return {REQUEST_CONTEXT_HEADER: json.dumps({"authorizer": {"jwt": {"claims": claims}}})}
+
+    ADMIN: Mapping[str, Any] = {"sub": "admin-0001", "roles": ["admin", "user"]}
+
+    PAYLOAD: Mapping[str, Any] = {"email": EMAIL, "password": PASSWORD, "attributes": {}}
+
+    def test_an_admin_creates_and_deletes_a_user(self, hooks: FakeHooks, module_key: rsa.RSAPrivateKey) -> None:
+        """The plugin's exact payload answers 201, and the delete answers 200 with `deleted`."""
+        client = self.client(module_key, hooks)
+        created = client.post("/api/auth/e2e/users", json=dict(self.PAYLOAD), headers=self.headers_for(self.ADMIN))
+        assert created.status_code == 201, created.text
+        body = created.json()
+        assert body["email"] == EMAIL
+        assert body["user_id"]
+        assert PASSWORD not in created.text
+        deleted = client.delete(f"/api/auth/e2e/users/{body['user_id']}", headers=self.headers_for(self.ADMIN))
+        assert deleted.status_code == 200, deleted.text
+        assert deleted.json() == {"user_id": body["user_id"], "deleted": True}
+        assert hooks.load_user_by_email(EMAIL) is None
+
+    def test_an_anonymous_caller_is_refused(self, hooks: FakeHooks, module_key: rsa.RSAPrivateKey) -> None:
+        """No claims at all reads as not signed in."""
+        client = self.client(module_key, hooks)
+        response = client.post("/api/auth/e2e/users", json=dict(self.PAYLOAD), headers=self.headers_for(None))
+        assert response.status_code == 401
+        assert response.json()["error_code"] == "NOT_AUTHENTICATED"
+
+    def test_a_non_admin_is_refused(self, hooks: FakeHooks, module_key: rsa.RSAPrivateKey) -> None:
+        """A signed-in user without the role, which is CarModPicker's durable e2e user."""
+        client = self.client(module_key, hooks)
+        claims = {"sub": "user-0001", "roles": ["user"]}
+        response = client.post("/api/auth/e2e/users", json=dict(self.PAYLOAD), headers=self.headers_for(claims))
+        assert response.status_code == 403
+        assert response.json()["error_code"] == "ADMIN_REQUIRED"
+
+    def test_a_policy_failure_answers_422_with_its_code(self, hooks: FakeHooks, module_key: rsa.RSAPrivateKey) -> None:
+        """The one 422 the route means, distinguishable from a validation fault by its code."""
+        client = self.client(module_key, hooks)
+        payload = {"email": EMAIL, "password": "short", "attributes": {}}
+        response = client.post("/api/auth/e2e/users", json=payload, headers=self.headers_for(self.ADMIN))
+        assert response.status_code == 422
+        assert response.json()["error_code"] == "PASSWORD_TOO_SHORT"
