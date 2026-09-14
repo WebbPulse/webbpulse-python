@@ -25,6 +25,8 @@ from typing import Any
 
 import pytest
 
+from webbpulse.config import rate_limits_apply
+
 from .access_log import AccessLogLookup
 from .client import DEFAULT_PER_MINUTE, E2EClient
 from .gate import GateCookies
@@ -176,6 +178,15 @@ class E2EEnvironment:
     def is_production(self) -> bool:
         """Whether this is the production stage, which has no gate and refuses minting."""
         return self.environment.lower() == "production"
+
+    @property
+    def rate_limited(self) -> bool:
+        """Whether the target paces callers, by the same convention the services deploy with.
+
+        Staging is never rate limited, so the suite runs there at full speed; everywhere
+        else the client paces itself under the per-IP minute limit.
+        """
+        return rate_limits_apply(self.environment)
 
     @property
     def has_web_gate(self) -> bool:
@@ -342,7 +353,7 @@ def anon(e2e_env: E2EEnvironment, gate_headers: Mapping[str, str]) -> Iterator[E
     client = E2EClient(
         base_url=e2e_env.api_base_url,
         gate_headers=gate_headers,
-        per_minute=DEFAULT_PER_MINUTE,
+        per_minute=DEFAULT_PER_MINUTE if e2e_env.rate_limited else 0,
     )
     try:
         yield client

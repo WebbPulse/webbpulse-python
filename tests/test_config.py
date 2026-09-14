@@ -14,6 +14,7 @@ from webbpulse.config import (
     BaseServiceSettings,
     SecretNotJsonObjectError,
     load_json_secret,
+    rate_limits_apply,
     reset_secret_cache,
 )
 
@@ -161,3 +162,19 @@ def test_importing_the_module_calls_no_aws(monkeypatch: MonkeyPatch) -> None:
 
     monkeypatch.setattr(boto3_module, "client", explode)
     ServiceSettings()
+
+
+def test_staging_is_the_only_rate_limit_free_environment() -> None:
+    """The convention every limiter follows: staging never limits, the rest always do."""
+    assert rate_limits_apply("staging") is False
+    assert rate_limits_apply(" Staging ") is False
+    for environment in ("local", "test", "production"):
+        assert rate_limits_apply(environment) is True
+
+
+def test_rate_limiting_enabled_follows_the_environment(monkeypatch: MonkeyPatch) -> None:
+    """`rate_limiting_enabled` is the convention read through the settings object."""
+    monkeypatch.setenv("ENVIRONMENT", "staging")
+    assert ServiceSettings().rate_limiting_enabled is False
+    monkeypatch.setenv("ENVIRONMENT", "production")
+    assert ServiceSettings().rate_limiting_enabled is True

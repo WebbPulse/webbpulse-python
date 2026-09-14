@@ -57,6 +57,11 @@ class TestParsing:
         env = E2EEnvironment.from_environ({**COMPLETE, "E2E_ENVIRONMENT": "production"})
         assert env.is_production
 
+    def test_staging_is_not_rate_limited_and_the_rest_are(self) -> None:
+        """The suite paces itself by the convention the services deploy with."""
+        assert not E2EEnvironment.from_environ({**COMPLETE, "E2E_ENVIRONMENT": "staging"}).rate_limited
+        assert E2EEnvironment.from_environ({**COMPLETE, "E2E_ENVIRONMENT": "production"}).rate_limited
+
     def test_the_resource_prefix_carries_the_marker_and_the_run_id(self) -> None:
         """The prefix is what the start-of-session sweep finds leftovers by."""
         env = E2EEnvironment.from_environ(COMPLETE)

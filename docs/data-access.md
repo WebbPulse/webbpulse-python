@@ -164,9 +164,19 @@ CLASSES = [
 ]
 
 app.middleware("http")(
-    rate_limit_middleware(CLASSES, exempt_paths=("/", "/health"), exempt_prefixes=("/docs",))
+    rate_limit_middleware(
+        CLASSES,
+        exempt_paths=("/", "/health"),
+        exempt_prefixes=("/docs",),
+        enabled=lambda: get_settings().rate_limiting_enabled,
+    )
 )
 ```
+
+`enabled` is the environment convention from `webbpulse.config`: staging never rate limits,
+because the access gate already decides who reaches it and the full e2e suite runs there at
+full speed, and every other environment does. Every limiter a service has, the login failure
+counter included, reads the same property so one environment name turns all of them off.
 
 Each class counts in its own row, namespaced by its name, so a page's read fanout cannot
 spend the allowance guarding credential endpoints. A class's `exempt_paths` falls through to

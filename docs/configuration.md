@@ -26,6 +26,12 @@ def get_settings() -> Settings:
 Construct settings behind a cache in the service, not at import, so a missing environment
 variable fails a request rather than the whole cold start.
 
+`environment` drives two properties. `is_production` is true for production only, never
+staging. `rate_limiting_enabled` is false for staging and true everywhere else, by the
+`rate_limits_apply` convention: staging sits behind the access gate and hosts the full e2e
+suite, so nothing in it throttles. Wire every limiter through that property rather than a
+product variable, and the e2e client stops pacing itself against staging for the same reason.
+
 List-valued environment variables accept both JSON and the bare comma-separated form, so
 `CORS_ALLOW_ORIGINS=https://a.example,https://b.example` works. That needed a custom
 settings source: pydantic-settings calls `json.loads` on a complex field *inside* the

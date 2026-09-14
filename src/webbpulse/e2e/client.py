@@ -83,7 +83,8 @@ class Pacer:
     answer rather than by a fixed sleep. The limiter is in-memory per execution
     environment, so the remaining count is the only honest read on how much budget this
     instance has left; when the header is missing the pacer falls back to its own count of
-    calls in the current window.
+    calls in the current window. A `per_minute` of zero means the target does not limit at
+    all, which is the staging convention, and then no call ever waits.
     """
 
     def __init__(
@@ -110,6 +111,8 @@ class Pacer:
 
     def before_call(self) -> None:
         """Block until this instance has budget for one more call."""
+        if self._per_minute <= 0:
+            return
         now = self._clock()
         if self._window_start is None:
             self._window_start = now

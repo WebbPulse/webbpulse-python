@@ -18,10 +18,12 @@ if TYPE_CHECKING:  # pragma: no cover
     from mypy_boto3_secretsmanager.client import SecretsManagerClient
 
 __all__ = [
+    "RATE_LIMIT_FREE_ENVIRONMENTS",
     "BaseServiceSettings",
     "Environment",
     "SecretNotJsonObjectError",
     "load_json_secret",
+    "rate_limits_apply",
     "read_json_secret",
     "reset_secret_cache",
     "split_csv",
@@ -31,11 +33,23 @@ Environment = Literal["local", "test", "staging", "production"]
 
 APP_SECRETS_ARN_ENV = "APP_SECRETS_ARN"
 
+RATE_LIMIT_FREE_ENVIRONMENTS: frozenset[str] = frozenset({"staging"})
+
 _LOG_LEVELS = frozenset({"CRITICAL", "ERROR", "WARNING", "INFO", "DEBUG", "NOTSET"})
 
 
 class SecretNotJsonObjectError(ValueError):
     """Raised when a secret's value is not a JSON object and so cannot become settings."""
+
+
+def rate_limits_apply(environment: str) -> bool:
+    """Whether a deployment named `environment` rate limits its callers at all.
+
+    Staging never does: reaching it already takes the access gate, and the full e2e suite
+    runs there at whatever speed it can. Every other environment, local included, keeps its
+    limits so the limiter is exercised everywhere a person can reach without the gate.
+    """
+    return environment.strip().lower() not in RATE_LIMIT_FREE_ENVIRONMENTS
 
 
 def split_csv(value: str) -> list[str]:
@@ -157,6 +171,15 @@ class BaseServiceSettings(BaseSettings):
     def is_production(self) -> bool:
         """True in production only. Staging is not production."""
         return self.environment == "production"
+
+    @property
+    def rate_limiting_enabled(self) -> bool:
+        """Whether this deployment rate limits, by the `rate_limits_apply` convention.
+
+        Wire every limiter the service has through this, so staging turns all of them off
+        together and a product never needs a per-environment variable to do it.
+        """
+        return rate_limits_apply(self.environment)
 
     def load_secrets(self) -> dict[str, Any]:
         """Load this service's JSON secret, or return `{}` when no ARN is configured.
