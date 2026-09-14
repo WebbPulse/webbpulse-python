@@ -1718,3 +1718,51 @@ def test_the_session_service_revokes_through_the_index_when_there_is_one(dynamo_
     sessions = SessionService(make_settings(), dynamo_refresh_store)
 
     assert sessions.revoke_all_for_user(USER_ID) == 2
+
+
+def _login_route_dependencies(router: Any) -> list[Any]:
+    """The declared dependencies of the password login route, where the limits live."""
+    for route in router.routes:
+        if route.path.endswith("/login") and "POST" in route.methods:
+            return list(route.dependencies)
+    raise AssertionError("no login route mounted")
+
+
+class TestLimitsFollowTheEnvironmentConvention:
+    """`limiter_enabled=None` reads `rate_limits_apply`, so staging mounts no limits."""
+
+    def test_staging_mounts_the_flows_without_limits(
+        self, hooks: FakeHooks, stores: IdentityStores, kms: FakeKms, attempts: InMemoryLoginAttemptStore
+    ) -> None:
+        """A staging deployment gets the login route with no rate limit dependency."""
+        router = build_identity_router(
+            make_settings(environment="staging"), hooks, stores, kms_client=kms, attempts=attempts
+        )
+        assert _login_route_dependencies(router) == []
+
+    def test_production_keeps_its_limits(
+        self, hooks: FakeHooks, stores: IdentityStores, kms: FakeKms, attempts: InMemoryLoginAttemptStore
+    ) -> None:
+        """Every other environment mounts the same route behind its limits."""
+        router = build_identity_router(
+            make_settings(environment="production"), hooks, stores, kms_client=kms, attempts=attempts
+        )
+        assert _login_route_dependencies(router)
+
+    def test_an_explicit_switch_still_wins(
+        self, hooks: FakeHooks, stores: IdentityStores, kms: FakeKms, attempts: InMemoryLoginAttemptStore
+    ) -> None:
+        """Passing the flag overrides the convention in both directions."""
+        on = build_identity_router(
+            make_settings(environment="staging"), hooks, stores, kms_client=kms, attempts=attempts, limiter_enabled=True
+        )
+        off = build_identity_router(
+            make_settings(environment="production"),
+            hooks,
+            stores,
+            kms_client=kms,
+            attempts=attempts,
+            limiter_enabled=False,
+        )
+        assert _login_route_dependencies(on)
+        assert _login_route_dependencies(off) == []

@@ -5,6 +5,12 @@ Notable changes to the `webbpulse` package. The version here is the one in
 
 This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## 0.32.1
+
+`build_identity_router` defaults `limiter_enabled` to the same convention: `None` now means
+`rate_limits_apply(settings.environment)`, so the login, MFA and email flow limits are off
+in staging without the product passing anything. An explicit `True` or `False` still wins.
+
 ## 0.32.0
 
 Staging is never rate limited, as one convention shared by the services and the e2e suite.

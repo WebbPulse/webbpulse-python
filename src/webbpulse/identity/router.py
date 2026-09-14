@@ -131,16 +131,23 @@ def build_identity_router(
     version: str = "",
     attempts: LoginAttemptStore | None = None,
     email_sender: EmailSender | None = None,
-    limiter_enabled: bool = True,
+    limiter_enabled: bool | None = None,
     oauth_client_secrets: Mapping[str, str] | None = None,
 ) -> APIRouter:
     """The identity router for a product, mounted with no prefix.
 
     The discovery, JWKS, health, OAuth provider and passkey availability routes always
-    mount; the flows mount only when their hooks and stores are supplied.
+    mount; the flows mount only when their hooks and stores are supplied. `limiter_enabled`
+    left as `None` follows the environment convention, so staging mounts the flows with no
+    per-route rate limits and every other environment keeps them.
     """
     from fastapi import APIRouter
     from fastapi.responses import JSONResponse
+
+    from webbpulse.config import rate_limits_apply
+
+    if limiter_enabled is None:
+        limiter_enabled = rate_limits_apply(settings.environment)
 
     if tokens is None:
         if kms_client is None:
