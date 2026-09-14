@@ -388,6 +388,19 @@ class TestEphemeralRoutesOverHttp:
         return TestClient(app)
 
     @staticmethod
+    def bearer_for(module_key: rsa.RSAPrivateKey, subject: str, roles: list[str]) -> dict[str, str]:
+        """An `Authorization` header carrying a token this module's own key minted.
+
+        No request context header goes with it, which is how a request arrives at a staging
+        deployment whose identity surface sits behind one coarse route key with no JWT
+        authorizer on it.
+        """
+        settings = make_settings(ephemeral_users_enabled=True, environment="staging")
+        tokens = TokenService(settings, FakeKms({KEY_A: module_key}))
+        minted = tokens.mint_access_token(subject, claims={"roles": roles})
+        return {"Authorization": f"Bearer {minted}"}
+
+    @staticmethod
     def headers_for(claims: Mapping[str, Any] | None) -> dict[str, str]:
         """The request context header the Lambda Web Adapter injects behind API Gateway."""
         import json
@@ -438,3 +451,58 @@ class TestEphemeralRoutesOverHttp:
         response = client.post("/api/auth/e2e/users", json=payload, headers=self.headers_for(self.ADMIN))
         assert response.status_code == 422
         assert response.json()["error_code"] == "PASSWORD_TOO_SHORT"
+
+    def test_an_admin_bearer_token_with_no_authorizer_creates_a_user(
+        self, hooks: FakeHooks, module_key: rsa.RSAPrivateKey
+    ) -> None:
+        """CarModPicker staging's real shape: a valid admin token and no authorizer claims.
+
+        The whole identity surface sits behind one coarse route key with the access gate on
+        it and no JWT authorizer, so nothing verifies the token before the function does.
+        """
+        client = self.client(module_key, hooks)
+        response = client.post(
+            "/api/auth/e2e/users",
+            json=dict(self.PAYLOAD),
+            headers=self.bearer_for(module_key, "admin-0001", ["admin", "user"]),
+        )
+        assert response.status_code == 201, response.text
+        assert response.json()["email"] == EMAIL
+        assert PASSWORD not in response.text
+
+    def test_a_non_admin_bearer_token_with_no_authorizer_is_refused(
+        self, hooks: FakeHooks, module_key: rsa.RSAPrivateKey
+    ) -> None:
+        """A verified token without the role is 403, the same as the authorizer path."""
+        client = self.client(module_key, hooks)
+        response = client.post(
+            "/api/auth/e2e/users",
+            json=dict(self.PAYLOAD),
+            headers=self.bearer_for(module_key, "user-0001", ["user"]),
+        )
+        assert response.status_code == 403
+        assert response.json()["error_code"] == "ADMIN_REQUIRED"
+
+    def test_a_bearer_token_that_does_not_verify_is_refused_as_unauthenticated(
+        self, hooks: FakeHooks, module_key: rsa.RSAPrivateKey
+    ) -> None:
+        """A token that fails verification is 401, never a 500."""
+        client = self.client(module_key, hooks)
+        response = client.post(
+            "/api/auth/e2e/users",
+            json=dict(self.PAYLOAD),
+            headers={"Authorization": "Bearer not-a-token"},
+        )
+        assert response.status_code == 401
+        assert response.json()["error_code"] == "NOT_AUTHENTICATED"
+
+    def test_an_admin_bearer_token_deletes_a_user(self, hooks: FakeHooks, module_key: rsa.RSAPrivateKey) -> None:
+        """The delete route resolves its caller the same way the create route does."""
+        client = self.client(module_key, hooks)
+        admin = self.bearer_for(module_key, "admin-0001", ["admin", "user"])
+        created = client.post("/api/auth/e2e/users", json=dict(self.PAYLOAD), headers=admin)
+        assert created.status_code == 201, created.text
+        user_id = created.json()["user_id"]
+        deleted = client.delete(f"/api/auth/e2e/users/{user_id}", headers=admin)
+        assert deleted.status_code == 200, deleted.text
+        assert deleted.json() == {"user_id": user_id, "deleted": True}

@@ -12,7 +12,11 @@ mount in production whatever the flag says, so a misconfigured production deploy
 route to reach rather than a route that answers 403.
 
 The caller must present an access token carrying `admin` in its `roles` claim, which in
-staging means a KMS-minted token the e2e workflow alone can produce.
+staging means a KMS-minted token the e2e workflow alone can produce. Verified authorizer
+claims are preferred where an authorizer ran, and the bearer token is verified in process
+where none did: CarModPicker staging fronts the whole identity surface with one coarse key
+behind the access gate and no JWT authorizer, so a valid admin token arrives with no claims
+attached to it.
 
 No password ever reaches a log line, a response body or an exception message.
 """
@@ -29,6 +33,7 @@ if TYPE_CHECKING:  # pragma: no cover
     from starlette.requests import Request
 
     from webbpulse.identity.flows import IdentityFlows
+    from webbpulse.identity.service import TokenService
     from webbpulse.identity.settings import IdentitySettings
 
 __all__ = [
@@ -37,6 +42,7 @@ __all__ = [
     "EPHEMERAL_USERS_PATH",
     "EPHEMERAL_USER_ITEM_PATH",
     "caller_is_admin",
+    "caller_roles",
     "register_ephemeral_routes",
 ]
 
@@ -82,23 +88,39 @@ EPHEMERAL_ROUTE_RESPONSES: Final[Mapping[tuple[str, str], dict[int, str]]] = {
 }
 
 
+def caller_roles(claims: Mapping[str, Any]) -> list[str]:
+    """The `roles` claim as a list, whichever shape it arrived in.
+
+    An authorizer flattens an array claim, so a single role can arrive as a bare string,
+    while a token verified in process carries the native JSON list. Both become a list here
+    so membership is tested the same way on either path.
+    """
+    roles = claims.get("roles") or []
+    if isinstance(roles, str):
+        return [roles] if roles else []
+    if isinstance(roles, (list, tuple, set, frozenset)):
+        return [str(role) for role in roles]
+    return [str(roles)]
+
+
 def caller_is_admin(request: Request) -> bool:
-    """Whether this request's verified claims carry the admin role.
+    """Whether this request's verified authorizer claims carry the admin role.
 
     Read through `identity_claims` rather than the router's own claim helper, because that
     one stringifies every value and `roles` is an array claim: a list would arrive as its
     repr and no membership test on it would be meaningful. `identity_claims` coerces the
     array claims back to lists for both the native JWT authorizer and the staging gate.
+
+    Only the authorizer path, kept for callers outside this module. The routes resolve their
+    caller through `_resolve_caller`, which also verifies a bearer token in process where no
+    authorizer ran.
     """
     from webbpulse.identity.claims import identity_claims
 
     claims = identity_claims(request)
     if claims is None:
         return False
-    roles = claims.get("roles") or []
-    if isinstance(roles, str):
-        return roles == ADMIN_ROLE
-    return ADMIN_ROLE in {str(role) for role in roles}
+    return ADMIN_ROLE in set(caller_roles(claims))
 
 
 def register_ephemeral_routes(
@@ -107,6 +129,7 @@ def register_ephemeral_routes(
     prefix: str,
     settings: IdentitySettings,
     flows: IdentityFlows,
+    tokens: TokenService,
     rejected: Callable[[Request, Any], JSONResponse],
 ) -> None:
     """Mount the ephemeral e2e user routes, unless this environment refuses them.
@@ -129,15 +152,38 @@ def register_ephemeral_routes(
     from webbpulse.identity.passwords import PasswordRejected
     from webbpulse.identity.router import run_sync
 
+    def _resolve_caller(request: Request) -> tuple[str, list[str]]:
+        """This request's subject and roles, from whichever source could answer.
+
+        Verified authorizer claims win where an authorizer ran. Where none did, the bearer
+        token is verified in process, which is what an identity surface fronted by one coarse
+        route key behind the staging access gate needs. A token that fails verification
+        resolves to no subject, so it reads as not authenticated rather than as a fault.
+        """
+        from webbpulse.identity.claims import identity_claims
+
+        claims = identity_claims(request)
+        if claims is not None:
+            return str(claims.get("sub", "") or ""), caller_roles(claims)
+
+        authorization = request.headers.get("authorization", "")
+        scheme, _, token = authorization.partition(" ")
+        if scheme.lower() != "bearer" or not token.strip():
+            return "", []
+        try:
+            verified = tokens.verify_access_token(token.strip())
+        except Exception:
+            return "", []
+        return str(verified.get("sub", "") or ""), caller_roles(verified)
+
     def refuse_non_admin(request: Request) -> JSONResponse | None:
         """The refusal for a caller who is not an admin, or None to let the call through.
 
         A missing subject and a present one without the role are told apart, so a workflow
         that minted a token with no roles reads differently from one that sent none.
         """
-        from webbpulse.identity.claims import identity_subject
-
-        if not identity_subject(request):
+        subject, roles = _resolve_caller(request)
+        if not subject:
             return rejected(
                 request,
                 LoginRejected(
@@ -146,7 +192,7 @@ def register_ephemeral_routes(
                     status_code=401,
                 ),
             )
-        if not caller_is_admin(request):
+        if ADMIN_ROLE not in set(roles):
             return rejected(
                 request,
                 LoginRejected(
