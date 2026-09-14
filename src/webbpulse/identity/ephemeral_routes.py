@@ -47,6 +47,24 @@ ADMIN_ROLE: Final = "admin"
 
 _REFUSED_ENVIRONMENTS: Final[frozenset[str]] = frozenset({"production", "prod"})
 
+_FastAPIRequest: Any = None
+
+
+def _bind_fastapi_request() -> None:
+    """Put `fastapi.Request` in this module's globals for FastAPI's annotation lookup.
+
+    With postponed annotations FastAPI resolves a handler's parameter types against the
+    module globals, and a `Request` that exists only under `TYPE_CHECKING` resolves to
+    nothing, so FastAPI reads the parameter as a required body field named `request` and
+    every call answers 422 before the handler runs.
+    """
+    global _FastAPIRequest
+    if _FastAPIRequest is None:
+        from fastapi import Request as _Request
+
+        _FastAPIRequest = _Request
+
+
 EPHEMERAL_ROUTE_RESPONSES: Final[Mapping[tuple[str, str], dict[int, str]]] = {
     ("POST", EPHEMERAL_USERS_PATH): {
         201: "The ephemeral user was created.",
@@ -102,6 +120,8 @@ def register_ephemeral_routes(
     if settings.environment.strip().lower() in _REFUSED_ENVIRONMENTS:
         return
 
+    _bind_fastapi_request()
+
     from fastapi import Body
     from fastapi.responses import JSONResponse as _JSONResponse
 
@@ -144,7 +164,7 @@ def register_ephemeral_routes(
         include_in_schema=False,
         response_model=None,
     )
-    async def create_ephemeral_user(request: Request, payload: dict[str, Any] = Body(...)) -> Any:
+    async def create_ephemeral_user(request: _FastAPIRequest, payload: dict[str, Any] = Body(...)) -> Any:
         """Create one verified account for this run and return its id and email.
 
         The password arrives in the body, is hashed by the flow and is never echoed back:
@@ -179,7 +199,7 @@ def register_ephemeral_routes(
         include_in_schema=False,
         response_model=None,
     )
-    async def delete_ephemeral_user(request: Request, user_id: str) -> Any:
+    async def delete_ephemeral_user(request: _FastAPIRequest, user_id: str) -> Any:
         """Delete this run's user, letting the users-table stream purge its identity rows.
 
         A user that is already gone answers 200 with `deleted` false, so a retried cleanup

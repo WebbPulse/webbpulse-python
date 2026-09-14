@@ -5,6 +5,15 @@ Notable changes to the `webbpulse` package. The version here is the one in
 
 This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## 0.38.1
+
+The ephemeral e2e user routes answer requests again. FastAPI resolved the handlers'
+`request` parameter against a `Request` that existed only under `TYPE_CHECKING`, so it read
+the parameter as a required body field and every `POST /e2e/users` and `DELETE
+/e2e/users/{user_id}` answered 422 before the handler ran. The module now binds
+`fastapi.Request` into its globals the way the identity router does, and the routes are
+covered by requests through a test client rather than by flow calls alone.
+
 ## 0.38.0
 
 A `local` environment kind for the e2e plugin, and the identity pieces a local stack needs.
