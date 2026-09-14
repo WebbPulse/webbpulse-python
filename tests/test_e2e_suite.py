@@ -7,13 +7,25 @@ that reads exactly like a broken authorizer.
 
 from __future__ import annotations
 
+import time
 from typing import Any
 
+import httpx
 import pytest
 from _pytest.outcomes import Skipped
 
-from webbpulse.e2e.gateway import Operation, Route
-from webbpulse.e2e.suite import ProbeTarget, _first_identity_probe
+from webbpulse.e2e.access_log import AccessLogEntry
+from webbpulse.e2e.client import E2EClient, RateLimitExhausted
+from webbpulse.e2e.gateway import ABSENT_ID, Operation, Route
+from webbpulse.e2e.suite import (
+    ProbeTarget,
+    RouteProbe,
+    _first_identity_probe,
+    probe_every_route,
+    route_probes,
+)
+from webbpulse.e2e.suite import TestRouteCut as RouteCutGroup
+from webbpulse.http import ROUTE_KEY_HEADER
 
 GATE_ID = "gate123"
 IDENTITY_ID = "jwt456"
@@ -174,3 +186,254 @@ class TestProbeTarget:
         """A rejected token must report which route key answered, not just the path."""
         target: Any = ProbeTarget(method="POST", path="/api/admin/db-ops", route_key="ANY /api/admin/db-ops")
         assert target.route_key == "ANY /api/admin/db-ops"
+
+
+def probe_client(handler: Any) -> E2EClient:
+    """An unpaced `E2EClient` over a MockTransport, for the probe sweep."""
+    return E2EClient(
+        base_url="https://api.example.invalid",
+        transport=httpx.MockTransport(handler),
+        per_minute=0,
+    )
+
+
+def answering(status: int = 404, headers: dict[str, str] | None = None) -> Any:
+    """A handler answering every probe the same way, recording the paths it saw."""
+    seen: list[tuple[str, str]] = []
+
+    def handle(request: httpx.Request) -> httpx.Response:
+        """Record one probe and answer it."""
+        seen.append((request.method, request.url.path))
+        return httpx.Response(status, headers=headers or {}, json={})
+
+    handle.seen = seen  # type: ignore[attr-defined]
+    return handle
+
+
+class TestProbeEveryRoute:
+    """Tests for probing the whole route table before any access log is read.
+
+    The sweep is what makes the group fast: 147 routes each waiting out their own roughly
+    half-minute delivery lag took 3393 s of a 60 minute run, and probing first means the
+    group pays that lag once, if at all.
+    """
+
+    def test_every_live_route_is_probed_once(self) -> None:
+        """One probe per route, so the whole table is in flight before any log is read."""
+        handler = answering()
+        routes = [route("GET /api/parts"), route("POST /api/build-lists")]
+        probes = probe_every_route(routes, [r.route_key for r in routes], probe_client(handler))
+        assert len(probes) == 2
+        assert handler.seen == [("GET", "/api/parts"), ("POST", "/api/build-lists")]
+
+    def test_an_any_key_is_probed_with_get(self) -> None:
+        """The same rule the per-route case used, now applied once up front."""
+        handler = answering()
+        routes = [route("ANY /api/admin/db-ops")]
+        probe_every_route(routes, [r.route_key for r in routes], probe_client(handler))
+        assert handler.seen == [("GET", "/api/admin/db-ops")]
+
+    def test_path_variables_are_filled_with_the_absent_marker(self) -> None:
+        """A probe is a lookup that misses, so no handler writes anything."""
+        handler = answering()
+        routes = [route("GET /api/parts/{part_id}")]
+        probe_every_route(routes, [r.route_key for r in routes], probe_client(handler))
+        assert handler.seen == [("GET", f"/api/parts/{ABSENT_ID}")]
+
+    def test_a_shadowed_route_is_not_probed_and_carries_its_reason(self) -> None:
+        """Asserting the shadowing key would be asserting the wrong thing, so the case skips."""
+        handler = answering()
+        routes = [route("GET /api/{proxy+}"), route("GET /api/{part_id}")]
+        keys = [item.route_key for item in routes]
+        probes = probe_every_route(routes, keys, probe_client(handler))
+        shadowed = probes["GET /api/{proxy+}"]
+        assert shadowed.request_id == ""
+        assert "shadows GET /api/{proxy+}" in shadowed.skip_reason
+        assert handler.seen == [("GET", f"/api/{ABSENT_ID}")]
+
+    def test_the_request_id_and_status_are_recorded(self) -> None:
+        """The per-route case takes its id from here rather than probing again."""
+        handler = answering(200, {"apigw-requestid": "gw-1"})
+        routes = [route("GET /api/parts")]
+        probes = probe_every_route(routes, [r.route_key for r in routes], probe_client(handler))
+        assert probes["GET /api/parts"].request_id == "gw-1"
+        assert probes["GET /api/parts"].status == 200
+
+    def test_the_served_route_key_header_is_recorded(self) -> None:
+        """The app's own report of which key served it, which is the primary proof."""
+        handler = answering(404, {ROUTE_KEY_HEADER: "GET /api/parts"})
+        routes = [route("GET /api/parts")]
+        probes = probe_every_route(routes, [r.route_key for r in routes], probe_client(handler))
+        assert probes["GET /api/parts"].served_route_key == "GET /api/parts"
+
+    def test_a_gateway_answer_carries_no_served_route_key(self) -> None:
+        """A request the gateway answered never reached the function, so the log is the proof."""
+        handler = answering(401)
+        routes = [route("GET /api/me")]
+        probes = probe_every_route(routes, [r.route_key for r in routes], probe_client(handler))
+        assert probes["GET /api/me"].served_route_key == ""
+
+    def test_a_probe_that_raises_is_kept_against_its_own_route(self) -> None:
+        """One route's exhausted budget costs one case, not the rest of the sweep."""
+
+        def handle(request: httpx.Request) -> httpx.Response:
+            """Answer the first route 429 forever and the rest 200."""
+            if request.url.path == "/api/parts":
+                return httpx.Response(429, headers={"retry-after": "0"}, json={})
+            return httpx.Response(200, json={})
+
+        routes = [route("GET /api/parts"), route("GET /api/build-lists")]
+        probes = probe_every_route(routes, [r.route_key for r in routes], probe_client(handle))
+        assert isinstance(probes["GET /api/parts"].error, RateLimitExhausted)
+        assert probes["GET /api/build-lists"].error is None
+        assert probes["GET /api/build-lists"].status == 200
+
+
+class FakeLookup:
+    """An `AccessLogLookup` stand-in returning a scripted entry and counting the asks."""
+
+    def __init__(self, entry: AccessLogEntry | None = None) -> None:
+        """Hold the entry every `find` returns, or None for a miss."""
+        self.entry = entry
+        self.asked: list[str] = []
+        self.windows: list[int] = []
+
+    def open_window(self, first_probe_ms: int) -> None:
+        """Record the window the probe sweep opened."""
+        self.windows.append(first_probe_ms)
+
+    def find(self, request_id: str, *, start_time_ms: int | None = None) -> AccessLogEntry | None:
+        """Record the ask and hand back the scripted entry."""
+        self.asked.append(request_id)
+        return self.entry
+
+
+def entry_for(route_key: str, *, integration_error: str = "") -> AccessLogEntry:
+    """One parsed access log entry naming a route key."""
+    return AccessLogEntry(
+        request_id="gw-1",
+        route_key=route_key,
+        path="/api/parts",
+        method="GET",
+        status=200,
+        integration_status=200,
+        integration_error=integration_error,
+        raw={},
+    )
+
+
+class TestRouteCutProofs:
+    """Tests for the two proofs the route cut case reads, cheapest first.
+
+    The app's own `X-WebbPulse-Route-Key` proves the cut the moment the probe answers. The
+    access log is the fallback for a request the gateway answered before the function ran,
+    and it is the one that costs a delivery lag.
+    """
+
+    def probe(self, **overrides: Any) -> dict[str, RouteProbe]:
+        """One route's probe, keyed the way the fixture returns it."""
+        fields: dict[str, Any] = {
+            "route_key": "GET /api/parts",
+            "method": "GET",
+            "path": "/api/parts",
+            "request_id": "gw-1",
+            "status": 200,
+        }
+        fields.update(overrides)
+        return {fields["route_key"]: RouteProbe(**fields)}
+
+    def case(self, probes: dict[str, RouteProbe], lookup: FakeLookup) -> None:
+        """Run the route cut case against one probe and one lookup."""
+        RouteCutGroup().test_access_log_names_this_route_key(route("GET /api/parts"), lookup, probes)  # type: ignore[arg-type]
+
+    def test_the_response_header_alone_proves_the_cut(self) -> None:
+        """A probe that reached the function needs no access log at all."""
+        lookup = FakeLookup()
+        self.case(self.probe(served_route_key="GET /api/parts"), lookup)
+        assert lookup.asked == []
+
+    def test_the_wrong_header_fails_without_reading_the_log(self) -> None:
+        """A key the app did not expect is a failure the moment the probe answers."""
+        lookup = FakeLookup()
+        with pytest.raises(AssertionError, match="ANY /api/"):
+            self.case(self.probe(served_route_key="ANY /api/{proxy+}"), lookup)
+        assert lookup.asked == []
+
+    def test_a_gateway_answer_falls_back_to_the_access_log(self) -> None:
+        """No header means the gateway answered first, and the log is then the only proof."""
+        lookup = FakeLookup(entry_for("GET /api/parts"))
+        self.case(self.probe(status=401), lookup)
+        assert lookup.asked == ["gw-1"]
+
+    def test_the_fallback_still_catches_a_wrong_key(self) -> None:
+        """The access log assertion is unchanged, only reached less often."""
+        lookup = FakeLookup(entry_for("ANY /api/{proxy+}"))
+        with pytest.raises(AssertionError, match="according to the access log"):
+            self.case(self.probe(status=401), lookup)
+
+    def test_an_undelivered_entry_is_still_a_skip(self) -> None:
+        """A miss inside the budget is a miss, not a routing verdict."""
+        with pytest.raises(Skipped, match="no access log entry arrived"):
+            self.case(self.probe(status=401), FakeLookup())
+
+    def test_a_shadowed_route_skips_with_the_sweep_reason(self) -> None:
+        """The reason the sweep recorded is the message the case skips with."""
+        probes = self.probe(request_id="", skip_reason="/api/parts resolves to no route")
+        with pytest.raises(Skipped, match="resolves to no route"):
+            self.case(probes, FakeLookup())
+
+    def test_a_probe_that_raised_fails_its_own_case(self) -> None:
+        """An exhausted budget fails the route rather than quietly skipping it."""
+        probes = self.probe(request_id="", error=RateLimitExhausted("429 on all 4 attempts"))
+        with pytest.raises(RateLimitExhausted):
+            self.case(probes, FakeLookup())
+
+    def test_a_five_hundred_fails_before_either_proof(self) -> None:
+        """A cut cannot be verified against a gateway that is erroring."""
+        with pytest.raises(AssertionError, match="erroring"):
+            self.case(self.probe(status=502, served_route_key=""), FakeLookup())
+
+    def test_an_integration_error_still_fails_on_the_fallback(self) -> None:
+        """The log's integration error is the other thing only the log can say."""
+        lookup = FakeLookup(entry_for("GET /api/parts", integration_error="Internal Server Error"))
+        with pytest.raises(AssertionError, match="logged an integration error"):
+            self.case(self.probe(status=401), lookup)
+
+
+class TestRouteProbesFixture:
+    """Tests for the session fixture that probes first and opens the delivery window."""
+
+    def test_it_probes_every_route_and_opens_the_window(self) -> None:
+        """One sweep, and the window the later lookups scan starts at the first probe."""
+        handler = answering(200, {"apigw-requestid": "gw-1"})
+        routes = [route("GET /api/parts"), route("GET /api/build-lists")]
+        lookup = FakeLookup()
+        before = int(time.time() * 1000)
+        probes = route_probes.__wrapped__(  # type: ignore[attr-defined]
+            routes,
+            [item.route_key for item in routes],
+            probe_client(handler),
+            lookup,
+        )
+        assert len(handler.seen) == 2
+        assert len(probes) == 2
+        assert lookup.windows and lookup.windows[0] >= before
+
+    def test_the_window_is_opened_before_the_first_probe_is_sent(self) -> None:
+        """An entry delivered for the very first probe must fall inside the window."""
+        seen_windows: list[int] = []
+
+        def handle(request: httpx.Request) -> httpx.Response:
+            """Record what the lookup was told when the first probe went out."""
+            seen_windows.append(len(lookup.windows))
+            return httpx.Response(200, json={})
+
+        lookup = FakeLookup()
+        routes = [route("GET /api/parts")]
+        route_probes.__wrapped__(  # type: ignore[attr-defined]
+            routes,
+            [item.route_key for item in routes],
+            probe_client(handle),
+            lookup,
+        )
+        assert seen_windows == [1]

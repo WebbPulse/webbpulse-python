@@ -25,21 +25,28 @@ The six groups, in the order they build on each other:
 
 from __future__ import annotations
 
+import time
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any
 
 import pytest
 
+from webbpulse.http import ROUTE_KEY_HEADER
+
 from .access_log import AccessLogLookup
 from .browser import ROOT_SELECTORS, BrowserFailure, ConsoleErrors, FailedRequests, browser_contract, sign_in
 from .client import E2EClient, RateLimitExhausted
 from .frontend import fetch_bundle, missing_allowed_headers, shell_looks_like_an_app
 from .gateway import (
+    ABSENT_ID,
     Operation,
     Route,
+    concrete_path,
     identity_authorization_is_observable,
     matching_route,
+    probe_method,
+    probe_path,
     resolve,
     route_key_is_expressible,
     route_requires_identity,
@@ -61,6 +68,7 @@ from .journeys import (
 )
 
 __all__ = [
+    "RouteProbe",
     "TestBrowser",
     "TestCoverage",
     "TestFrontend",
@@ -70,12 +78,13 @@ __all__ = [
     "TestRouteCut",
     "journey_id",
     "operation_id",
+    "probe_every_route",
     "pytest_generate_tests",
     "route_id",
+    "route_probes",
     "route_spec_id",
 ]
 
-ABSENT_ID = "e2e-obviously-absent-id"
 GATEWAY_404_BODY = "Not Found"
 GATE_STATUSES = (401, 403)
 
@@ -101,31 +110,6 @@ def journey_id(journey: Journey) -> str:
 
 
 MAX_NAVIGATIONS = 5
-
-
-def _probe_path(route: Route) -> str:
-    """A concrete path that resolves to this route and to no more specific one."""
-    return _concrete_path(route.path)
-
-
-def _concrete_path(template: str) -> str:
-    """A path template with every variable filled with the absent-id marker.
-
-    Variables are filled with a marker rather than a plausible id so the request is a
-    lookup that misses, which every handler answers without writing anything.
-    """
-    segments = []
-    for segment in template.strip("/").split("/"):
-        if segment == "{proxy+}" or (segment.startswith("{") and segment.endswith("}")):
-            segments.append(ABSENT_ID)
-        else:
-            segments.append(segment)
-    return "/" + "/".join(segment for segment in segments if segment)
-
-
-def _probe_method(route: Route) -> str:
-    """The method to probe a route with, using GET for an `ANY` key."""
-    return "GET" if route.method == "ANY" else route.method
 
 
 def pytest_generate_tests(metafunc: pytest.Metafunc) -> None:
@@ -260,12 +244,93 @@ def _product_openapi_document(config: pytest.Config) -> Mapping[str, Any]:
     )
 
 
+@dataclass(frozen=True)
+class RouteProbe:
+    """What one route's up-front probe produced, which the access log case then asks about.
+
+    `served_route_key` is what the app itself reported on the response, which is empty when
+    the gateway answered before the function ran. A route every path of which a more
+    specific key shadows is never probed, and carries the `skip_reason` its case skips with
+    instead of a request id. A probe that raised carries the `error` its case re-raises, so
+    a limiter that exhausted the budget fails that route rather than quietly skipping it.
+    """
+
+    route_key: str
+    method: str
+    path: str
+    request_id: str = ""
+    served_route_key: str = ""
+    status: int = 0
+    skip_reason: str = ""
+    error: Exception | None = None
+
+
+def probe_every_route(
+    routes: Sequence[Route],
+    route_keys: Sequence[str],
+    client: E2EClient,
+) -> dict[str, RouteProbe]:
+    """Probe every live route once, returning each route key's probe.
+
+    Probing the whole group before any log is read is what makes the group fast: delivery
+    lags roughly half a minute per stream, and one probe per route followed by one wait for
+    all of them pays that lag once rather than once per route. A probe that raises is kept
+    against its route rather than abandoning the sweep, so one route's exhausted budget
+    costs one case and not the whole group.
+    """
+    probes: dict[str, RouteProbe] = {}
+    for route in routes:
+        method = probe_method(route)
+        path = probe_path(route)
+        expected = resolve(path, method, route_keys)
+        if expected != route.route_key:
+            probes[route.route_key] = RouteProbe(
+                route_key=route.route_key,
+                method=method,
+                path=path,
+                skip_reason=f"{path} resolves to {expected or 'no route'}, which shadows {route.route_key}",
+            )
+            continue
+        try:
+            response = client.request(method, path)
+        except Exception as error:
+            probes[route.route_key] = RouteProbe(route_key=route.route_key, method=method, path=path, error=error)
+            continue
+        probes[route.route_key] = RouteProbe(
+            route_key=route.route_key,
+            method=method,
+            path=path,
+            request_id=response.headers.get("apigw-requestid", ""),
+            served_route_key=response.headers.get(ROUTE_KEY_HEADER.lower(), ""),
+            status=response.status_code,
+        )
+    return probes
+
+
+@pytest.fixture(scope="session")
+def route_probes(
+    gateway_routes: Sequence[Route],
+    route_keys: Sequence[str],
+    anon: E2EClient,
+    access_log: AccessLogLookup,
+) -> Mapping[str, RouteProbe]:
+    """Every live route probed once, up front, before any access log entry is asked for.
+
+    Opens the lookup's delivery window at the first probe, so the later per-route cases scan
+    that one window instead of filtering for one request id at a time.
+    """
+    first_probe_ms = int(time.time() * 1000)
+    access_log.open_window(first_probe_ms)
+    return probe_every_route(gateway_routes, route_keys, anon)
+
+
 class TestRouteCut:
     """Group 1: every live route is served by the integration its route key declares.
 
-    A 200 proves something answered. Only the access log entry says which route key matched
-    and which integration ran, which is the difference between a landed cut and a request
-    falling through a `{proxy+}` catch-all with no authorizer claims.
+    A 200 proves something answered. Which route key matched is said by the app's own
+    `X-WebbPulse-Route-Key` response header where the request reached the function, and by
+    the access log entry where it did not, and that is the difference between a landed cut
+    and a request falling through a `{proxy+}` catch-all with no identity claims.
     """
 
     def test_route_key_is_expressible(self, live_route: Route) -> None:
@@ -286,39 +351,58 @@ class TestRouteCut:
     def test_access_log_names_this_route_key(
         self,
         live_route: Route,
-        anon: E2EClient,
         access_log: AccessLogLookup,
-        route_keys: Sequence[str],
+        route_probes: Mapping[str, RouteProbe],
     ) -> None:
-        """A probe to this route is logged with this route key and no integration error.
+        """A probe to this route is served by this route key, with no integration error.
 
-        The probe path is resolved back through the precedence matcher first: a route whose
-        every path a more specific key shadows cannot be probed directly, and asserting the
-        shadowing key would be asserting the wrong thing.
+        Two proofs, cheapest first. The shared HTTP layer echoes the gateway's own
+        `routeKey` as `X-WebbPulse-Route-Key` on every response, so a probe that reached the
+        function proves the cut the moment it answers. Where the header is absent the
+        gateway answered before the function ran, which is what an identity rejection, a
+        gate rejection or the gateway's own 404 look like, and then the access log entry is
+        the only thing that says which key matched.
+
+        The probe itself was sent by the `route_probes` fixture, which probed every route
+        before this group started, so a group that has to fall back waits out one delivery
+        lag rather than one per route. The probe path is resolved back through the
+        precedence matcher there: a route whose every path a more specific key shadows
+        cannot be probed directly, and asserting the shadowing key would be asserting the
+        wrong thing.
         """
-        method = _probe_method(live_route)
-        path = _probe_path(live_route)
-        expected = resolve(path, method, route_keys)
-        if expected != live_route.route_key:
-            pytest.skip(f"{path} resolves to {expected or 'no route'}, which shadows {live_route.route_key}")
-
-        response = anon.request(method, path)
-        assert response.status_code < 500, (
-            f"{method} {path} answered {response.status_code}. A cut cannot be verified "
-            "against a gateway that is erroring."
+        probe = route_probes.get(live_route.route_key)
+        if probe is None:
+            pytest.skip(f"{live_route.route_key} was not probed, so there is nothing to correlate")
+        if probe.error is not None:
+            raise probe.error
+        if probe.skip_reason:
+            pytest.skip(probe.skip_reason)
+        method, path = probe.method, probe.path
+        assert probe.status < 500, (
+            f"{method} {path} answered {probe.status}. A cut cannot be verified against a gateway that is erroring."
         )
 
-        entry = access_log.find(response.headers.get("apigw-requestid", ""))
+        if probe.served_route_key:
+            assert probe.served_route_key == live_route.route_key, (
+                f"{method} {path} was served by route key {probe.served_route_key!r}, not "
+                f"{live_route.route_key!r}, as the app itself reported on "
+                f"{ROUTE_KEY_HEADER}. Either an apply has not landed or a key was changed "
+                "outside Terraform."
+            )
+            return
+
+        entry = access_log.find(probe.request_id)
         if entry is None:
             pytest.skip(
-                f"No access log entry for {method} {path} inside the budget. Delivery is per "
-                "stream and can lag, and the probe above already reached the API, so this is "
-                "not itself evidence of a bad route."
+                f"{method} {path} answered {probe.status} without {ROUTE_KEY_HEADER}, so the "
+                "gateway answered before the function ran, and no access log entry arrived "
+                "inside the budget either. Delivery is per stream and can lag, and the probe "
+                "already reached the API, so this is not itself evidence of a bad route."
             )
         assert entry.route_key == live_route.route_key, (
             f"{method} {path} was served by route key {entry.route_key!r}, not "
-            f"{live_route.route_key!r}. Either an apply has not landed or a key was changed "
-            "outside Terraform."
+            f"{live_route.route_key!r}, according to the access log. Either an apply has "
+            "not landed or a key was changed outside Terraform."
         )
         assert not entry.integration_error, (
             f"{live_route.route_key} logged an integration error: {entry.integration_error}"
@@ -414,7 +498,7 @@ class TestReachability:
 
     def _assert_reachable(self, operation: Operation, client: E2EClient, who: str) -> None:
         """One reachability probe, with the distinction between the failure modes named."""
-        path = _concrete_path(operation.path)
+        path = concrete_path(operation.path)
         try:
             response = client.request(operation.method, path, json={} if operation.method != "GET" else None)
         except RateLimitExhausted as error:
@@ -507,7 +591,8 @@ class TestIdentity:
         payload = response.json()
         assert isinstance(payload, dict), "refresh answered 200 with a body that is not an object"
 
-    def test_minted_token_is_accepted_by_the_authorizer(
+    @pytest.mark.e2e_writes
+    def test_minted_token_is_accepted_by_the_api(
         self,
         minted_token: Callable[..., str],
         anon: E2EClient,
@@ -515,15 +600,25 @@ class TestIdentity:
         gate_authorizers: frozenset[str],
         openapi_operations: Sequence[Operation],
     ) -> None:
-        """Staging only: a KMS-minted token is accepted on a route that requires identity."""
+        """Staging only: a KMS-minted token is accepted on a route that requires identity.
+
+        A 403 counts as accepted. The probe is whichever auth-requiring operation the
+        deployed configuration offers first, which on a product with an admin surface is an
+        admin route, and there a 403 means the token was verified and the subject resolved
+        to a real user who simply lacks the role. Only a 401 says the token itself was not
+        accepted, which is the thing under test.
+        """
         probe = _first_identity_probe(gateway_routes, gate_authorizers, openapi_operations)
         token = minted_token({"roles": ["admin"]})
         response = anon.with_token(token).request(probe.method, probe.path)
-        assert response.status_code not in (401, 403), (
-            f"a minted token was rejected with {response.status_code} on {probe.route_key}, so "
-            "the authorizer does not accept a token this environment's own key signed."
+        assert response.status_code != 401, (
+            f"a minted token was rejected with 401 on {probe.route_key}, so the API does not "
+            "accept a token this environment's own key signed. A 403 would have been fine: "
+            "it means the token verified and the subject resolved, and only the role check "
+            "refused."
         )
 
+    @pytest.mark.e2e_writes
     def test_minted_token_with_the_wrong_audience_is_rejected(
         self,
         minted_token: Callable[..., str],
@@ -532,15 +627,20 @@ class TestIdentity:
         gate_authorizers: frozenset[str],
         openapi_operations: Sequence[Operation],
     ) -> None:
-        """Staging only: a token for another audience is refused by the authorizer."""
+        """Staging only: a token for another audience is refused.
+
+        The subject is the durable e2e user's own, so the only thing wrong with this token
+        is its `aud` and the refusal can only be about that.
+        """
         probe = _first_identity_probe(gateway_routes, gate_authorizers, openapi_operations)
         token = minted_token(audience="https://e2e.invalid/not-this-audience")
         response = anon.with_token(token).request(probe.method, probe.path)
         assert response.status_code in (401, 403), (
             f"a token minted for another audience answered {response.status_code} on "
-            f"{probe.route_key}. The authorizer is not checking `aud`."
+            f"{probe.route_key}. The API is not checking `aud`."
         )
 
+    @pytest.mark.e2e_writes
     def test_expired_minted_token_is_rejected(
         self,
         minted_token: Callable[..., str],
@@ -549,15 +649,16 @@ class TestIdentity:
         gate_authorizers: frozenset[str],
         openapi_operations: Sequence[Operation],
     ) -> None:
-        """Staging only: a token whose `exp` has passed is refused by the authorizer."""
-        import time
+        """Staging only: a token whose `exp` has passed is refused.
 
+        The subject is the durable e2e user's own, so the only thing wrong with this token
+        is its `exp` and the refusal can only be about that.
+        """
         probe = _first_identity_probe(gateway_routes, gate_authorizers, openapi_operations)
         token = minted_token(expires_in=1, now=int(time.time()) - 3600)
         response = anon.with_token(token).request(probe.method, probe.path)
         assert response.status_code in (401, 403), (
-            f"an expired token answered {response.status_code} on {probe.route_key}. The "
-            "authorizer is not checking `exp`."
+            f"an expired token answered {response.status_code} on {probe.route_key}. The API is not checking `exp`."
         )
 
     @pytest.mark.e2e_writes
@@ -619,7 +720,7 @@ def _identity_probe_from_routes(routes: Sequence[Route], gate_ids: frozenset[str
     """
     for route in sorted(routes, key=lambda item: item.route_key):
         if route_requires_identity(route, gate_ids) and "{proxy+}" not in route.path:
-            return ProbeTarget(method=_probe_method(route), path=_probe_path(route), route_key=route.route_key)
+            return ProbeTarget(method=probe_method(route), path=probe_path(route), route_key=route.route_key)
     return None
 
 
@@ -644,7 +745,7 @@ def _identity_probe_from_operations(routes: Sequence[Route], operations: Sequenc
         route = matching_route(operation, routes)
         if route is None:
             continue
-        return ProbeTarget(method=operation.method, path=_concrete_path(operation.path), route_key=route.route_key)
+        return ProbeTarget(method=operation.method, path=concrete_path(operation.path), route_key=route.route_key)
     return None
 
 
@@ -735,7 +836,7 @@ class TestFrontend:
         cross-origin, which no server-side probe can see because a probe sends no `Origin`.
         """
         route = _first_authorized_route(gateway_routes) if gateway_routes else None
-        path = _probe_path(route) if route else "/"
+        path = probe_path(route) if route else "/"
         response = http.request(
             "OPTIONS",
             e2e_env.api_base_url + path,

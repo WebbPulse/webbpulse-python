@@ -15,7 +15,7 @@ import boto3
 import pytest
 from moto import mock_aws
 
-from webbpulse.e2e.access_log import AccessLogLookup, parse_entry
+from webbpulse.e2e.access_log import WINDOW_MARGIN_MILLISECONDS, AccessLogLookup, parse_entry
 
 REGION = "us-west-2"
 LOG_GROUP = "/aws/apigateway/example-staging-api"
@@ -204,10 +204,14 @@ class TestLookupTiming:
         assert lookup.find("req-1") is not None
         assert client.calls[1]["nextToken"] == "t1"
 
-    def test_the_request_id_is_the_filter_pattern(self) -> None:
-        """Filtering server side keeps a busy stage's log group from being read whole."""
+    def test_the_request_id_is_the_filter_pattern_of_the_fallback(self) -> None:
+        """Filtering server side keeps a busy stage's log group from being read whole.
+
+        The fallback read is the one that filters. The group's own lookups scan the window
+        the probes opened, which is the read that serves every id at once.
+        """
         client = FakeLogs([{"events": [{"message": line()}]}])
-        AccessLogLookup(client, LOG_GROUP, wait_seconds=0.0).find("req-1")
+        AccessLogLookup(client, LOG_GROUP, wait_seconds=0.0).find("req-1", start_time_ms=1_000)
         assert client.calls[0]["filterPattern"] == '"req-1"'
         assert client.calls[0]["logGroupName"] == LOG_GROUP
 
@@ -309,3 +313,184 @@ class TestUnsetPlaceholder:
         entry = parse_entry(line(path="/api/build-lists/a-b-c"))
         assert entry is not None
         assert entry.path == "/api/build-lists/a-b-c"
+
+
+class TestWindowScan:
+    """Tests for reading the whole delivery window instead of one request id at a time.
+
+    The suite probes every live route up front and then asks for all of their entries, so
+    one unfiltered scan of the window serves every id. Before this, 147 routes each waited
+    out their own roughly half-minute delivery lag.
+    """
+
+    def test_a_scan_caches_every_entry_in_the_window(self) -> None:
+        """One unfiltered read serves every id the probes produced."""
+        client = FakeLogs(
+            [
+                {
+                    "events": [
+                        {"message": line()},
+                        {"message": line(requestId="req-2")},
+                        {"message": line(requestId="req-3")},
+                    ]
+                }
+            ]
+        )
+        lookup = AccessLogLookup(client, LOG_GROUP, wait_seconds=0.0)
+        assert lookup.scan_window() == 3
+        assert len(client.calls) == 1
+        assert "filterPattern" not in client.calls[0]
+
+    def test_the_window_starts_before_the_first_probe(self) -> None:
+        """The gateway timestamps an entry when it finishes, so the window takes a margin."""
+        client = FakeLogs([{"events": []}])
+        lookup = AccessLogLookup(client, LOG_GROUP, wait_seconds=0.0)
+        lookup.open_window(1_000_000)
+        lookup.scan_window()
+        assert client.calls[0]["startTime"] == 1_000_000 - WINDOW_MARGIN_MILLISECONDS
+
+    def test_the_earliest_probe_wins_a_second_window(self) -> None:
+        """Opening the window twice keeps the earlier start, so no probe falls outside it."""
+        client = FakeLogs([{"events": []}])
+        lookup = AccessLogLookup(client, LOG_GROUP, wait_seconds=0.0)
+        lookup.open_window(2_000_000)
+        lookup.open_window(1_000_000)
+        lookup.scan_window()
+        assert client.calls[0]["startTime"] == 1_000_000 - WINDOW_MARGIN_MILLISECONDS
+
+    def test_every_page_of_a_scan_is_consumed(self) -> None:
+        """A window busier than one page is followed to its end."""
+        client = FakeLogs(
+            [
+                {"events": [{"message": line()}], "nextToken": "t1"},
+                {"events": [{"message": line(requestId="req-2")}]},
+            ]
+        )
+        lookup = AccessLogLookup(client, LOG_GROUP, wait_seconds=0.0)
+        assert lookup.scan_window() == 2
+        assert client.calls[1]["nextToken"] == "t1"
+
+    def test_find_scans_the_window_rather_than_filtering(self) -> None:
+        """A lookup with no explicit window takes the scan, so the next id costs nothing."""
+        client = FakeLogs([{"events": [{"message": line()}, {"message": line(requestId="req-2")}]}])
+        lookup = AccessLogLookup(client, LOG_GROUP, wait_seconds=0.0)
+        assert lookup.find("req-1") is not None
+        assert lookup.find("req-2") is not None
+        assert len(client.calls) == 1
+        assert "filterPattern" not in client.calls[0]
+
+    def test_one_delivery_lag_is_paid_for_the_whole_group(self) -> None:
+        """The first miss waits; the entries that arrive with it are then free.
+
+        This is the whole point of the change. The first id polls until delivery, and every
+        id delivered in that same scan is served from the cache with no further wait.
+        """
+        clock = Clock()
+        delivered = {
+            "events": [{"message": line()}, {"message": line(requestId="req-2")}, {"message": line(requestId="req-3")}]
+        }
+        client = FakeLogs([{"events": []}, {"events": []}, delivered])
+        lookup = AccessLogLookup(
+            client,
+            LOG_GROUP,
+            poll_seconds=5.0,
+            sleeper=clock.sleep,
+            clock=clock,
+        )
+        assert lookup.find("req-1") is not None
+        first_wait = clock.now
+        assert lookup.find("req-2") is not None
+        assert lookup.find("req-3") is not None
+        assert clock.now == first_wait
+
+
+class TestRescanThrottle:
+    """Tests for the one-scan-per-poll-interval throttle shared by every caller.
+
+    147 lookups that all miss must cost one CloudWatch read between them rather than one
+    each, or batching the probes would just move the cost from sleeping to throttling.
+    """
+
+    def test_a_second_scan_inside_the_poll_interval_is_reused(self) -> None:
+        """A scan that already ran within the poll interval is not repeated."""
+        clock = Clock()
+        client = FakeLogs([{"events": []}])
+        lookup = AccessLogLookup(client, LOG_GROUP, poll_seconds=5.0, sleeper=clock.sleep, clock=clock)
+        lookup.scan_window()
+        lookup.scan_window()
+        assert len(client.calls) == 1
+
+    def test_a_scan_after_the_poll_interval_reads_again(self) -> None:
+        """Past the interval the window is read again, since delivery may have caught up."""
+        clock = Clock()
+        client = FakeLogs([{"events": []}])
+        lookup = AccessLogLookup(client, LOG_GROUP, poll_seconds=5.0, sleeper=clock.sleep, clock=clock)
+        lookup.scan_window()
+        clock.sleep(5.0)
+        lookup.scan_window()
+        assert len(client.calls) == 2
+
+    def test_forcing_a_scan_ignores_the_throttle(self) -> None:
+        """A caller that needs a fresh read can ask for one."""
+        clock = Clock()
+        client = FakeLogs([{"events": []}])
+        lookup = AccessLogLookup(client, LOG_GROUP, poll_seconds=5.0, sleeper=clock.sleep, clock=clock)
+        lookup.scan_window()
+        lookup.scan_window(force=True)
+        assert len(client.calls) == 2
+
+    def test_a_run_of_misses_costs_one_read_between_them(self) -> None:
+        """Several ids missing inside one poll interval share the one scan."""
+        clock = Clock()
+        client = FakeLogs([{"events": []}])
+        lookup = AccessLogLookup(
+            client, LOG_GROUP, wait_seconds=0.0, poll_seconds=5.0, sleeper=clock.sleep, clock=clock
+        )
+        for index in range(10):
+            assert lookup.find(f"req-{index}") is None
+        assert len(client.calls) == 1
+
+    def test_a_miss_inside_the_budget_is_still_a_miss(self) -> None:
+        """The throttle does not turn a never-delivered entry into anything but None."""
+        clock = Clock()
+        client = FakeLogs([{"events": []}])
+        lookup = AccessLogLookup(
+            client, LOG_GROUP, wait_seconds=20.0, poll_seconds=5.0, sleeper=clock.sleep, clock=clock
+        )
+        assert lookup.find("req-1") is None
+        assert clock.now == pytest.approx(20.0)
+
+
+class TestFilteredFallback:
+    """Tests for the per-request-id read kept for a lookup outside the window."""
+
+    def test_an_explicit_window_takes_the_filtered_read(self) -> None:
+        """A caller naming its own start time is a one-off diagnostic, not the group."""
+        client = FakeLogs([{"events": [{"message": line()}]}])
+        lookup = AccessLogLookup(client, LOG_GROUP, wait_seconds=0.0)
+        assert lookup.find("req-1", start_time_ms=1_000) is not None
+        assert client.calls[0]["filterPattern"] == '"req-1"'
+        assert client.calls[0]["startTime"] == 1_000
+
+    def test_read_one_can_be_called_directly(self) -> None:
+        """The narrow read stays available for a single lookup outside the window."""
+        client = FakeLogs([{"events": [{"message": line()}]}])
+        lookup = AccessLogLookup(client, LOG_GROUP, wait_seconds=0.0)
+        entry = lookup.read_one("req-1")
+        assert entry is not None
+        assert client.calls[0]["filterPattern"] == '"req-1"'
+
+    def test_the_filtered_read_fills_the_same_cache(self) -> None:
+        """An id found by the fallback is not read twice."""
+        client = FakeLogs([{"events": [{"message": line()}]}])
+        lookup = AccessLogLookup(client, LOG_GROUP, wait_seconds=0.0)
+        lookup.read_one("req-1")
+        assert lookup.find("req-1") is not None
+        assert len(client.calls) == 1
+
+    def test_the_cached_ids_are_reportable(self) -> None:
+        """A diagnostic can ask what the window delivered without reading it again."""
+        client = FakeLogs([{"events": [{"message": line()}, {"message": line(requestId="req-2")}]}])
+        lookup = AccessLogLookup(client, LOG_GROUP, wait_seconds=0.0)
+        lookup.scan_window()
+        assert lookup.cached_ids == frozenset({"req-1", "req-2"})

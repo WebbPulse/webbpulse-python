@@ -15,6 +15,7 @@ from dataclasses import dataclass
 from typing import Any
 
 __all__ = [
+    "ABSENT_ID",
     "GATE_AUTHORIZER_SUFFIX",
     "GREEDY",
     "LITERAL",
@@ -22,12 +23,15 @@ __all__ = [
     "Authorizer",
     "Operation",
     "Route",
+    "concrete_path",
     "fetch_authorizers",
     "fetch_routes",
     "gate_authorizer_ids",
     "identity_authorization_is_observable",
     "matching_route",
     "operations_from_openapi",
+    "probe_method",
+    "probe_path",
     "resolve",
     "route_key_is_expressible",
     "route_requires_identity",
@@ -38,6 +42,8 @@ VARIABLE = 1
 GREEDY = 0
 
 GATE_AUTHORIZER_SUFFIX = "-access-gate-origin-verify"
+
+ABSENT_ID = "e2e-obviously-absent-id"
 
 _METHODS = ("GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS")
 
@@ -248,6 +254,31 @@ def _match_score(key_path: str, path: str) -> tuple[int, tuple[int, ...]] | None
     if len(key_segments) != len(path_segments):
         return None
     return (len(score), tuple(score))
+
+
+def concrete_path(template: str) -> str:
+    """A path template with every variable filled with the absent-id marker.
+
+    Variables are filled with a marker rather than a plausible id so the request is a
+    lookup that misses, which every handler answers without writing anything.
+    """
+    segments = []
+    for segment in template.strip("/").split("/"):
+        if segment == "{proxy+}" or (segment.startswith("{") and segment.endswith("}")):
+            segments.append(ABSENT_ID)
+        else:
+            segments.append(segment)
+    return "/" + "/".join(segment for segment in segments if segment)
+
+
+def probe_path(route: Route) -> str:
+    """A concrete path that resolves to this route and to no more specific one."""
+    return concrete_path(route.path)
+
+
+def probe_method(route: Route) -> str:
+    """The method to probe a route with, using GET for an `ANY` key."""
+    return "GET" if route.method == "ANY" else route.method
 
 
 def resolve(path: str, method: str, route_keys: Iterable[str]) -> str:

@@ -41,6 +41,19 @@ can be a password or a token.
 [the warning in logging-and-metrics.md](logging-and-metrics.md#do-not-call-set_user_id-from-a-sync-def-fastapi-dependency),
 which is the shape to read before wiring authentication.
 
+### The route key header
+
+`RequestIdMiddleware` echoes the request id as `X-Request-ID` and the gateway's own matched
+`routeKey` as `X-WebbPulse-Route-Key`, on every response in every environment. The key is
+read verbatim from the `x-amzn-request-context` header the Lambda Web Adapter forwards, so
+it is absent on a local run, where nothing forwards a request context, and absent whenever
+the gateway answered before the function ran.
+
+The access log is the other place that says which route key served a request, and it takes
+about half a minute to deliver. This header is the same fact on the response itself, which
+is what lets the e2e route cut group prove a cut the moment its probe answers. `route_key`
+and `request_context` are exported for a service that wants either directly.
+
 ### The request log
 
 `create_app` installs `RequestLoggingMiddleware`, which emits one INFO line per request,
