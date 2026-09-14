@@ -106,6 +106,8 @@ When the product deletes a user, its `users` Lambda hard-deletes the users row a
 else. The identity Lambda purges that user's identity data asynchronously from the users
 table's DynamoDB stream. The users Lambda never writes identity tables.
 
+The flow routes mount behind per-route rate limits unless `limiter_enabled=False` is passed; left at its default the switch follows `webbpulse.config.rate_limits_apply` on the settings' `environment`, so staging mounts them unlimited and every other environment keeps the limits.
+
 `build_identity_router` mounts a stream route wherever the flows mount, at an absolute path
 outside the issuer prefix. Identity Lambdas run behind the AWS Lambda Web Adapter, which posts
 a non-HTTP invocation as a JSON body to its pass-through path and returns the response body as
