@@ -17,6 +17,7 @@ from webbpulse.e2e.browser import (
     DEFAULT_ARTIFACTS_DIR,
     ROOT_SELECTORS,
     TRACE_REDACTION_MARKER,
+    BrowserFailure,
     ConsoleErrors,
     FailedRequests,
     artifact_name,
@@ -25,7 +26,19 @@ from webbpulse.e2e.browser import (
     message_location_url,
     redact_zip,
     resource_load_status,
+    sign_in,
+    sign_out,
 )
+from webbpulse.e2e.journeys import LoginForm
+
+
+class _Env:
+    """The few environment fields the sign-in and sign-out helpers read."""
+
+    user_email = "e2e@example.invalid"
+    user_password = "a-very-secret-password"
+    browser_timeout_ms = 15000
+
 
 pytest_plugins = ["pytester"]
 
@@ -724,3 +737,102 @@ class TestTraceRedaction:
         assert redact_zip(source, destination, "a-very-secret-password") == 0
         with zipfile.ZipFile(str(destination)) as reader:
             assert reader.read("trace.trace") == b"no secret here"
+
+
+class _RecordingPage:
+    """A page that records every call and answers waits from a scripted marker timeline."""
+
+    def __init__(self, detached: tuple[str, ...] = ()) -> None:
+        self.calls: list[tuple[str, str, str]] = []
+        self._detached = set(detached)
+
+    def goto(self, path: str, **_: object) -> None:
+        self.calls.append(("goto", path, ""))
+
+    def fill(self, selector: str, _value: str) -> None:
+        self.calls.append(("fill", selector, ""))
+
+    def click(self, selector: str) -> None:
+        self.calls.append(("click", selector, ""))
+
+    def wait_for_selector(self, selector: str, state: str = "visible", **_: object) -> None:
+        self.calls.append(("wait", selector, state))
+        if state == "detached" and selector not in self._detached:
+            raise TimeoutError(f"{selector} never detached")
+
+    def waits(self) -> list[tuple[str, str]]:
+        """The wait calls only, as selector and state pairs."""
+        return [(selector, state) for kind, selector, state in self.calls if kind == "wait"]
+
+
+class TestSignInSettles:
+    """`sign_in` hands back a page whose login route has actually gone.
+
+    The signed-in marker going visible is not a settled sign-in: an app whose header reads
+    the session store shows it before the router swaps the login route away, so for a frame
+    the marker and the login form are both up.
+    """
+
+    def test_it_waits_for_the_marker_and_then_the_form_to_detach(self) -> None:
+        """Both waits run, the visible marker first and the detached submit button second."""
+        form = LoginForm(path="/login")
+        page = _RecordingPage(detached=(form.submit,))
+
+        sign_in(page, form, _Env())
+
+        assert page.waits() == [(form.signed_in_marker, "visible"), (form.submit, "detached")]
+
+    def test_a_login_form_that_never_leaves_fails_the_sign_in(self) -> None:
+        """A marker that appears over a login page still up is reported as sign-in failing."""
+        form = LoginForm(path="/login")
+        page = _RecordingPage()
+
+        with pytest.raises(BrowserFailure, match="does not complete a sign-in"):
+            sign_in(page, form, _Env())
+
+    def test_the_password_never_reaches_the_failure_message(self) -> None:
+        """The refusal names the path and the marker, never a value from the form."""
+        form = LoginForm(path="/login")
+        page = _RecordingPage()
+
+        with pytest.raises(BrowserFailure) as caught:
+            sign_in(page, form, _Env())
+
+        assert _Env().user_password not in str(caught.value)
+
+
+class TestSignOutClearsFirst:
+    """`sign_out` waits for the signed-in marker to go before reading the signed-out one.
+
+    A shared session client holds `isAuthenticated` true while the logout call is in
+    flight, so the header keeps the marker up until that call settles.
+    """
+
+    def test_the_signed_in_marker_must_detach_before_the_login_form_is_read(self) -> None:
+        """The detach wait comes first, so the assertion never races the logout call."""
+        form = LoginForm(path="/login")
+        page = _RecordingPage(detached=(form.signed_in_marker,))
+
+        sign_out(page, form, _Env())
+
+        assert page.waits() == [
+            (form.signed_in_marker, "detached"),
+            (form.signed_out_marker, "visible"),
+        ]
+
+    def test_it_clicks_sign_out_before_waiting(self) -> None:
+        """The click is the first call, so the waits describe the state it produced."""
+        form = LoginForm(path="/login")
+        page = _RecordingPage(detached=(form.signed_in_marker,))
+
+        sign_out(page, form, _Env())
+
+        assert page.calls[0] == ("click", form.sign_out, "")
+
+    def test_a_marker_that_never_goes_away_still_fails(self) -> None:
+        """A session the app never clears keeps raising, which is the defect this case exists for."""
+        form = LoginForm(path="/login")
+        page = _RecordingPage()
+
+        with pytest.raises(TimeoutError):
+            sign_out(page, form, _Env())

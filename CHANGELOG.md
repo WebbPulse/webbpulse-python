@@ -7,7 +7,7 @@ This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## 0.36.0
 
-Three defects in `webbpulse.e2e` that the CarModPicker staging runs found, all of them cases
+Four defects in `webbpulse.e2e` that the CarModPicker staging runs found, all of them cases
 failing on a healthy deployment.
 
 The minted-token cases judge where the answer came from rather than what status it carried.
@@ -39,6 +39,20 @@ further action, so the app under test can neither cause it nor fix it, and it fa
 `public:/` on an otherwise clean render. The match is on `report-only Content Security
 Policy`, case insensitively; an enforced violation names no report-only directive and still
 fails the route.
+
+The sign-in and sign-out steps wait for the page to settle rather than for one marker. A
+header that reads the session store shows the signed-in marker as soon as the store holds a
+user, which is before the router has swapped the login route away, so for a frame the marker
+and the login form are both on the page. `sign_in` returned inside that frame, the sign-out
+click landed mid-transition, and the signed-out wait was then satisfied instantly by the
+login form that had never left, so the assertion read the header of a page still showing the
+old session and called a correct sign-out a failure. `sign_in` now also waits for the submit
+button to detach, and the new `sign_out` waits for the signed-in marker to detach before
+reading the signed-out one. That second wait matters on its own: the shared `@webbpulse/auth`
+client holds `isAuthenticated` true while the logout call is in flight, deliberately, so the
+marker stays up until the call settles and an assertion made before then is reading a session
+the app is still in the middle of ending. A session the app genuinely never clears still
+fails, which is the defect the case exists for.
 
 ## 0.35.0
 

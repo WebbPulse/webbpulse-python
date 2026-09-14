@@ -529,10 +529,18 @@ def signed_in_page(page: Any, login_form: LoginForm, e2e_env: Any) -> Any:
 
 
 def sign_in(page: Any, form: LoginForm, env: Any) -> None:
-    """Fill and submit the login form, then wait for the signed-in marker.
+    """Fill and submit the login form, then wait for the signed-in page to have settled.
 
     The password reaches `Locator.fill` and nowhere else. A timeout here is reported as
     the sign-in failing, with no value from the form in the message.
+
+    The signed-in marker going visible is not on its own a settled sign-in. An app whose
+    header reads the session store renders that marker as soon as the store holds a user,
+    which is before the router has swapped the login route away, so for a frame the marker
+    and the login form are both on the page. Acting then clicks sign-out against a page
+    that is still mid-transition, and the signed-out wait is satisfied instantly by the
+    login form that never left. Waiting for the submit button to detach as well pins the
+    navigation down, so a caller is handed a page showing only the signed-in state.
     """
     page.goto(form.path, wait_until="domcontentloaded")
     page.fill(form.email, env.user_email)
@@ -540,12 +548,26 @@ def sign_in(page: Any, form: LoginForm, env: Any) -> None:
     page.click(form.submit)
     try:
         page.wait_for_selector(form.signed_in_marker, state="visible", timeout=env.browser_timeout_ms)
+        page.wait_for_selector(form.submit, state="detached", timeout=env.browser_timeout_ms)
     except Exception as error:
         raise BrowserFailure(
             f"signing in as the durable e2e user through {form.path} never showed "
             f"{form.signed_in_marker}, so the deployed login page does not complete a "
             f"sign-in ({type(error).__name__})"
         ) from None
+
+
+def sign_out(page: Any, form: LoginForm, env: Any) -> None:
+    """Click sign-out and wait for the signed-in marker to go away, then the login form.
+
+    The signed-in marker detaching is the step that carries the meaning. A shared session
+    client holds `isAuthenticated` true while the logout call is in flight, so the header
+    keeps the marker up until the call settles; asserting before then reads a session the
+    app is still in the middle of ending and calls a correct sign-out a failure.
+    """
+    page.click(form.sign_out)
+    page.wait_for_selector(form.signed_in_marker, state="detached", timeout=env.browser_timeout_ms)
+    page.wait_for_selector(form.signed_out_marker, state="visible", timeout=env.browser_timeout_ms)
 
 
 @dataclass(frozen=True)
