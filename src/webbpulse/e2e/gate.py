@@ -172,16 +172,18 @@ def mint_gate_cookies(
 
 
 @pytest.fixture(scope="session")
-def gate_cookies(e2e_env: Any, boto3_session: Any) -> Iterator[GateCookies | None]:
+def gate_cookies(e2e_env: Any, request: Any) -> Iterator[GateCookies | None]:
     """The minted staging session cookies, or None where no web gate is configured.
 
     The three `E2E_GATE_*` web gate variables are all set or all empty; the environment
-    parse refuses a mix, so by here an empty parameter name means production or a
-    deliberately gate-less stage.
+    parse refuses a mix, so by here an empty parameter name means production, a local
+    stack, or a deliberately gate-less stage. `boto3_session` is requested only after that
+    check, so a run with no gate constructs no AWS client.
     """
     if not e2e_env.gate_signing_key_ssm_parameter:
         yield None
         return
+    boto3_session = request.getfixturevalue("boto3_session")
     yield mint_gate_cookies(
         ssm_client=boto3_session.client("ssm"),
         parameter_name=e2e_env.gate_signing_key_ssm_parameter,

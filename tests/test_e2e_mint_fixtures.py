@@ -86,6 +86,25 @@ class RecordingKms:
         return object()
 
 
+class RecordingRequest:
+    """A `pytest.FixtureRequest` stand-in that hands out one lazily requested fixture.
+
+    The mint fixtures pull `boto3_session` through `getfixturevalue` rather than as a
+    parameter, so a run that cannot mint never builds one, and this records which fixtures
+    were asked for so a test can assert that nothing was.
+    """
+
+    def __init__(self) -> None:
+        """Hold the names asked for and the session handed back."""
+        self.asked: list[str] = []
+        self.session = RecordingKms()
+
+    def getfixturevalue(self, name: str) -> Any:
+        """Record the fixture asked for and hand back the recording session."""
+        self.asked.append(name)
+        return self.session
+
+
 def subject_fixture(user_session: IdentitySession) -> str:
     """Call the `minted_subject` fixture function the way pytest would."""
     return minted_subject.__wrapped__(user_session)  # type: ignore[attr-defined,no-any-return]
@@ -107,7 +126,7 @@ def recorded_mints(monkeypatch: pytest.MonkeyPatch) -> list[dict[str, Any]]:
 
 def token_fixture(env: E2EEnvironment, subject: str) -> Any:
     """Call the `minted_token` fixture function the way pytest would."""
-    return minted_token.__wrapped__(env, RecordingKms(), subject)  # type: ignore[attr-defined]
+    return minted_token.__wrapped__(env, RecordingRequest(), subject)  # type: ignore[attr-defined]
 
 
 class TestMintedSubject:

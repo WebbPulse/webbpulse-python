@@ -93,18 +93,18 @@ names every variable that is unset, rather than failing each test with a connect
 
 | Variable | Meaning |
 | --- | --- |
-| `E2E_ENVIRONMENT` | `staging` or `production`. Production has no gate and mints nothing |
+| `E2E_ENVIRONMENT` | `staging`, `production` or `local`. Production has no gate and mints nothing; `local` is a stack built from source and makes no AWS call. See below |
 | `E2E_API_BASE_URL` | The API origin under test |
 | `E2E_WEB_BASE_URL` | The deployed web origin, for the shell and bundle checks |
 | `E2E_AWS_REGION` | The region holding the API, the log group and the KMS key |
-| `E2E_API_ID` | The HTTP API id, for `apigatewayv2 get-routes` |
-| `E2E_ACCESS_LOG_GROUP` | The access log group the route assertions correlate against |
+| `E2E_API_ID` | The HTTP API id, for `apigatewayv2 get-routes`. Not required when the environment is `local` |
+| `E2E_ACCESS_LOG_GROUP` | The access log group the route assertions correlate against. Not required when the environment is `local` |
 | `E2E_USER_EMAIL` | The durable e2e user, which signs in through the real login route. Not required when `E2E_READ_ONLY` is set |
 | `E2E_USER_PASSWORD` | That user's password. Never printed, and kept out of the dataclass repr. Not required when `E2E_READ_ONLY` is set |
 | `E2E_READ_ONLY` | Set to run the anonymous read-only smoke, which is what production runs. See below |
 | `E2E_RUN_ID` | This run's id, which becomes the `e2e-<run id>-` resource prefix |
-| `E2E_GATE_SSM_PARAMETER` | The SSM SecureString holding the staging gate value. Required outside production |
-| `E2E_MINT_ENABLED` | Set to enable the `minted_token` fixture. Unset elsewhere, and `mint_test_token` refuses production independently |
+| `E2E_GATE_SSM_PARAMETER` | The SSM SecureString holding the staging gate value. Required outside production and `local` |
+| `E2E_MINT_ENABLED` | Set to enable the `minted_token` fixture. Unset elsewhere, ignored under `local`, which has no KMS key, and `mint_test_token` refuses production independently |
 | `E2E_KMS_KEY_ID`, `E2E_ISSUER`, `E2E_AUDIENCE` | Required only when minting is enabled |
 | `E2E_RATE_LIMIT_PER_MINUTE` | The pacing fallback for answers carrying no `X-RateLimit-Remaining-Minute` header. Defaults to 10, and is ignored where the target does not rate limit |
 | `E2E_LEGACY_ROUTE_NAMES` | Comma separated paths that must no longer appear in the deployed bundle |
@@ -212,12 +212,57 @@ application then made its own decision about the subject or the role. The wrong-
 expired cases require it to be absent alongside the 401 or 403, which is what separates a
 gateway refusal from an app refusal carrying the same status.
 
+## Running it on a local stack
+
+`E2E_ENVIRONMENT=local` points the suite at a stack built from source on a CI runner: one
+composed FastAPI app on `http://127.0.0.1:8000`, DynamoDB Local, and a vite preview server on
+`http://127.0.0.1:4173`. The run makes no AWS API call at all, so no fixture on that path
+constructs a boto3 client. The org reusable workflow `e2e-local.yml@v3` drives it.
+
+The contract is the two base URLs, the region, the run id and a user the product seeds
+itself:
+
+```
+E2E_ENVIRONMENT=local
+E2E_API_BASE_URL=http://127.0.0.1:8000
+E2E_WEB_BASE_URL=http://127.0.0.1:4173
+E2E_AWS_REGION=us-west-2
+E2E_RUN_ID=<run id>-<attempt>
+E2E_BROWSER=chromium
+E2E_HEADLESS=true
+E2E_READ_ONLY=false
+E2E_USER_EMAIL / E2E_USER_PASSWORD
+```
+
+`E2E_API_ID`, `E2E_ACCESS_LOG_GROUP`, `E2E_GATE_SSM_PARAMETER` and `E2E_MINT_ENABLED` are
+left unset. They are not required here and setting `E2E_MINT_ENABLED` turns nothing on: a
+local stack has no KMS key, so minting stays off, `admin_mint_token` is empty and the run
+signs in as the durable local user from `E2E_USER_EMAIL` and `E2E_USER_PASSWORD`, which the
+product seeds through its own admin seed or registration route. Read-only is still governed
+by `E2E_READ_ONLY` alone, and a local stack is one source IP bucket so the pacer is off.
+
+What each group does:
+
+| Group | Locally |
+| --- | --- |
+| `TestRouteCut` | Skipped whole. It needs the deployed route table, the forwarded API Gateway request context and the CloudWatch access log, none of which exist locally |
+| `TestCoverage` | Degraded. The route resolution and trailing slash cases run against a route table synthesized from the product's own OpenAPI document, so they compare the document to itself. The authorizer case is skipped |
+| `TestReachability` | Runs, and is the highest value group locally: every operation is called and must answer a status its own spec declares |
+| `TestIdentity` | Runs, minus the three minted-token cases, which skip because minting is off |
+| `TestFrontend` | Runs. The bundle check asserts against the local API base URL and the CORS preflight runs against the local backend. There is no gate cookie to mint, so `gate_cookies` is None |
+| `TestBrowser` | Runs, against the preview server |
+| `TestHygiene` | Runs |
+
+A green local run does not prove the route cut, the gateway's own precedence and CORS, the
+authorizer, the access gate, per domain isolation or the stream consumers. Those are gateway
+and deployment concerns and they stay in the post deploy run, which is the required check.
+
 ## Fixtures
 
 | Fixture | Gives |
 | --- | --- |
-| `e2e_env` | The parsed `E2EEnvironment`, including `resource_prefix`, `is_production` and `rate_limited` |
-| `gate_headers` | The `x-origin-verify` header, or an empty mapping in production |
+| `e2e_env` | The parsed `E2EEnvironment`, including `resource_prefix`, `is_production`, `is_local` and `rate_limited` |
+| `gate_headers` | The `x-origin-verify` header, or an empty mapping in production and on a local stack |
 | `anon` | A client carrying the gate header and no identity, paced everywhere but staging. It serves `get`, `post`, `put`, `patch`, `delete` and `options`, each through the same `request` path, so pacing, the 429 retry and the request record apply to every verb |
 | `ephemeral_user` | This run's own login user, created at session start and deleted at the end, or None where the route is not offered |
 | `credentials` | The email and password the suite signs in with: this run's ephemeral user where there is one, the durable user otherwise. The password is kept out of the repr |
@@ -225,10 +270,10 @@ gateway refusal from an app refusal carrying the same status.
 | `api` | The authenticated client, sharing the anonymous client's pacer |
 | `minted_subject` | The `sub` claim of the durable e2e user's access token, which is the subject a minted token has to name to resolve to a stored user |
 | `minted_token` | Mints a token through KMS with no login, defaulting to `minted_subject` and taking an explicit `subject=` override. Skips unless `E2E_MINT_ENABLED` is set, and in read-only mode, where there is no user to mint for |
-| `gateway_routes`, `route_keys` | The live routes, read once per run |
+| `gateway_routes`, `route_keys` | The live routes, read once per run, or synthesized from the OpenAPI document on a local stack |
 | `gateway_authorizers`, `gate_authorizers` | The API's authorizers, and the ids of the access gate ones among them |
 | `openapi_document`, `openapi_operations` | The product's document and its operations |
-| `access_log` | Find an access log entry by request id: the window scan first, then a bounded wait |
+| `access_log` | Find an access log entry by request id: the window scan first, then a bounded wait. Skips on a local stack, which has no access log |
 | `route_probes` | Every live route probed once, up front, so the group waits out one delivery lag rather than one per route |
 | `http` | A plain client for the web origin, carrying no API gate header |
 | `cors_request_headers` | The header names the shared TypeScript client sends |
