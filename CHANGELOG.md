@@ -5,6 +5,25 @@ Notable changes to the `webbpulse` package. The version here is the one in
 
 This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## 0.38.3
+
+The ephemeral e2e user routes now verify a bearer token in process where no authorizer ran.
+
+`refuse_non_admin` resolved its caller through the API Gateway authorizer's claims alone, so
+a deployment whose identity surface sits behind one coarse route key with the staging access
+gate on it and no JWT authorizer refused every call with 401 `NOT_AUTHENTICATED`, whatever
+token the caller held. That is exactly CarModPicker staging, where a valid KMS-minted admin
+token arrives with no claims attached to it.
+
+Both routes now resolve the caller the way the rest of the identity router already does:
+verified authorizer claims win where an authorizer ran, and the `Authorization: Bearer` token
+is verified in process with the router's own `TokenService` where none did. The subject and
+the roles both come from whichever source answered, with `roles` coerced to a list on either
+path, since an authorizer flattens a single-element array claim to a bare string while a
+token verified in process carries the native list. The 401 and 403 split is unchanged, and a
+token that fails verification is 401 rather than 500. `register_ephemeral_routes` takes a
+`tokens` argument to do this, which `build_identity_router` passes.
+
 ## 0.38.2
 
 A failing ephemeral e2e user route now says why it failed.

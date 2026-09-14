@@ -614,6 +614,7 @@ def _mount_flows(
         prefix=prefix,
         settings=settings,
         flows=flows,
+        tokens=tokens,
         rejected=rejected,
     )
 
