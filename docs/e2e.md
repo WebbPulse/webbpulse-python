@@ -22,7 +22,7 @@ journey is one junit case:
 | `TestRouteCut` | Every live route key is expressible, has an integration, and the response header or the access log confirms which key served the probe |
 | `TestCoverage` | Every OpenAPI operation resolves to a live route, carries no trailing slash, and lands on a route whose identity authorizer matches its security requirement. The staging access gate does not count as identity, and where it is the only authorizer the check is skipped |
 | `TestReachability` | Every operation is answered by the API rather than by the gate, the limiter or a catch-all. A mutation with no path parameter is probed anonymously only, so the run never signs its own user out |
-| `TestIdentity` | Login returns an RS256 token carrying this environment's issuer and audience, refresh and logout work, the JWKS is reachable without the gate header, and a minted token with the wrong audience or an expired one is rejected |
+| `TestIdentity` | Login returns an RS256 token carrying this environment's issuer and audience, refresh and logout work, the JWKS is reachable without the gate header, a minted token for the durable user's own subject reaches the function, and one with the wrong audience or an expired one is refused before it does |
 | `TestFrontend` | The web origin serves the app shell, an unknown path renders it too, the bundle references this environment's API and no legacy route name, and the CORS preflight allows the headers the shared client sends. It goes through the staging gate on signed cookies, not the origin header |
 | `TestBrowser` | A real browser signs in and out through the UI, every protected route bounces an anonymous visitor, every guest-only route bounces a signed-in one, every declared route paints with no console error and no failed API call, and every declared journey runs. An anonymous visit's own 401 or 403 is exempt in both collectors, because the browser reports one such response twice, and the auth client's cold-load session probe is exempt whoever is visiting |
 | `TestHygiene` | Names carry the run prefix, the cleanup hook is registered, and created resources are tracked |
@@ -60,6 +60,14 @@ signed-in case makes that same call before it signs in, so holding it against th
 failed the sign-in journey and every product journey that starts cold. Only that path with
 that status is exempt: a 500 from it, a 401 from any other path, and the same path on another
 origin all still fail.
+
+A report-only Content Security Policy violation is exempt on its own terms too, in the
+console collector alone. A third-party frame reports its own policy against its own origin,
+as the AdSense iframe does with `frame-ancestors` against `www.google.com`, and the browser
+says in the same breath that it took no further action. The app under test can neither cause
+that nor fix it. The match is on the phrase `report-only Content Security Policy`, case
+insensitively, so an enforced violation, which names no report-only directive and did block
+something, still fails the route.
 
 The minted-token probe picks its own request out of the deployed configuration. It prefers a
 route carrying a non-gate authorizer; where the access gate is the only authorizer it falls
@@ -186,13 +194,22 @@ What still runs anonymously:
 | Journeys declaring neither `signed_in` nor `mutates` | The cleanup hook, in both phases |
 
 Minting stays governed by `E2E_MINT_ENABLED`. Production does not set it, and
-`mint_test_token` refuses production independently of the flag. The minted subject defaults
-to the durable e2e user's own id, so read-only mode skips the mint cases as well: a
-made-up subject names no real user, the API refuses the token on subject resolution, and a
-negative case would then pass for a reason that has nothing to do with the `aud` or `exp` it
-claims to test. The accepted-token case treats a 403 as proof the token authenticated,
-because the probe is whichever auth-requiring operation the configuration offers first and
-on a product with an admin surface that is an admin route; only a 401 fails it.
+`mint_test_token` refuses production independently of the flag. The minted subject comes
+from the `minted_subject` fixture, which reads the `sub` claim off the durable e2e user's
+own access token, so read-only mode skips the mint cases as well: a made-up subject names no
+real user, the API refuses the token on subject resolution, and a negative case would then
+pass for a reason that has nothing to do with the `aud` or `exp` it claims to test. An
+explicit `subject=` still overrides it.
+
+The three mint cases assert on where the answer came from rather than on the status. The
+function sets `X-WebbPulse-Route-Key` on every response it produces and a gateway or
+authorizer denial never carries it, so that header is the proof. The accepted-token case
+requires it to be present: the probe is whichever auth-requiring operation the configuration
+offers first, which on a product with an admin surface is an admin route, and an app-level
+401 or 403 there is still an accepted token because the authorizer verified it and the
+application then made its own decision about the subject or the role. The wrong-audience and
+expired cases require it to be absent alongside the 401 or 403, which is what separates a
+gateway refusal from an app refusal carrying the same status.
 
 ## Fixtures
 
@@ -203,7 +220,8 @@ on a product with an admin surface that is an admin route; only a 401 fails it.
 | `anon` | A client carrying the gate header and no identity, paced everywhere but staging. It serves `get`, `post`, `put`, `patch`, `delete` and `options`, each through the same `request` path, so pacing, the 429 retry and the request record apply to every verb |
 | `user_session` | The durable user signed in through the real login route. Skips in read-only mode |
 | `api` | The authenticated client, sharing the anonymous client's pacer |
-| `minted_token` | Mints a token through KMS with no login, for the durable e2e user's own subject. Skips unless `E2E_MINT_ENABLED` is set, and in read-only mode, where there is no user to mint for |
+| `minted_subject` | The `sub` claim of the durable e2e user's access token, which is the subject a minted token has to name to resolve to a stored user |
+| `minted_token` | Mints a token through KMS with no login, defaulting to `minted_subject` and taking an explicit `subject=` override. Skips unless `E2E_MINT_ENABLED` is set, and in read-only mode, where there is no user to mint for |
 | `gateway_routes`, `route_keys` | The live routes, read once per run |
 | `gateway_authorizers`, `gate_authorizers` | The API's authorizers, and the ids of the access gate ones among them |
 | `openapi_document`, `openapi_operations` | The product's document and its operations |

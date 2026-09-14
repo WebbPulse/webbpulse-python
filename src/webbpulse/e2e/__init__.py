@@ -381,17 +381,40 @@ def api(user_session: IdentitySession) -> E2EClient:
 
 
 @pytest.fixture(scope="session")
+def minted_subject(user_session: IdentitySession) -> str:
+    """The durable e2e user's real subject: the `sub` claim of the session's access token.
+
+    A minted token names a subject the application has to resolve to a stored user, so a
+    synthetic string is refused at that step whatever the claim under test says. Read from
+    the access token rather than from a login response field, because `sub` is what the
+    authorizer forwards and what the application maps.
+
+    Skips rather than fails on a session whose token carries no `sub`: a token naming no
+    real subject makes every mint case fail for the wrong reason.
+    """
+    subject = user_session.user_id
+    if not subject:
+        pytest.skip(
+            "the durable e2e user's access token carries no `sub` claim, so a minted token "
+            "would name no real subject and the API would reject it before reading any "
+            "other claim."
+        )
+    return subject
+
+
+@pytest.fixture(scope="session")
 def minted_token(
     e2e_env: E2EEnvironment,
     boto3_session: Any,
-    user_session: IdentitySession,
+    minted_subject: str,
 ) -> Callable[..., str]:
     """Mint an access token through KMS without a login, staging only.
 
-    The subject defaults to the durable e2e user's own id. A made-up subject names no real
-    user, so the API rejects the token on subject resolution and every mint case passes or
-    fails for a reason that has nothing to do with the claim it was testing: a token minted
-    with the wrong audience would be refused even with the right one.
+    The subject defaults to `minted_subject`, which is the `sub` claim of the durable e2e
+    user's own access token, and an explicit `subject=` still overrides it. A made-up
+    subject names no real user, so the API rejects the token on subject resolution and every
+    mint case passes or fails for a reason that has nothing to do with the claim it was
+    testing: a token minted with the wrong audience would be refused even with the right one.
 
     Skips rather than fails when `E2E_MINT_ENABLED` is unset, which is every environment
     but staging. `mint_test_token` refuses production independently of that flag, so the
@@ -402,12 +425,6 @@ def minted_token(
     if not e2e_env.mint_enabled:
         pytest.skip("E2E_MINT_ENABLED is not set, so no token is minted in this environment")
     kms = boto3_session.client("kms")
-    default_subject = user_session.user_id
-    if not default_subject:
-        pytest.skip(
-            "The durable e2e user's login returned no user id, so a minted token would name "
-            "no real subject and the API would reject it before reading any other claim."
-        )
 
     def _mint(
         claims: Mapping[str, Any] | None = None,
@@ -424,7 +441,7 @@ def minted_token(
             environment=e2e_env.environment,
             issuer=e2e_env.issuer,
             audience=e2e_env.audience if audience is None else audience,
-            subject=subject or default_subject,
+            subject=subject or minted_subject,
             expires_in=expires_in,
             extra_claims=claims,
             now=now,

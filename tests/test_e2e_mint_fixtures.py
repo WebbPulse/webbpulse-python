@@ -1,0 +1,165 @@
+"""Tests for the `minted_subject` and `minted_token` fixtures.
+
+The subject a token is minted for is the one claim every other mint case depends on. The
+application maps `sub` to a stored user, so a synthetic subject is refused at that step
+whatever the claim under test says, and a wrong-audience case would then pass for the wrong
+reason. These call the fixture functions directly through `__wrapped__`, which is what pytest
+would call, so what is asserted is the fixture's own logic rather than a session's plumbing.
+"""
+
+from __future__ import annotations
+
+import base64
+import json
+from typing import Any
+
+import pytest
+from _pytest.outcomes import Skipped
+
+from webbpulse.e2e import E2EEnvironment, minted_subject, minted_token
+from webbpulse.e2e.identity import IdentitySession
+
+DURABLE_SUBJECT = "2f6c1a7e-6b5f-4a1f-9a8e-0d2b3c4d5e6f"
+
+
+def segment(payload: dict[str, Any]) -> str:
+    """One base64url JWT segment with its padding stripped, the way a real token carries it."""
+    raw = json.dumps(payload).encode()
+    return base64.urlsafe_b64encode(raw).decode().rstrip("=")
+
+
+def access_token(subject: str) -> str:
+    """An unsigned RS256-shaped token carrying one `sub` claim."""
+    header = segment({"alg": "RS256", "typ": "JWT"})
+    claims = segment({"sub": subject, "iss": "https://issuer.invalid", "aud": "api"})
+    return f"{header}.{claims}.signature"
+
+
+def session(subject: str) -> IdentitySession:
+    """A signed-in durable user whose access token names `subject`."""
+    from webbpulse.e2e.identity import decode_claims
+
+    token = access_token(subject)
+    header, claims = decode_claims(token)
+    return IdentitySession(
+        client=None,  # type: ignore[arg-type]
+        access_token=token,
+        claims=claims,
+        header=header,
+        refresh_token="",
+        refresh_cookies={},
+        user_id=str(claims.get("sub", "")),
+    )
+
+
+def environment(**overrides: Any) -> E2EEnvironment:
+    """A staging environment with minting enabled."""
+    fields: dict[str, Any] = {
+        "environment": "staging",
+        "api_base_url": "https://api.example.invalid",
+        "web_base_url": "https://www.example.invalid",
+        "aws_region": "us-west-2",
+        "api_id": "api123",
+        "access_log_group": "/aws/apigateway/example",
+        "user_email": "e2e@example.invalid",
+        "user_password": "unused",
+        "run_id": "34801932369",
+        "mint_enabled": True,
+        "kms_key_id": "arn:aws:kms:us-west-2:1:key/abc",
+        "issuer": "https://issuer.invalid",
+        "audience": "api",
+    }
+    fields.update(overrides)
+    return E2EEnvironment(**fields)
+
+
+class RecordingKms:
+    """A boto3 session stand-in whose `kms` client records nothing but is handed through."""
+
+    def __init__(self) -> None:
+        """Hold the one client the fixture asks for."""
+        self.asked: list[str] = []
+
+    def client(self, name: str) -> Any:
+        """Record the service asked for and hand back a placeholder client."""
+        self.asked.append(name)
+        return object()
+
+
+def subject_fixture(user_session: IdentitySession) -> str:
+    """Call the `minted_subject` fixture function the way pytest would."""
+    return minted_subject.__wrapped__(user_session)  # type: ignore[attr-defined,no-any-return]
+
+
+@pytest.fixture
+def recorded_mints(monkeypatch: pytest.MonkeyPatch) -> list[dict[str, Any]]:
+    """Replace the plugin's `mint` with a recorder, so no test reaches KMS."""
+    minted: list[dict[str, Any]] = []
+
+    def fake_mint(**kwargs: Any) -> str:
+        """Record the mint arguments instead of signing anything."""
+        minted.append(kwargs)
+        return "minted.token.value"
+
+    monkeypatch.setattr("webbpulse.e2e.mint", fake_mint)
+    return minted
+
+
+def token_fixture(env: E2EEnvironment, subject: str) -> Any:
+    """Call the `minted_token` fixture function the way pytest would."""
+    return minted_token.__wrapped__(env, RecordingKms(), subject)  # type: ignore[attr-defined]
+
+
+class TestMintedSubject:
+    """Tests for the default subject a minted token names."""
+
+    def test_it_is_the_sub_claim_of_the_session_token(self) -> None:
+        """The real subject, which is what the application resolves to a stored user."""
+        assert subject_fixture(session(DURABLE_SUBJECT)) == DURABLE_SUBJECT
+
+    def test_it_is_not_a_synthetic_prefix_string(self) -> None:
+        """The defect this replaces: `e2e-<run id>-mint` names no stored user."""
+        subject = subject_fixture(session(DURABLE_SUBJECT))
+        assert not subject.startswith("e2e-")
+        assert not subject.endswith("-mint")
+
+    def test_a_session_with_no_sub_skips(self) -> None:
+        """A token naming no subject makes every mint case fail for the wrong reason."""
+        with pytest.raises(Skipped, match="no `sub` claim"):
+            subject_fixture(session(""))
+
+
+class TestMintedToken:
+    """Tests for the token factory the identity cases call."""
+
+    def test_the_default_subject_comes_from_the_session(self, recorded_mints: list[dict[str, Any]]) -> None:
+        """No caller passes a subject, so the session's own is what gets signed."""
+        token_fixture(environment(), DURABLE_SUBJECT)({"roles": ["admin"]})
+        assert recorded_mints[0]["subject"] == DURABLE_SUBJECT
+
+    def test_an_explicit_subject_still_wins(self, recorded_mints: list[dict[str, Any]]) -> None:
+        """The override the rejection cases would use for a subject-specific probe."""
+        token_fixture(environment(), DURABLE_SUBJECT)(subject="someone-else")
+        assert recorded_mints[0]["subject"] == "someone-else"
+
+    def test_the_audience_override_keeps_the_default_subject(self, recorded_mints: list[dict[str, Any]]) -> None:
+        """The wrong-audience case must differ from a good token in `aud` alone."""
+        token_fixture(environment(), DURABLE_SUBJECT)(audience="https://e2e.invalid/not-this-audience")
+        assert recorded_mints[0]["subject"] == DURABLE_SUBJECT
+        assert recorded_mints[0]["audience"] == "https://e2e.invalid/not-this-audience"
+
+    def test_the_expiry_override_keeps_the_default_subject(self, recorded_mints: list[dict[str, Any]]) -> None:
+        """The expired case must differ from a good token in `exp` alone."""
+        token_fixture(environment(), DURABLE_SUBJECT)(expires_in=1, now=0)
+        assert recorded_mints[0]["subject"] == DURABLE_SUBJECT
+        assert recorded_mints[0]["expires_in"] == 1
+
+    def test_the_environments_audience_is_the_default(self, recorded_mints: list[dict[str, Any]]) -> None:
+        """A token with no override carries this environment's own audience."""
+        token_fixture(environment(), DURABLE_SUBJECT)()
+        assert recorded_mints[0]["audience"] == "api"
+
+    def test_minting_disabled_skips(self) -> None:
+        """Every environment but staging, where the fixture must never reach KMS."""
+        with pytest.raises(Skipped, match="E2E_MINT_ENABLED"):
+            token_fixture(environment(mint_enabled=False), DURABLE_SUBJECT)

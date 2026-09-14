@@ -602,6 +602,60 @@ class TestSessionProbeExemption:
         assert errors
 
 
+class TestReportOnlyCspViolations:
+    """A CSP violation the browser only reported is not the app under test's failure.
+
+    CMP staging run 34805419305 failed `public:/` on the AdSense iframe reporting its own
+    `frame-ancestors` policy against `www.google.com`. The app can neither cause it nor fix
+    it, and the browser took no action, so it must not fail a render case.
+    """
+
+    ADSENSE = (
+        "Framing 'https://www.google.com/' violates the following report-only Content "
+        "Security Policy directive: \"frame-ancestors 'self'\". The violation has been "
+        "logged, but no further action has been taken."
+    )
+
+    def test_the_adsense_report_only_violation_is_exempt(self) -> None:
+        """The exact message the staging run failed on must not be recorded."""
+        errors = ConsoleErrors(api_base_url=API)
+        errors.record(self.ADSENSE)
+        assert not errors
+
+    def test_the_exemption_is_unconditional(self) -> None:
+        """A signed-in journey's page reports the same third-party frame the same way."""
+        errors = ConsoleErrors(api_base_url=API, ignore_guard_statuses=False)
+        errors.record(self.ADSENSE)
+        assert not errors
+
+    def test_the_match_is_case_insensitive(self) -> None:
+        """Browsers differ on the casing of the directive name they quote."""
+        errors = ConsoleErrors(api_base_url=API)
+        errors.record("Refused to frame: violates the following REPORT-ONLY CONTENT SECURITY POLICY directive")
+        assert not errors
+
+    def test_an_enforced_violation_still_counts(self) -> None:
+        """An enforced policy blocked something, which is a real defect in the app's own page."""
+        errors = ConsoleErrors(api_base_url=API)
+        errors.record(
+            "Refused to load the script 'https://cdn.invalid/x.js' because it violates the "
+            "following Content Security Policy directive: \"script-src 'self'\"."
+        )
+        assert errors
+
+    def test_an_unrelated_console_error_still_counts(self) -> None:
+        """Nothing but a report-only CSP message gains this exemption."""
+        errors = ConsoleErrors(api_base_url=API)
+        errors.record("pageerror: TypeError: undefined is not a function")
+        assert errors
+
+    def test_the_predicate_is_callable_on_its_own(self) -> None:
+        """The exemption is a named method, so a product can ask the same question."""
+        errors = ConsoleErrors()
+        assert errors.is_report_only_csp_violation(self.ADSENSE)
+        assert not errors.is_report_only_csp_violation("Content Security Policy directive")
+
+
 class TestTraceRedaction:
     """The durable e2e user's password never reaches a trace zip in the artifacts directory.
 
