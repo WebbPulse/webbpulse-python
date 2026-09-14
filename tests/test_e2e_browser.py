@@ -9,6 +9,8 @@ chromium is not installed, which is the ordinary state of this package's own CI.
 
 from __future__ import annotations
 
+from typing import ClassVar
+
 import pytest
 
 from webbpulse.e2e.browser import (
@@ -18,6 +20,8 @@ from webbpulse.e2e.browser import (
     FailedRequests,
     artifact_name,
     browser_is_available,
+    message_location_url,
+    resource_load_status,
 )
 
 pytest_plugins = ["pytester"]
@@ -93,6 +97,159 @@ class TestConsoleErrors:
         for index in range(20):
             errors.record(f"error-{index}")
         assert errors.summary(limit=3) == "error-0; error-1; error-2"
+
+
+CHROMIUM_401 = "Failed to load resource: the server responded with a status of 401 ()"
+WEBKIT_403 = "Failed to load resource: the server responded with a status of 403 (Forbidden)"
+FIREFOX_401 = f"Failed to load resource: the server responded with a status 401 for {API}/api/auth/refresh"
+
+
+class TestResourceLoadStatus:
+    """Tests for reading the status out of each engine's resource-load message."""
+
+    @pytest.mark.parametrize(
+        ("text", "expected"),
+        [
+            (CHROMIUM_401, 401),
+            (WEBKIT_403, 403),
+            (FIREFOX_401, 401),
+            ("HTTP load failed with status 403. See the console for details.", 403),
+            ("Failed to load resource: the server responded with a status of 500 ()", 500),
+        ],
+    )
+    def test_a_resource_load_message_yields_its_status(self, text: str, expected: int) -> None:
+        """Chromium, WebKit and Firefox each phrase it differently and all three must parse."""
+        assert resource_load_status(text) == expected
+
+    @pytest.mark.parametrize(
+        "text",
+        [
+            "TypeError: Cannot read properties of undefined (reading 'map')",
+            "Warning: Each child in a list should have a unique key prop.",
+            "Uncaught (in promise) Error: 401",
+        ],
+    )
+    def test_an_ordinary_error_yields_no_status(self, text: str) -> None:
+        """A render error that merely mentions a number is not a resource-load error."""
+        assert resource_load_status(text) is None
+
+
+class TestConsoleGuardExemption:
+    """Tests for the console collector agreeing with `FailedRequests` about one HTTP event.
+
+    The shared `@webbpulse/api-client` calls `POST /api/auth/refresh` on load, and
+    anonymously that correctly answers 401, which the browser also logs as a console error.
+    """
+
+    def test_a_guard_resource_error_is_ignored_when_asked(self) -> None:
+        """The 401 an anonymous visit provokes must not fail every public route."""
+        errors = ConsoleErrors(api_base_url=API, ignore_guard_statuses=True)
+        errors.record(f"console.error: {CHROMIUM_401}", f"{API}/api/auth/refresh")
+        assert not errors
+
+    @pytest.mark.parametrize("status", [401, 403])
+    def test_both_guard_statuses_are_ignored(self, status: int) -> None:
+        """The exemption covers the same status set `FailedRequests` exempts."""
+        errors = ConsoleErrors(api_base_url=API, ignore_guard_statuses=True)
+        text = f"Failed to load resource: the server responded with a status of {status} ()"
+        errors.record(f"console.error: {text}", f"{API}/api/auth/refresh")
+        assert not errors
+
+    def test_the_firefox_shape_is_ignored_from_its_text_alone(self) -> None:
+        """Firefox names the URL in the text rather than in a location, and still matches."""
+        errors = ConsoleErrors(api_base_url=API, ignore_guard_statuses=True)
+        errors.record(f"console.error: {FIREFOX_401}")
+        assert not errors
+
+    def test_the_webkit_shape_is_ignored(self) -> None:
+        """WebKit spells the reason phrase out and the status still parses."""
+        errors = ConsoleErrors(api_base_url=API, ignore_guard_statuses=True)
+        errors.record(f"console.error: {WEBKIT_403}", f"{API}/api/auth/refresh")
+        assert not errors
+
+    def test_a_guard_status_counts_when_signed_in(self) -> None:
+        """A protected route is visited signed in, where a 401 is a real failure."""
+        errors = ConsoleErrors(api_base_url=API)
+        errors.record(f"console.error: {CHROMIUM_401}", f"{API}/api/auth/refresh")
+        assert errors
+
+    def test_a_server_error_still_fails_while_guards_are_exempt(self) -> None:
+        """The exemption is for the two guard statuses alone, exactly as on `FailedRequests`."""
+        errors = ConsoleErrors(api_base_url=API, ignore_guard_statuses=True)
+        text = "Failed to load resource: the server responded with a status of 500 ()"
+        errors.record(f"console.error: {text}", f"{API}/api/builds")
+        assert errors
+
+    def test_a_404_still_fails_while_guards_are_exempt(self) -> None:
+        """A missing endpoint is a real bug an anonymous visit has no licence to provoke."""
+        errors = ConsoleErrors(api_base_url=API, ignore_guard_statuses=True)
+        text = "Failed to load resource: the server responded with a status of 404 ()"
+        errors.record(f"console.error: {text}", f"{API}/api/gone")
+        assert errors
+
+    def test_a_render_error_still_fails_while_guards_are_exempt(self) -> None:
+        """The whole point of the collector is the uncaught exception behind a blank page."""
+        errors = ConsoleErrors(api_base_url=API, ignore_guard_statuses=True)
+        errors.record("console.error: TypeError: Cannot read properties of undefined")
+        assert errors
+
+    def test_a_page_error_still_fails_while_guards_are_exempt(self) -> None:
+        """An uncaught page error carries no status and is never a guard response."""
+        errors = ConsoleErrors(api_base_url=API, ignore_guard_statuses=True)
+        errors.record("pageerror: Error: render crashed")
+        assert errors
+
+    def test_a_guard_status_on_another_origin_still_fails(self) -> None:
+        """The exemption is scoped to this product's API, the way `FailedRequests` is."""
+        errors = ConsoleErrors(api_base_url=API, ignore_guard_statuses=True)
+        errors.record(f"console.error: {CHROMIUM_401}", "https://cdn.example.invalid/private.json")
+        assert errors
+
+    def test_the_summary_still_names_what_was_kept(self) -> None:
+        """A failure message must quote the errors that survived the exemption."""
+        errors = ConsoleErrors(api_base_url=API, ignore_guard_statuses=True)
+        errors.record(f"console.error: {CHROMIUM_401}", f"{API}/api/auth/refresh")
+        errors.record("console.error: TypeError: boom")
+        assert errors.summary() == "console.error: TypeError: boom"
+
+
+class TestMessageLocationUrl:
+    """Tests for reading the URL off a Playwright console message."""
+
+    def test_a_mapping_location_yields_its_url(self) -> None:
+        """The sync API hands `location` over as a mapping."""
+
+        class Message:
+            location: ClassVar[dict[str, object]] = {"url": f"{API}/api/auth/refresh", "lineNumber": 0}
+
+        assert message_location_url(Message()) == f"{API}/api/auth/refresh"
+
+    def test_an_object_location_yields_its_url(self) -> None:
+        """A driver build that hands an object over must read the same."""
+
+        class Location:
+            url = f"{API}/api/auth/refresh"
+
+        class Message:
+            location = Location()
+
+        assert message_location_url(Message()) == f"{API}/api/auth/refresh"
+
+    def test_a_message_with_no_location_yields_none(self) -> None:
+        """A message reported without one must not raise."""
+
+        class Message:
+            pass
+
+        assert message_location_url(Message()) is None
+
+    def test_an_empty_url_yields_none(self) -> None:
+        """An empty string is no URL, and must not be scoped against the API base."""
+
+        class Message:
+            location: ClassVar[dict[str, object]] = {"url": ""}
+
+        assert message_location_url(Message()) is None
 
 
 class TestFailedRequests:

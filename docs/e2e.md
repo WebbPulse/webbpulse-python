@@ -24,7 +24,7 @@ journey is one junit case:
 | `TestReachability` | Every operation is answered by the API rather than by the gate, the limiter or a catch-all. A mutation with no path parameter is probed anonymously only, so the run never signs its own user out |
 | `TestIdentity` | Login returns an RS256 token carrying this environment's issuer and audience, refresh and logout work, the JWKS is reachable without the gate header, and a minted token with the wrong audience or an expired one is rejected |
 | `TestFrontend` | The web origin serves the app shell, an unknown path renders it too, the bundle references this environment's API and no legacy route name, and the CORS preflight allows the headers the shared client sends. It goes through the staging gate on signed cookies, not the origin header |
-| `TestBrowser` | A real browser signs in and out through the UI, every protected route bounces an anonymous visitor, every guest-only route bounces a signed-in one, every declared route paints with no console error and no failed API call, and every declared journey runs |
+| `TestBrowser` | A real browser signs in and out through the UI, every protected route bounces an anonymous visitor, every guest-only route bounces a signed-in one, every declared route paints with no console error and no failed API call, and every declared journey runs. An anonymous visit's own 401 or 403 is exempt in both collectors, because the browser reports one such response twice |
 | `TestHygiene` | Names carry the run prefix, the cleanup hook is registered, and created resources are tracked |
 
 Two of those deserve their reasons stated, because both have shipped as green before.
@@ -32,6 +32,22 @@ Two of those deserve their reasons stated, because both have shipped as green be
 The access log is the only place that says which `routeKey` matched, so a 200 alone never
 proves the cut landed. Delivery is per stream and lags, so the lookup waits inside a budget
 and reports a miss as a miss rather than as a routing failure.
+
+An anonymous visit to a public route is meant to provoke a 401: the shared
+`@webbpulse/api-client` calls `POST /api/auth/refresh` on load, and with no session that is
+the correct answer. The browser reports that one response twice, once to the response
+listener and once as a resource-load `console.error`, so both collectors exempt it under the
+same flag, the same status set and the same anonymous versus signed-in rule. The exemption
+is narrow: the message must read as a resource-load report naming 401 or 403 for a URL under
+this product's API base. A 404, a 500, a call to another origin and every uncaught page error
+still fail the route.
+
+The minted-token probe picks its own request out of the deployed configuration. It prefers a
+route carrying a non-gate authorizer; where the access gate is the only authorizer it falls
+back to a declared operation that requires auth and maps to a live route, and it sends that
+operation's own method, because a route key of `ANY /api/admin/db-ops` may be served by a
+router that defines only POST and a GET would be answered 404 before any auth dependency
+runs. Candidates are ordered safest first, and the logout path is never one.
 
 Both limiter layers key on source IP alone, so every call from one runner shares one bucket.
 The client paces itself under that budget and retries a 429 up to a cap; past the cap it
@@ -114,7 +130,7 @@ kept out of the dataclass repr, so a pytest failure report cannot leak a live se
 | `gate_cookies` | The signed CloudFront cookies for the staging web origin, or None when no gate is configured |
 | `playwright`, `browser` | Session scoped. Skipped with a reason when the browser binary is absent |
 | `context`, `page` | Per test. The context carries the gate cookies and the web base URL, and traces |
-| `console_errors`, `failed_requests` | What the page logged and which API calls failed, for the render assertions |
+| `console_errors`, `failed_requests` | What the page logged and which API calls failed, for the render assertions. Both exempt the 401 and 403 an anonymous visit provokes, on the same rule |
 | `login_form` | The product's `LoginForm`, from `pytest_e2e_login_form` |
 | `signed_in_page` | A page already signed in as the durable e2e user |
 
