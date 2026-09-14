@@ -571,17 +571,12 @@ def _operation_probe_rank(operation: Operation) -> tuple[int, str]:
 
     A GET is the best probe: it carries no body, changes nothing, and every app serves one
     for a resource it also protects. A HEAD or OPTIONS is as safe and rarer. A mutation that
-    takes a path parameter comes next, because the probe points it at an absent id and the
-    handler answers the miss without writing. A mutation with no path parameter is last: it
-    would execute for real if the token were accepted, so it is used only when the app
-    declares nothing else behind auth, which is the `ANY /api/admin/db-ops` shape.
+    takes a path parameter comes last, because the probe points it at an absent id and the
+    handler answers the miss without writing. A mutation with no path parameter is never a
+    candidate: the accepted-token probe carries an admin token, so the request would execute
+    for real, and on CarModPicker the first such operation is `POST /api/admin/db-ops/cars/delete-all`.
     """
-    if operation.method in SAFE_METHODS:
-        rank = 0
-    elif operation.path_parameters:
-        rank = 1
-    else:
-        rank = 2
+    rank = 0 if operation.method in SAFE_METHODS else 1
     return (rank, operation.label)
 
 
@@ -601,20 +596,22 @@ def _identity_probe_from_operations(routes: Sequence[Route], operations: Sequenc
     """A declared operation that requires auth and maps to a live route, as a probe target, or None.
 
     Used where the gate is the only authorizer and verifies the identity token itself, so the
-    route table cannot say which routes need one. The operation's own method is what the
-    probe sends, because the route key it resolves to may be an `ANY` key whose router
-    defines only some methods, and a method with no handler is answered 404 before the auth
-    dependency runs. Candidates are ordered safest first by `_operation_probe_rank`, and the
-    logout path is never a candidate because the probe would end the run's own session.
+    route table cannot say which routes need one. The operation's own method and concrete
+    path are what the probe sends, because the route key it resolves to may be an `ANY` or
+    `{proxy+}` key whose router defines only some methods, and a method with no handler is
+    answered 404 before the auth dependency runs. Candidates are ordered safest first by
+    `_operation_probe_rank`; a bare mutation is never one because an accepted admin token
+    would run it for real, and the logout path is never one because the probe would end the
+    run's own session.
     """
     candidates = [
         operation
         for operation in operations
-        if operation.requires_auth and "{proxy+}" not in operation.path and operation.path not in UNSAFE_PROBE_PATHS
+        if operation.requires_auth and not operation.is_bare_mutation and operation.path not in UNSAFE_PROBE_PATHS
     ]
     for operation in sorted(candidates, key=_operation_probe_rank):
         route = matching_route(operation, routes)
-        if route is None or "{proxy+}" in route.path:
+        if route is None:
             continue
         return ProbeTarget(method=operation.method, path=_concrete_path(operation.path), route_key=route.route_key)
     return None

@@ -47,7 +47,9 @@ route carrying a non-gate authorizer; where the access gate is the only authoriz
 back to a declared operation that requires auth and maps to a live route, and it sends that
 operation's own method, because a route key of `ANY /api/admin/db-ops` may be served by a
 router that defines only POST and a GET would be answered 404 before any auth dependency
-runs. Candidates are ordered safest first, and the logout path is never one.
+runs. Candidates are ordered safest first: a safe method, then a mutation pointed at an
+absent id. A mutation with no path parameter is never one, because the accepted-token probe
+carries an admin token and would run it for real, and neither is the logout path.
 
 Both limiter layers key on source IP alone, so every call from one runner shares one bucket.
 The client paces itself under that budget and retries a 429 up to a cap; past the cap it

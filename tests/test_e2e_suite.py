@@ -102,10 +102,10 @@ class TestIdentityProbeFromOperations:
 
     def test_logout_loses_to_any_other_protected_operation(self) -> None:
         """Even alongside a candidate it ranks behind, logout is not a candidate at all."""
-        routes = [gated("ANY /api/auth/logout"), gated("ANY /api/admin/db-ops")]
-        operations = [operation("POST", "/api/auth/logout"), operation("POST", "/api/admin/db-ops")]
+        routes = [gated("ANY /api/auth/logout"), gated("ANY /api/builds/{build_id}")]
+        operations = [operation("POST", "/api/auth/logout"), operation("DELETE", "/api/builds/{build_id}")]
         probe = _first_identity_probe(routes, GATE_IDS, operations)
-        assert probe.path == "/api/admin/db-ops"
+        assert probe.path.startswith("/api/builds/")
 
     def test_a_safe_method_outranks_a_parameterised_mutation(self) -> None:
         """A GET changes nothing at all, so it is tried before a DELETE on an absent id."""
@@ -114,13 +114,21 @@ class TestIdentityProbeFromOperations:
         probe = _first_identity_probe(routes, GATE_IDS, operations)
         assert probe.method == "GET"
 
-    def test_a_parameterised_mutation_outranks_a_bare_one(self) -> None:
-        """One points at an absent id and writes nothing; the other executes for real."""
-        routes = [gated("ANY /api/builds/{build_id}"), gated("ANY /api/admin/db-ops")]
-        operations = [operation("DELETE", "/api/builds/{build_id}"), operation("POST", "/api/admin/db-ops")]
+    def test_a_bare_mutation_is_never_a_probe_target(self) -> None:
+        """An accepted admin token would run it for real, so the suite skips rather than risk it."""
+        routes = [gated("ANY /api/admin/db-ops"), gated("ANY /api/admin/db-ops/{proxy+}")]
+        operations = [operation("POST", "/api/admin/db-ops/cars/delete-all"), operation("POST", "/api/admin/db-ops")]
+        with pytest.raises(Skipped):
+            _first_identity_probe(routes, GATE_IDS, operations)
+
+    def test_an_operation_behind_a_proxy_route_is_probed_at_its_own_path(self) -> None:
+        """The route key may be a catch-all; the probe still sends the operation's concrete path."""
+        routes = [gated("ANY /api/users"), gated("ANY /api/users/{proxy+}")]
+        operations = [operation("GET", "/api/users/me")]
         probe = _first_identity_probe(routes, GATE_IDS, operations)
-        assert probe.method == "DELETE"
-        assert probe.path.startswith("/api/builds/")
+        assert probe.method == "GET"
+        assert probe.path == "/api/users/me"
+        assert probe.route_key == "ANY /api/users/{proxy+}"
 
     def test_a_public_operation_is_not_a_probe_target(self) -> None:
         """An operation declaring no security requirement answers 200 to any token."""

@@ -30,10 +30,12 @@ CarModPicker shape of `ANY /api/admin/db-ops` in the route table with only
 `POST /api/admin/db-ops` in the OpenAPI document was still wrong: the fallback looked for
 `GET /api/admin/db-ops` among the declared operations, did not find it, and skipped. The
 probe now resolves to a `ProbeTarget` carrying the matched operation's own method and path,
-so the request reaches the auth dependency rather than a FastAPI 404. Candidates are ordered
+so the request reaches the auth dependency rather than a FastAPI 404, and an operation that
+resolves to a `{proxy+}` key is probed at its own concrete path. Candidates are ordered
 safest first: a GET, HEAD or OPTIONS, then a mutation with a path parameter pointed at an
-absent id, then a mutation with no path parameter. The logout path is never a candidate,
-because probing it would end the run's own session.
+absent id. A mutation with no path parameter is never a candidate, because the accepted-token
+probe carries an admin token and the request would execute for real, and the logout path is
+never one because probing it would end the run's own session.
 
 ## 0.30.1
 
