@@ -161,7 +161,7 @@ def _parametrise_browser_cases(metafunc: pytest.Metafunc) -> None:
     leaving an unparametrised fixture behind, which would error as a missing fixture and
     read as a broken plugin rather than as a product that declared no routes.
     """
-    from . import E2EEnvironment
+    from . import READ_ONLY_REASON, E2EEnvironment, _read_only_from_environ
 
     contract = browser_contract(metafunc.config, E2EEnvironment.from_environ())
     declared: dict[str, tuple[RouteSpec, ...] | tuple[Journey, ...]] = {
@@ -176,6 +176,7 @@ def _parametrise_browser_cases(metafunc: pytest.Metafunc) -> None:
         "guest_only_route": "pytest_e2e_routes declared no guest-only routes",
         "journey": "pytest_e2e_journeys declared no journeys",
     }
+    read_only = _read_only_from_environ()
     for name, values in declared.items():
         if name not in metafunc.fixturenames:
             continue
@@ -183,7 +184,32 @@ def _parametrise_browser_cases(metafunc: pytest.Metafunc) -> None:
             metafunc.parametrize(name, [pytest.param(None, marks=pytest.mark.skip(reason=reasons[name]))])
             continue
         ids = [value.label for value in values]
-        metafunc.parametrize(name, list(values), ids=ids)
+        params = [_browser_param(value, read_only, READ_ONLY_REASON) for value in values]
+        metafunc.parametrize(name, params, ids=ids)
+
+
+def _browser_param(value: RouteSpec | Journey, read_only: bool, reason: str) -> Any:
+    """One parametrised browser case, skipped in read-only mode when it needs a session.
+
+    Marked per parameter rather than per test, because the render case covers both a
+    protected route, which has to be visited signed in, and every public one, which does
+    not. A read-only run keeps the public parameters and skips only the parameters that
+    would need the durable e2e user.
+    """
+    if read_only and _needs_a_session(value):
+        return pytest.param(value, marks=pytest.mark.skip(reason=reason))
+    return value
+
+
+def _needs_a_session(value: RouteSpec | Journey) -> bool:
+    """Whether one declared route or journey can only run as a signed-in user.
+
+    A protected route is visited signed in by definition. A journey says so itself, through
+    `signed_in` or `mutates`, and either one is enough.
+    """
+    if isinstance(value, Journey):
+        return value.signed_in or value.mutates
+    return value.access == "protected"
 
 
 class CollectionInputs:
@@ -373,6 +399,7 @@ class TestReachability:
         """Calling an operation anonymously reaches the API rather than the gate or a 404."""
         self._assert_reachable(operation, anon, "anonymously")
 
+    @pytest.mark.e2e_writes
     def test_authenticated_call_is_answered_by_the_api(self, operation: Operation, api: E2EClient) -> None:
         """Calling an operation as the durable e2e user reaches the API.
 
@@ -432,6 +459,7 @@ def _looks_like_a_gateway_404(response: Any) -> bool:
 class TestIdentity:
     """Group 4: the identity flows and the token shape, plus the staging authorizer probes."""
 
+    @pytest.mark.e2e_writes
     def test_login_returns_an_rs256_token(self, user_session: Any) -> None:
         """The durable user's access token is RS256, not a legacy HS256 one."""
         assert user_session.algorithm == "RS256", (
@@ -439,6 +467,7 @@ class TestIdentity:
             "would mean a resolver still mints one, which is a claim about which code path ran."
         )
 
+    @pytest.mark.e2e_writes
     def test_token_carries_this_environments_issuer_and_audience(self, user_session: Any, e2e_env: Any) -> None:
         """The token's `iss` and `aud` are this environment's, byte for byte.
 
@@ -470,6 +499,7 @@ class TestIdentity:
         )
         assert response.json().get("keys"), "the JWKS document carries no keys"
 
+    @pytest.mark.e2e_writes
     def test_refresh_issues_a_new_token(self, user_session: Any) -> None:
         """The refresh route exchanges the refresh material for a fresh access token."""
         response = refresh(user_session)
@@ -530,6 +560,7 @@ class TestIdentity:
             "authorizer is not checking `exp`."
         )
 
+    @pytest.mark.e2e_writes
     def test_logout_ends_the_session(self, user_session: Any) -> None:
         """The logout route answers, and runs last because it ends the session."""
         response = logout(user_session)
@@ -765,6 +796,7 @@ class TestBrowser:
     it adds the hooks.
     """
 
+    @pytest.mark.e2e_writes
     def test_sign_in_and_out_through_the_ui(
         self,
         page: Any,
@@ -817,6 +849,7 @@ class TestBrowser:
             "an anonymous visitor is the whole reason this case exists."
         )
 
+    @pytest.mark.e2e_writes
     def test_guest_only_routes_redirect_signed_in_users(
         self,
         guest_only_route: RouteSpec,

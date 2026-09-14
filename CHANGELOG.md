@@ -5,6 +5,42 @@ Notable changes to the `webbpulse` package. The version here is the one in
 
 This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## 0.31.0
+
+Adds an anonymous read-only mode to `webbpulse.e2e`, for the run that follows a production
+deploy. The full suite runs against staging; production has no durable e2e user, so only an
+anonymous smoke runs there. `e2e.yml` v3.5.0 exports `E2E_READ_ONLY=true` for production and
+leaves `E2E_USER_EMAIL` and `E2E_USER_PASSWORD` empty.
+
+`E2EEnvironment` gains `read_only`, read from `E2E_READ_ONLY`, and a `signs_in` property the
+fixtures ask instead of the raw flag. When the flag is set the two user variables are no
+longer required at collection; every other variable still is, so a workflow wired wrong is
+still refused up front. The flag is independent of the stage name, so the mode is testable
+against staging.
+
+The mode is enforced in one place rather than per test. A new `e2e_writes` marker names a
+case that signs in, writes or mutates, and a `pytest_collection_modifyitems` hook skips every
+marked case with one shared reason when the flag is set. A product that marks a new mutating
+test of its own gets the production skip for free and cannot ship one that runs there by
+forgetting a conditional. The `user_session` fixture skips rather than attempting a login
+with no credential, which is the backstop for a case that forgot the marker: it can only
+skip, never sign in.
+
+The browser cases are skipped per parameter, not per test, because the render case covers
+both a protected route and every public one. A read-only run keeps the public route
+parameters and skips the protected ones, and skips a journey declaring `signed_in=True` or
+`mutates=True` while keeping the rest.
+
+`pytest_e2e_cleanup` is not invoked at all in read-only mode, in either phase. The run
+creates nothing of its own, and the start phase deletes stale resources, which is exactly
+what a read-only run must not do.
+
+What still runs anonymously: the route cut, gateway coverage, anonymous reachability
+including that a protected operation answers 401 or 403 to an anonymous caller, frontend
+hygiene, the protected-routes-redirect-anonymous-visitors check, every declared public route
+rendering clean, and every journey declaring neither `signed_in` nor `mutates`. Minting stays
+governed by `E2E_MINT_ENABLED` alone and is unchanged.
+
 ## 0.30.2
 
 Fixes two more `webbpulse.e2e` bugs, found by running the suite against CarModPicker

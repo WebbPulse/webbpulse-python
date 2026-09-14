@@ -106,6 +106,9 @@ ignore_missing_imports = true
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 addopts = "-q --strict-markers --strict-config"
+markers = [
+  "e2e_writes: a post-deploy case that signs in, writes or mutates. Skipped when E2E_READ_ONLY is set",
+]
 filterwarnings = [
   "error",
   "ignore:The anyio.abc.BlockingPortal alias is deprecated:DeprecationWarning:starlette.testclient",
