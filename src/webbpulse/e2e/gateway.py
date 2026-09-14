@@ -15,21 +15,29 @@ from dataclasses import dataclass
 from typing import Any
 
 __all__ = [
+    "GATE_AUTHORIZER_SUFFIX",
     "GREEDY",
     "LITERAL",
     "VARIABLE",
+    "Authorizer",
     "Operation",
     "Route",
+    "fetch_authorizers",
     "fetch_routes",
+    "gate_authorizer_ids",
+    "identity_authorization_is_observable",
     "matching_route",
     "operations_from_openapi",
     "resolve",
     "route_key_is_expressible",
+    "route_requires_identity",
 ]
 
 LITERAL = 2
 VARIABLE = 1
 GREEDY = 0
+
+GATE_AUTHORIZER_SUFFIX = "-access-gate-origin-verify"
 
 _METHODS = ("GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS")
 
@@ -59,8 +67,93 @@ class Route:
 
     @property
     def has_authorizer(self) -> bool:
-        """Whether the gateway will run an authorizer before this route's integration."""
+        """Whether the gateway will run any authorizer before this route's integration.
+
+        Structural only, and on a gated staging API that is every route, gate included. Use
+        `route_requires_identity` to ask the question the coverage assertion means.
+        """
         return bool(self.authorizer_id) or self.authorization_type in ("JWT", "CUSTOM", "AWS_IAM")
+
+
+@dataclass(frozen=True)
+class Authorizer:
+    """One authorizer declared on the HTTP API.
+
+    `kind` is the API Gateway type, `REQUEST` for a Lambda authorizer and `JWT` for a
+    native one.
+    """
+
+    authorizer_id: str
+    name: str
+    kind: str
+
+    @property
+    def is_gate(self) -> bool:
+        """Whether this is the staging access gate's origin-verify authorizer.
+
+        The gate is a REQUEST authorizer that `modules/staging-access-gate` always names
+        `<prefix>-access-gate-origin-verify`, so type and name together identify it without
+        a new environment variable. Type alone would not: a product is free to protect a
+        route with a Lambda authorizer of its own.
+        """
+        return self.kind.upper() == "REQUEST" and self.name.endswith(GATE_AUTHORIZER_SUFFIX)
+
+
+def fetch_authorizers(client: Any, api_id: str) -> tuple[Authorizer, ...]:
+    """Every authorizer declared on the API, read through `apigatewayv2 get-authorizers`.
+
+    Paginated by hand for the same reason `fetch_routes` is: botocore ships no paginator
+    for the operation, and a partial list would misclassify the authorizers it did not see.
+    """
+    authorizers: list[Authorizer] = []
+    next_token: str | None = None
+    while True:
+        kwargs: dict[str, Any] = {"ApiId": api_id, "MaxResults": "100"}
+        if next_token:
+            kwargs["NextToken"] = next_token
+        response = client.get_authorizers(**kwargs)
+        for item in response.get("Items", []):
+            authorizers.append(
+                Authorizer(
+                    authorizer_id=str(item.get("AuthorizerId", "")),
+                    name=str(item.get("Name", "")),
+                    kind=str(item.get("AuthorizerType", "")),
+                )
+            )
+        next_token = response.get("NextToken")
+        if not next_token:
+            break
+    return tuple(sorted(authorizers, key=lambda authorizer: authorizer.name))
+
+
+def gate_authorizer_ids(authorizers: Iterable[Authorizer]) -> frozenset[str]:
+    """The ids of the access gate authorizers among a set, which is none in production."""
+    return frozenset(authorizer.authorizer_id for authorizer in authorizers if authorizer.is_gate)
+
+
+def route_requires_identity(route: Route, gate_ids: frozenset[str]) -> bool:
+    """Whether a route is behind an authorizer that checks caller identity.
+
+    The staging access gate admits any request carrying the `x-origin-verify` header or the
+    signed gate cookies, with no notion of who is calling, and the http-api module attaches
+    it to every route it creates including deliberately public ones. Counting it as identity
+    authorization makes every public operation look protected, so it is excluded here and
+    only a non-gate authorizer counts.
+    """
+    if not route.has_authorizer:
+        return False
+    return route.authorizer_id not in gate_ids
+
+
+def identity_authorization_is_observable(routes: Iterable[Route], gate_ids: frozenset[str]) -> bool:
+    """Whether any live route carries a non-gate authorizer, so the structural check means something.
+
+    On a staging API with `identity_jwt` null the gate's Lambda authorizer holds each route's
+    only authorizer slot and verifies the identity token itself, so no route carries a
+    separate identity authorizer and the deployed configuration cannot say which operations
+    require a token. The caller skips rather than failing in that case.
+    """
+    return any(route_requires_identity(route, gate_ids) for route in routes)
 
 
 @dataclass(frozen=True)

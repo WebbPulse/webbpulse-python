@@ -13,13 +13,18 @@ from typing import Any
 import pytest
 
 from webbpulse.e2e.gateway import (
+    Authorizer,
     Operation,
     Route,
+    fetch_authorizers,
     fetch_routes,
+    gate_authorizer_ids,
+    identity_authorization_is_observable,
     matching_route,
     operations_from_openapi,
     resolve,
     route_key_is_expressible,
+    route_requires_identity,
 )
 
 
@@ -41,6 +46,12 @@ class FakeApiGateway:
         self.calls: list[dict[str, Any]] = []
 
     def get_routes(self, **kwargs: Any) -> dict[str, Any]:
+        """Return the page matching the supplied NextToken, recording the call."""
+        self.calls.append(kwargs)
+        index = int(kwargs.get("NextToken", "0"))
+        return self.pages[index]
+
+    def get_authorizers(self, **kwargs: Any) -> dict[str, Any]:
         """Return the page matching the supplied NextToken, recording the call."""
         self.calls.append(kwargs)
         index = int(kwargs.get("NextToken", "0"))
@@ -285,3 +296,152 @@ class TestBareMutation:
         """Reads change nothing, whatever their path."""
         operation = Operation("GET", "/api/users/me", "me", True, (200,))
         assert not operation.is_bare_mutation
+
+
+GATE_ID = "p5vo7t"
+IDENTITY_ID = "jwt123"
+
+GATE = Authorizer(authorizer_id=GATE_ID, name="webbpulse-staging-access-gate-origin-verify", kind="REQUEST")
+IDENTITY = Authorizer(authorizer_id=IDENTITY_ID, name="webbpulse-production-identity-jwt", kind="JWT")
+
+
+def gated(key: str) -> Route:
+    """A route behind the staging access gate alone, which is what staging deploys."""
+    return route(key, authorizer=GATE_ID, auth_type="CUSTOM")
+
+
+def identity_protected(key: str) -> Route:
+    """A route behind the identity JWT authorizer, which is what production deploys."""
+    return route(key, authorizer=IDENTITY_ID, auth_type="JWT")
+
+
+def public(key: str) -> Route:
+    """A route carrying no authorizer at all."""
+    return route(key, auth_type="NONE")
+
+
+class TestGateRecognition:
+    """The access gate is told apart from an identity authorizer by the API's own configuration.
+
+    `modules/staging-access-gate` always names its authorizer
+    `<prefix>-access-gate-origin-verify` and always declares it REQUEST, so the pair
+    identifies the gate with no new environment variable. Type alone would not: a product
+    may protect a route with a Lambda authorizer of its own.
+    """
+
+    def test_the_gate_authorizer_is_recognised(self) -> None:
+        """A REQUEST authorizer with the module's naming is the gate."""
+        assert GATE.is_gate
+
+    def test_a_jwt_authorizer_is_not_the_gate(self) -> None:
+        """The identity JWT authorizer is never the gate."""
+        assert not IDENTITY.is_gate
+
+    def test_a_products_own_request_authorizer_is_not_the_gate(self) -> None:
+        """A REQUEST authorizer that is not named for the gate is left alone."""
+        other = Authorizer(authorizer_id="own", name="carmodpicker-staging-custom-auth", kind="REQUEST")
+        assert not other.is_gate
+
+    def test_a_jwt_authorizer_named_like_the_gate_is_not_the_gate(self) -> None:
+        """Name alone does not make a gate; the type has to be REQUEST too."""
+        impostor = Authorizer(authorizer_id="x", name="webbpulse-staging-access-gate-origin-verify", kind="JWT")
+        assert not impostor.is_gate
+
+    def test_gate_ids_are_collected(self) -> None:
+        """Only the gate authorizers' ids come back."""
+        assert gate_authorizer_ids([GATE, IDENTITY]) == frozenset({GATE_ID})
+
+    def test_production_has_no_gate_ids(self) -> None:
+        """An API with only an identity authorizer yields no gate ids."""
+        assert gate_authorizer_ids([IDENTITY]) == frozenset()
+
+
+class TestGatedStagingApi:
+    """The Portfolio and CarModPicker staging shape: one REQUEST gate authorizer on every route.
+
+    Both staging APIs carry exactly one authorizer, the gate, attached as CUSTOM to every
+    route the http-api module creates including deliberately public ones. `identity_jwt` is
+    null there, so the gate's own Lambda verifies the identity token and no route carries a
+    separate identity authorizer.
+    """
+
+    def test_the_gate_is_not_identity_authorization(self) -> None:
+        """A public route behind the gate does not count as requiring identity."""
+        gate_ids = gate_authorizer_ids([GATE])
+        assert not route_requires_identity(gated("GET /health"), gate_ids)
+
+    def test_every_gated_route_reads_the_same_way(self) -> None:
+        """A protected route and a public one are indistinguishable when only the gate is on."""
+        gate_ids = gate_authorizer_ids([GATE])
+        routes = [gated("GET /health"), gated("POST /api/auth/login"), gated("ANY /api/v1/admin")]
+        assert not any(route_requires_identity(item, gate_ids) for item in routes)
+
+    def test_identity_authorization_is_not_observable(self) -> None:
+        """With only the gate deployed, the route table cannot say which routes need a token."""
+        gate_ids = gate_authorizer_ids([GATE])
+        routes = [gated("GET /health"), gated("ANY /api/v1/admin")]
+        assert not identity_authorization_is_observable(routes, gate_ids)
+
+    def test_an_explicitly_open_route_is_still_not_identity(self) -> None:
+        """The two NONE routes Portfolio staging carries stay unprotected."""
+        gate_ids = gate_authorizer_ids([GATE])
+        assert not route_requires_identity(public("GET /api/auth/.well-known/jwks.json"), gate_ids)
+
+
+class TestProductionApi:
+    """The production shape: a JWT identity authorizer on the routes that need one, no gate."""
+
+    def test_a_jwt_route_requires_identity(self) -> None:
+        """A route behind the identity JWT authorizer requires identity."""
+        gate_ids = gate_authorizer_ids([IDENTITY])
+        assert route_requires_identity(identity_protected("ANY /api/v1/admin"), gate_ids)
+
+    def test_an_unflagged_route_does_not(self) -> None:
+        """A NONE route requires no identity."""
+        gate_ids = gate_authorizer_ids([IDENTITY])
+        assert not route_requires_identity(public("GET /health"), gate_ids)
+
+    def test_identity_authorization_is_observable(self) -> None:
+        """With a real identity authorizer attached, the structural check means something."""
+        gate_ids = gate_authorizer_ids([IDENTITY])
+        routes = [public("GET /health"), identity_protected("ANY /api/v1/admin")]
+        assert identity_authorization_is_observable(routes, gate_ids)
+
+    def test_identity_is_observable_alongside_the_gate(self) -> None:
+        """A gated API that also attaches an identity authorizer is still checkable."""
+        gate_ids = gate_authorizer_ids([GATE, IDENTITY])
+        routes = [gated("GET /health"), identity_protected("ANY /api/v1/admin")]
+        assert identity_authorization_is_observable(routes, gate_ids)
+        assert not route_requires_identity(routes[0], gate_ids)
+        assert route_requires_identity(routes[1], gate_ids)
+
+
+class TestFetchAuthorizers:
+    """`get-authorizers` is paged by hand, since botocore ships no paginator for it."""
+
+    def test_every_page_is_read(self) -> None:
+        """An authorizer on the second page is not lost."""
+        client = FakeApiGateway(
+            [
+                {
+                    "Items": [
+                        {"AuthorizerId": GATE_ID, "Name": GATE.name, "AuthorizerType": "REQUEST"},
+                    ],
+                    "NextToken": "1",
+                },
+                {
+                    "Items": [
+                        {"AuthorizerId": IDENTITY_ID, "Name": IDENTITY.name, "AuthorizerType": "JWT"},
+                    ]
+                },
+            ]
+        )
+        authorizers = fetch_authorizers(client, "api-1")
+        assert len(authorizers) == 2
+        assert gate_authorizer_ids(authorizers) == frozenset({GATE_ID})
+
+    def test_an_api_with_no_authorizers_is_empty(self) -> None:
+        """An API declaring no authorizer yields no gate ids rather than raising."""
+        client = FakeApiGateway([{"Items": []}])
+        assert fetch_authorizers(client, "api-1") == ()
+        assert gate_authorizer_ids(fetch_authorizers(client, "api-1")) == frozenset()

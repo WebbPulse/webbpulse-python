@@ -20,7 +20,7 @@ journey is one junit case:
 | Group | Asks |
 | --- | --- |
 | `TestRouteCut` | Every live route key is expressible, has an integration, and the access log confirms which key served the probe |
-| `TestCoverage` | Every OpenAPI operation resolves to a live route, carries no trailing slash, and lands on a route whose authorizer matches its security requirement |
+| `TestCoverage` | Every OpenAPI operation resolves to a live route, carries no trailing slash, and lands on a route whose identity authorizer matches its security requirement. The staging access gate does not count as identity, and where it is the only authorizer the check is skipped |
 | `TestReachability` | Every operation is answered by the API rather than by the gate, the limiter or a catch-all. A mutation with no path parameter is probed anonymously only, so the run never signs its own user out |
 | `TestIdentity` | Login returns an RS256 token carrying this environment's issuer and audience, refresh and logout work, the JWKS is reachable without the gate header, and a minted token with the wrong audience or an expired one is rejected |
 | `TestFrontend` | The web origin serves the app shell, an unknown path renders it too, the bundle references this environment's API and no legacy route name, and the CORS preflight allows the headers the shared client sends. It goes through the staging gate on signed cookies, not the origin header |
@@ -72,6 +72,20 @@ value from SSM with decryption and puts it in a header, and nothing prints it. A
 with the parameter unset fails there rather than answering 401 to every probe, because the
 gate's 401 reads exactly like a broken route.
 
+The gate authorizer is not identity. It admits any caller presenting `x-origin-verify` or the
+signed gate cookies without asking who they are, and the `http-api` module attaches it to
+every route it creates, deliberately public ones included. The plugin recognises it from the
+API's own configuration, by REQUEST type plus the `<prefix>-access-gate-origin-verify` name
+`modules/staging-access-gate` always gives it, so no extra variable names it. Only a non-gate
+authorizer counts as identity authorization, and the minted-token probes pick a route that
+actually requires one.
+
+On a staging API configured with `identity_jwt` null, the gate's own Lambda verifies the
+identity token and holds each route's only authorizer slot, so no route carries a separate
+identity authorizer. The deployed route table then cannot say which operations need a token,
+and `TestCoverage` skips that check with that reason rather than failing every public
+operation.
+
 The web origin has its own gate, and it does not read a header. A CloudFront viewer-request
 function admits a request only when it carries valid CloudFront signed cookies, so the plugin
 signs its own: it reads the RSA key from `E2E_GATE_SIGNING_KEY_SSM_PARAMETER` with decryption
@@ -91,6 +105,7 @@ kept out of the dataclass repr, so a pytest failure report cannot leak a live se
 | `api` | The authenticated client, sharing the anonymous client's pacer |
 | `minted_token` | Mints a token through KMS with no login. Skips unless `E2E_MINT_ENABLED` is set |
 | `gateway_routes`, `route_keys` | The live routes, read once per run |
+| `gateway_authorizers`, `gate_authorizers` | The API's authorizers, and the ids of the access gate ones among them |
 | `openapi_document`, `openapi_operations` | The product's document and its operations |
 | `access_log` | Find an access log entry by request id, with a bounded wait |
 | `http` | A plain client for the web origin, carrying no API gate header |

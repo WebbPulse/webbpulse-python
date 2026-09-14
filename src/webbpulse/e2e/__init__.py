@@ -28,7 +28,15 @@ import pytest
 from .access_log import AccessLogLookup
 from .client import DEFAULT_PER_MINUTE, E2EClient
 from .gate import GateCookies
-from .gateway import Operation, Route, fetch_routes, operations_from_openapi
+from .gateway import (
+    Authorizer,
+    Operation,
+    Route,
+    fetch_authorizers,
+    fetch_routes,
+    gate_authorizer_ids,
+    operations_from_openapi,
+)
 from .identity import IdentitySession, login, mint
 from .journeys import (
     Click,
@@ -351,6 +359,23 @@ def gateway_routes(request: pytest.FixtureRequest, e2e_env: E2EEnvironment, boto
             "vacuously rather than say the api id is wrong."
         )
     return routes
+
+
+@pytest.fixture(scope="session")
+def gateway_authorizers(e2e_env: E2EEnvironment, boto3_session: Any) -> tuple[Authorizer, ...]:
+    """Every authorizer declared on the API, which is how the gate is told apart from identity."""
+    return fetch_authorizers(boto3_session.client("apigatewayv2"), e2e_env.api_id)
+
+
+@pytest.fixture(scope="session")
+def gate_authorizers(gateway_authorizers: Sequence[Authorizer]) -> frozenset[str]:
+    """Ids of the access gate authorizers on this API, empty in production.
+
+    The gate authorizer is recognised from the API configuration itself, by REQUEST type
+    plus the module's own `-access-gate-origin-verify` naming, so no environment variable
+    has to name it.
+    """
+    return gate_authorizer_ids(gateway_authorizers)
 
 
 @pytest.fixture(scope="session")
