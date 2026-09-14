@@ -101,6 +101,16 @@ class TestPacer:
         pacer.before_call()
         assert clock.slept == []
 
+    def test_a_zero_budget_never_waits(self) -> None:
+        """Zero means the target is not rate limited, so no call is ever held back."""
+        clock = Clock()
+        pacer = Pacer(per_minute=0, sleeper=clock.sleep, clock=clock)
+        for _ in range(50):
+            pacer.before_call()
+            pacer.after_call({})
+        assert clock.slept == []
+        assert pacer.slept_seconds == 0
+
     def test_it_waits_out_the_window_once_the_budget_is_spent(self) -> None:
         """With the budget spent, the next call waits for the rest of the minute."""
         clock = Clock()

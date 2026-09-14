@@ -52,9 +52,12 @@ absent id. A mutation with no path parameter is never one, because the accepted-
 carries an admin token and would run it for real, and neither is the logout path.
 
 Both limiter layers key on source IP alone, so every call from one runner shares one bucket.
-The client paces itself under that budget and retries a 429 up to a cap; past the cap it
-raises rather than banking the 429 as a pass, because a 429 is evidence about the limiter and
-none at all about the route.
+Against staging nothing paces: the services there run with rate limiting off by the
+`rate_limits_apply` convention, and the client's budget is zero for the same reason, so the
+full suite runs as fast as the API answers. Against any other environment the client paces
+itself under the budget and retries a 429 up to a cap; past the cap it raises rather than
+banking the 429 as a pass, because a 429 is evidence about the limiter and none at all about
+the route.
 
 ## Configuration
 
@@ -170,9 +173,9 @@ it, and `mint_test_token` refuses production independently of the flag.
 
 | Fixture | Gives |
 | --- | --- |
-| `e2e_env` | The parsed `E2EEnvironment`, including `resource_prefix` and `is_production` |
+| `e2e_env` | The parsed `E2EEnvironment`, including `resource_prefix`, `is_production` and `rate_limited` |
 | `gate_headers` | The `x-origin-verify` header, or an empty mapping in production |
-| `anon` | A paced client carrying the gate header and no identity |
+| `anon` | A client carrying the gate header and no identity, paced everywhere but staging |
 | `user_session` | The durable user signed in through the real login route. Skips in read-only mode |
 | `api` | The authenticated client, sharing the anonymous client's pacer |
 | `minted_token` | Mints a token through KMS with no login. Skips unless `E2E_MINT_ENABLED` is set, in read-only mode too |

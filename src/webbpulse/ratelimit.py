@@ -511,6 +511,9 @@ def rate_limit_middleware(
 
     An allowed request carries the RateLimit headers on its response, and a failed-open one
     carries none, so a full quota is never advertised from a limiter that is not counting.
+
+    `enabled` is asked on every request; pass `lambda: settings.rate_limiting_enabled` so the
+    middleware follows the environment convention and staging runs unlimited.
     """
     from starlette.concurrency import run_in_threadpool
     from starlette.responses import Response as StarletteResponse

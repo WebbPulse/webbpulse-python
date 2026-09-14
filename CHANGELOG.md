@@ -5,6 +5,18 @@ Notable changes to the `webbpulse` package. The version here is the one in
 
 This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## 0.32.0
+
+Staging is never rate limited, as one convention shared by the services and the e2e suite.
+`webbpulse.config` gains `RATE_LIMIT_FREE_ENVIRONMENTS`, `rate_limits_apply(environment)`
+and the `BaseServiceSettings.rate_limiting_enabled` property; wire every limiter a service
+has through the property, including `rate_limit_middleware(enabled=...)`. Reaching staging
+already takes the access gate, and the full suite runs there, so throttling it only paces
+the tests. Every other environment keeps its limits.
+
+`E2EEnvironment.rate_limited` reads the same convention and the `anon` client's budget is
+zero against staging, so `Pacer` never waits there; a zero `per_minute` now means unpaced.
+
 ## 0.31.0
 
 Adds an anonymous read-only mode to `webbpulse.e2e`, for the run that follows a production
