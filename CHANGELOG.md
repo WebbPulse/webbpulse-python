@@ -5,6 +5,29 @@ Notable changes to the `webbpulse` package. The version here is the one in
 
 This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## 0.38.2
+
+A failing ephemeral e2e user route now says why it failed.
+
+`create_ephemeral_user` raised a message naming only the status, so today's CarModPicker
+staging 422 reported that the route answered 422 and nothing about the cause, which was a
+validation error the shared envelope described in full. The raised message now renders that
+envelope: `error_code`, `message`, `request_id` and one compact line per `details` entry,
+with a raw `loc`/`msg` detail read as well as the `field`/`message` shape. A body that is
+not JSON is excerpted to 300 characters, and an empty body says so rather than rendering as
+nothing. Only the response is read, so neither the generated password nor the admin token
+can reach a message.
+
+Cleanup gained the same rendering through the new `describe_delete_failure`, which returns
+why a delete failed instead of discarding it, and the session teardown warning now names
+that reason. `delete_ephemeral_user` keeps its boolean contract and its promise never to
+raise.
+
+`admin_mint_token` no longer swallows a mint failure in silence. A run that asked to mint
+and could not now warns with the exception type and message before falling back to the
+durable user, so a denied KMS call is visible in the run output rather than looking like an
+ordinary durable-user run. No token value reaches the warning.
+
 ## 0.38.1
 
 The ephemeral e2e user routes answer requests again. FastAPI resolved the handlers'

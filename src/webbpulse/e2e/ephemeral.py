@@ -22,6 +22,7 @@ from dataclasses import dataclass, field
 from typing import Any, Final, Protocol
 
 __all__ = [
+    "BODY_EXCERPT_LIMIT",
     "CREATE_PATH",
     "PASSWORD_LENGTH",
     "Credentials",
@@ -29,6 +30,8 @@ __all__ = [
     "TokenClient",
     "create_ephemeral_user",
     "delete_ephemeral_user",
+    "describe_delete_failure",
+    "describe_error_body",
     "ephemeral_email",
     "generate_password",
     "item_path",
@@ -37,6 +40,10 @@ __all__ = [
 CREATE_PATH: Final = "/api/auth/e2e/users"
 
 PASSWORD_LENGTH: Final = 32
+
+BODY_EXCERPT_LIMIT: Final = 300
+
+DETAIL_LIMIT: Final = 10
 
 _ALPHABET: Final = string.ascii_letters + string.digits
 
@@ -55,6 +62,70 @@ class TokenClient(Protocol):
     def request(self, method: str, path: str, *, json: Any = None) -> Any:
         """Send one request and return the response."""
         ...
+
+
+def _detail_entry(entry: Any) -> str:
+    """One validation detail rendered as `field: message (type)`, from whatever shape it has."""
+    if not isinstance(entry, dict):
+        return str(entry)
+    field_name = entry.get("field")
+    if field_name is None:
+        location = entry.get("loc")
+        if isinstance(location, (list, tuple)):
+            field_name = ".".join(str(part) for part in location)
+    rendered = str(field_name) if field_name else "?"
+    message = entry.get("message") or entry.get("msg")
+    if message:
+        rendered = f"{rendered}: {message}"
+    kind = entry.get("type")
+    if kind:
+        rendered = f"{rendered} ({kind})"
+    return rendered
+
+
+def _detail_text(details: Any) -> str:
+    """A compact rendering of the envelope's `details`, or the empty string when it holds none."""
+    if isinstance(details, dict):
+        details = [details]
+    if not isinstance(details, (list, tuple)) or not details:
+        return ""
+    shown = [_detail_entry(entry) for entry in list(details)[:DETAIL_LIMIT]]
+    text = "; ".join(part for part in shown if part)
+    if len(details) > DETAIL_LIMIT:
+        text = f"{text}; ... {len(details) - DETAIL_LIMIT} more"
+    return text
+
+
+def describe_error_body(response: Any) -> str:
+    """What the failing response said, safe to put in a message a person reads.
+
+    A JSON body is read as the shared error envelope and rendered from its `error_code`,
+    `message`, `request_id` and `details`. Anything else is excerpted to at most
+    `BODY_EXCERPT_LIMIT` characters. Only the response is read, so no request payload and no
+    credential can reach the result.
+    """
+    try:
+        payload = response.json()
+    except Exception:
+        payload = None
+    if isinstance(payload, dict):
+        parts = []
+        for key in ("error_code", "message", "request_id"):
+            value = payload.get(key)
+            if value:
+                parts.append(f"{key}={value}")
+        detail_text = _detail_text(payload.get("details"))
+        if detail_text:
+            parts.append(f"details=[{detail_text}]")
+        if parts:
+            return " ".join(parts)
+    text = str(getattr(response, "text", "") or "")
+    if not text.strip():
+        return "the body was empty"
+    excerpt = text[:BODY_EXCERPT_LIMIT]
+    if len(text) > BODY_EXCERPT_LIMIT:
+        excerpt = f"{excerpt}..."
+    return f"body={excerpt}"
 
 
 def item_path(user_id: str, *, create_path: str = CREATE_PATH) -> str:
@@ -142,7 +213,7 @@ def create_ephemeral_user(
         raise RuntimeError(
             f"POST {create_path} answered {response.status_code} rather than creating this "
             "run's ephemeral e2e user. The route is mounted, so this is a real failure "
-            "rather than a deployment that does not offer it."
+            f"rather than a deployment that does not offer it. It said: {describe_error_body(response)}"
         )
     try:
         payload = response.json()
@@ -170,9 +241,21 @@ def delete_ephemeral_user(client: TokenClient, user: EphemeralUser, *, admin_tok
     run's results with a teardown error. A failure is reported by the return value and the
     caller turns it into a warning.
     """
+    return not describe_delete_failure(client, user, admin_token=admin_token)
+
+
+def describe_delete_failure(client: TokenClient, user: EphemeralUser, *, admin_token: str) -> str:
+    """Delete this run's user, returning why it failed or the empty string when it worked.
+
+    The same never-raising contract as `delete_ephemeral_user`, with the reason kept rather
+    than discarded so the caller's teardown warning can name it. Only the response and the
+    exception are read, so neither the password nor the admin token can reach the result.
+    """
     path = item_path(user.user_id, create_path=user.create_path)
     try:
         response = client.with_token(admin_token).request("DELETE", path)
-    except Exception:
-        return False
-    return bool(response.status_code == 200)
+    except Exception as error:
+        return f"DELETE {path} raised {type(error).__name__}: {error}"
+    if response.status_code == 200:
+        return ""
+    return f"DELETE {path} answered {response.status_code}. It said: {describe_error_body(response)}"
