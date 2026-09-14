@@ -23,9 +23,13 @@ if TYPE_CHECKING:  # pragma: no cover
     from webbpulse.dynamodb import Repository
     from webbpulse.identity.oauth import OAuthLinkStore, OAuthStateStore
 
+    TABLES: tuple[TableSpec, ...]
+
 __all__ = [
+    "BILLING_MODE",
     "CREDENTIALS_TABLE",
     "IDENTITY_TOKENS_TABLE",
+    "IDENTITY_TTL_ATTRIBUTE",
     "PASSKEYS_TABLE",
     "PASSKEY_CREDENTIAL_INDEX",
     "RECOVERY_CODES_TABLE",
@@ -33,6 +37,7 @@ __all__ = [
     "REFRESH_TOKENS_TABLE",
     "REFRESH_USER_INDEX",
     "REFRESH_USER_INDEX_ENV",
+    "TABLES",
     "TOTP_FACTORS_TABLE",
     "USERS_TABLE",
     "WEBAUTHN_CHALLENGES_TABLE",
@@ -62,6 +67,9 @@ __all__ = [
     "RecoveryCodeStore",
     "RefreshTokenRecord",
     "RefreshTokenStore",
+    "TableAttribute",
+    "TableIndex",
+    "TableSpec",
     "TotpFactorRecord",
     "TotpFactorStore",
     "WebAuthnChallengeRecord",
@@ -89,6 +97,12 @@ REFRESH_USER_INDEX: Final = "user_id-family_id-index"
 REFRESH_USER_INDEX_ENV: Final = "IDENTITY_REFRESH_USER_INDEX"
 
 PASSKEY_CREDENTIAL_INDEX: Final = "credential_id-index"
+
+IDENTITY_TTL_ATTRIBUTE: Final = "expires_at"
+"""The TTL attribute on every identity table that has one. Only session state expires."""
+
+BILLING_MODE: Final = "PAY_PER_REQUEST"
+"""On-demand billing, matching the platform module's default for every identity table."""
 
 type IdentityTokenPurpose = Literal["verify_email", "reset_password", "mfa_ticket"]
 
@@ -1583,3 +1597,188 @@ def constant_time_equals(left: str, right: str) -> bool:
     not remove it, because the attacker controls one of them.
     """
     return hmac.compare_digest(left, right)
+
+
+@dataclass(frozen=True, slots=True)
+class TableAttribute:
+    """One key attribute definition: its name and its DynamoDB scalar type."""
+
+    name: str
+    type: Literal["S", "N", "B"]
+
+
+@dataclass(frozen=True, slots=True)
+class TableIndex:
+    """One global secondary index: its name, its key schema and its projection."""
+
+    name: str
+    hash_key: str
+    range_key: str | None = None
+    projection_type: Literal["ALL", "KEYS_ONLY", "INCLUDE"] = "ALL"
+    non_key_attributes: tuple[str, ...] = ()
+
+    def to_request(self) -> dict[str, Any]:
+        """The `GlobalSecondaryIndexes` entry for this index, as `create_table` wants it."""
+        key_schema = [{"AttributeName": self.hash_key, "KeyType": "HASH"}]
+        if self.range_key is not None:
+            key_schema.append({"AttributeName": self.range_key, "KeyType": "RANGE"})
+        projection: dict[str, Any] = {"ProjectionType": self.projection_type}
+        if self.non_key_attributes:
+            projection["NonKeyAttributes"] = list(self.non_key_attributes)
+        return {"IndexName": self.name, "KeySchema": key_schema, "Projection": projection}
+
+
+@dataclass(frozen=True, slots=True)
+class TableSpec:
+    """One identity table, in the shape the platform module provisions it.
+
+    The authority is `platform-modules/aws//modules/identity`, whose `tables` default is
+    this same set. A local bootstrap built from these specs creates tables a deployed
+    service would recognise, so a query that works locally is not one the deployed table
+    cannot serve.
+    """
+
+    logical_name: str
+    attributes: tuple[TableAttribute, ...]
+    hash_key: str
+    range_key: str | None = None
+    global_secondary_indexes: tuple[TableIndex, ...] = ()
+    ttl_attribute: str | None = None
+
+    def table_name(self, prefix: str = "") -> str:
+        """The physical table name under `prefix`, by the estate's `<prefix>-<logical>` rule."""
+        from webbpulse.dynamodb import table_name
+
+        return table_name(self.logical_name, prefix)
+
+    def create_table_request(self, prefix: str = "") -> dict[str, Any]:
+        """The `dynamodb:CreateTable` keyword arguments for this table under `prefix`.
+
+        Billing is always `PAY_PER_REQUEST`, matching the module's default: the identity
+        access patterns are point lookups whose volume tracks sign-ins. The TTL is not part
+        of `CreateTable` and is applied separately through `update_time_to_live`.
+        """
+        key_schema = [{"AttributeName": self.hash_key, "KeyType": "HASH"}]
+        if self.range_key is not None:
+            key_schema.append({"AttributeName": self.range_key, "KeyType": "RANGE"})
+        request: dict[str, Any] = {
+            "TableName": self.table_name(prefix),
+            "BillingMode": BILLING_MODE,
+            "KeySchema": key_schema,
+            "AttributeDefinitions": [
+                {"AttributeName": attribute.name, "AttributeType": attribute.type} for attribute in self.attributes
+            ],
+        }
+        if self.global_secondary_indexes:
+            request["GlobalSecondaryIndexes"] = [index.to_request() for index in self.global_secondary_indexes]
+        return request
+
+    def time_to_live_request(self, prefix: str = "") -> dict[str, Any] | None:
+        """The `dynamodb:UpdateTimeToLive` keyword arguments, or `None` when the table has no TTL."""
+        if self.ttl_attribute is None:
+            return None
+        return {
+            "TableName": self.table_name(prefix),
+            "TimeToLiveSpecification": {"Enabled": True, "AttributeName": self.ttl_attribute},
+        }
+
+
+def _build_tables() -> tuple[TableSpec, ...]:
+    """Build the ten identity table specs, resolving the names each module owns.
+
+    The OAuth and lockout table names live in sibling modules that import this one, so they
+    are resolved here rather than at import time.
+    """
+    from webbpulse.identity.lockout import LOGIN_ATTEMPTS_TABLE
+    from webbpulse.identity.oauth import OAUTH_LINK_USER_INDEX, OAUTH_LINKS_TABLE, OAUTH_STATES_TABLE
+
+    return (
+        TableSpec(
+            logical_name=CREDENTIALS_TABLE,
+            attributes=(TableAttribute("user_id", "S"), TableAttribute("credential_type", "S")),
+            hash_key="user_id",
+            range_key="credential_type",
+        ),
+        TableSpec(
+            logical_name=REFRESH_TOKENS_TABLE,
+            attributes=(
+                TableAttribute("token_hash", "S"),
+                TableAttribute("family_id", "S"),
+                TableAttribute("generation", "N"),
+                TableAttribute("user_id", "S"),
+            ),
+            hash_key="token_hash",
+            global_secondary_indexes=(
+                TableIndex(name=REFRESH_FAMILY_INDEX, hash_key="family_id", range_key="generation"),
+                TableIndex(
+                    name=REFRESH_USER_INDEX,
+                    hash_key="user_id",
+                    range_key="family_id",
+                    projection_type="KEYS_ONLY",
+                ),
+            ),
+            ttl_attribute=IDENTITY_TTL_ATTRIBUTE,
+        ),
+        TableSpec(
+            logical_name=LOGIN_ATTEMPTS_TABLE,
+            attributes=(TableAttribute("identity_key", "S"), TableAttribute("attempted_at", "S")),
+            hash_key="identity_key",
+            range_key="attempted_at",
+            ttl_attribute=IDENTITY_TTL_ATTRIBUTE,
+        ),
+        TableSpec(
+            logical_name=IDENTITY_TOKENS_TABLE,
+            attributes=(TableAttribute("token_hash", "S"),),
+            hash_key="token_hash",
+            ttl_attribute=IDENTITY_TTL_ATTRIBUTE,
+        ),
+        TableSpec(
+            logical_name=TOTP_FACTORS_TABLE,
+            attributes=(TableAttribute("user_id", "S"),),
+            hash_key="user_id",
+        ),
+        TableSpec(
+            logical_name=RECOVERY_CODES_TABLE,
+            attributes=(TableAttribute("user_id", "S"), TableAttribute("code_hash", "S")),
+            hash_key="user_id",
+            range_key="code_hash",
+        ),
+        TableSpec(
+            logical_name=PASSKEYS_TABLE,
+            attributes=(TableAttribute("user_id", "S"), TableAttribute("credential_id", "S")),
+            hash_key="user_id",
+            range_key="credential_id",
+            global_secondary_indexes=(TableIndex(name=PASSKEY_CREDENTIAL_INDEX, hash_key="credential_id"),),
+        ),
+        TableSpec(
+            logical_name=WEBAUTHN_CHALLENGES_TABLE,
+            attributes=(TableAttribute("challenge_id", "S"),),
+            hash_key="challenge_id",
+            ttl_attribute=IDENTITY_TTL_ATTRIBUTE,
+        ),
+        TableSpec(
+            logical_name=OAUTH_STATES_TABLE,
+            attributes=(TableAttribute("state", "S"),),
+            hash_key="state",
+            ttl_attribute=IDENTITY_TTL_ATTRIBUTE,
+        ),
+        TableSpec(
+            logical_name=OAUTH_LINKS_TABLE,
+            attributes=(TableAttribute("provider_subject", "S"), TableAttribute("user_id", "S")),
+            hash_key="provider_subject",
+            global_secondary_indexes=(TableIndex(name=OAUTH_LINK_USER_INDEX, hash_key="user_id"),),
+        ),
+    )
+
+
+def __getattr__(name: str) -> Any:
+    """Resolve `TABLES` on first access, so the OAuth and lockout imports stay lazy.
+
+    `oauth` imports this module at its top, so a module-level import of its table names
+    here would be a cycle. Building the tuple on demand keeps the import graph one way.
+    """
+    if name == "TABLES":
+        tables = _build_tables()
+        globals()["TABLES"] = tables
+        return tables
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

@@ -22,15 +22,18 @@ OAuth needs the `oauth` extra on top of `identity`, for `httpx`, and passkeys ne
 neither: both are constructed lazily, so importing the package without them works.
 
 ```python
-import boto3
-from webbpulse.identity import IdentitySettings, TokenService, build_identity_router
+from webbpulse.identity import IdentitySettings, TokenService, build_identity_router, signing_client
 
 settings = IdentitySettings()  # reads IDENTITY_* from the environment
-tokens = TokenService(settings, boto3.client("kms"))
+tokens = TokenService(settings, signing_client(settings))
 
 # One per execution environment: it caches a JWK per configured key.
 app.include_router(build_identity_router(settings, hooks, stores, tokens=tokens))
 ```
+
+`signing_client` returns a boto3 KMS client, or `LocalSigner` when `IDENTITY_SIGNER=local`.
+See [the configuration surface](identity-configuration.md) for the switch and
+[the data model](identity-data-model.md) for `TABLES`.
 
 | Piece | What it owns |
 | --- | --- |
@@ -46,6 +49,8 @@ app.include_router(build_identity_router(settings, hooks, stores, tokens=tokens)
 | `EnvelopeCipher` | Sealing a TOTP seed under a per-secret KMS data key with a per-user encryption context |
 | `EmailSender` | Sending mail, with an SES v2 implementation and a recording one for tests |
 | `TokenService` | Minting, local verification, JWKS, discovery, rotation across keys |
+| `LocalSigner` | An in-process RSA signer standing in for KMS on a local stack, refused in production |
+| `TABLES` | The ten identity tables as `TableSpec`, matching the Terraform identity module |
 | `JwksVerifier` | Verifying an access token against the issuer's published JWKS, with no KMS grant |
 | `authorizer_claims` | Reading and coercing what the authorizer put on the request |
 | `CredentialStore` and friends | Storage interfaces, with DynamoDB and in-memory implementations |

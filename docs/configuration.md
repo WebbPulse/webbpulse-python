@@ -27,10 +27,13 @@ Construct settings behind a cache in the service, not at import, so a missing en
 variable fails a request rather than the whole cold start.
 
 `environment` drives two properties. `is_production` is true for production only, never
-staging. `rate_limiting_enabled` is false for staging and true everywhere else, by the
-`rate_limits_apply` convention: staging sits behind the access gate and hosts the full e2e
-suite, so nothing in it throttles. Wire every limiter through that property rather than a
-product variable, and the e2e client stops pacing itself against staging for the same reason.
+staging. `rate_limiting_enabled` is false for the environments in
+`RATE_LIMIT_FREE_ENVIRONMENTS`, which are `staging` and `local`, and true everywhere else, by
+the `rate_limits_apply` convention. Staging sits behind the access gate and hosts the full e2e
+suite, so nothing in it throttles; a local stack is one developer or one CI runner sharing a
+single source IP bucket, so the limiter would pace a run it protects nothing from. Wire every
+limiter through that property rather than a product variable, and the e2e client stops pacing
+itself against either for the same reason.
 
 List-valued environment variables accept both JSON and the bare comma-separated form, so
 `CORS_ALLOW_ORIGINS=https://a.example,https://b.example` works. That needed a custom

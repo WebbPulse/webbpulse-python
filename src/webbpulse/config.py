@@ -33,7 +33,7 @@ Environment = Literal["local", "test", "staging", "production"]
 
 APP_SECRETS_ARN_ENV = "APP_SECRETS_ARN"
 
-RATE_LIMIT_FREE_ENVIRONMENTS: frozenset[str] = frozenset({"staging"})
+RATE_LIMIT_FREE_ENVIRONMENTS: frozenset[str] = frozenset({"local", "staging"})
 
 _LOG_LEVELS = frozenset({"CRITICAL", "ERROR", "WARNING", "INFO", "DEBUG", "NOTSET"})
 
@@ -46,8 +46,10 @@ def rate_limits_apply(environment: str) -> bool:
     """Whether a deployment named `environment` rate limits its callers at all.
 
     Staging never does: reaching it already takes the access gate, and the full e2e suite
-    runs there at whatever speed it can. Every other environment, local included, keeps its
-    limits so the limiter is exercised everywhere a person can reach without the gate.
+    runs there at whatever speed it can. Local never does either: a local stack is one
+    developer or one CI runner sharing a single source IP bucket, so the limiter would pace
+    a run it protects nothing from. Test and production keep their limits, so the limiter is
+    exercised in the suite and applies everywhere a stranger can reach.
     """
     return environment.strip().lower() not in RATE_LIMIT_FREE_ENVIRONMENTS
 

@@ -79,9 +79,9 @@ absent id. A mutation with no path parameter is never one, because the accepted-
 carries an admin token and would run it for real, and neither is the logout path.
 
 Both limiter layers key on source IP alone, so every call from one runner shares one bucket.
-Against staging nothing paces: the services there run with rate limiting off by the
-`rate_limits_apply` convention, and the client's budget is zero for the same reason, so the
-full suite runs as fast as the API answers. Against any other environment the client paces
+Against staging and against a local stack nothing paces: the services there run with rate
+limiting off by the `rate_limits_apply` convention, and the client's budget is zero for the
+same reason, so the full suite runs as fast as the API answers. Against any other environment the client paces
 itself under the budget and retries a 429 up to a cap; past the cap it raises rather than
 banking the 429 as a pass, because a 429 is evidence about the limiter and none at all about
 the route.

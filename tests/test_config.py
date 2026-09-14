@@ -11,6 +11,7 @@ from moto import mock_aws
 from pytest import MonkeyPatch
 
 from webbpulse.config import (
+    RATE_LIMIT_FREE_ENVIRONMENTS,
     BaseServiceSettings,
     SecretNotJsonObjectError,
     load_json_secret,
@@ -164,11 +165,12 @@ def test_importing_the_module_calls_no_aws(monkeypatch: MonkeyPatch) -> None:
     ServiceSettings()
 
 
-def test_staging_is_the_only_rate_limit_free_environment() -> None:
-    """The convention every limiter follows: staging never limits, the rest always do."""
-    assert rate_limits_apply("staging") is False
-    assert rate_limits_apply(" Staging ") is False
-    for environment in ("local", "test", "production"):
+def test_staging_and_local_are_the_rate_limit_free_environments() -> None:
+    """The convention every limiter follows: staging and local never limit, the rest always do."""
+    assert frozenset({"local", "staging"}) == RATE_LIMIT_FREE_ENVIRONMENTS
+    for free in ("staging", " Staging ", "local", " LOCAL "):
+        assert rate_limits_apply(free) is False
+    for environment in ("test", "production"):
         assert rate_limits_apply(environment) is True
 
 
