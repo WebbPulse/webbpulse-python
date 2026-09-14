@@ -24,7 +24,7 @@ journey is one junit case:
 | `TestReachability` | Every operation is answered by the API rather than by the gate, the limiter or a catch-all. A mutation with no path parameter is probed anonymously only, so the run never signs its own user out |
 | `TestIdentity` | Login returns an RS256 token carrying this environment's issuer and audience, refresh and logout work, the JWKS is reachable without the gate header, and a minted token with the wrong audience or an expired one is rejected |
 | `TestFrontend` | The web origin serves the app shell, an unknown path renders it too, the bundle references this environment's API and no legacy route name, and the CORS preflight allows the headers the shared client sends. It goes through the staging gate on signed cookies, not the origin header |
-| `TestBrowser` | A real browser signs in and out through the UI, every protected route bounces an anonymous visitor, every guest-only route bounces a signed-in one, every declared route paints with no console error and no failed API call, and every declared journey runs. An anonymous visit's own 401 or 403 is exempt in both collectors, because the browser reports one such response twice |
+| `TestBrowser` | A real browser signs in and out through the UI, every protected route bounces an anonymous visitor, every guest-only route bounces a signed-in one, every declared route paints with no console error and no failed API call, and every declared journey runs. An anonymous visit's own 401 or 403 is exempt in both collectors, because the browser reports one such response twice, and the auth client's cold-load session probe is exempt whoever is visiting |
 | `TestHygiene` | Names carry the run prefix, the cleanup hook is registered, and created resources are tracked |
 
 Two of those deserve their reasons stated, because both have shipped as green before.
@@ -46,14 +46,20 @@ a run of misses costs one CloudWatch read between them. The per-request-id filte
 stays available as `read_one`, for a single lookup outside the window. A miss inside the
 budget is still reported as a miss rather than as a routing failure.
 
-An anonymous visit to a public route is meant to provoke a 401: the shared
-`@webbpulse/api-client` calls `POST /api/auth/refresh` on load, and with no session that is
-the correct answer. The browser reports that one response twice, once to the response
-listener and once as a resource-load `console.error`, so both collectors exempt it under the
-same flag, the same status set and the same anonymous versus signed-in rule. The exemption
-is narrow: the message must read as a resource-load report naming 401 or 403 for a URL under
-this product's API base. A 404, a 500, a call to another origin and every uncaught page error
-still fail the route.
+An anonymous visit to a public route is meant to provoke a 401, and the browser reports that
+one response twice, once to the response listener and once as a resource-load
+`console.error`. Both collectors exempt it under the same flag, the same status set and the
+same anonymous versus signed-in rule. The exemption is narrow: the message must read as a
+resource-load report naming 401 or 403 for a URL under this product's API base. A 404, a 500,
+a call to another origin and every uncaught page error still fail the route.
+
+One request is exempt on its own terms, whatever that flag says. The shared `@webbpulse/auth`
+client sends `POST /api/auth/refresh` on every cold load to find out whether a refresh cookie
+already exists, and before any sign in the API correctly answers 401 `NO_SESSION`. A
+signed-in case makes that same call before it signs in, so holding it against the guard flag
+failed the sign-in journey and every product journey that starts cold. Only that path with
+that status is exempt: a 500 from it, a 401 from any other path, and the same path on another
+origin all still fail.
 
 The minted-token probe picks its own request out of the deployed configuration. It prefers a
 route carrying a non-gate authorizer; where the access gate is the only authorizer it falls
@@ -337,6 +343,14 @@ declare only the path and the signed-in marker.
 `{run_id}` is the only placeholder, and it expands to this run's id, so every name a journey
 creates carries the `e2e-` prefix the start-of-session sweep looks for.
 
+Every wait polls rather than reading once. `ExpectText` re-reads its locator on a 250 ms tick
+up to the browser timeout and reports the last text it saw, so a heading caught part way
+through a lazy-chunk transition settles rather than failing. The guard cases watch the URL to
+a real deadline of about five seconds, or the browser timeout if that is smaller, before
+calling it settled, because a measured route guard redirect lands between 750 and 980 ms and
+a single quiet tick used to report the protected path as final. Reaching the expected path
+returns immediately, so a passing case costs nothing extra.
+
 Browser journeys may mutate in both environments, which is why `mutates=True` requires at
 least one `Record` step. The refusal happens at construction, so a journey that would leak
 fails collection rather than the stage. Whatever a `Record` carries reaches
@@ -344,6 +358,13 @@ fails collection rather than the stage. Whatever a `Record` carries reaches
 
 A failing browser case writes a Playwright trace and a screenshot into
 `E2E_BROWSER_ARTIFACTS_DIR`, named after the test. A passing one writes nothing.
+
+The trace is scrubbed before it lands there. Playwright records a `fill` step's parameters
+verbatim, and every other typing path it offers records the value just as verbatim, so the
+durable e2e user's password would otherwise sit in plaintext in a CI artifact. The trace is
+written to a temporary file first, every occurrence of the password is replaced with
+`[redacted]` in every entry of the zip, and only then is it moved into the artifacts
+directory. The result stays openable by `playwright show-trace`.
 
 ## Running it locally against staging
 

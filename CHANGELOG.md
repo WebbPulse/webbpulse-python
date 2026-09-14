@@ -5,6 +5,52 @@ Notable changes to the `webbpulse` package. The version here is the one in
 
 This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## 0.35.0
+
+Five defects the first staging runs of the browser layer found, four in `webbpulse.e2e` and
+one in `webbpulse.identity`.
+
+`ExpectText` polls instead of reading once. It waited for the locator, read `inner_text` a
+single time and asserted immediately, so a heading read part way through a lazy-chunk
+transition or a profile field read milliseconds after a submit click failed a correct app.
+It now re-reads on the same 250 ms tick `ExpectUrl` uses, up to the browser timeout, and the
+failure names the last text seen rather than the first.
+
+`_settle` waits for a real redirect. Returning on the first unchanged 400 ms tick called the
+protected path settled while the guard was still working, and measured redirects land
+between 750 and 980 ms, so the guard cases reported a phantom security failure. It now polls
+to a deadline of five seconds, or the browser timeout when that is smaller, short-circuiting
+as soon as the URL reaches the path the caller expects. The redirect-loop refusal is
+unchanged.
+
+The shared `@webbpulse/auth` client's cold-load session probe is exempt in both collectors
+whatever `ignore_guard_statuses` says. That client sends `POST /api/auth/refresh` on every
+cold load to learn whether a refresh cookie exists, and before any sign in the API correctly
+answers 401 `NO_SESSION`. Signed-in cases do not set the guard flag, so that one console
+error failed the sign-in journey and every product journey starting from a cold load. The
+new `is_session_probe` matches on the URL path under this product's API base plus that one
+status, because the console listener may only ever see the message text and a URL. Nothing
+else gains an exemption and the existing guard semantics are untouched.
+
+Playwright traces no longer carry the durable e2e user's password. Playwright records a
+`fill` step's parameters verbatim, and every other typing path it offers records the value
+just as verbatim, so there is no way to type a password that keeps it out of the recording.
+The trace is now written to a temporary file, every occurrence of the password is replaced
+with `[redacted]` in every entry of the zip, `.trace`, `.network` and resource files alike,
+and only then is it moved into the artifacts directory. The new `redact_zip` does the work
+and the result stays openable by `playwright show-trace`.
+
+`build_identity_router` declares the statuses its routes really answer. Every route carried
+FastAPI's default 200 plus 422 alone, so an adopter's published OpenAPI document promised
+statuses the routes do not keep and the post-deploy suite flagged them. The three new tables
+`IDENTITY_ROUTE_RESPONSES`, `OAUTH_ROUTE_RESPONSES` and `PASSKEY_ROUTE_RESPONSES` are keyed
+by method and unprefixed path and applied to whatever the deployment mounted, so a route the
+deployment did not mount is simply absent. `POST /register` declares 201, `GET
+/oauth/callback` declares the 303 every browser leg takes, `DELETE /oauth/{provider}/link`
+and `DELETE /passkeys/{credential_id}` declare the 409 that refuses removing the last way
+into an account, and every rate limited route declares 429 whatever this deployment's
+limiter setting is. Adopters carrying their own stopgap table can delete it.
+
 ## 0.34.0
 
 `webbpulse.identity` gains `JwksVerifier`, which verifies an access token against the

@@ -16,11 +16,14 @@ import pytest
 from webbpulse.e2e.browser import (
     DEFAULT_ARTIFACTS_DIR,
     ROOT_SELECTORS,
+    TRACE_REDACTION_MARKER,
     ConsoleErrors,
     FailedRequests,
     artifact_name,
     browser_is_available,
+    is_session_probe,
     message_location_url,
+    redact_zip,
     resource_load_status,
 )
 
@@ -168,9 +171,13 @@ class TestConsoleGuardExemption:
         assert not errors
 
     def test_a_guard_status_counts_when_signed_in(self) -> None:
-        """A protected route is visited signed in, where a 401 is a real failure."""
+        """A protected route is visited signed in, where a 401 is a real failure.
+
+        Asserted on a product path rather than on the refresh path, because the cold-load
+        session probe is exempt on its own terms whoever is visiting.
+        """
         errors = ConsoleErrors(api_base_url=API)
-        errors.record(f"console.error: {CHROMIUM_401}", f"{API}/api/auth/refresh")
+        errors.record(f"console.error: {CHROMIUM_401}", f"{API}/api/builds")
         assert errors
 
     def test_a_server_error_still_fails_while_guards_are_exempt(self) -> None:
@@ -524,3 +531,142 @@ class TestSuiteExports:
         for name in ("LoginForm", "RouteSpec", "Journey", "Goto", "Click", "Fill", "Record"):
             assert name in e2e.__all__
             assert hasattr(e2e, name)
+
+
+REFRESH = f"{API}/api/auth/refresh"
+
+PROBE_ERROR = "console.error: Failed to load resource: the server responded with a status of 401 ()"
+
+
+class TestSessionProbeExemption:
+    """The shared auth client's cold-load `POST /api/auth/refresh` probe is always exempt.
+
+    `@webbpulse/auth` asks on every cold load whether a refresh cookie exists, and with no
+    session the API correctly answers 401 `NO_SESSION`. Counting that one exchange failed the
+    sign-in journey and every product journey that starts from a cold load, because those
+    cases are signed in and so do not set the guard-status flag.
+    """
+
+    def test_the_probe_is_not_a_failed_request_when_signed_in(self) -> None:
+        """The exemption does not depend on `ignore_guard_statuses`."""
+        requests = FailedRequests(api_base_url=API)
+        requests.record(REFRESH, 401)
+        assert not requests
+
+    def test_the_probe_is_not_a_console_error_when_signed_in(self) -> None:
+        """The console listener's copy of the same event is exempt on the same terms."""
+        errors = ConsoleErrors(api_base_url=API)
+        errors.record(PROBE_ERROR, REFRESH)
+        assert not errors
+
+    def test_the_probe_is_recognised_from_the_message_text_alone(self) -> None:
+        """A browser that reports the URL only inside the text is still matched."""
+        errors = ConsoleErrors(api_base_url=API)
+        text = f"Failed to load resource: the server responded with a status of 401 for {REFRESH}"
+        errors.record(f"console.error: {text}")
+        assert not errors
+
+    def test_a_query_string_on_the_probe_is_still_the_probe(self) -> None:
+        """Matching is on the path, so a cache-busting query does not defeat it."""
+        requests = FailedRequests(api_base_url=API)
+        requests.record(f"{REFRESH}?t=1", 401)
+        assert not requests
+
+    @pytest.mark.parametrize("status", [403, 500, 404])
+    def test_only_a_401_on_that_path_is_exempt(self, status: int) -> None:
+        """A different status from the same path is a real failure and still counts."""
+        requests = FailedRequests(api_base_url=API)
+        requests.record(REFRESH, status)
+        assert requests
+
+    def test_a_401_on_another_path_still_counts(self) -> None:
+        """Nothing but the refresh path gains the exemption."""
+        requests = FailedRequests(api_base_url=API)
+        requests.record(f"{API}/api/builds", 401)
+        assert requests
+
+    def test_the_probe_path_on_another_origin_still_counts(self) -> None:
+        """The path is only exempt under this product's own API base."""
+        assert not is_session_probe("https://other.example.invalid/api/auth/refresh", 401, API)
+
+    def test_the_guard_semantics_are_unchanged_for_everything_else(self) -> None:
+        """An anonymous case still exempts guard statuses on other paths, as before."""
+        requests = FailedRequests(api_base_url=API, ignore_guard_statuses=True)
+        requests.record(f"{API}/api/builds", 401)
+        assert not requests
+
+    def test_a_render_error_is_never_exempted_by_the_probe_rule(self) -> None:
+        """An uncaught page error carries no status, so it can never match."""
+        errors = ConsoleErrors(api_base_url=API)
+        errors.record("pageerror: TypeError: undefined is not a function")
+        assert errors
+
+
+class TestTraceRedaction:
+    """The durable e2e user's password never reaches a trace zip in the artifacts directory.
+
+    Playwright records a `fill` step's parameters verbatim, and so does every other typing
+    path it offers, so the trace is scrubbed before it is written where CI collects it.
+    """
+
+    @staticmethod
+    def _zip_with_the_secret(path: object, secret: str) -> None:
+        """Build a small zip carrying the secret in two separate entries."""
+        import zipfile
+
+        with zipfile.ZipFile(str(path), "w") as writer:
+            writer.writestr(
+                "trace.trace",
+                '{"method":"fill","params":{"selector":"#pw","value":"' + secret + '"}}\n{"type":"log"}\n',
+            )
+            writer.writestr("trace.network", '{"body":"password=' + secret + '"}')
+            writer.writestr("resources/page.html", f"<input value='{secret}'>")
+
+    def test_every_entry_is_scrubbed(self, tmp_path: object) -> None:
+        """The secret is gone from all three entries, and the count names how many changed."""
+        import zipfile
+
+        secret = "a-very-secret-password"
+        source = tmp_path / "raw.zip"  # type: ignore[operator]
+        destination = tmp_path / "out" / "trace.zip"  # type: ignore[operator]
+        self._zip_with_the_secret(source, secret)
+
+        changed = redact_zip(source, destination, secret)
+
+        assert changed == 3
+        with zipfile.ZipFile(str(destination)) as reader:
+            names = reader.namelist()
+            assert names == ["trace.trace", "trace.network", "resources/page.html"]
+            for name in names:
+                assert secret.encode() not in reader.read(name)
+                assert TRACE_REDACTION_MARKER in reader.read(name)
+
+    def test_the_trace_entry_stays_valid_jsonl(self, tmp_path: object) -> None:
+        """Replacing bytes inside a JSON string leaves the trace parseable, so it still opens."""
+        import json
+        import zipfile
+
+        secret = "a-very-secret-password"
+        source = tmp_path / "raw.zip"  # type: ignore[operator]
+        destination = tmp_path / "trace.zip"  # type: ignore[operator]
+        self._zip_with_the_secret(source, secret)
+
+        redact_zip(source, destination, secret)
+
+        with zipfile.ZipFile(str(destination)) as reader:
+            lines = [line for line in reader.read("trace.trace").decode().splitlines() if line.strip()]
+            parsed = [json.loads(line) for line in lines]
+        assert parsed[0]["params"]["value"] == TRACE_REDACTION_MARKER.decode()
+
+    def test_an_untouched_entry_is_copied_through(self, tmp_path: object) -> None:
+        """An entry that never held the secret is preserved exactly."""
+        import zipfile
+
+        source = tmp_path / "raw.zip"  # type: ignore[operator]
+        destination = tmp_path / "trace.zip"  # type: ignore[operator]
+        with zipfile.ZipFile(str(source), "w") as writer:
+            writer.writestr("trace.trace", "no secret here")
+
+        assert redact_zip(source, destination, "a-very-secret-password") == 0
+        with zipfile.ZipFile(str(destination)) as reader:
+            assert reader.read("trace.trace") == b"no secret here"

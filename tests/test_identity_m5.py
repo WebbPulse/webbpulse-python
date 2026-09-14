@@ -45,6 +45,7 @@ from webbpulse.identity.passkey_routes import (
     LOGIN_PASSKEY_VERIFY_PATH,
     PASSKEY_AVAILABILITY_CACHE_CONTROL,
     PASSKEY_AVAILABILITY_PATH,
+    PASSKEY_ITEM_PATH,
     PASSKEY_REGISTER_OPTIONS_PATH,
     PASSKEY_REGISTER_VERIFY_PATH,
     PASSKEYS_PATH,
@@ -1547,3 +1548,103 @@ class TestAvailability:
         """The ordering claim above, exercised rather than asserted about."""
         seed_account(hooks, stores)
         assert _get_availability(client).json() == {"enabled": True, "passwordless": True}
+
+
+class TestDeclaredResponses:
+    """Every route declares the statuses it really answers, so the published document is true.
+
+    FastAPI declares a route with 200 and 422 alone, so without this the OpenAPI document
+    promised statuses the routes do not keep and the post-deploy suite flagged them. An
+    adopter carrying its own stopgap table deletes it once the package declares these.
+    """
+
+    @staticmethod
+    def _responses(router: APIRouter, method: str, path: str) -> set[int | str]:
+        """The statuses one route declares, found by method and unprefixed path."""
+        from fastapi.routing import APIRoute
+
+        base = prefix()
+        for route in router.routes:
+            if not isinstance(route, APIRoute):
+                continue
+            if route.path == f"{base}{path}" and method in (route.methods or ()):
+                return set(route.responses)
+        raise AssertionError(f"{method} {path} is not mounted on this router")
+
+    @pytest.fixture
+    def router(self, hooks: FakeHooks, stores: IdentityStores, kms: FakeKms) -> APIRouter:
+        """A router with the flow, MFA and passkey groups mounted."""
+        return build_identity_router(make_settings(), hooks, stores, kms_client=kms, limiter_enabled=False)
+
+    @pytest.mark.parametrize(
+        ("method", "path", "expected"),
+        [
+            ("POST", "/register", {201, 400, 403, 429}),
+            ("POST", "/login", {400, 401, 403, 429}),
+            ("POST", "/refresh", {401, 403, 429}),
+            ("POST", "/logout", {403}),
+            ("POST", "/logout-all", {401}),
+            ("POST", "/password", {401}),
+            ("POST", LOGIN_TOTP_PATH, {401, 403, 429}),
+            ("POST", "/step-up", {401, 429}),
+        ],
+    )
+    def test_a_flow_route_declares_what_it_answers(
+        self, router: APIRouter, method: str, path: str, expected: set[int | str]
+    ) -> None:
+        """Each flow route's declared statuses are the ones its own code can return."""
+        assert self._responses(router, method, path) >= expected
+
+    def test_register_declares_its_created_status(self, router: APIRouter) -> None:
+        """A real registration answers 201, which the FastAPI default never mentioned."""
+        assert 201 in self._responses(router, "POST", "/register")
+
+    def test_refresh_declares_the_cross_site_refusal(self, router: APIRouter) -> None:
+        """`POST /refresh` answers 403 to a request from a disallowed fetch site."""
+        assert 403 in self._responses(router, "POST", "/refresh")
+
+    def test_passkey_register_verify_declares_created(self, router: APIRouter) -> None:
+        """Registering a passkey answers 201, not 200."""
+        assert 201 in self._responses(router, "POST", PASSKEY_REGISTER_VERIFY_PATH)
+
+    def test_deleting_a_passkey_declares_the_last_credential_refusal(self, router: APIRouter) -> None:
+        """Deleting the last way into an account answers 409, which the stopgap table missed."""
+        assert {401, 404, 409} <= self._responses(router, "DELETE", PASSKEY_ITEM_PATH)
+
+    def test_a_management_route_declares_not_found(self, router: APIRouter) -> None:
+        """Renaming a passkey that is not the caller's answers 404."""
+        assert 404 in self._responses(router, "PATCH", PASSKEY_ITEM_PATH)
+
+    def test_rate_limited_routes_declare_429(self, router: APIRouter) -> None:
+        """The document describes the route, so 429 is declared whatever this deployment set."""
+        assert 429 in self._responses(router, "POST", "/login")
+
+    def test_the_declarations_survive_a_limiter_that_is_off(
+        self, hooks: FakeHooks, stores: IdentityStores, kms: FakeKms
+    ) -> None:
+        """This router was built with `limiter_enabled=False` and still declares 429."""
+        built = build_identity_router(make_settings(), hooks, stores, kms_client=kms, limiter_enabled=False)
+        assert 429 in self._responses(built, "POST", "/login")
+
+    def test_an_unmounted_group_declares_nothing(self, hooks: FakeHooks, kms: FakeKms) -> None:
+        """A deployment with no passkey stores has no passkey route to declare."""
+        from fastapi.routing import APIRoute
+
+        bare = IdentityStores(
+            credentials=InMemoryCredentialStore(),
+            refresh_tokens=InMemoryRefreshTokenStore(),
+        )
+        built = build_identity_router(make_settings(), hooks, bare, kms_client=kms, limiter_enabled=False)
+        paths = {route.path for route in built.routes if isinstance(route, APIRoute)}
+        assert f"{prefix()}{PASSKEYS_PATH}" not in paths
+
+    def test_a_description_is_attached_to_each_declared_status(self, router: APIRouter) -> None:
+        """Every declared status carries a short description, not a bare entry."""
+        from fastapi.routing import APIRoute
+
+        base = prefix()
+        for route in router.routes:
+            if not isinstance(route, APIRoute) or not route.path.startswith(base):
+                continue
+            for status_code, body in route.responses.items():
+                assert body.get("description"), f"{route.path} declares {status_code} with no description"

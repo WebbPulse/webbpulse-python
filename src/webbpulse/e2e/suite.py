@@ -25,6 +25,7 @@ The six groups, in the order they build on each other:
 
 from __future__ import annotations
 
+import contextlib
 import time
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
@@ -110,6 +111,12 @@ def journey_id(journey: Journey) -> str:
 
 
 MAX_NAVIGATIONS = 5
+
+STEP_POLL_MS = 250
+
+SETTLE_POLL_MS = 250
+
+SETTLE_TIMEOUT_MS = 5000
 
 
 def pytest_generate_tests(metafunc: pytest.Metafunc) -> None:
@@ -943,7 +950,7 @@ class TestBrowser:
         e2e_env: Any,
     ) -> None:
         """An anonymous visit to a protected route lands on the login path, with no loop."""
-        landing = _settle(page, protected_route.path, e2e_env)
+        landing = _settle(page, protected_route.path, e2e_env, expected=login_form.anonymous_redirect)
         assert landing.startswith(login_form.anonymous_redirect), (
             f"an anonymous visit to {protected_route.path} settled on {landing}, not on "
             f"{login_form.anonymous_redirect}. A guard that renders the protected route to "
@@ -959,7 +966,7 @@ class TestBrowser:
         e2e_env: Any,
     ) -> None:
         """A signed-in visit to a guest-only route lands on the signed-in landing path."""
-        landing = _settle(signed_in_page, guest_only_route.path, e2e_env)
+        landing = _settle(signed_in_page, guest_only_route.path, e2e_env, expected=login_form.guest_redirect)
         assert landing.startswith(login_form.guest_redirect), (
             f"a signed-in visit to {guest_only_route.path} settled on {landing}, not on "
             f"{login_form.guest_redirect}. A guest guard that waits on a loading flag "
@@ -1060,15 +1067,32 @@ def _expect_visible(page: Any, locator: str, timeout: int, where: str) -> None:
 
 
 def _expect_text(page: Any, step: Any, env: Any, timeout: int, where: str) -> None:
-    """Wait for one locator to contain the expected text."""
+    """Poll one locator until it contains the expected text, to the browser timeout.
+
+    Reading once the moment the element becomes visible fails a correct app: a heading read
+    part way through a lazy-chunk transition, or a profile field read milliseconds after the
+    submit click, holds the old text for a tick and then settles. So the read is repeated on
+    the same 250 ms cadence `_expect_url` uses, and the failure names the last text seen
+    rather than the first.
+    """
     wanted = expand(step.text, env.run_id)
-    deadline = timeout
     try:
-        page.wait_for_selector(step.locator, state="visible", timeout=deadline)
-        actual = page.locator(step.locator).inner_text()
+        page.wait_for_selector(step.locator, state="visible", timeout=timeout)
     except Exception as error:
         raise BrowserFailure(f"{where}: {step.locator} never became visible ({type(error).__name__})") from None
-    assert wanted in actual, f"{where}: {step.locator} reads {actual[:200]!r}, which does not contain {wanted!r}"
+
+    actual = ""
+    waited = 0
+    while True:
+        with contextlib.suppress(Exception):
+            actual = page.locator(step.locator).inner_text()
+        if wanted in actual:
+            return
+        if waited >= timeout:
+            break
+        page.wait_for_timeout(STEP_POLL_MS)
+        waited += STEP_POLL_MS
+    raise BrowserFailure(f"{where}: {step.locator} reads {actual[:200]!r}, which does not contain {wanted!r}")
 
 
 def _expect_url(page: Any, step: Any, env: Any, timeout: int, where: str) -> None:
@@ -1078,31 +1102,50 @@ def _expect_url(page: Any, step: Any, env: Any, timeout: int, where: str) -> Non
     while waited < timeout:
         if url_matches(pattern, page.url):
             return
-        page.wait_for_timeout(250)
-        waited += 250
+        page.wait_for_timeout(STEP_POLL_MS)
+        waited += STEP_POLL_MS
     raise BrowserFailure(f"{where}: the URL settled on {page.url}, which does not match {pattern!r}")
 
 
-def _settle(page: Any, path: str, env: Any) -> str:
+def _settle(page: Any, path: str, env: Any, expected: str = "") -> str:
     """Visit a path, follow the guard's redirects and return the path it settled on.
 
-    Navigations are counted and capped, because a pair of guards that each redirect to the
-    other loops until the runner times out, and a timeout says nothing about which guard
+    A single unchanged tick is not settlement. A route guard that reads its session before
+    redirecting lands between 750 and 980 ms in practice, so returning on the first quiet
+    400 ms tick reports the protected path as final and the guard cases read a phantom
+    security failure. The URL is therefore polled to a real deadline, and only the path it
+    still holds at the end is called settled.
+
+    `expected` short-circuits that wait: once the URL reaches the path the caller is waiting
+    for, there is nothing left to prove and the remaining ticks are not spent.
+
+    Navigations are still counted and capped, because a pair of guards that each redirect to
+    the other loops until the runner times out, and a timeout says nothing about which guard
     is wrong.
     """
     page.goto(path, wait_until="domcontentloaded")
+    deadline = min(SETTLE_TIMEOUT_MS, env.browser_timeout_ms)
     seen = [_path_of(page.url)]
-    for _ in range(MAX_NAVIGATIONS):
-        page.wait_for_timeout(400)
+    if expected and seen[-1].startswith(expected):
+        return seen[-1]
+
+    waited = 0
+    while waited < deadline:
+        page.wait_for_timeout(SETTLE_POLL_MS)
+        waited += SETTLE_POLL_MS
         current = _path_of(page.url)
         if current == seen[-1]:
-            return current
+            continue
         seen.append(current)
-    raise BrowserFailure(
-        f"visiting {path} never settled: the app navigated more than {MAX_NAVIGATIONS} "
-        f"times, through {' -> '.join(seen)}. That is a redirect loop between two guards, "
-        "not a slow page."
-    )
+        if expected and current.startswith(expected):
+            return current
+        if len(seen) > MAX_NAVIGATIONS:
+            raise BrowserFailure(
+                f"visiting {path} never settled: the app navigated more than {MAX_NAVIGATIONS} "
+                f"times, through {' -> '.join(seen)}. That is a redirect loop between two "
+                "guards, not a slow page."
+            )
+    return seen[-1]
 
 
 def _path_of(url: str) -> str:
