@@ -31,18 +31,24 @@ from .journeys import Journey, LoginForm, RouteSpec
 __all__ = [
     "DEFAULT_ARTIFACTS_DIR",
     "ROOT_SELECTORS",
+    "TRACE_REDACTION_MARKER",
     "BrowserFailure",
     "ConsoleErrors",
     "FailedRequests",
     "artifact_name",
     "browser_is_available",
+    "is_session_probe",
     "message_location_url",
+    "redact_zip",
     "resource_load_status",
 ]
 
 DEFAULT_ARTIFACTS_DIR = "e2e-browser-artifacts"
 ROOT_SELECTORS = ("#root", "#app", "main", "body")
 GUARD_STATUSES = (401, 403)
+SESSION_PROBE_PATH = "/api/auth/refresh"
+SESSION_PROBE_STATUS = 401
+TRACE_REDACTION_MARKER = b"[redacted]"
 _UNSAFE = re.compile(r"[^A-Za-z0-9._-]+")
 _RESOURCE_LOAD_PREFIX = re.compile(r"\b(?:Failed to load resource|HTTP load failed|NS_ERROR_|was loaded over)\b")
 _RESOURCE_LOAD_STATUS = re.compile(r"\bstatus(?: of|:)? (\d{3})\b")
@@ -62,6 +68,29 @@ def resource_load_status(text: str) -> int | None:
         return None
     found = _RESOURCE_LOAD_STATUS.search(text)
     return int(found.group(1)) if found else None
+
+
+def is_session_probe(url: str, status: int, api_base_url: str) -> bool:
+    """Whether one response is the shared auth client's cold-load session probe.
+
+    `@webbpulse/auth` sends `POST /api/auth/refresh` on every cold load to find out whether
+    a refresh cookie already exists, and before any sign in the API correctly answers 401
+    `NO_SESSION`. That one exchange is a healthy app answering correctly, so it is exempt in
+    both collectors whether or not the case is signed in: a signed-in journey that starts
+    from a cold load makes the same probe before its sign in, and counting it fails every
+    such journey.
+
+    The match is deliberately narrow, on the URL path under this product's API base and that
+    one status. A 500 from the same path, a 401 from any other path, and the same path on
+    another origin all still count.
+    """
+    if status != SESSION_PROBE_STATUS or not api_base_url:
+        return False
+    if not url.startswith(api_base_url):
+        return False
+    from urllib.parse import urlsplit
+
+    return urlsplit(url).path == SESSION_PROBE_PATH
 
 
 class BrowserFailure(AssertionError):
@@ -118,10 +147,13 @@ class ConsoleErrors:
     set by the same cases for the same reason. The two collectors see one HTTP event twice:
     the response listener sees the 401 an anonymous visit is meant to provoke, and the
     console listener sees the resource-load error the browser logs for it. Ignoring the
-    first while counting the second fails every public route on a healthy app, because the
-    shared `@webbpulse/api-client` calls `POST /api/auth/refresh` on load and anonymously
-    that correctly answers 401. So the exemption covers both, on the same status set and the
-    same anonymous versus signed-in rule. Every other console error still counts.
+    first while counting the second fails every public route on a healthy app, so the
+    exemption covers both, on the same status set and the same anonymous versus signed-in
+    rule.
+
+    The shared auth client's cold-load session probe is exempt separately and
+    unconditionally, through `is_session_probe`, because it is correct on a signed-in
+    journey's first load too. Every other console error still counts.
     """
 
     api_base_url: str = ""
@@ -129,10 +161,28 @@ class ConsoleErrors:
     messages: list[str] = field(default_factory=list)
 
     def record(self, message: str, url: str | None = None) -> None:
-        """Record one console error or page error, honouring the guard-status exemption."""
+        """Record one console error or page error, honouring both exemptions."""
+        if self.is_session_probe_error(message, url):
+            return
         if self.is_ignored_guard_error(message, url):
             return
         self.messages.append(message)
+
+    def is_session_probe_error(self, message: str, url: str | None = None) -> bool:
+        """Whether a console message is the resource-load error the session probe made.
+
+        Unconditional, because the probe is correct behaviour on a cold load whoever is
+        visiting. The console listener may only ever see the message text and a location,
+        so the URL is taken from either and judged on its path plus the status the message
+        names.
+        """
+        status = resource_load_status(message)
+        if status is None:
+            return False
+        target = url if url else _url_in(message)
+        if target is None:
+            return False
+        return is_session_probe(target, status, self.api_base_url)
 
     def is_ignored_guard_error(self, message: str, url: str | None = None) -> bool:
         """Whether a console message is the resource-load error an exempt failed request made.
@@ -170,7 +220,9 @@ class FailedRequests:
     """Every response the page received from the API with a status of 400 or above.
 
     `ignore_guard_statuses` is set while a case visits a route anonymously on purpose, so
-    the 401 and 403 the app is meant to provoke are not counted as failures.
+    the 401 and 403 the app is meant to provoke are not counted as failures. The shared auth
+    client's cold-load session probe is exempt whatever that flag says, through
+    `is_session_probe`.
     """
 
     api_base_url: str
@@ -178,10 +230,12 @@ class FailedRequests:
     entries: list[tuple[str, int]] = field(default_factory=list)
 
     def record(self, url: str, status: int) -> None:
-        """Record one API response, honouring the guard-status exemption."""
+        """Record one API response, honouring both exemptions."""
         if not url.startswith(self.api_base_url):
             return
         if status < 400:
+            return
+        if is_session_probe(url, status, self.api_base_url):
             return
         if self.ignore_guard_statuses and status in GUARD_STATUSES:
             return
@@ -262,12 +316,85 @@ def context(
         failed = _test_failed(request)
         try:
             if failed:
-                instance.tracing.stop(path=str(browser_artifacts_dir / f"{stem}-trace.zip"))
+                _stop_tracing_redacted(
+                    instance,
+                    browser_artifacts_dir / f"{stem}-trace.zip",
+                    e2e_env.user_password,
+                )
                 _screenshot_open_pages(instance, browser_artifacts_dir, stem)
             else:
                 instance.tracing.stop()
         finally:
             instance.close()
+
+
+def _stop_tracing_redacted(instance: Any, destination: Any, secret: str) -> None:
+    """Stop tracing and write the trace out with the password replaced everywhere.
+
+    Playwright records a `fill` step's parameters, and every other typing path it offers
+    records the value just as verbatim, so there is no way to type a password that keeps it
+    out of the recording. The trace is therefore written to a temporary file first, scrubbed,
+    and only then moved into the artifacts directory, so a secret never exists at the path
+    CI collects.
+    """
+    import pathlib
+    import tempfile
+
+    target = pathlib.Path(destination)
+    if not secret:
+        instance.tracing.stop(path=str(target))
+        return
+
+    with tempfile.TemporaryDirectory() as staging:
+        raw = pathlib.Path(staging) / "trace.zip"
+        instance.tracing.stop(path=str(raw))
+        redact_zip(raw, target, secret)
+
+
+def redact_zip(source: Any, destination: Any, secret: str, marker: bytes = TRACE_REDACTION_MARKER) -> int:
+    """Copy one zip to `destination`, replacing every occurrence of `secret` in every entry.
+
+    Entries are rewritten byte for byte rather than parsed, because the password reaches a
+    trace through several shapes at once: the `fill` call parameters and its log line in
+    `trace.trace`, a `__playwright_value_` attribute in the DOM snapshot beside it, a request
+    body in `trace.network`, and any resource entry that quoted it. Replacing the bytes
+    catches all of them, and because the secret only ever appears inside a JSON string or a
+    resource body, the result stays valid JSONL and `playwright show-trace` still opens it.
+
+    Returns the number of entries that were changed, so a caller can assert on it.
+    """
+    import pathlib
+    import zipfile
+
+    needle = secret.encode()
+    changed = 0
+    source_path = pathlib.Path(source)
+    destination_path = pathlib.Path(destination)
+    destination_path.parent.mkdir(parents=True, exist_ok=True)
+
+    with zipfile.ZipFile(source_path) as reader, zipfile.ZipFile(destination_path, "w", zipfile.ZIP_DEFLATED) as writer:
+        for info in reader.infolist():
+            data = reader.read(info.filename)
+            if needle and needle in data:
+                data = data.replace(needle, marker)
+                changed += 1
+            writer.writestr(_copied_info(info), data)
+    return changed
+
+
+def _copied_info(info: Any) -> Any:
+    """A `ZipInfo` carrying the original entry's name, timestamp and mode, for the new zip.
+
+    The size is deliberately left to be recomputed, because redaction changes it.
+    """
+    import zipfile
+
+    copied = zipfile.ZipInfo(info.filename, date_time=info.date_time)
+    copied.compress_type = zipfile.ZIP_DEFLATED
+    copied.external_attr = info.external_attr
+    copied.internal_attr = info.internal_attr
+    copied.create_system = info.create_system
+    return copied
 
 
 def _screenshot_open_pages(instance: Any, directory: Any, stem: str) -> None:

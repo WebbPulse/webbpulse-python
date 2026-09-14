@@ -25,6 +25,7 @@ __all__ = [
     "OAUTH_LINK_PATH",
     "OAUTH_PROVIDERS_CACHE_CONTROL",
     "OAUTH_PROVIDERS_PATH",
+    "OAUTH_ROUTE_RESPONSES",
     "OAUTH_START_IP_LIMIT",
     "OAUTH_START_PATH",
     "register_oauth_provider_discovery",
@@ -340,3 +341,35 @@ def _with_flag(target: str, key: str, value: str = "1") -> str:
     base = target or "/"
     separator = "&" if "?" in base else "?"
     return f"{base}{separator}{key}={quote(value)}"
+
+
+OAUTH_ROUTE_RESPONSES: Final[dict[tuple[str, str], dict[int, str]]] = {
+    ("GET", OAUTH_START_PATH): {
+        302: "The browser is redirected to the provider's authorization endpoint",
+        400: "The provider is unknown or the redirect target is not allowed",
+        401: "A link start was made without a bearer token",
+        429: "Too many authorization starts from this address",
+        503: "The provider is configured but its client secret is absent",
+    },
+    ("GET", OAUTH_CALLBACK_PATH): {
+        303: "The browser leg is redirected back to the frontend, on success and on failure alike",
+        400: "The state was spent, unknown or malformed",
+    },
+    ("POST", OAUTH_LINK_PATH): {
+        400: "The provider is unknown",
+        401: "No bearer token was presented",
+        503: "The provider is configured but its client secret is absent",
+    },
+    ("DELETE", OAUTH_LINK_PATH): {
+        400: "The provider is unknown",
+        401: "No bearer token was presented",
+        409: "That provider is the last way into the account",
+    },
+    ("GET", OAUTH_LINKS_PATH): {401: "No bearer token was presented"},
+}
+"""The statuses the OAuth routes really answer, keyed by method and unprefixed path.
+
+`GET /oauth/callback` never answers 200: every outcome, success and failure alike, is a 303
+back to the frontend carrying a flag. `DELETE /oauth/{provider}/link` answers 409 when the
+provider is the only remaining way into the account.
+"""

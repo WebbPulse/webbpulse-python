@@ -17,10 +17,17 @@ from _pytest.outcomes import Skipped
 from webbpulse.e2e.access_log import AccessLogEntry
 from webbpulse.e2e.client import E2EClient, RateLimitExhausted
 from webbpulse.e2e.gateway import ABSENT_ID, Operation, Route
+from webbpulse.e2e.journeys import ExpectText
 from webbpulse.e2e.suite import (
+    SETTLE_POLL_MS,
+    SETTLE_TIMEOUT_MS,
+    STEP_POLL_MS,
+    BrowserFailure,
     ProbeTarget,
     RouteProbe,
+    _expect_text,
     _first_identity_probe,
+    _settle,
     probe_every_route,
     route_probes,
 )
@@ -437,3 +444,160 @@ class TestRouteProbesFixture:
             lookup,
         )
         assert seen_windows == [1]
+
+
+class FakePage:
+    """A page whose text and URL change on a virtual clock driven by `wait_for_timeout`.
+
+    Real waits would make these cases slow and flaky for no gain: what is worth asserting is
+    that the helpers keep polling past the first tick, so the clock only has to advance when
+    the code under test asks it to.
+    """
+
+    def __init__(self, *, texts: Any = None, urls: Any = None, url: str = "https://app.invalid/") -> None:
+        """Record the scripted timelines and start the clock at zero."""
+        self.elapsed = 0
+        self._texts = texts or []
+        self._urls = urls or []
+        self._url = url
+        self.goto_calls: list[str] = []
+        self.reads = 0
+
+    def wait_for_timeout(self, milliseconds: int) -> None:
+        """Advance the virtual clock, which is what moves both timelines along."""
+        self.elapsed += milliseconds
+
+    def wait_for_selector(self, selector: str, **kwargs: Any) -> None:
+        """Succeed immediately, since these cases are about what happens after that."""
+
+    def goto(self, path: str, **kwargs: Any) -> None:
+        """Record the visit and apply the first scripted URL."""
+        self.goto_calls.append(path)
+        self._advance_url()
+
+    def _scripted(self, timeline: Any, fallback: Any) -> Any:
+        """The last scripted value whose time has come, or the fallback."""
+        current = fallback
+        for at, value in timeline:
+            if self.elapsed >= at:
+                current = value
+        return current
+
+    def _advance_url(self) -> None:
+        """Move the URL to whatever the timeline says for the current time."""
+        self._url = self._scripted(self._urls, self._url)
+
+    @property
+    def url(self) -> str:
+        """The current URL, taken from the timeline at the current virtual time."""
+        self._advance_url()
+        return self._url
+
+    def locator(self, selector: str) -> Any:
+        """A locator whose `inner_text` reads the scripted text at the current time."""
+        page = self
+
+        class _Locator:
+            def inner_text(self) -> str:
+                page.reads += 1
+                return page._scripted(page._texts, "")
+
+        return _Locator()
+
+
+class FakeEnvironment:
+    """The two fields the wait helpers read off `e2e_env`."""
+
+    def __init__(self, browser_timeout_ms: int = 15000) -> None:
+        """Record the browser timeout and a fixed run id."""
+        self.browser_timeout_ms = browser_timeout_ms
+        self.run_id = "run1"
+
+
+class TestExpectTextPolls:
+    """`_expect_text` must poll to the deadline rather than reading once.
+
+    Reading once the moment the element became visible failed a correct app: a heading read
+    part way through a lazy-chunk transition, or a profile field read milliseconds after a
+    submit click, holds the old text for a tick and then settles.
+    """
+
+    def test_text_that_settles_after_the_first_read_passes(self) -> None:
+        """A heading that lands at 237 ms must not fail a correct app."""
+        page = FakePage(texts=[(0, "Loading"), (250, "My Garage")])
+        _expect_text(page, ExpectText("h1", "My Garage"), FakeEnvironment(), 15000, "journey step 1")
+        assert page.reads > 1
+
+    def test_a_field_that_settles_late_still_passes(self) -> None:
+        """A profile field read 16 ms after a submit click settles within the deadline."""
+        page = FakePage(texts=[(0, ""), (1000, "new-name")])
+        _expect_text(page, ExpectText("#name", "new-name"), FakeEnvironment(), 15000, "journey step 2")
+
+    def test_text_that_never_arrives_fails_with_the_last_text_seen(self) -> None:
+        """The failure names what the element actually read, not the first empty value."""
+        page = FakePage(texts=[(0, "Loading"), (500, "Something else")])
+        with pytest.raises(BrowserFailure) as caught:
+            _expect_text(page, ExpectText("h1", "My Garage"), FakeEnvironment(1000), 1000, "journey step 3")
+        assert "Something else" in str(caught.value)
+        assert "My Garage" in str(caught.value)
+
+    def test_it_gives_up_at_the_browser_timeout(self) -> None:
+        """Polling is bounded by the timeout it was handed, not unbounded."""
+        page = FakePage(texts=[(0, "never")])
+        with pytest.raises(BrowserFailure):
+            _expect_text(page, ExpectText("h1", "wanted"), FakeEnvironment(1000), 1000, "journey step 4")
+        assert page.elapsed <= 1000 + STEP_POLL_MS
+
+    def test_the_run_id_is_expanded_before_matching(self) -> None:
+        """`{run_id}` in an expected text still expands, as it did before."""
+        page = FakePage(texts=[(0, "e2e-run1-build")])
+        _expect_text(page, ExpectText("h1", "e2e-{run_id}-build"), FakeEnvironment(), 15000, "journey step 5")
+
+
+class TestSettleWaitsForARealRedirect:
+    """`_settle` must not call the first unchanged 400 ms tick a settled URL.
+
+    Measured route guard redirects land between 750 and 980 ms, so returning early reported
+    the protected path as final and the guard cases read a phantom security failure.
+    """
+
+    def test_a_redirect_at_980ms_is_seen(self) -> None:
+        """The slowest measured real redirect must be observed, not missed."""
+        page = FakePage(urls=[(0, "https://app.invalid/garage"), (980, "https://app.invalid/login")])
+        assert _settle(page, "/garage", FakeEnvironment()) == "/login"
+
+    def test_a_redirect_at_750ms_is_seen(self) -> None:
+        """The fastest measured real redirect is past the old single 400 ms tick too."""
+        page = FakePage(urls=[(0, "https://app.invalid/garage"), (750, "https://app.invalid/login")])
+        assert _settle(page, "/garage", FakeEnvironment()) == "/login"
+
+    def test_a_route_that_never_redirects_is_reported_as_it_stands(self) -> None:
+        """A guard that genuinely does not fire is still reported as the protected path."""
+        page = FakePage(urls=[(0, "https://app.invalid/garage")])
+        assert _settle(page, "/garage", FakeEnvironment()) == "/garage"
+
+    def test_it_polls_to_a_real_deadline(self) -> None:
+        """A page that never moves is watched for seconds, not for one tick."""
+        page = FakePage(urls=[(0, "https://app.invalid/garage")])
+        _settle(page, "/garage", FakeEnvironment())
+        assert page.elapsed >= SETTLE_TIMEOUT_MS
+
+    def test_reaching_the_expected_path_returns_at_once(self) -> None:
+        """A passing guard case does not spend the rest of the deadline proving it again."""
+        page = FakePage(urls=[(0, "https://app.invalid/garage"), (500, "https://app.invalid/login")])
+        assert _settle(page, "/garage", FakeEnvironment(), expected="/login") == "/login"
+        assert page.elapsed < SETTLE_TIMEOUT_MS
+
+    def test_the_deadline_never_exceeds_the_browser_timeout(self) -> None:
+        """A product with a short browser timeout is not made to wait past it."""
+        page = FakePage(urls=[(0, "https://app.invalid/garage")])
+        _settle(page, "/garage", FakeEnvironment(browser_timeout_ms=1000))
+        assert page.elapsed <= 1000 + SETTLE_POLL_MS
+
+    def test_a_redirect_loop_is_still_named_as_one(self) -> None:
+        """The loop refusal survives, because a timeout says nothing about which guard is wrong."""
+        flapping = [(index * 300, f"https://app.invalid/{'a' if index % 2 else 'b'}") for index in range(1, 12)]
+        page = FakePage(urls=flapping)
+        with pytest.raises(BrowserFailure) as caught:
+            _settle(page, "/garage", FakeEnvironment())
+        assert "redirect loop" in str(caught.value)

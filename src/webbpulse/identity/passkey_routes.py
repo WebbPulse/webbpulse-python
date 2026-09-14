@@ -6,7 +6,7 @@ The seven mount onto the identity router when both passkey tables exist;
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Final
 
 from webbpulse.identity.router import (
     _subject_from_request,
@@ -46,6 +46,7 @@ __all__ = [
     "PASSKEY_REGISTER_LIMIT",
     "PASSKEY_REGISTER_OPTIONS_PATH",
     "PASSKEY_REGISTER_VERIFY_PATH",
+    "PASSKEY_ROUTE_RESPONSES",
     "register_passkey_availability",
     "register_passkey_routes",
 ]
@@ -304,3 +305,43 @@ def register_passkey_routes(
         except LoginRejected as exc:
             return rejected(request, exc)
         return JSONResponse({"deleted": True})
+
+
+PASSKEY_ROUTE_RESPONSES: Final[dict[tuple[str, str], dict[int, str]]] = {
+    ("POST", PASSKEY_REGISTER_OPTIONS_PATH): {
+        401: "No bearer token was presented",
+        404: "No such account",
+        429: "Too many registration attempts from this address",
+    },
+    ("POST", PASSKEY_REGISTER_VERIFY_PATH): {
+        201: "Passkey registered",
+        401: "No bearer token was presented, or the attestation was refused",
+        409: "That credential is already registered",
+        429: "Too many registration attempts from this address",
+    },
+    ("POST", LOGIN_PASSKEY_OPTIONS_PATH): {
+        400: "The request named no account",
+        403: "Passwordless sign in is closed on this deployment",
+        429: "Too many attempts from this address",
+    },
+    ("POST", LOGIN_PASSKEY_VERIFY_PATH): {
+        401: "The assertion was refused",
+        403: "Passwordless sign in is closed on this deployment",
+        429: "Too many attempts from this address",
+    },
+    ("GET", PASSKEYS_PATH): {401: "No bearer token was presented"},
+    ("PATCH", PASSKEY_ITEM_PATH): {
+        401: "No bearer token was presented",
+        404: "No such passkey for this account",
+    },
+    ("DELETE", PASSKEY_ITEM_PATH): {
+        401: "No bearer token was presented",
+        404: "No such passkey for this account",
+        409: "That passkey is the last way into the account",
+    },
+}
+"""The statuses the passkey routes really answer, keyed by method and unprefixed path.
+
+A management route answers 404 for a passkey that is not the caller's and 409 when deleting
+one would leave the account with no way in; every login and verify refusal stays a 401.
+"""

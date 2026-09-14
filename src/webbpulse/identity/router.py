@@ -29,6 +29,7 @@ __all__ = [
     "ALLOWED_FETCH_SITES",
     "DISCOVERY_CACHE_CONTROL",
     "HEALTH_PATH",
+    "IDENTITY_ROUTE_RESPONSES",
     "JWKS_CACHE_CONTROL",
     "LOGIN_PATH",
     "LOGIN_TOTP_PATH",
@@ -212,7 +213,21 @@ def build_identity_router(
             oauth_client_secrets=oauth_client_secrets,
         )
 
+    _declare_identity_responses(router, prefix)
     return router
+
+
+def _declare_identity_responses(router: APIRouter, prefix: str) -> None:
+    """Declare the real statuses on every mounted route, from the three package tables.
+
+    Applied once at the end, so a route declared in any of the three modules is covered and
+    a route this deployment did not mount is simply absent.
+    """
+    from webbpulse.identity.oauth_routes import OAUTH_ROUTE_RESPONSES
+    from webbpulse.identity.passkey_routes import PASSKEY_ROUTE_RESPONSES
+
+    for table in (IDENTITY_ROUTE_RESPONSES, OAUTH_ROUTE_RESPONSES, PASSKEY_ROUTE_RESPONSES):
+        _declare_route_responses(router, prefix, table)
 
 
 def _mount_oauth_discovery(
@@ -949,3 +964,83 @@ def _claims_from_request(request: Request, tokens: TokenService) -> dict[str, st
     except Exception:
         return {}
     return {str(k): str(v) for k, v in verified.items()}
+
+
+IDENTITY_ROUTE_RESPONSES: Final[dict[tuple[str, str], dict[int, str]]] = {
+    ("POST", REGISTER_PATH): {
+        201: "Account created and signed in",
+        400: "The request carried no email address",
+        403: "Registration or password sign up is closed on this deployment",
+        429: "Too many registration attempts from this address",
+    },
+    ("POST", LOGIN_PATH): {
+        400: "The request carried no email address",
+        401: "The credentials were refused",
+        403: "The account is locked or password sign in is closed",
+        429: "Too many sign in attempts from this address",
+    },
+    ("POST", REFRESH_PATH): {
+        401: "The refresh material was refused",
+        403: "The request did not come from an allowed origin",
+        429: "Too many refresh attempts from this address",
+    },
+    ("POST", LOGOUT_PATH): {403: "The request did not come from an allowed origin"},
+    ("POST", LOGOUT_ALL_PATH): {401: "No bearer token was presented"},
+    ("POST", PASSWORD_PATH): {401: "The current password was refused"},
+    ("POST", VERIFY_REQUEST_PATH): {429: "Too many verification requests"},
+    ("POST", VERIFY_CONFIRM_PATH): {400: "The link is unknown, expired or already used"},
+    ("POST", RESET_REQUEST_PATH): {429: "Too many reset requests"},
+    ("POST", RESET_CONFIRM_PATH): {400: "The link is unknown, expired or already used"},
+    ("POST", LOGIN_TOTP_PATH): {
+        401: "The code was refused",
+        403: "The challenge is no longer open",
+        429: "Too many attempts from this address",
+    },
+    ("POST", TOTP_ENROL_PATH): {401: "No bearer token was presented", 429: "Too many enrolment attempts"},
+    ("POST", TOTP_ACTIVATE_PATH): {
+        401: "No bearer token was presented, or the code was refused",
+        429: "Too many attempts from this address",
+    },
+    ("POST", TOTP_DISABLE_PATH): {
+        401: "No bearer token was presented, or the code was refused",
+        429: "Too many attempts from this address",
+    },
+    ("POST", RECOVERY_CODES_PATH): {
+        401: "No bearer token was presented, or the code was refused",
+        429: "Too many attempts from this address",
+    },
+    ("POST", STEP_UP_PATH): {
+        401: "No bearer token was presented, or the factor was refused",
+        429: "Too many attempts from this address",
+    },
+}
+"""The statuses the identity routes really answer, keyed by method and unprefixed path.
+
+FastAPI declares a route with 200 and 422 alone, so without this the published document
+promises statuses the routes do not keep: `POST /register` answers 400 to a body with no
+email, `GET /oauth/callback` answers 303 on every browser leg, and every rate limited route
+answers 429. That is not cosmetic, because the post-deploy suite holds each operation to its
+own `responses` table.
+
+A route's rate limited statuses are declared here whether or not this deployment mounts the
+limiter, since the document describes the route rather than one environment's settings.
+"""
+
+
+def _declare_route_responses(router: APIRouter, prefix: str, table: Mapping[tuple[str, str], dict[int, str]]) -> None:
+    """Add each route's real statuses to its OpenAPI responses, leaving existing ones alone.
+
+    Keyed by unprefixed path so one table serves every deployment whatever issuer path the
+    settings give it. A status a route already describes keeps its own description.
+    """
+    from fastapi.routing import APIRoute
+
+    for route in router.routes:
+        if not isinstance(route, APIRoute):
+            continue
+        if not route.path.startswith(prefix):
+            continue
+        bare = route.path[len(prefix) :]
+        for method in route.methods or ():
+            for status_code, description in table.get((method, bare), {}).items():
+                route.responses.setdefault(status_code, {"description": description})
