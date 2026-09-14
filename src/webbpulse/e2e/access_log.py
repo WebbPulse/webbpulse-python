@@ -8,6 +8,12 @@ ran, and that distinction is what separates a landed cut from a request falling 
 Delivery is per stream and can lag, so the lookup is a bounded wait rather than a single
 read. A miss inside the budget is reported as a miss rather than as a routing failure: the
 HTTP probe already proved the request reached the API.
+
+The suite probes every live route up front and then asks for all of their entries, so the
+lookup reads the whole delivery window in one unfiltered scan and serves every id from that
+one cache. One group of 147 routes then pays one delivery lag rather than 147 of them. A
+rescan is throttled to one per poll interval across all callers, so a run of misses costs
+one CloudWatch read rather than one each.
 """
 
 from __future__ import annotations
@@ -25,6 +31,8 @@ UNSET_PLACEHOLDER = "-"
 DEFAULT_WAIT_SECONDS = 120.0
 DEFAULT_POLL_SECONDS = 5.0
 LOOKBACK_MILLISECONDS = 120_000
+WINDOW_MARGIN_MILLISECONDS = 10_000
+SCAN_PAGE_LIMIT = 10_000
 
 
 @dataclass(frozen=True)
@@ -125,29 +133,91 @@ class AccessLogLookup:
         self._clock = clock
         self._now_ms = now_ms
         self._cache: dict[str, AccessLogEntry] = {}
+        self._window_start_ms: int | None = None
+        self._last_scan_at: float | None = None
 
     @property
     def log_group(self) -> str:
         """The access log group this looks in."""
         return self._log_group
 
-    def _read_once(self, request_id: str, start_time_ms: int) -> AccessLogEntry | None:
-        """One `filter_log_events` pass, caching every entry it can parse."""
+    @property
+    def cached_ids(self) -> frozenset[str]:
+        """Every request id a scan or a read has already parsed, for a diagnostic."""
+        return frozenset(self._cache)
+
+    def open_window(self, first_probe_ms: int) -> None:
+        """Declare the delivery window every later lookup scans, from the first probe.
+
+        The suite probes every route before it asks for any entry, so the window is opened
+        once with the timestamp of that first probe and each scan reads from there. A
+        margin is taken off the front because the gateway timestamps an entry when it
+        finishes the request, not when the probe was sent.
+        """
+        start = first_probe_ms - WINDOW_MARGIN_MILLISECONDS
+        if self._window_start_ms is None or start < self._window_start_ms:
+            self._window_start_ms = start
+
+    def _window_start(self) -> int:
+        """The start of the scan window, falling back to a lookback when none was opened."""
+        if self._window_start_ms is not None:
+            return self._window_start_ms
+        return self._now_ms() - LOOKBACK_MILLISECONDS
+
+    def scan_window(self, *, force: bool = False) -> int:
+        """Read the whole delivery window unfiltered and cache every entry it parses.
+
+        Returns how many entries the cache holds afterwards. Throttled to one scan per poll
+        interval across every caller unless `force` is set, so 147 lookups that all miss
+        cost one CloudWatch read between them rather than one each.
+        """
+        now = self._clock()
+        if not force and self._last_scan_at is not None and now - self._last_scan_at < self._poll_seconds:
+            return len(self._cache)
+        self._last_scan_at = now
         token: str | None = None
         while True:
             kwargs: dict[str, Any] = {
                 "logGroupName": self._log_group,
-                "startTime": start_time_ms,
+                "startTime": self._window_start(),
+                "limit": SCAN_PAGE_LIMIT,
+            }
+            if token:
+                kwargs["nextToken"] = token
+            response = self._client.filter_log_events(**kwargs)
+            self._absorb(response.get("events", []))
+            token = response.get("nextToken")
+            if not token:
+                break
+        return len(self._cache)
+
+    def _absorb(self, events: Any) -> None:
+        """Cache every event in one page that parses as an access log entry."""
+        for event in events:
+            entry = parse_entry(str(event.get("message", "")))
+            if entry is not None:
+                self._cache[entry.request_id] = entry
+
+    def read_one(self, request_id: str, *, start_time_ms: int | None = None) -> AccessLogEntry | None:
+        """One `filter_log_events` pass filtered to a single request id, caching what it parses.
+
+        The narrow read the window scan replaced for the suite. It stays available as the
+        fallback for a single lookup outside the window, where scanning the whole delivery
+        window would read a busy stage's log group whole for one id.
+        """
+        start = start_time_ms if start_time_ms is not None else self._window_start()
+        token: str | None = None
+        while True:
+            kwargs: dict[str, Any] = {
+                "logGroupName": self._log_group,
+                "startTime": start,
                 "filterPattern": f'"{request_id}"',
                 "limit": 100,
             }
             if token:
                 kwargs["nextToken"] = token
             response = self._client.filter_log_events(**kwargs)
-            for event in response.get("events", []):
-                entry = parse_entry(str(event.get("message", "")))
-                if entry is not None:
-                    self._cache[entry.request_id] = entry
+            self._absorb(response.get("events", []))
             token = response.get("nextToken")
             if not token:
                 break
@@ -155,6 +225,10 @@ class AccessLogLookup:
 
     def find(self, request_id: str, *, start_time_ms: int | None = None) -> AccessLogEntry | None:
         """The access log entry for one request id, or None once the budget runs out.
+
+        The cache is consulted first, then the delivery window is scanned, and only then
+        does the bounded wait begin. A `start_time_ms` names a window this lookup was not
+        opened for, so that call takes the per-id filtered read instead of the scan.
 
         None means "not delivered inside the budget", not "the request did not happen". The
         caller decides whether that is a failure, which it is for a route cut assertion and
@@ -166,13 +240,19 @@ class AccessLogLookup:
         if cached is not None:
             return cached
 
-        start = start_time_ms if start_time_ms is not None else self._now_ms() - LOOKBACK_MILLISECONDS
         deadline = self._clock() + self._wait_seconds
         while True:
-            entry = self._read_once(request_id, start)
+            entry = self._read(request_id, start_time_ms)
             if entry is not None:
                 return entry
             remaining = deadline - self._clock()
             if remaining <= 0:
                 return None
             self._sleep(min(self._poll_seconds, remaining))
+
+    def _read(self, request_id: str, start_time_ms: int | None) -> AccessLogEntry | None:
+        """One attempt at an id: the window scan, or the filtered read for an explicit window."""
+        if start_time_ms is not None:
+            return self.read_one(request_id, start_time_ms=start_time_ms)
+        self.scan_window()
+        return self._cache.get(request_id)

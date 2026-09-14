@@ -24,6 +24,7 @@ from webbpulse.http import (
     DYNAMODB_RETRY_AFTER_SECONDS,
     REQUEST_CONTEXT_HEADER,
     REQUEST_ID_HEADER,
+    ROUTE_KEY_HEADER,
     ErrorSpec,
     bind_user_id,
     client_ip,
@@ -33,6 +34,7 @@ from webbpulse.http import (
     mount_all,
     register_error_handlers,
     request_id,
+    route_key,
     user_id_dependency,
 )
 from webbpulse.logging import configure_logging
@@ -1341,3 +1343,51 @@ def test_the_request_log_can_be_turned_off(caplog: pytest.LogCaptureFixture) -> 
         client.get("/health")
 
     assert _request_lines(caplog.records) == []
+
+
+class TestRouteKeyHeader:
+    """The gateway's `routeKey` echoed on every response, in every environment.
+
+    The access log is the other place that says which route key served a request, and it
+    takes half a minute to deliver. Echoing it here makes a route cut provable the moment
+    the probe answers.
+    """
+
+    def test_the_route_key_is_read_from_the_request_context(self) -> None:
+        """The Web Adapter forwards the context, and `routeKey` is taken verbatim."""
+        request = _request(_context_header({"routeKey": "GET /api/parts/{part_id}"}))
+        assert route_key(request) == "GET /api/parts/{part_id}"
+
+    def test_a_local_run_has_no_route_key(self) -> None:
+        """Nothing forwards a request context locally, so the fact is simply unknown."""
+        assert route_key(_request()) == ""
+
+    def test_an_unparseable_context_has_no_route_key(self) -> None:
+        """A header that is not JSON is ignored rather than failing the request."""
+        assert route_key(_request({REQUEST_CONTEXT_HEADER: "{not json"})) == ""
+
+    def test_a_context_without_a_route_key_has_none(self) -> None:
+        """A REST-format context carries no `routeKey`, which is not an error."""
+        assert route_key(_request(_context_header({"http": {"sourceIp": "203.0.113.7"}}))) == ""
+
+    def test_a_non_string_route_key_is_ignored(self) -> None:
+        """A malformed value is no value, since the caller compares it against a key."""
+        assert route_key(_request(_context_header({"routeKey": 7}))) == ""
+
+    def test_the_response_carries_the_route_key(self) -> None:
+        """Every response through the shared middleware echoes the key that served it."""
+        client = TestClient(create_app())
+        response = client.get("/health", headers=_context_header({"routeKey": "ANY /{proxy+}"}))
+        assert response.headers[ROUTE_KEY_HEADER] == "ANY /{proxy+}"
+
+    def test_an_error_response_carries_it_too(self) -> None:
+        """A 404 is exactly the answer a route cut assertion needs the key for."""
+        client = TestClient(create_app())
+        response = client.get("/missing", headers=_context_header({"routeKey": "ANY /{proxy+}"}))
+        assert response.status_code == 404
+        assert response.headers[ROUTE_KEY_HEADER] == "ANY /{proxy+}"
+
+    def test_the_header_is_absent_without_a_request_context(self) -> None:
+        """A local run answers with no route key header at all rather than an empty one."""
+        response = TestClient(create_app()).get("/health")
+        assert ROUTE_KEY_HEADER not in response.headers

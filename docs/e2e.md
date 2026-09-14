@@ -19,7 +19,7 @@ journey is one junit case:
 
 | Group | Asks |
 | --- | --- |
-| `TestRouteCut` | Every live route key is expressible, has an integration, and the access log confirms which key served the probe |
+| `TestRouteCut` | Every live route key is expressible, has an integration, and the response header or the access log confirms which key served the probe |
 | `TestCoverage` | Every OpenAPI operation resolves to a live route, carries no trailing slash, and lands on a route whose identity authorizer matches its security requirement. The staging access gate does not count as identity, and where it is the only authorizer the check is skipped |
 | `TestReachability` | Every operation is answered by the API rather than by the gate, the limiter or a catch-all. A mutation with no path parameter is probed anonymously only, so the run never signs its own user out |
 | `TestIdentity` | Login returns an RS256 token carrying this environment's issuer and audience, refresh and logout work, the JWKS is reachable without the gate header, and a minted token with the wrong audience or an expired one is rejected |
@@ -29,9 +29,22 @@ journey is one junit case:
 
 Two of those deserve their reasons stated, because both have shipped as green before.
 
-The access log is the only place that says which `routeKey` matched, so a 200 alone never
-proves the cut landed. Delivery is per stream and lags, so the lookup waits inside a budget
-and reports a miss as a miss rather than as a routing failure.
+A 200 alone never proves the cut landed, because it does not say which `routeKey` matched.
+Two things do. The shared HTTP layer echoes the gateway's own `routeKey` on every response
+as `X-WebbPulse-Route-Key`, in every environment, read from the request context the Lambda
+Web Adapter forwards, so a probe that reached the function proves the cut the moment it
+answers. Where that header is absent the gateway answered before the function ran, which is
+what an identity rejection, a gate rejection and the gateway's own 404 look like, and the
+access log entry is then the only thing that names the key.
+
+The group probes every live route up front through the `route_probes` fixture and only then
+asks for the entries, and `AccessLogLookup` reads the whole delivery window in one
+unfiltered scan rather than filtering for one request id at a time. Delivery is per stream
+and lags roughly half a minute, so a group that has to fall back pays that lag once rather
+than once per route; a rescan is throttled to one per poll interval across every caller, so
+a run of misses costs one CloudWatch read between them. The per-request-id filtered read
+stays available as `read_one`, for a single lookup outside the window. A miss inside the
+budget is still reported as a miss rather than as a routing failure.
 
 An anonymous visit to a public route is meant to provoke a 401: the shared
 `@webbpulse/api-client` calls `POST /api/auth/refresh` on load, and with no session that is
@@ -158,16 +171,22 @@ What still runs anonymously:
 
 | Still runs | Skipped |
 | --- | --- |
-| The route cut, every live route probed and correlated in the access log | Every case that signs in as the durable e2e user |
+| The route cut, every live route probed and correlated | Every case that signs in as the durable e2e user |
 | Gateway coverage, every operation resolving to a live route | The authenticated reachability probe |
 | Anonymous reachability, including a protected operation answering 401 or 403 | Sign in and out through the UI, and the guest-only redirect check |
-| Frontend hygiene: the shell, the catch-all, the bundle and the preflight | Login, refresh and logout, and the token shape assertions |
+| Frontend hygiene: the shell, the catch-all, the bundle and the preflight | Login, refresh and logout, the token shape assertions, and the minted-token cases |
 | Protected routes redirecting an anonymous visitor | Every declared protected route's render case |
 | Every declared public route rendering clean | Every journey with `signed_in=True` or `mutates=True` |
 | Journeys declaring neither `signed_in` nor `mutates` | The cleanup hook, in both phases |
 
-Minting is unchanged and stays governed by `E2E_MINT_ENABLED` alone. Production does not set
-it, and `mint_test_token` refuses production independently of the flag.
+Minting stays governed by `E2E_MINT_ENABLED`. Production does not set it, and
+`mint_test_token` refuses production independently of the flag. The minted subject defaults
+to the durable e2e user's own id, so read-only mode skips the mint cases as well: a
+made-up subject names no real user, the API refuses the token on subject resolution, and a
+negative case would then pass for a reason that has nothing to do with the `aud` or `exp` it
+claims to test. The accepted-token case treats a 403 as proof the token authenticated,
+because the probe is whichever auth-requiring operation the configuration offers first and
+on a product with an admin surface that is an admin route; only a 401 fails it.
 
 ## Fixtures
 
@@ -175,14 +194,15 @@ it, and `mint_test_token` refuses production independently of the flag.
 | --- | --- |
 | `e2e_env` | The parsed `E2EEnvironment`, including `resource_prefix`, `is_production` and `rate_limited` |
 | `gate_headers` | The `x-origin-verify` header, or an empty mapping in production |
-| `anon` | A client carrying the gate header and no identity, paced everywhere but staging |
+| `anon` | A client carrying the gate header and no identity, paced everywhere but staging. It serves `get`, `post`, `put`, `patch`, `delete` and `options`, each through the same `request` path, so pacing, the 429 retry and the request record apply to every verb |
 | `user_session` | The durable user signed in through the real login route. Skips in read-only mode |
 | `api` | The authenticated client, sharing the anonymous client's pacer |
-| `minted_token` | Mints a token through KMS with no login. Skips unless `E2E_MINT_ENABLED` is set, in read-only mode too |
+| `minted_token` | Mints a token through KMS with no login, for the durable e2e user's own subject. Skips unless `E2E_MINT_ENABLED` is set, and in read-only mode, where there is no user to mint for |
 | `gateway_routes`, `route_keys` | The live routes, read once per run |
 | `gateway_authorizers`, `gate_authorizers` | The API's authorizers, and the ids of the access gate ones among them |
 | `openapi_document`, `openapi_operations` | The product's document and its operations |
-| `access_log` | Find an access log entry by request id, with a bounded wait |
+| `access_log` | Find an access log entry by request id: the window scan first, then a bounded wait |
+| `route_probes` | Every live route probed once, up front, so the group waits out one delivery lag rather than one per route |
 | `http` | A plain client for the web origin, carrying no API gate header |
 | `cors_request_headers` | The header names the shared TypeScript client sends |
 | `created_resources` | A list this run appends to, handed to the cleanup hook at the end |

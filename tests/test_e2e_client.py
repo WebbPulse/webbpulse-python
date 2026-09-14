@@ -266,3 +266,57 @@ class TestGateHeaderAndRequestIds:
         clock = Clock()
         client = client_for(responder([500]), clock)
         assert client.get("/api/parts").status_code == 500
+
+
+class TestVerbs:
+    """Tests that every verb goes through `request`, so pacing and recording apply."""
+
+    @pytest.mark.parametrize("verb", ["get", "post", "put", "patch", "delete", "options"])
+    def test_each_verb_sends_its_own_method(self, verb: str) -> None:
+        """`put` and `patch` join the four that were already there."""
+        seen: list[str] = []
+
+        def handle(request: httpx.Request) -> httpx.Response:
+            """Record the method and answer 200."""
+            seen.append(request.method)
+            return httpx.Response(200, json={})
+
+        clock = Clock()
+        client = client_for(handle, clock)
+        getattr(client, verb)("/api/parts")
+        assert seen == [verb.upper()]
+
+    @pytest.mark.parametrize("verb", ["put", "patch"])
+    def test_the_new_verbs_are_recorded(self, verb: str) -> None:
+        """A recorded request is what the hygiene group and the failure reports read."""
+        clock = Clock()
+        client = client_for(responder([200], {"apigw-requestid": "gw-1"}), clock)
+        getattr(client, verb)("/api/parts/abc")
+        record = client.records[-1]
+        assert record.method == verb.upper()
+        assert record.path == "/api/parts/abc"
+        assert record.request_id == "gw-1"
+
+    @pytest.mark.parametrize("verb", ["put", "patch"])
+    def test_the_new_verbs_retry_a_429(self, verb: str) -> None:
+        """Going through `request` means the limiter policy applies to them too."""
+        clock = Clock()
+        client = client_for(responder([429, 200], {"retry-after": "5"}), clock)
+        response = getattr(client, verb)("/api/parts/abc")
+        assert response.status_code == 200
+        assert clock.slept == [5.0]
+
+    @pytest.mark.parametrize("verb", ["put", "patch"])
+    def test_the_new_verbs_carry_the_gate_header(self, verb: str) -> None:
+        """Staging's header is injected on every verb, not only the four that had methods."""
+        seen: list[httpx.Headers] = []
+
+        def handle(request: httpx.Request) -> httpx.Response:
+            """Record the headers and answer 200."""
+            seen.append(request.headers)
+            return httpx.Response(200, json={})
+
+        clock = Clock()
+        client = client_for(handle, clock, gate_headers={"x-origin-verify": "secret-value"})
+        getattr(client, verb)("/api/parts/abc", json={"name": "x"})
+        assert seen[0]["x-origin-verify"] == "secret-value"

@@ -302,6 +302,14 @@ class E2EClient:
         """Send a POST."""
         return self.request("POST", path, **kwargs)
 
+    def put(self, path: str, **kwargs: Any) -> httpx.Response:
+        """Send a PUT, for an operation the app declares as a full replacement."""
+        return self.request("PUT", path, **kwargs)
+
+    def patch(self, path: str, **kwargs: Any) -> httpx.Response:
+        """Send a PATCH, for an operation the app declares as a partial update."""
+        return self.request("PATCH", path, **kwargs)
+
     def delete(self, path: str, **kwargs: Any) -> httpx.Response:
         """Send a DELETE."""
         return self.request("DELETE", path, **kwargs)

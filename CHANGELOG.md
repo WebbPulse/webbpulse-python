@@ -5,6 +5,46 @@ Notable changes to the `webbpulse` package. The version here is the one in
 
 This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## 0.33.0
+
+The e2e route cut group proves a cut from the response rather than from the access log, and
+where it still needs the log it pays one delivery lag for the whole group instead of one per
+route. On the first full CarModPicker staging run that group was 3393 s of a 60 minute wall,
+147 routes at a median of 27 s each, and the run ran out of OIDC credentials before it
+finished.
+
+`RequestIdMiddleware` now echoes the gateway's matched `routeKey` as `X-WebbPulse-Route-Key`
+on every response in every environment, read verbatim from the request context the Lambda
+Web Adapter forwards and absent when that header is not there. `webbpulse.http` exports
+`ROUTE_KEY_HEADER`, `route_key` and `request_context`.
+`TestRouteCut.test_access_log_names_this_route_key` reads that header as its primary proof
+and falls back to the access log only for a request the gateway answered before the function
+ran, which is what an identity rejection, a gate rejection and the gateway's own 404 look
+like.
+
+A new session-scoped `route_probes` fixture probes every live route up front, with the same
+method, path and precedence-shadowing rules the per-route case used, and opens the lookup's
+delivery window at the first probe. `AccessLogLookup` gains `open_window`, `scan_window` and
+`read_one`: `find` consults the cache, scans the whole window unfiltered, and only then
+polls, with a rescan throttled to one per poll interval across every caller. The
+per-request-id filtered read stays as `read_one` for a single lookup outside the window.
+`DEFAULT_WAIT_SECONDS` and `DEFAULT_POLL_SECONDS` mean what they meant, and a miss inside
+the budget is still a miss. The three per-route cases and their parametrisation are
+unchanged, so the junit shape is the same.
+
+`E2EClient` gains `put` and `patch`, through the same `request` path as the other four, so
+pacing, the 429 retry and the request record apply to them.
+
+Two minted-token defects are fixed. `minted_token` defaults its subject to the durable e2e
+user's own id instead of a made-up `<prefix>mint`, which named no real user, so the API
+refused every minted token on subject resolution and the two negative cases passed for the
+wrong reason; the fixture needs the user session and therefore skips in read-only mode, and
+the three mint cases carry `e2e_writes`. The accepted-token case now treats a 403 as proof
+the token authenticated, since the probe is whichever auth-requiring operation the
+configuration offers first and on a product with an admin surface that is an admin route;
+only a 401 fails it. Those messages say "the API" rather than "the authorizer", because a
+product that verifies tokens in process has no gateway JWT authorizer.
+
 ## 0.32.1
 
 `build_identity_router` defaults `limiter_enabled` to the same convention: `None` now means

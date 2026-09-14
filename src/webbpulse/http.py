@@ -40,6 +40,7 @@ __all__ = [
     "REQUEST_CONTEXT_HEADER",
     "REQUEST_ID_HEADER",
     "RETRY_ATTEMPT_HEADER",
+    "ROUTE_KEY_HEADER",
     "DynamoDBErrorHandlerOptions",
     "DynamoDBErrors",
     "ErrorContext",
@@ -62,8 +63,10 @@ __all__ = [
     "install_dynamodb_handlers",
     "mount_all",
     "register_error_handlers",
+    "request_context",
     "request_id",
     "resolve_error_envelope",
+    "route_key",
     "user_id_dependency",
 ]
 
@@ -76,6 +79,8 @@ LAMBDA_CONTEXT_HEADER: Final = "x-amzn-lambda-context"
 REQUEST_ID_HEADER: Final = "X-Request-ID"
 
 RETRY_ATTEMPT_HEADER: Final = "X-Retry-Attempt"
+
+ROUTE_KEY_HEADER: Final = "X-WebbPulse-Route-Key"
 
 DEFAULT_CORS_ALLOW_HEADERS: Final = (
     "Accept",
@@ -111,28 +116,49 @@ _ROUTING_DETAILS: Final[Mapping[str, str]] = {
 }
 
 
+def request_context(request: Request) -> Mapping[str, Any] | None:
+    """The API Gateway request context the Lambda Web Adapter forwards, or None.
+
+    None on a local run, where nothing sets the header, and on a header that is not JSON,
+    which is logged once and then ignored rather than failing the request.
+    """
+    raw = request.headers.get(REQUEST_CONTEXT_HEADER)
+    if not raw:
+        return None
+    try:
+        context = json.loads(raw)
+    except (TypeError, ValueError):
+        _log.warning("Could not parse %s as JSON; ignoring it.", REQUEST_CONTEXT_HEADER)
+        return None
+    return context if isinstance(context, Mapping) else None
+
+
+def route_key(request: Request) -> str:
+    """The `routeKey` API Gateway matched this request to, or "" when it is not known.
+
+    The access log is the other place that says which route key served a request, and it
+    takes half a minute to deliver. This is the same fact on the response itself, so a
+    route cut is provable the moment the probe answers.
+    """
+    context = request_context(request)
+    if context is None:
+        return ""
+    value = context.get("routeKey")
+    return value if isinstance(value, str) and value else ""
+
+
 def client_ip(request: Request, *, local_fallback: bool = True) -> str:
     """The caller's IP address, read from the API Gateway request context header.
 
     `X-Forwarded-For` is never read, because a client can forge it. Falls back to the peer
     address when `local_fallback` is set, and returns `"unknown"` otherwise.
     """
-    raw = request.headers.get(REQUEST_CONTEXT_HEADER)
-    if raw:
-        try:
-            context = json.loads(raw)
-        except (TypeError, ValueError):
-            _log.warning("Could not parse %s as JSON; ignoring it.", REQUEST_CONTEXT_HEADER)
-            context = None
-        if isinstance(context, Mapping):
-            http_section = context.get("http")
-            if isinstance(http_section, Mapping):
-                source_ip = http_section.get("sourceIp")
-                if isinstance(source_ip, str) and source_ip:
-                    return source_ip
-            identity = context.get("identity")
-            if isinstance(identity, Mapping):
-                source_ip = identity.get("sourceIp")
+    context = request_context(request)
+    if context is not None:
+        for section in ("http", "identity"):
+            values = context.get(section)
+            if isinstance(values, Mapping):
+                source_ip = values.get("sourceIp")
                 if isinstance(source_ip, str) and source_ip:
                     return source_ip
 
@@ -200,10 +226,15 @@ class RequestIdMiddleware(BaseHTTPMiddleware):
 
     An inbound `X-Request-ID` is honoured and a UUID4 minted otherwise. The id reaches
     `request.state`, the log context variable, and the active OpenTelemetry span.
+
+    It also echoes the gateway's own `routeKey` as `X-WebbPulse-Route-Key`, in every
+    environment, so which route served a request is provable from the response rather than
+    only from an access log that lags. The header is absent on a local run, where nothing
+    forwards a request context.
     """
 
     async def dispatch(self, request: Request, call_next: RequestResponseEndpoint) -> Response:
-        """Bind the request id for the call, then echo it on the response header."""
+        """Bind the request id for the call, then echo it and the route key on the response."""
         incoming = request.headers.get(REQUEST_ID_HEADER, "").strip()
         rid = incoming[:128] if incoming else str(uuid.uuid4())
         setattr(request.state, _REQUEST_ID_STATE, rid)
@@ -223,6 +254,9 @@ class RequestIdMiddleware(BaseHTTPMiddleware):
         finally:
             request_id_var.reset(token)
         response.headers[REQUEST_ID_HEADER] = rid
+        matched = route_key(request)
+        if matched:
+            response.headers[ROUTE_KEY_HEADER] = matched
         return response
 
 
