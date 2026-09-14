@@ -354,6 +354,10 @@ class IdentityFlows:
 
         Checks lockout, loads the user, always verifies against a real or dummy hash, asks the
         product, then records the attempt. Every refusal raises the same `LoginRejected`.
+
+        An empty address is refused before lockout and records no attempt: lockout protects
+        one account, and the empty key names none, so counting it would only let anonymous
+        probes lock every later empty submission out for up to fifteen minutes.
         """
         moment = now or datetime.now(UTC)
         if not self._settings.passwords_enabled:
@@ -364,6 +368,8 @@ class IdentityFlows:
             )
 
         normalised_email = _normalise_email(email)
+        if not normalised_email:
+            raise LoginRejected()
         identity = email_key(normalised_email)
 
         state = self._lockout_state(identity, now=moment)

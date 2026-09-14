@@ -50,6 +50,14 @@ It refuses production twice over, at settings validation and in the constructor,
 `mint_test_token` does. `RATE_LIMIT_FREE_ENVIRONMENTS` gained `"local"`. Two hash and range
 key rows in `docs/identity-data-model.md` were wrong and are corrected.
 
+One login defect the CarModPicker staging runs surfaced. `IdentityFlows.login` recorded a
+lockout failure against the empty email key whenever the address was blank, so the
+anonymous reachability probe, which posts an empty login on every run, walked the empty
+key up to the fifteen minute delay and every later empty submission answered 429. A blank
+address is now refused with the ordinary invalid-credentials answer before lockout is
+consulted and records no attempt: lockout protects one account, and the empty key names
+none.
+
 ## 0.37.0
 
 Concurrent e2e runs, a parallel suite, and three pacing and correlation defects the
