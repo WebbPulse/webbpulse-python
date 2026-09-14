@@ -15,6 +15,7 @@ import pytest
 from _pytest.outcomes import Skipped
 
 from webbpulse.e2e.access_log import AccessLogEntry
+from webbpulse.e2e.browser import BrowserFailure
 from webbpulse.e2e.client import E2EClient, RateLimitExhausted
 from webbpulse.e2e.gateway import ABSENT_ID, Operation, Route
 from webbpulse.e2e.journeys import ExpectText
@@ -22,7 +23,6 @@ from webbpulse.e2e.suite import (
     SETTLE_POLL_MS,
     SETTLE_TIMEOUT_MS,
     STEP_POLL_MS,
-    BrowserFailure,
     ProbeTarget,
     RouteProbe,
     _expect_text,
@@ -500,7 +500,7 @@ class FakePage:
         class _Locator:
             def inner_text(self) -> str:
                 page.reads += 1
-                return page._scripted(page._texts, "")
+                return str(page._scripted(page._texts, ""))
 
         return _Locator()
 
