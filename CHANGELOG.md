@@ -5,6 +5,31 @@ Notable changes to the `webbpulse` package. The version here is the one in
 
 This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## 0.34.0
+
+`webbpulse.identity` gains `JwksVerifier`, which verifies an access token against the
+issuer's published JWKS over HTTPS rather than through `kms:GetPublicKey`. `TokenService`
+reads its keys from KMS and so builds only where the signing key ARNs and that grant are,
+which is the identity function alone; a domain function holding nothing but the issuer and
+the audience now has a supported way to resolve a bearer token in process. That is what an
+optional-auth route needs, because the gateway publishes claims only for the route keys it
+enforces a token on and an optional-auth route is never one of those.
+
+RS256 only, with `iss`, `aud`, `exp` and `nbf` all verified and `exp`, `iat`, `iss` and
+`sub` all required. `alg` is checked against the header before any key is fetched, so an
+`alg: none` or HS256 token is refused without a network call, and `typ` is asserted
+positively against `access` unless a caller names another. Every rejection is
+`InvalidToken`, the same type `TokenService.verify_access_token` raises.
+
+The key set is cached across invocations by `PyJWKClient`, with `lifespan` bounding how
+long a set is served and `cooldown_duration` bounding how often an unknown `kid` may
+trigger a refetch, so a signing key rotation is picked up without an unbounded fetch loop.
+`discovery_jwks_uri` resolves the `jwks_uri` from the issuer's discovery document and
+refuses one that points at another origin; passing `jwks_uri` directly skips that fetch.
+`JwksVerifier.from_settings` builds one from `IdentitySettings` without reading a signing
+key ARN. New exports: `JwksVerifier`, `discovery_jwks_uri`, `DEFAULT_CACHE_LIFESPAN`,
+`DEFAULT_COOLDOWN` and `DEFAULT_TIMEOUT`.
+
 ## 0.33.0
 
 The e2e route cut group proves a cut from the response rather than from the access log, and

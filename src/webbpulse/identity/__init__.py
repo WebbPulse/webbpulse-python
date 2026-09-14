@@ -283,6 +283,13 @@ from webbpulse.identity.verification import (
     LinkService,
     describe_expiry,
 )
+from webbpulse.identity.verifier import (
+    DEFAULT_CACHE_LIFESPAN,
+    DEFAULT_COOLDOWN,
+    DEFAULT_TIMEOUT,
+    JwksVerifier,
+    discovery_jwks_uri,
+)
 
 __all__ = [
     "ACCESS_TOKEN_TYPE",
@@ -300,7 +307,10 @@ __all__ = [
     "CHALLENGE_TTL_SECONDS",
     "CONFIRMATION_FAILED_MESSAGE",
     "CREDENTIALS_TABLE",
+    "DEFAULT_CACHE_LIFESPAN",
+    "DEFAULT_COOLDOWN",
     "DEFAULT_EVENTS_PATH",
+    "DEFAULT_TIMEOUT",
     "DEFAULT_USERS_KEY_ATTRIBUTE",
     "DIGEST_MESSAGE_TYPE",
     "DISCOVERY_CACHE_CONTROL",
@@ -430,6 +440,7 @@ __all__ = [
     "InvalidToken",
     "IssuedLink",
     "IssuedRefresh",
+    "JwksVerifier",
     "KmsClient",
     "KmsDataKeyClient",
     "KmsSigner",
@@ -489,6 +500,7 @@ __all__ = [
     "coerce_claims",
     "constant_time_equals",
     "describe_expiry",
+    "discovery_jwks_uri",
     "email_key",
     "encryption_context",
     "equalise_password_timing",
