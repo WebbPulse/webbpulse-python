@@ -5,6 +5,45 @@ Notable changes to the `webbpulse` package. The version here is the one in
 
 This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## 0.30.1
+
+Fixes four `webbpulse.e2e` bugs the first full run against the Portfolio staging deployment
+turned up. All four are plugin bugs, not product defects.
+
+An access log field the gateway had no value for is written as a literal `-`, not as an empty
+string, because the access log format names every field it wants and the gateway renders an
+unset `$context` variable that way. `parse_entry` read that as a value, so a healthy request
+carrying `"integrationErrorMessage":"-"` looked like a failed integration and
+`TestRouteCut::test_access_log_names_this_route_key` failed on a successful login. Every
+string field now reads `-` as empty, through a shared `log_field` helper.
+
+The staging access gate is no longer counted as identity authorization. It is a REQUEST
+authorizer admitting any caller that presents `x-origin-verify` or the signed gate cookies,
+and the `http-api` module attaches it to every route it creates, deliberately public ones
+included, so `TestCoverage::test_authorizer_matches_the_operation` failed for every public
+operation and the minted-token probes were handed a public route. The plugin now reads the
+API's authorizers and recognises the gate from the configuration itself, by REQUEST type plus
+the `<prefix>-access-gate-origin-verify` name `modules/staging-access-gate` always gives it,
+so no new environment variable is needed. Only a non-gate authorizer counts as identity, and
+the minted-token probes pick a route that actually requires one. Where the gate is the only
+authorizer on the API, which is what `identity_jwt = null` deploys, the gate's own Lambda
+verifies the identity token and no route carries a separate identity authorizer; the route
+table cannot say which operations need one, so that check is skipped with that reason rather
+than failing. New `gateway_authorizers` and `gate_authorizers` fixtures, and new
+`Authorizer`, `fetch_authorizers`, `gate_authorizer_ids`, `route_requires_identity` and
+`identity_authorization_is_observable` in `webbpulse.e2e.gateway`.
+
+The "route renders clean" failure message now names the locator that was actually tried. A
+`RouteSpec` carrying its own `root_locator` was reported against the shared `ROOT_SELECTORS`
+it never looked at, so the message pointed at selectors that had nothing to do with the
+failure.
+
+`TestBrowser::test_sign_in_and_out_through_the_ui` no longer requires the path to change on
+sign out. An app that renders its login form in place, as Portfolio `/admin` does, could never
+pass that. Sign out is now judged by what the page shows: the signed-in marker is gone, the
+login form is visible again, and a reload does not bring the marker back, which is still the
+assertion that catches a session cleared in memory but left in storage.
+
 ## 0.30.0
 
 Adds the browser layer to `webbpulse.e2e`, so the post-deploy suite exercises the deployed UI

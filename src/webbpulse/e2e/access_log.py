@@ -18,7 +18,9 @@ from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from typing import Any
 
-__all__ = ["AccessLogEntry", "AccessLogLookup", "parse_entry"]
+__all__ = ["AccessLogEntry", "AccessLogLookup", "log_field", "parse_entry"]
+
+UNSET_PLACEHOLDER = "-"
 
 DEFAULT_WAIT_SECONDS = 120.0
 DEFAULT_POLL_SECONDS = 5.0
@@ -49,6 +51,21 @@ class AccessLogEntry:
         return bool(self.route_key) and self.route_key != "$default"
 
 
+def log_field(payload: Mapping[str, Any], *keys: str) -> str:
+    """The first non-empty string field among `keys`, with API Gateway's `-` read as empty.
+
+    An access log format names `$context` variables, and the gateway renders one that is
+    unset for the request as a literal `-` rather than omitting the field or writing an
+    empty string. A healthy request therefore carries `"integrationErrorMessage":"-"`, which
+    a plain truthiness check reads as an error message and reports as a failed integration.
+    """
+    for key in keys:
+        value = str(payload.get(key) or "").strip()
+        if value and value != UNSET_PLACEHOLDER:
+            return value
+    return ""
+
+
 def parse_entry(message: str) -> AccessLogEntry | None:
     """Parse one access log message, or None when it is not the JSON format the stage sets.
 
@@ -70,17 +87,17 @@ def parse_entry(message: str) -> AccessLogEntry | None:
         except (TypeError, ValueError):
             return 0
 
-    request_id = str(payload.get("requestId") or payload.get("requestid") or "")
+    request_id = log_field(payload, "requestId", "requestid")
     if not request_id:
         return None
     return AccessLogEntry(
         request_id=request_id,
-        route_key=str(payload.get("routeKey") or ""),
-        path=str(payload.get("path") or payload.get("rawPath") or ""),
-        method=str(payload.get("httpMethod") or payload.get("method") or ""),
+        route_key=log_field(payload, "routeKey"),
+        path=log_field(payload, "path", "rawPath"),
+        method=log_field(payload, "httpMethod", "method"),
         status=_int("status"),
         integration_status=_int("integrationStatus"),
-        integration_error=str(payload.get("integrationErrorMessage") or ""),
+        integration_error=log_field(payload, "integrationErrorMessage"),
         raw=payload,
     )
 

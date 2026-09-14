@@ -256,3 +256,56 @@ class TestAgainstCloudwatch:
                 clock=clock,
             )
             assert lookup.find("req-absent", start_time_ms=now_ms - 60_000) is None
+
+
+class TestUnsetPlaceholder:
+    """API Gateway renders an unset `$context` variable as `-`, which is not a value.
+
+    The access log format names every field it wants, so the gateway always writes every
+    field. One that has no value for this request is written as a literal `-`, and a healthy
+    request therefore carries `"integrationErrorMessage":"-"`. Reading that as an error
+    message fails the route cut assertion on exactly the requests that worked.
+    """
+
+    def test_a_dash_integration_error_reads_as_no_error(self) -> None:
+        """A successful request logging `-` for its integration error has no error."""
+        entry = parse_entry(line(integrationErrorMessage="-", integrationLatency="42"))
+        assert entry is not None
+        assert entry.integration_error == ""
+        assert not entry.integration_error
+
+    def test_a_real_integration_error_survives(self) -> None:
+        """A genuine integration error message is still reported."""
+        entry = parse_entry(line(integrationErrorMessage="Internal Server Error"))
+        assert entry is not None
+        assert entry.integration_error == "Internal Server Error"
+
+    def test_a_dash_route_key_reads_as_no_route(self) -> None:
+        """A request the gateway answered itself logs `-` for its route key."""
+        entry = parse_entry(line(routeKey="-"))
+        assert entry is not None
+        assert entry.route_key == ""
+        assert not entry.matched_a_route
+
+    def test_a_dash_is_empty_for_every_string_field(self) -> None:
+        """Path and method read `-` as empty too, not as a one-character value."""
+        entry = parse_entry(line(path="-", httpMethod="-"))
+        assert entry is not None
+        assert entry.path == ""
+        assert entry.method == ""
+
+    def test_a_dash_request_id_is_not_an_entry(self) -> None:
+        """An entry whose request id is the placeholder is unusable, so it is skipped."""
+        assert parse_entry(line(requestId="-")) is None
+
+    def test_a_dash_falls_through_to_the_next_key(self) -> None:
+        """A field with alternates takes the first that is neither empty nor the placeholder."""
+        entry = parse_entry(line(path="-", rawPath="/api/build-lists"))
+        assert entry is not None
+        assert entry.path == "/api/build-lists"
+
+    def test_a_path_that_is_only_a_dash_segment_survives(self) -> None:
+        """A real path merely containing a dash is untouched."""
+        entry = parse_entry(line(path="/api/build-lists/a-b-c"))
+        assert entry is not None
+        assert entry.path == "/api/build-lists/a-b-c"

@@ -34,7 +34,15 @@ from .access_log import AccessLogLookup
 from .browser import ROOT_SELECTORS, BrowserFailure, ConsoleErrors, FailedRequests, browser_contract, sign_in
 from .client import E2EClient, RateLimitExhausted
 from .frontend import fetch_bundle, missing_allowed_headers, shell_looks_like_an_app
-from .gateway import Operation, Route, matching_route, resolve, route_key_is_expressible
+from .gateway import (
+    Operation,
+    Route,
+    identity_authorization_is_observable,
+    matching_route,
+    resolve,
+    route_key_is_expressible,
+    route_requires_identity,
+)
 from .identity import JWKS_PATH, decode_claims, logout, refresh
 from .journeys import (
     Click,
@@ -316,14 +324,32 @@ class TestCoverage:
             "claims and answers 401 to a valid token."
         )
 
-    def test_authorizer_matches_the_operation(self, operation: Operation, gateway_routes: Sequence[Route]) -> None:
-        """An operation needing auth lands on a route with an authorizer, and vice versa."""
+    def test_authorizer_matches_the_operation(
+        self,
+        operation: Operation,
+        gateway_routes: Sequence[Route],
+        gate_authorizers: frozenset[str],
+    ) -> None:
+        """An operation needing auth lands on a route with an identity authorizer, and vice versa.
+
+        The access gate is not identity: it admits any caller presenting the `x-origin-verify`
+        header or the signed gate cookies, and the http-api module attaches it to every route
+        it creates, public ones included. Only a non-gate authorizer counts here.
+        """
         route = matching_route(operation, gateway_routes)
         if route is None:
             pytest.skip("no live route matches, which the coverage case above already reports")
-        assert route.has_authorizer == operation.requires_auth, (
+        if not identity_authorization_is_observable(gateway_routes, gate_authorizers):
+            pytest.skip(
+                "no live route carries an authorizer other than the staging access gate, so "
+                "the gate's Lambda authorizer holds every route's only authorizer slot and "
+                "verifies the identity token itself. The deployed route configuration cannot "
+                "say which operations require a token, so there is nothing structural to check."
+            )
+        requires_identity = route_requires_identity(route, gate_authorizers)
+        assert requires_identity == operation.requires_auth, (
             f"{operation.label} declares requires_auth={operation.requires_auth} but resolves "
-            f"to {route.route_key!r}, which has_authorizer={route.has_authorizer}. A "
+            f"to {route.route_key!r}, which requires_identity={requires_identity}. A "
             "protected operation behind an unflagged route is served with no claims; an open "
             "one behind an authorizer is unreachable."
         )
@@ -459,9 +485,11 @@ class TestIdentity:
         minted_token: Callable[..., str],
         anon: E2EClient,
         gateway_routes: Sequence[Route],
+        gate_authorizers: frozenset[str],
+        openapi_operations: Sequence[Operation],
     ) -> None:
-        """Staging only: a KMS-minted token is accepted on a route behind the authorizer."""
-        route = _first_authorized_route(gateway_routes)
+        """Staging only: a KMS-minted token is accepted on a route that requires identity."""
+        route = _first_identity_route(gateway_routes, gate_authorizers, openapi_operations)
         token = minted_token({"roles": ["admin"]})
         response = anon.with_token(token).request(_probe_method(route), _probe_path(route))
         assert response.status_code not in (401, 403), (
@@ -474,9 +502,11 @@ class TestIdentity:
         minted_token: Callable[..., str],
         anon: E2EClient,
         gateway_routes: Sequence[Route],
+        gate_authorizers: frozenset[str],
+        openapi_operations: Sequence[Operation],
     ) -> None:
         """Staging only: a token for another audience is refused by the authorizer."""
-        route = _first_authorized_route(gateway_routes)
+        route = _first_identity_route(gateway_routes, gate_authorizers, openapi_operations)
         token = minted_token(audience="https://e2e.invalid/not-this-audience")
         response = anon.with_token(token).request(_probe_method(route), _probe_path(route))
         assert response.status_code in (401, 403), (
@@ -489,11 +519,13 @@ class TestIdentity:
         minted_token: Callable[..., str],
         anon: E2EClient,
         gateway_routes: Sequence[Route],
+        gate_authorizers: frozenset[str],
+        openapi_operations: Sequence[Operation],
     ) -> None:
         """Staging only: a token whose `exp` has passed is refused by the authorizer."""
         import time
 
-        route = _first_authorized_route(gateway_routes)
+        route = _first_identity_route(gateway_routes, gate_authorizers, openapi_operations)
         token = minted_token(expires_in=1, now=int(time.time()) - 3600)
         response = anon.with_token(token).request(_probe_method(route), _probe_path(route))
         assert response.status_code in (401, 403), (
@@ -508,11 +540,50 @@ class TestIdentity:
 
 
 def _first_authorized_route(routes: Sequence[Route]) -> Route:
-    """One live route that sits behind an authorizer, for the minted-token probes."""
+    """One live route that sits behind any authorizer, for a probe that needs a real path.
+
+    Structural, so on a gated staging API this is simply the first route. Callers asserting
+    something about identity want `_first_identity_route` instead.
+    """
     for route in sorted(routes, key=lambda item: item.route_key):
         if route.has_authorizer and "{proxy+}" not in route.path:
             return route
     pytest.skip("no live route carries an authorizer, so there is nothing to present a minted token to")
+
+
+def _first_identity_route(
+    routes: Sequence[Route],
+    gate_ids: frozenset[str],
+    operations: Sequence[Operation],
+) -> Route:
+    """One live route that actually requires an identity token, for the minted-token probes.
+
+    A route carrying only the access gate's authorizer is not one: the gate admits any
+    caller presenting the origin-verify header, so an expired or wrong-audience token
+    reaches the integration and is answered 200, and the probe asserting a 401 fails on a
+    healthy API. Where no route carries a non-gate authorizer the gate verifies the identity
+    token itself, and the route table cannot say which routes those are, so the operation
+    list the app declares is used instead.
+    """
+    ordered = sorted(routes, key=lambda item: item.route_key)
+    for route in ordered:
+        if route_requires_identity(route, gate_ids) and "{proxy+}" not in route.path:
+            return route
+
+    protected = {
+        operation.label for operation in operations if operation.requires_auth and not operation.is_bare_mutation
+    }
+    for route in ordered:
+        if "{proxy+}" in route.path:
+            continue
+        if f"{_probe_method(route)} {route.path}" in protected:
+            return route
+
+    pytest.skip(
+        "no live route requires an identity token: every authorizer on this API is the "
+        "staging access gate, and no declared operation that requires auth maps to a "
+        "concrete route key, so there is nothing to present a minted token to."
+    )
 
 
 class TestFrontend:
@@ -639,17 +710,20 @@ class TestBrowser:
 
     def test_sign_in_and_out_through_the_ui(
         self,
-        request: pytest.FixtureRequest,
         page: Any,
         login_form: LoginForm,
         e2e_env: Any,
         console_errors: ConsoleErrors,
     ) -> None:
-        """Signing in shows the signed-in marker, signing out takes it away, and the guard returns.
+        """Signing in shows the signed-in marker, signing out takes it away, and a reload keeps it away.
 
-        The reload at the end is the part worth having: an app that clears its in-memory
-        session on sign-out but leaves a token in storage looks signed out until the next
-        page load, which is when a person discovers they never were.
+        The reload is the part worth having: an app that clears its in-memory session on
+        sign-out but leaves a token in storage looks signed out until the next page load,
+        which is when a person discovers they never were.
+
+        Sign-out is judged by what the page shows, never by the URL. An app that renders its
+        login form in place leaves the path untouched, so requiring a change would fail every
+        run against a correct app.
         """
         sign_in(page, login_form, e2e_env)
         assert page.locator(login_form.signed_in_marker).is_visible(), (
@@ -658,18 +732,17 @@ class TestBrowser:
 
         page.click(login_form.sign_out)
         page.wait_for_selector(login_form.signed_out_marker, state="visible", timeout=e2e_env.browser_timeout_ms)
+        assert page.locator(login_form.signed_in_marker).count() == 0, (
+            f"{login_form.signed_in_marker} is still on the page after signing out, so the session was never cleared."
+        )
         assert not console_errors, f"signing in and out logged console errors: {console_errors.summary()}"
 
-        declared = browser_contract(request.config, e2e_env).routes
-        protected = _first_with_access(declared, "protected")
-        if protected is None:
-            pytest.skip("no protected route is declared, so there is no guard to reload against")
-        page.goto(protected.path, wait_until="domcontentloaded")
-        page.wait_for_timeout(500)
-        assert _path_of(page.url) != protected.path, (
-            f"after signing out, reloading {protected.path} still rendered it rather than "
-            f"redirecting to {login_form.anonymous_redirect}. A session cleared in memory "
-            "but left in storage reads as signed out until the next page load."
+        page.reload(wait_until="domcontentloaded")
+        page.wait_for_selector(login_form.signed_out_marker, state="visible", timeout=e2e_env.browser_timeout_ms)
+        assert page.locator(login_form.signed_in_marker).count() == 0, (
+            f"{login_form.signed_in_marker} came back after reloading, so signing out cleared "
+            "the session in memory but left a token in storage. The app reads as signed out "
+            "until the next page load, and a person discovers they never were."
         )
 
     def test_protected_routes_redirect_anonymous_visitors(
@@ -730,7 +803,8 @@ class TestBrowser:
         root = _root_locator(page, declared_route)
         assert root is not None, (
             f"{declared_route.path} rendered no mount point matching any of "
-            f"{', '.join(ROOT_SELECTORS)}, so there is nothing on the page to assert about"
+            f"{', '.join(_root_selectors(declared_route))}, so there is nothing on the page "
+            "to assert about"
         )
         assert root.locator("*").count() > 0, (
             f"{declared_route.path} answered with an empty mount point. A 200 carrying an "
@@ -844,21 +918,21 @@ def _path_of(url: str) -> str:
     return parts.path or "/"
 
 
+def _root_selectors(spec: RouteSpec) -> tuple[str, ...]:
+    """The selectors a route's mount point is looked for under, override first.
+
+    A route carrying its own `root_locator` is tried against that alone, so a failure
+    report names the selector that was actually used rather than the shared defaults.
+    """
+    return (spec.root_locator,) if spec.root_locator else tuple(ROOT_SELECTORS)
+
+
 def _root_locator(page: Any, spec: RouteSpec) -> Any:
     """The mount point to assert children under, honouring a route's own override."""
-    candidates = (spec.root_locator,) if spec.root_locator else ROOT_SELECTORS
-    for selector in candidates:
+    for selector in _root_selectors(spec):
         locator = page.locator(selector).first
         if locator.count() > 0:
             return locator
-    return None
-
-
-def _first_with_access(specs: Sequence[RouteSpec], access: str) -> RouteSpec | None:
-    """The first declared route at a given access level, or None."""
-    for spec in specs:
-        if spec.access == access:
-            return spec
     return None
 
 
