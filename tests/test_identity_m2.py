@@ -589,6 +589,23 @@ def test_five_failures_lock_the_account_and_the_sixth_is_a_429(
     assert caught.value.retry_after >= 1
 
 
+def test_an_empty_address_is_refused_without_recording_an_attempt(
+    flows: IdentityFlows, attempts: InMemoryLoginAttemptStore
+) -> None:
+    """An empty address names no account, so it neither counts toward nor trips lockout.
+
+    Anonymous probes post empty logins on every run; counting them would lock the empty
+    key for fifteen minutes and answer 429 to every later empty submission.
+    """
+    for _ in range(7):
+        with pytest.raises(LoginRejected) as caught:
+            flows.login(email="  ", password=OTHER_PASSWORD)
+        assert caught.value.status_code == 401
+        assert caught.value.error_code == "INVALID_CREDENTIALS"
+
+    assert attempts.recent(email_key("")) == []
+
+
 def test_a_correct_password_works_once_the_delay_has_elapsed(
     flows: IdentityFlows, hooks: FakeHooks, stores: IdentityStores
 ) -> None:
