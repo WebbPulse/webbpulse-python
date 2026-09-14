@@ -34,7 +34,7 @@ from .ephemeral import (
     Credentials,
     EphemeralUser,
     create_ephemeral_user,
-    delete_ephemeral_user,
+    describe_delete_failure,
 )
 from .gate import GateCookies
 from .gateway import (
@@ -475,6 +475,10 @@ def admin_mint_token(e2e_env: E2EEnvironment, request: pytest.FixtureRequest) ->
 
     The subject is this run's own id rather than a real user: the ephemeral routes read only
     the `roles` claim, so no subject has to resolve to a stored row.
+
+    A mint that was asked for and failed warns before falling back, naming the exception
+    type and message. A silent fallback made a broken key or a missing permission look like
+    an ordinary durable-user run. The token itself never reaches the warning.
     """
     if not e2e_env.mint_enabled or e2e_env.read_only:
         return ""
@@ -490,7 +494,15 @@ def admin_mint_token(e2e_env: E2EEnvironment, request: pytest.FixtureRequest) ->
             expires_in=3600,
             extra_claims={"roles": ["admin"]},
         )
-    except Exception:
+    except Exception as error:
+        request.config.issue_config_time_warning(
+            UserWarning(
+                f"Minting the admin token failed with {type(error).__name__}: {error}. This run "
+                "falls back to the durable user, so it creates no ephemeral user and shares the "
+                "account with every other run against this environment."
+            ),
+            stacklevel=2,
+        )
         return ""
 
 
@@ -524,11 +536,12 @@ def ephemeral_user(
     try:
         yield user
     finally:
-        if user is not None and not delete_ephemeral_user(anon, user, admin_token=admin_mint_token):
+        failure = describe_delete_failure(anon, user, admin_token=admin_mint_token) if user is not None else ""
+        if user is not None and failure:
             request.config.issue_config_time_warning(
                 UserWarning(
-                    f"The ephemeral e2e user {user.user_id} could not be deleted. It carries "
-                    "the e2e- prefix, so the next run's start sweep will collect it."
+                    f"The ephemeral e2e user {user.user_id} could not be deleted: {failure} It "
+                    "carries the e2e- prefix, so the next run's start sweep will collect it."
                 ),
                 stacklevel=2,
             )

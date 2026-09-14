@@ -13,11 +13,14 @@ from typing import Any, ClassVar
 import pytest
 
 from webbpulse.e2e.ephemeral import (
+    BODY_EXCERPT_LIMIT,
     CREATE_PATH,
     Credentials,
     EphemeralUser,
     create_ephemeral_user,
     delete_ephemeral_user,
+    describe_delete_failure,
+    describe_error_body,
     ephemeral_email,
     generate_password,
     item_path,
@@ -33,13 +36,24 @@ RUN_ID = "run-1234"
 ADMIN_TOKEN = "minted-admin-token"
 
 
+VALIDATION_ENVELOPE: Any = {
+    "success": False,
+    "status": 422,
+    "error_code": "VALIDATION_ERROR",
+    "message": "Request validation failed.",
+    "request_id": "req-abc123",
+    "details": [{"field": "request", "message": "Field required", "type": "missing"}],
+}
+
+
 class FakeResponse:
     """One scripted HTTP answer."""
 
-    def __init__(self, status_code: int, payload: Any = None) -> None:
-        """Hold the status and the body this answer carries."""
+    def __init__(self, status_code: int, payload: Any = None, text: str = "") -> None:
+        """Hold the status, the body this answer carries and its raw text."""
         self.status_code = status_code
         self._payload = payload
+        self.text = text
 
     def json(self) -> Any:
         """The body, raising the way httpx does when it is not JSON."""
@@ -196,6 +210,107 @@ class TestCreateEphemeralUser:
         assert "the-generated-password" not in str(caught.value)
         assert ADMIN_TOKEN not in str(caught.value)
 
+    def test_no_secret_reaches_a_message_carrying_an_envelope(self) -> None:
+        """The password is in the request body, and the response rendering must not echo it."""
+        client = FakeClient([FakeResponse(422, VALIDATION_ENVELOPE)])
+        with pytest.raises(RuntimeError) as caught:
+            create_ephemeral_user(client, run_id=RUN_ID, admin_token=ADMIN_TOKEN, password="the-generated-password")
+        message = str(caught.value)
+        assert "the-generated-password" not in message
+        assert ADMIN_TOKEN not in message
+
+    def test_no_secret_reaches_a_message_carrying_a_non_json_body(self) -> None:
+        """The excerpt path reads the response alone, so the posted password cannot reach it."""
+        client = FakeClient([FakeResponse(400, ValueError("not json"), text="Bad Request")])
+        with pytest.raises(RuntimeError) as caught:
+            create_ephemeral_user(client, run_id=RUN_ID, admin_token=ADMIN_TOKEN, password="the-generated-password")
+        message = str(caught.value)
+        assert "the-generated-password" not in message
+        assert ADMIN_TOKEN not in message
+        assert "body=Bad Request" in message
+
+    def test_the_envelope_reaches_the_raised_message(self) -> None:
+        """Today's staging 422 said nothing about why until the envelope was rendered."""
+        client = FakeClient([FakeResponse(422, VALIDATION_ENVELOPE)])
+        with pytest.raises(RuntimeError) as caught:
+            create_ephemeral_user(client, run_id=RUN_ID, admin_token=ADMIN_TOKEN)
+        message = str(caught.value)
+        assert "VALIDATION_ERROR" in message
+        assert "Request validation failed." in message
+        assert "req-abc123" in message
+        assert "request: Field required (missing)" in message
+
+
+class TestDescribeErrorBody:
+    """What a failing response is rendered as, which is the whole point of the change."""
+
+    def test_it_renders_the_shared_envelope_with_details(self) -> None:
+        """The shape CarModPicker's 422 carries, whose cause was invisible before."""
+        rendered = describe_error_body(FakeResponse(422, VALIDATION_ENVELOPE))
+        assert "error_code=VALIDATION_ERROR" in rendered
+        assert "message=Request validation failed." in rendered
+        assert "request_id=req-abc123" in rendered
+        assert "details=[request: Field required (missing)]" in rendered
+
+    def test_it_renders_an_envelope_without_details(self) -> None:
+        """Only a 422 carries details, so every other status renders the three scalar fields."""
+        rendered = describe_error_body(
+            FakeResponse(500, {"error_code": "INTERNAL_ERROR", "message": "Boom.", "request_id": "req-xyz"})
+        )
+        assert rendered == "error_code=INTERNAL_ERROR message=Boom. request_id=req-xyz"
+        assert "details" not in rendered
+
+    def test_it_renders_every_detail_entry(self) -> None:
+        """A validation failure naming several fields must name all of them."""
+        rendered = describe_error_body(
+            FakeResponse(
+                422,
+                {
+                    "error_code": "VALIDATION_ERROR",
+                    "details": [
+                        {"field": "email", "message": "Field required", "type": "missing"},
+                        {"field": "password", "message": "Too short", "type": "string_too_short"},
+                    ],
+                },
+            )
+        )
+        assert "email: Field required (missing)" in rendered
+        assert "password: Too short (string_too_short)" in rendered
+
+    def test_it_reads_a_pydantic_shaped_detail(self) -> None:
+        """A product answering raw FastAPI errors names the field under `loc` and `msg`."""
+        rendered = describe_error_body(
+            FakeResponse(
+                422,
+                {
+                    "error_code": "VALIDATION_ERROR",
+                    "details": [{"loc": ["body", "email"], "msg": "Field required", "type": "missing"}],
+                },
+            )
+        )
+        assert "body.email: Field required (missing)" in rendered
+
+    def test_a_non_json_body_is_excerpted(self) -> None:
+        """A gateway or proxy answers HTML, and a whole page in a message is unreadable."""
+        html = "<html>" + "x" * 1000 + "</html>"
+        rendered = describe_error_body(FakeResponse(502, ValueError("not json"), text=html))
+        assert rendered.startswith("body=<html>")
+        assert rendered.endswith("...")
+        assert len(rendered) <= BODY_EXCERPT_LIMIT + len("body=") + len("...")
+
+    def test_a_short_non_json_body_is_rendered_whole(self) -> None:
+        """Nothing is lost when the body already fits."""
+        rendered = describe_error_body(FakeResponse(502, ValueError("not json"), text="Bad Gateway"))
+        assert rendered == "body=Bad Gateway"
+
+    def test_an_empty_body_says_so(self) -> None:
+        """A bare status with no body is itself the finding, and must not render as nothing."""
+        assert describe_error_body(FakeResponse(500, ValueError("not json"), text="")) == "the body was empty"
+
+    def test_a_json_body_that_is_not_an_object_is_excerpted(self) -> None:
+        """A bare list or string is not the envelope, so it falls through to the excerpt."""
+        assert describe_error_body(FakeResponse(500, ["nope"], text='["nope"]')) == 'body=["nope"]'
+
 
 class TestDeleteEphemeralUser:
     """Teardown, which must never replace a finished run's results with an error."""
@@ -228,6 +343,31 @@ class TestDeleteEphemeralUser:
         """A raise at session teardown would replace a completed run's results."""
         client = FakeClient(raises=RuntimeError("connection reset"))
         assert delete_ephemeral_user(client, self.user(), admin_token=ADMIN_TOKEN) is False
+
+    def test_a_success_describes_no_failure(self) -> None:
+        """The empty string is what the caller reads as "nothing to warn about"."""
+        client = FakeClient([FakeResponse(200)])
+        assert describe_delete_failure(client, self.user(), admin_token=ADMIN_TOKEN) == ""
+
+    def test_a_failure_status_carries_the_envelope(self) -> None:
+        """The teardown warning is the only place a cleanup failure is ever seen."""
+        client = FakeClient([FakeResponse(422, VALIDATION_ENVELOPE)])
+        failure = describe_delete_failure(client, self.user(), admin_token=ADMIN_TOKEN)
+        assert "answered 422" in failure
+        assert "VALIDATION_ERROR" in failure
+        assert "request: Field required (missing)" in failure
+
+    def test_a_transport_failure_names_the_exception(self) -> None:
+        """A reset connection and a refused delete must not read alike."""
+        client = FakeClient(raises=RuntimeError("connection reset"))
+        failure = describe_delete_failure(client, self.user(), admin_token=ADMIN_TOKEN)
+        assert "RuntimeError" in failure
+        assert "connection reset" in failure
+
+    def test_no_admin_token_reaches_a_described_failure(self) -> None:
+        """The delete call is admin gated, and its message lands in CI logs."""
+        client = FakeClient([FakeResponse(500, ValueError("not json"), text="nope")])
+        assert ADMIN_TOKEN not in describe_delete_failure(client, self.user(), admin_token=ADMIN_TOKEN)
 
 
 class FakeItem:
