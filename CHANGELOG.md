@@ -5,6 +5,51 @@ Notable changes to the `webbpulse` package. The version here is the one in
 
 This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## 0.38.0
+
+A `local` environment kind for the e2e plugin, and the identity pieces a local stack needs.
+
+The `webbpulse.e2e` plugin can now run against a stack built from source on a CI runner:
+one composed FastAPI app, DynamoDB Local and a vite preview server, with no AWS API call at
+all. `E2E_ENVIRONMENT=local` is the switch, and the contract is the two base URLs, the
+region, the run id and a user the product seeds itself. `E2E_API_ID` and
+`E2E_ACCESS_LOG_GROUP` are no longer required there, and `E2E_GATE_SSM_PARAMETER` and
+`E2E_MINT_ENABLED` are ignored. Setting the mint flag locally turns nothing on, because a
+local stack has no KMS key, so `admin_mint_token` is empty and the run falls back to the
+durable user from `E2E_USER_EMAIL` and `E2E_USER_PASSWORD`. Read-only stays governed by
+`E2E_READ_ONLY` alone, and the pacer is off because one runner is one source IP bucket.
+
+No fixture on the local path builds an AWS client. `gate_headers` yields an empty mapping
+without reading SSM, `gateway_authorizers` is empty, `access_log` skips rather than
+constructing a logs client, and `CollectionInputs` no longer imports boto3 at all there:
+the route table is synthesized from the product's own OpenAPI document through the new
+`routes_from_openapi`, one route per declared operation with the authorizer flag taken from
+the operation's declared security. `gate_cookies`, `admin_mint_token` and `minted_token`
+now pull `boto3_session` lazily, so a run that has no gate and cannot mint constructs no
+session anywhere.
+
+Group behaviour follows from what a local stack can prove. `TestRouteCut` is skipped whole,
+since it needs the deployed route table, the forwarded API Gateway request context and the
+CloudWatch access log. `TestCoverage` runs degraded: the route resolution cases compare the
+document to a table synthesized from that same document, and the authorizer case skips.
+`TestReachability`, `TestIdentity` minus the three minted-token cases, `TestFrontend`,
+`TestBrowser` and `TestHygiene` all run, and those are where a local run earns its place: a
+broken handler, a broken login, a broken bundle and a broken page are all caught before the
+branch is deployed. Every skip reason says it is a gateway concern that runs post deploy, so
+a skipped case does not read as a passed one.
+
+This release also carries the identity work that landed unreleased. `webbpulse.identity.storage`
+gained `TABLES`, the ten identity tables as `TableSpec` values transcribed from
+`platform-modules/aws//modules/identity`, with `TableAttribute`, `TableIndex`,
+`create_table_request()` and `time_to_live_request()`, so a local bootstrap and the deployed
+module cannot drift. `LocalSigner` is a supported signer implementing the same two-method
+`KmsClient` protocol `TokenService` signs through, with a 2048-bit RSA key derived
+deterministically from a seed so `kid` is stable across restarts, reached through the new
+`IdentitySettings.signer` and `local_signer_seed` and the `signing_client(settings)` helper.
+It refuses production twice over, at settings validation and in the constructor, the way
+`mint_test_token` does. `RATE_LIMIT_FREE_ENVIRONMENTS` gained `"local"`. Two hash and range
+key rows in `docs/identity-data-model.md` were wrong and are corrected.
+
 ## 0.37.0
 
 Concurrent e2e runs, a parallel suite, and three pacing and correlation defects the

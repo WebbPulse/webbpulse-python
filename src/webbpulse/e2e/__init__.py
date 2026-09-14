@@ -45,6 +45,7 @@ from .gateway import (
     fetch_routes,
     gate_authorizer_ids,
     operations_from_openapi,
+    routes_from_openapi,
 )
 from .identity import IdentitySession, login, mint
 from .journeys import (
@@ -65,6 +66,9 @@ __all__ = [
     "CREATE_PATH",
     "E2E_PREFIX",
     "GATE_HEADER",
+    "LOCAL_ACCESS_LOG_REASON",
+    "LOCAL_ENVIRONMENT",
+    "LOCAL_GATEWAY_REASON",
     "READ_ONLY_REASON",
     "SHARED_STATE_GROUP",
     "WRITES_MARKER",
@@ -97,6 +101,14 @@ _REQUIRED = (
     "E2E_ACCESS_LOG_GROUP",
     "E2E_RUN_ID",
 )
+
+LOCAL_ENVIRONMENT = "local"
+
+_GATEWAY_REQUIRED = ("E2E_API_ID", "E2E_ACCESS_LOG_GROUP")
+
+LOCAL_GATEWAY_REASON = "gateway only, runs post deploy"
+
+LOCAL_ACCESS_LOG_REASON = "the access log is gateway only, runs post deploy"
 
 _USER_REQUIRED = ("E2E_USER_EMAIL", "E2E_USER_PASSWORD")
 
@@ -197,6 +209,17 @@ class E2EEnvironment:
         return self.environment.lower() == "production"
 
     @property
+    def is_local(self) -> bool:
+        """Whether this run drives a stack built from source on the runner, with no AWS.
+
+        A local stack has no API Gateway, no CloudWatch access log, no access gate and no
+        KMS key, so `api_id`, `access_log_group`, the gate variables and the mint variables
+        are all empty and nothing here may construct an AWS client. What it does have is
+        the two base URLs, a run id and a user the product seeds itself.
+        """
+        return self.environment.lower() == LOCAL_ENVIRONMENT
+
+    @property
     def rate_limited(self) -> bool:
         """Whether the target paces callers, by the same convention the services deploy with.
 
@@ -224,10 +247,12 @@ class E2EEnvironment:
         """
         source = os.environ if environ is None else environ
         read_only = _truthy(source.get("E2E_READ_ONLY", ""))
-        missing = [name for name in _REQUIRED if not source.get(name, "").strip()]
+        is_local = source.get("E2E_ENVIRONMENT", "").strip().lower() == LOCAL_ENVIRONMENT
+        required = tuple(name for name in _REQUIRED if not (is_local and name in _GATEWAY_REQUIRED))
+        missing = [name for name in required if not source.get(name, "").strip()]
         if not read_only:
             missing.extend(name for name in _USER_REQUIRED if not source.get(name, "").strip())
-        mint_enabled = _truthy(source.get("E2E_MINT_ENABLED", ""))
+        mint_enabled = _truthy(source.get("E2E_MINT_ENABLED", "")) and not is_local
         if mint_enabled:
             missing.extend(name for name in _MINT_REQUIRED if not source.get(name, "").strip())
         if missing:
@@ -261,8 +286,8 @@ class E2EEnvironment:
             api_base_url=source["E2E_API_BASE_URL"].strip().rstrip("/"),
             web_base_url=source["E2E_WEB_BASE_URL"].strip().rstrip("/"),
             aws_region=source["E2E_AWS_REGION"].strip(),
-            api_id=source["E2E_API_ID"].strip(),
-            access_log_group=source["E2E_ACCESS_LOG_GROUP"].strip(),
+            api_id=source.get("E2E_API_ID", "").strip(),
+            access_log_group=source.get("E2E_ACCESS_LOG_GROUP", "").strip(),
             user_email=source.get("E2E_USER_EMAIL", "").strip(),
             user_password=source.get("E2E_USER_PASSWORD", ""),
             run_id=source["E2E_RUN_ID"].strip(),
@@ -312,18 +337,35 @@ def pytest_configure(config: pytest.Config) -> None:
     )
 
 
+LOCAL_SKIPPED_GROUPS: Mapping[str, str] = {
+    "TestRouteCut": (
+        "the route cut is a gateway concern: it needs the deployed route table, the "
+        f"forwarded request context and the CloudWatch access log. {LOCAL_GATEWAY_REASON}."
+    ),
+}
+
+LOCAL_SKIPPED_CASES: Mapping[str, str] = {
+    "test_authorizer_matches_the_operation": (
+        f"a local stack has no gateway authorizers to compare an operation against. {LOCAL_GATEWAY_REASON}."
+    ),
+}
+
+
 def pytest_collection_modifyitems(config: pytest.Config, items: list[pytest.Item]) -> None:
-    """Group the shared-state cases for xdist, then skip the mutating ones when read-only.
+    """Group the shared-state cases for xdist, then skip what this environment cannot run.
 
     The grouping runs on every collection, distributed or not: an `xdist_group` marker is
     inert without xdist, so one pass serves both.
 
     One place rather than a conditional in each case, so a product that marks a new mutating
-    test gets the production skip for free and cannot accidentally ship one that runs there.
-    The environment is read directly rather than through the `e2e_env` fixture because
+    test gets the production skip for free and cannot accidentally ship one that runs there,
+    and a local run skips every gateway case by group name without the case knowing. The
+    environment is read directly rather than through the `e2e_env` fixture because
     collection happens before any fixture runs.
     """
     apply_groups(items)
+    if _local_from_environ():
+        _skip_gateway_only_cases(items)
     if not _read_only_from_environ():
         return
     skip = pytest.mark.skip(reason=READ_ONLY_REASON)
@@ -332,9 +374,36 @@ def pytest_collection_modifyitems(config: pytest.Config, items: list[pytest.Item
             item.add_marker(skip)
 
 
+def _skip_gateway_only_cases(items: Sequence[pytest.Item]) -> None:
+    """Skip the cases that only a deployed gateway can answer, by group and by name.
+
+    Matched on the class name and the function name rather than on a marker, because the
+    groups are the plugin's own and a product re-exporting them must not have to mark
+    anything. A product case of its own is never touched: its class is not one of these.
+    """
+    for item in items:
+        group = _owning_group(item)
+        reason = LOCAL_SKIPPED_GROUPS.get(group) if group else None
+        if reason is None:
+            reason = LOCAL_SKIPPED_CASES.get(item.originalname if isinstance(item, pytest.Function) else item.name)
+        if reason is not None:
+            item.add_marker(pytest.mark.skip(reason=reason))
+
+
+def _owning_group(item: pytest.Item) -> str:
+    """The name of the suite class a case belongs to, or "" for a module level case."""
+    cls = getattr(item, "cls", None)
+    return "" if cls is None else str(cls.__name__)
+
+
 def _read_only_from_environ() -> bool:
     """Whether `E2E_READ_ONLY` is set, readable at collection with no fixture."""
     return _truthy(os.environ.get("E2E_READ_ONLY", ""))
+
+
+def _local_from_environ() -> bool:
+    """Whether `E2E_ENVIRONMENT` is local, readable at collection with no fixture."""
+    return os.environ.get("E2E_ENVIRONMENT", "").strip().lower() == LOCAL_ENVIRONMENT
 
 
 @pytest.fixture(scope="session")
@@ -352,15 +421,17 @@ def boto3_session(e2e_env: E2EEnvironment) -> Any:
 
 
 @pytest.fixture(scope="session")
-def gate_headers(e2e_env: E2EEnvironment, boto3_session: Any) -> Mapping[str, str]:
+def gate_headers(e2e_env: E2EEnvironment, request: pytest.FixtureRequest) -> Mapping[str, str]:
     """The `x-origin-verify` header staging requires, read from SSM and never printed.
 
-    Production has no gate and yields an empty mapping. A staging run whose parameter is
-    unset fails here rather than answering 401 to every probe, which is the failure mode
-    the prior art warns about loudest: the gate's 401 reads exactly like a broken route.
+    Production and a local stack have no gate and yield an empty mapping without reading
+    SSM, so neither builds a boto3 session at all: `boto3_session` is requested only on the
+    path that actually calls AWS. A staging run whose parameter is unset fails here rather
+    than answering 401 to every probe, which is the failure mode the prior art warns about
+    loudest: the gate's 401 reads exactly like a broken route.
     """
     if not e2e_env.gate_ssm_parameter:
-        if not e2e_env.is_production:
+        if not e2e_env.is_production and not e2e_env.is_local:
             pytest.fail(
                 "E2E_GATE_SSM_PARAMETER is empty in a non-production environment. Staging "
                 "sits behind the access gate, so every request below would be answered by "
@@ -368,6 +439,7 @@ def gate_headers(e2e_env: E2EEnvironment, boto3_session: Any) -> Mapping[str, st
                 "as broken routing that is really a missing credential."
             )
         return {}
+    boto3_session = request.getfixturevalue("boto3_session")
     client = boto3_session.client("ssm")
     response = client.get_parameter(Name=e2e_env.gate_ssm_parameter, WithDecryption=True)
     value = str(response["Parameter"]["Value"])
@@ -389,19 +461,24 @@ def anon(e2e_env: E2EEnvironment, gate_headers: Mapping[str, str]) -> Iterator[E
 
 
 @pytest.fixture(scope="session")
-def admin_mint_token(e2e_env: E2EEnvironment, boto3_session: Any) -> str:
+def admin_mint_token(e2e_env: E2EEnvironment, request: pytest.FixtureRequest) -> str:
     """A minted token carrying the admin role, or empty when this run cannot mint.
 
     The key that signs it is the staging KMS key the e2e workflow alone may use, so holding
     this token is the whole authorisation for creating and deleting an ephemeral user.
     Returns the empty string rather than skipping, because the caller falls back to the
-    durable user instead of failing.
+    durable user instead of failing. That is the local path: a local stack has no KMS key,
+    so minting is off, this is empty and the run signs in as the user the product seeded.
+
+    `boto3_session` is requested only once minting is known to be on, so a run that cannot
+    mint constructs no AWS client.
 
     The subject is this run's own id rather than a real user: the ephemeral routes read only
     the `roles` claim, so no subject has to resolve to a stored row.
     """
     if not e2e_env.mint_enabled or e2e_env.read_only:
         return ""
+    boto3_session = request.getfixturevalue("boto3_session")
     try:
         return mint(
             kms_client=boto3_session.client("kms"),
@@ -514,7 +591,7 @@ def minted_subject(user_session: IdentitySession) -> str:
 @pytest.fixture(scope="session")
 def minted_token(
     e2e_env: E2EEnvironment,
-    boto3_session: Any,
+    request: pytest.FixtureRequest,
     minted_subject: str,
 ) -> Callable[..., str]:
     """Mint an access token through KMS without a login, staging only.
@@ -533,7 +610,7 @@ def minted_token(
     """
     if not e2e_env.mint_enabled:
         pytest.skip("E2E_MINT_ENABLED is not set, so no token is minted in this environment")
-    kms = boto3_session.client("kms")
+    kms = request.getfixturevalue("boto3_session").client("kms")
 
     def _mint(
         claims: Mapping[str, Any] | None = None,
@@ -560,16 +637,21 @@ def minted_token(
 
 
 @pytest.fixture(scope="session")
-def gateway_routes(request: pytest.FixtureRequest, e2e_env: E2EEnvironment, boto3_session: Any) -> tuple[Route, ...]:
+def gateway_routes(request: pytest.FixtureRequest, e2e_env: E2EEnvironment) -> tuple[Route, ...]:
     """Every live route on the API, with its integration target and authorizer id.
 
     Reuses the list the suite's collection already read where there is one, so a run makes
-    one `get-routes` call rather than two against the same stage.
+    one `get-routes` call rather than two against the same stage. On a local stack the
+    cached list was synthesized from the product's own OpenAPI document and no AWS call is
+    made here either.
     """
     cached = request.config.pluginmanager.get_plugin("webbpulse-e2e-collection")
     routes = getattr(cached, "routes", None)
     if routes is None:
-        routes = fetch_routes(boto3_session.client("apigatewayv2"), e2e_env.api_id)
+        if e2e_env.is_local:
+            routes = routes_from_openapi(request.getfixturevalue("openapi_document"))
+        else:
+            routes = fetch_routes(request.getfixturevalue("boto3_session").client("apigatewayv2"), e2e_env.api_id)
     if not routes:
         pytest.fail(
             f"apigatewayv2 get-routes returned no routes for api {e2e_env.api_id}. Every "
@@ -580,8 +662,15 @@ def gateway_routes(request: pytest.FixtureRequest, e2e_env: E2EEnvironment, boto
 
 
 @pytest.fixture(scope="session")
-def gateway_authorizers(e2e_env: E2EEnvironment, boto3_session: Any) -> tuple[Authorizer, ...]:
-    """Every authorizer declared on the API, which is how the gate is told apart from identity."""
+def gateway_authorizers(e2e_env: E2EEnvironment, request: pytest.FixtureRequest) -> tuple[Authorizer, ...]:
+    """Every authorizer declared on the API, which is how the gate is told apart from identity.
+
+    Empty on a local stack, which has no gateway and so no authorizers, and no AWS client
+    is constructed to find that out.
+    """
+    if e2e_env.is_local:
+        return ()
+    boto3_session = request.getfixturevalue("boto3_session")
     return fetch_authorizers(boto3_session.client("apigatewayv2"), e2e_env.api_id)
 
 
@@ -603,8 +692,17 @@ def route_keys(gateway_routes: Sequence[Route]) -> tuple[str, ...]:
 
 
 @pytest.fixture(scope="session")
-def access_log(e2e_env: E2EEnvironment, boto3_session: Any) -> AccessLogLookup:
-    """A lookup that finds an access log entry by request id, with a bounded wait."""
+def access_log(e2e_env: E2EEnvironment, request: pytest.FixtureRequest) -> AccessLogLookup:
+    """A lookup that finds an access log entry by request id, with a bounded wait.
+
+    A local stack has no CloudWatch access log, so this skips rather than building a logs
+    client against an account the run has no credentials for. Every case that asks for it
+    is a gateway case that the local collection hook has already skipped; this is the
+    backstop for a product case that asks for it anyway.
+    """
+    if e2e_env.is_local:
+        pytest.skip(LOCAL_ACCESS_LOG_REASON)
+    boto3_session = request.getfixturevalue("boto3_session")
     return AccessLogLookup(boto3_session.client("logs"), e2e_env.access_log_group)
 
 

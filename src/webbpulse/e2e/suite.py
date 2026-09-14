@@ -224,16 +224,25 @@ class CollectionInputs:
     """
 
     def __init__(self, config: pytest.Config) -> None:
-        """Read the environment, the live routes and the product's operations."""
-        import boto3
+        """Read the environment, the live routes and the product's operations.
 
+        On a local stack there is no gateway to read, so boto3 is never imported and the
+        routes are synthesized from the very document the operations come from. Everywhere
+        else the route table is read live from `apigatewayv2 get-routes`.
+        """
         from . import E2EEnvironment
-        from .gateway import fetch_routes, operations_from_openapi
+        from .gateway import fetch_routes, operations_from_openapi, routes_from_openapi
 
         env = E2EEnvironment.from_environ()
+        document = _product_openapi_document(config)
+        self.operations: tuple[Operation, ...] = operations_from_openapi(document)
+        if env.is_local:
+            self.routes: tuple[Route, ...] = routes_from_openapi(document)
+            return
+        import boto3
+
         session = boto3.session.Session(region_name=env.aws_region)
-        self.routes: tuple[Route, ...] = fetch_routes(session.client("apigatewayv2"), env.api_id)
-        self.operations: tuple[Operation, ...] = operations_from_openapi(_product_openapi_document(config))
+        self.routes = fetch_routes(session.client("apigatewayv2"), env.api_id)
 
 
 def collection_inputs(config: pytest.Config) -> CollectionInputs:

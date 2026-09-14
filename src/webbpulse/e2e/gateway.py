@@ -37,11 +37,16 @@ __all__ = [
     "resolve",
     "route_key_is_expressible",
     "route_requires_identity",
+    "routes_from_openapi",
 ]
 
 LITERAL = 2
 VARIABLE = 1
 GREEDY = 0
+
+LOCAL_TARGET = "local/in-process"
+
+LOCAL_AUTHORIZER_ID = "local-identity"
 
 GATE_AUTHORIZER_SUFFIX = "-access-gate-origin-verify"
 
@@ -447,6 +452,35 @@ def operations_from_openapi(document: Mapping[str, Any]) -> tuple[Operation, ...
                 )
             )
     return tuple(operations)
+
+
+def routes_from_openapi(document: Mapping[str, Any]) -> tuple[Route, ...]:
+    """Synthesize a route table from an OpenAPI document, for a stack with no gateway.
+
+    A local stack serves one composed app on one origin and has no API Gateway, so there is
+    no route table to read and nothing to read it with. One route per declared operation
+    reproduces the shape the rest of the suite takes, keyed on `"<METHOD> <path>"`, with a
+    placeholder integration target because every operation is served in process, and with
+    an authorizer id set exactly when the operation declares a security requirement.
+
+    Coverage against this table is self consistent by construction: it compares the
+    document to a table derived from the same document. That is deliberate and is why the
+    route cut group stays post deploy, where the table is the deployed one.
+    """
+    return tuple(
+        sorted(
+            (
+                Route(
+                    route_key=f"{operation.method} {operation.path}",
+                    target=LOCAL_TARGET,
+                    authorizer_id=LOCAL_AUTHORIZER_ID if operation.requires_auth else "",
+                    authorization_type="CUSTOM" if operation.requires_auth else "NONE",
+                )
+                for operation in operations_from_openapi(document)
+            ),
+            key=lambda route: route.route_key,
+        )
+    )
 
 
 def matching_route(operation: Operation, routes: Sequence[Route]) -> Route | None:
