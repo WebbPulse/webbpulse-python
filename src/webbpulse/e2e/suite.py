@@ -46,6 +46,7 @@ from .browser import (
     sign_out,
 )
 from .client import E2EClient, RateLimitExhausted
+from .ephemeral import create_ephemeral_user, describe_delete_failure
 from .frontend import fetch_bundle, missing_allowed_headers, shell_looks_like_an_app
 from .gateway import (
     ABSENT_ID,
@@ -62,7 +63,7 @@ from .gateway import (
     route_key_is_expressible,
     route_requires_identity,
 )
-from .identity import JWKS_PATH, decode_claims, logout, refresh
+from .identity import DEFAULT_LOGIN_PATH, JWKS_PATH, decode_claims, login, logout, refresh
 from .journeys import (
     Click,
     ExpectText,
@@ -77,6 +78,7 @@ from .journeys import (
     expand,
     url_matches,
 )
+from .xdist import worker_id
 
 __all__ = [
     "RouteProbe",
@@ -782,10 +784,168 @@ class TestIdentity:
         )
 
     @pytest.mark.e2e_writes
+    def test_totp_enrolment_then_login_with_a_code(
+        self,
+        anon: E2EClient,
+        e2e_env: Any,
+        admin_mint_token: str,
+        request: pytest.FixtureRequest,
+    ) -> None:
+        """A whole second-factor life cycle against the deployed identity routes.
+
+        This is the only case that proves the TOTP seed survives a round trip through
+        whatever cipher the environment is configured with: enrolment seals a seed, and the
+        login a moment later can only succeed if the stored seed unsealed back to the same
+        bytes. A cipher misconfiguration that still accepts enrolment shows up here and
+        nowhere else, which is why the login leg is the assertion that matters.
+
+        The user is this case's own rather than the session's. `user_session` is shared by
+        every other identity case, so enrolling a factor on it would turn their plain
+        password logins into MFA challenges and fail them for a reason that has nothing to
+        do with what they test.
+
+        The codes come from the identity package's own generator rather than a third party
+        implementation, so a drift in how this project computes RFC 6238 fails the case
+        instead of being masked by two independent implementations happening to agree.
+        """
+        if e2e_env.read_only or not admin_mint_token:
+            pytest.skip("TOTP enrolment needs to create a user, which needs a writable environment and an admin token")
+
+        from webbpulse.identity import totp
+        from webbpulse.identity.router import (
+            LOGIN_TOTP_PATH,
+            TOTP_ACTIVATE_PATH,
+            TOTP_DISABLE_PATH,
+            TOTP_ENROL_PATH,
+        )
+
+        run_id = f"{e2e_env.run_id}-{worker_id(request.config)}-totp"
+        user = create_ephemeral_user(anon, run_id=run_id, admin_token=admin_mint_token)
+        if user is None:
+            pytest.skip("this deployment does not offer the ephemeral user route, so there is no user to enrol")
+
+        try:
+            session = login(anon, user.credentials.email, user.credentials.password)
+
+            enrol = session.client.post(f"{IDENTITY_PREFIX}{TOTP_ENROL_PATH}", json={})
+            assert enrol.status_code == 200, (
+                f"POST {IDENTITY_PREFIX}{TOTP_ENROL_PATH} answered {enrol.status_code} for a freshly "
+                f"created user: {enrol.text[:200]}"
+            )
+            seed = _totp_seed(enrol.json())
+            assert seed, (
+                "enrolment answered 200 with no secret in the body, so there is no seed to "
+                "generate a code from. The seed is returned exactly once, at enrolment."
+            )
+
+            activation_step = totp.current_step()
+            activate = session.client.post(
+                f"{IDENTITY_PREFIX}{TOTP_ACTIVATE_PATH}",
+                json={"code": totp.generate_code(seed, step=activation_step)},
+            )
+            assert activate.status_code == 200, (
+                f"POST {IDENTITY_PREFIX}{TOTP_ACTIVATE_PATH} answered {activate.status_code} for a code "
+                f"generated from the seed enrolment just returned: {activate.text[:200]}"
+            )
+
+            logout(session)
+
+            challenge = anon.post(
+                DEFAULT_LOGIN_PATH,
+                json={"email": user.credentials.email, "password": user.credentials.password},
+            )
+            assert challenge.status_code == 200, (
+                f"login answered {challenge.status_code} for a user with an active factor: {challenge.text[:200]}"
+            )
+            body = challenge.json()
+            assert body.get("mfa_required") is True, (
+                "login returned tokens for a user with an active TOTP factor rather than a "
+                "challenge, so the second factor is not being enforced at sign in."
+            )
+            ticket = body.get("mfa_ticket", "")
+            assert ticket, "login answered with mfa_required and no mfa_ticket, so the second leg cannot be called"
+
+            login_step = _next_unburned_step(totp, activation_step)
+            completion = anon.post(
+                f"{IDENTITY_PREFIX}{LOGIN_TOTP_PATH}",
+                json={"mfa_ticket": ticket, "code": totp.generate_code(seed, step=login_step)},
+            )
+            assert completion.status_code == 200, (
+                f"POST {IDENTITY_PREFIX}{LOGIN_TOTP_PATH} answered {completion.status_code}. The seed that "
+                "enrolment sealed did not unseal back to the same bytes, which is what a broken or "
+                f"misconfigured TOTP cipher looks like: {completion.text[:200]}"
+            )
+            assert _extract_access_token(completion.json()), (
+                "the second leg answered 200 with no access token, so the login never completed"
+            )
+
+            second_session = anon.with_token(_extract_access_token(completion.json()))
+            disable = second_session.post(
+                f"{IDENTITY_PREFIX}{TOTP_DISABLE_PATH}",
+                json={"code": totp.generate_code(seed, step=_next_unburned_step(totp, login_step))},
+            )
+            assert disable.status_code in (200, 204), (
+                f"POST {IDENTITY_PREFIX}{TOTP_DISABLE_PATH} answered {disable.status_code}, so the factor "
+                f"this case added is still on the account: {disable.text[:200]}"
+            )
+        finally:
+            describe_delete_failure(anon, user, admin_token=admin_mint_token)
+
+    @pytest.mark.e2e_writes
     def test_logout_ends_the_session(self, user_session: Any) -> None:
         """The logout route answers, and runs last because it ends the session."""
         response = logout(user_session)
         assert response.status_code in (200, 204), f"logout answered {response.status_code}: {response.text[:200]}"
+
+
+def _next_unburned_step(totp: Any, last_used_step: int) -> int:
+    """The soonest time step a code may be generated for after `last_used_step`.
+
+    Two rules have to hold at once. The server burns each step it accepts and refuses
+    anything at or below it, so the step must be strictly greater than the last one. The
+    server also verifies against its own clock within `VERIFICATION_WINDOW` steps, so a step
+    too far ahead is refused as readily as a replayed one. When the next unburned step is
+    still beyond the window this waits for the clock to reach it, which costs one time step
+    and only on the legs that need it.
+    """
+    target = last_used_step + 1
+    deadline = time.monotonic() + totp.TIME_STEP_SECONDS * (totp.VERIFICATION_WINDOW + 2)
+    while target > totp.current_step() + totp.VERIFICATION_WINDOW:
+        if time.monotonic() > deadline:
+            raise AssertionError(
+                f"waited past a full verification window for time step {target} to come into "
+                "range and it never did, so the clock this case reads is not advancing."
+            )
+        time.sleep(1)
+    return target
+
+
+def _totp_seed(payload: Any) -> str:
+    """The base32 seed from an enrolment body, under either of the names the route may use."""
+    if not isinstance(payload, dict):
+        return ""
+    for holder in (payload, payload.get("data")):
+        if not isinstance(holder, dict):
+            continue
+        for name in ("secret", "seed"):
+            value = holder.get(name)
+            if isinstance(value, str) and value:
+                return value
+    return ""
+
+
+def _extract_access_token(payload: Any) -> str:
+    """The access token from a login body, under any of the names the products use."""
+    if not isinstance(payload, dict):
+        return ""
+    for holder in (payload, payload.get("data")):
+        if not isinstance(holder, dict):
+            continue
+        for name in ("access_token", "accessToken", "token"):
+            value = holder.get(name)
+            if isinstance(value, str) and value:
+                return value
+    return ""
 
 
 def _first_authorized_route(routes: Sequence[Route]) -> Route:
