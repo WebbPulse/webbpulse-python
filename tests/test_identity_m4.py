@@ -9,6 +9,7 @@ from __future__ import annotations
 import base64
 import hashlib
 import hmac
+import json
 import struct
 import time
 from contextlib import contextmanager
@@ -1827,10 +1828,16 @@ def test_the_kms_cipher_stays_the_default() -> None:
     assert make_settings().totp_cipher == "kms"
 
 
-def test_the_secret_cipher_needs_a_master_key() -> None:
-    """`secret` without a master key fails validation at startup, not at first enrolment."""
-    with pytest.raises(ValidationError, match="totp_master_key"):
-        make_settings(totp_cipher="secret")
+def test_the_secret_cipher_may_take_its_master_key_from_the_app_secret(stores: IdentityStores, kms: FakeKms) -> None:
+    """An unset master key is allowed: a deployed environment resolves it from the app secret.
+
+    The failure then names both sources, rather than settings refusing an environment that
+    is actually configured correctly.
+    """
+    settings = make_settings(totp_cipher="secret")
+    service = MfaService(settings, stores, TokenService(make_settings(), kms), kms_client=kms)
+    with pytest.raises(ValueError, match="mfa_master_key"):
+        _ = service.cipher
 
 
 def test_a_master_key_that_is_not_base64_is_refused() -> None:
@@ -1870,3 +1877,34 @@ def test_the_secret_cipher_needs_no_kms_client_or_data_key(stores: IdentityStore
     service = MfaService(settings, stores, TokenService(make_settings(), kms), kms_client=None)
     sealed = service.cipher.seal(b"the seed", user_id=USER_ID)
     assert service.cipher.open(sealed, user_id=USER_ID) == b"the seed"
+
+
+def test_the_master_key_is_read_from_the_app_secret_not_the_environment(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The key arrives from the app secret at runtime, which keeps it out of Lambda config."""
+    from webbpulse.identity.crypto import resolve_totp_master_key
+
+    monkeypatch.delenv("IDENTITY_TOTP_MASTER_KEY", raising=False)
+
+    class FakeSecrets:
+        """A Secrets Manager stub holding one app secret."""
+
+        def get_secret_value(self, *, SecretId: str) -> dict[str, str]:
+            """Return the app secret carrying the master key."""
+            assert SecretId == "arn:aws:secretsmanager:us-west-2:1:secret:app"
+            return {"SecretString": json.dumps({"mfa_master_key": MASTER_KEY})}
+
+    resolved = resolve_totp_master_key(
+        secret_arn="arn:aws:secretsmanager:us-west-2:1:secret:app",
+        client=FakeSecrets(),
+    )
+    assert resolved == MASTER_KEY
+
+
+def test_the_environment_wins_over_the_app_secret(monkeypatch: pytest.MonkeyPatch) -> None:
+    """An explicit variable takes precedence, as it does for the OAuth client secrets."""
+    from webbpulse.identity.crypto import resolve_totp_master_key
+
+    monkeypatch.setenv("IDENTITY_TOTP_MASTER_KEY", MASTER_KEY)
+    assert resolve_totp_master_key(secret_arn="") == MASTER_KEY

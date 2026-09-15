@@ -22,6 +22,7 @@ __all__ = [
     "HKDF_INFO",
     "HKDF_SALT_BYTES",
     "MASTER_KEY_BYTES",
+    "MASTER_KEY_SECRET_ENTRY",
     "SCHEME_KMS_ENVELOPE",
     "SCHEME_SECRET_HKDF",
     "TOTP_ENCRYPTION_PURPOSE",
@@ -32,6 +33,7 @@ __all__ = [
     "SecretMasterKeyCipher",
     "TotpCipher",
     "encryption_context",
+    "resolve_totp_master_key",
 ]
 
 AES_KEY_BYTES: Final = 32
@@ -338,3 +340,37 @@ def _b64(raw: bytes) -> str:
 def _unb64(value: str) -> bytes:
     """Decode a strict ASCII base64 string back to bytes."""
     return base64.b64decode(value.encode("ascii"), validate=True)
+
+
+MASTER_KEY_SECRET_ENTRY: Final = "mfa_master_key"
+
+
+def resolve_totp_master_key(
+    *,
+    configured: str = "",
+    secret_arn: str | None = None,
+    client: Any = None,
+) -> str:
+    """The base64 TOTP master key, from the environment ahead of the app secret.
+
+    Mirrors how a product resolves its OAuth client secrets: an explicit value wins, then
+    `IDENTITY_TOTP_MASTER_KEY`, then the `mfa_master_key` entry of the app secret. Reading it
+    from the secret at runtime is what keeps the key out of the Lambda's environment, where
+    it would otherwise sit in plaintext configuration.
+
+    Returns an empty string when no source has it, which lets a caller in `kms` mode skip the
+    lookup entirely and a misconfigured `secret` mode fail settings validation by name.
+    """
+    import os
+
+    from webbpulse.security import app_secrets
+
+    if configured:
+        return configured
+
+    from_env = os.environ.get("IDENTITY_TOTP_MASTER_KEY", "")
+    if from_env:
+        return from_env
+
+    loaded = app_secrets(secret_arn, client=client)
+    return str(loaded.get(MASTER_KEY_SECRET_ENTRY, "") or "")

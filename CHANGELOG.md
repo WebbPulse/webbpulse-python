@@ -11,9 +11,11 @@ TOTP seeds can be sealed under a master key from the app secret instead of a KMS
 
 `IDENTITY_TOTP_CIPHER` picks the cipher. `kms` stays the default and is unchanged: a per-seed
 data key wrapped through `GenerateDataKey` under `IDENTITY_DATA_KEY_ARN`. `secret` is new and
-derives a per-seed key with HKDF-SHA256 from `IDENTITY_TOTP_MASTER_KEY`, a base64 32 byte key
-read from the environment's app secret, so an environment that uses it needs no symmetric KMS
-key and makes no KMS call when a user enrols or logs in.
+derives a per-seed key with HKDF-SHA256 from a base64 32 byte master key, so an environment
+that uses it needs no symmetric KMS key and makes no KMS call when a user enrols or logs in.
+The key is resolved on first use from `IDENTITY_TOTP_MASTER_KEY` where set and from the
+`mfa_master_key` entry of the app secret otherwise; a deployed environment should use the
+secret, since a variable would hold the key in the function's configuration in plaintext.
 
 Both ciphers bind `{"user_id", "purpose"}` into the ciphertext, the `secret` one through the
 HKDF info rather than a KMS encryption context, so a seed moved to another row still fails to

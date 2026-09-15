@@ -153,9 +153,12 @@ decrypt. `IDENTITY_TOTP_CIPHER` picks which cipher does it:
 - `kms`, the default, wraps a per-seed KMS data key through `GenerateDataKey`. Set
   `IDENTITY_DATA_KEY_ARN` to a symmetric key, distinct from the signing key. Reading a seed
   needs both table access and `kms:Decrypt`.
-- `secret` derives a per-seed key with HKDF-SHA256 from `IDENTITY_TOTP_MASTER_KEY`, a base64
-  32 byte key held as `mfa_master_key` in the environment's app secret. No KMS key and no KMS
-  call on the path. Reading a seed needs both table access and the app secret.
+- `secret` derives a per-seed key with HKDF-SHA256 from a base64 32 byte master key. No KMS
+  key and no KMS call on the path. Reading a seed needs both table access and the app secret.
+  The key is resolved on first use from `IDENTITY_TOTP_MASTER_KEY` where it is set, and from
+  the `mfa_master_key` entry of the app secret behind `APP_SECRETS_ARN` otherwise. A deployed
+  environment should use the secret: an environment variable would put the key in the
+  function's configuration in plaintext.
 
 The two formats are not interchangeable. A stored row carries `secret_scheme` in the `secret`
 format and omits it in the `kms` format, so each cipher refuses the other's records rather

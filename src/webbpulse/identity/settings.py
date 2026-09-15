@@ -261,10 +261,11 @@ class IdentitySettings(BaseSettings):
 
     @model_validator(mode="after")
     def _check_totp_cipher(self) -> IdentitySettings:
-        """Refuse `totp_cipher='secret'` without a usable master key.
+        """Refuse a master key that is set but unusable.
 
-        Checked here rather than at first enrolment so a misconfigured environment fails at
-        startup, not on the first user who tries to enrol.
+        An unset key is allowed: in a deployed environment it arrives from the app secret at
+        runtime rather than through the environment, so `MfaService` resolves it and raises
+        by name if no source has it.
         """
         if self.totp_cipher != "secret":
             return self
@@ -272,10 +273,7 @@ class IdentitySettings(BaseSettings):
         from webbpulse.identity.crypto import MASTER_KEY_BYTES
 
         if not self.totp_master_key:
-            raise ValueError(
-                "totp_cipher='secret' needs totp_master_key. Set IDENTITY_TOTP_MASTER_KEY "
-                "from the mfa_master_key entry of this environment's app secret."
-            )
+            return self
         try:
             raw = base64.b64decode(self.totp_master_key.encode("ascii"), validate=True)
         except Exception as exc:

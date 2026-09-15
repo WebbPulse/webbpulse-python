@@ -165,6 +165,32 @@ class MfaService:
         self._tokens = tokens
         self._kms = kms_client
 
+    def _master_key(self) -> bytes:
+        """The decoded master key, from settings where set and the app secret otherwise.
+
+        Resolved on demand rather than at validation, because the app secret is read at
+        runtime and must not be copied into the function's environment to get here.
+        """
+        import base64
+
+        from webbpulse.identity.crypto import resolve_totp_master_key
+
+        if self._settings.totp_master_key:
+            return self._settings.totp_master_key_bytes
+
+        resolved = resolve_totp_master_key()
+        if not resolved:
+            raise ValueError(
+                "totp_cipher='secret' but no master key was found. Set "
+                "IDENTITY_TOTP_MASTER_KEY, or put mfa_master_key in the app secret this "
+                "function reads through APP_SECRETS_ARN."
+            )
+        try:
+            raw = base64.b64decode(resolved.encode("ascii"), validate=True)
+        except Exception as exc:
+            raise ValueError(f"the TOTP master key is not valid base64: {exc}") from exc
+        return raw
+
     @property
     def cipher(self) -> TotpCipher:
         """Build the configured cipher for TOTP seeds, on demand.
@@ -174,7 +200,7 @@ class MfaService:
         already proved the master key in `secret` mode.
         """
         if self._settings.totp_cipher == "secret":
-            return SecretMasterKeyCipher(self._settings.totp_master_key_bytes)
+            return SecretMasterKeyCipher(self._master_key())
 
         if not self._settings.data_key_arn:
             raise ValueError(
