@@ -14,7 +14,13 @@ from typing import TYPE_CHECKING, Any, Final
 
 from webbpulse.dynamodb import now_iso, ttl_in
 from webbpulse.identity import totp
-from webbpulse.identity.crypto import EnvelopeCipher, EnvelopeDecryptionFailed, SealedSecret
+from webbpulse.identity.crypto import (
+    EnvelopeCipher,
+    EnvelopeDecryptionFailed,
+    SealedSecret,
+    SecretMasterKeyCipher,
+    TotpCipher,
+)
 from webbpulse.identity.storage import (
     IdentityTokenRecord,
     RecoveryCodeRecord,
@@ -159,12 +165,43 @@ class MfaService:
         self._tokens = tokens
         self._kms = kms_client
 
-    @property
-    def cipher(self) -> EnvelopeCipher:
-        """Build the envelope cipher for TOTP seeds, on demand.
+    def _master_key(self) -> bytes:
+        """The decoded master key, from settings where set and the app secret otherwise.
 
-        Not built in `__init__`, so a product without TOTP never needs `data_key_arn` set.
+        Resolved on demand rather than at validation, because the app secret is read at
+        runtime and must not be copied into the function's environment to get here.
         """
+        import base64
+
+        from webbpulse.identity.crypto import resolve_totp_master_key
+
+        if self._settings.totp_master_key:
+            return self._settings.totp_master_key_bytes
+
+        resolved = resolve_totp_master_key()
+        if not resolved:
+            raise ValueError(
+                "totp_cipher='secret' but no master key was found. Set "
+                "IDENTITY_TOTP_MASTER_KEY, or put mfa_master_key in the app secret this "
+                "function reads through APP_SECRETS_ARN."
+            )
+        try:
+            raw = base64.b64decode(resolved.encode("ascii"), validate=True)
+        except Exception as exc:
+            raise ValueError(f"the TOTP master key is not valid base64: {exc}") from exc
+        return raw
+
+    @property
+    def cipher(self) -> TotpCipher:
+        """Build the configured cipher for TOTP seeds, on demand.
+
+        Not built in `__init__`, so a product without TOTP needs neither `data_key_arn` nor
+        `totp_master_key` set. `totp_cipher` decides which one; settings validation has
+        already proved the master key in `secret` mode.
+        """
+        if self._settings.totp_cipher == "secret":
+            return SecretMasterKeyCipher(self._master_key())
+
         if not self._settings.data_key_arn:
             raise ValueError(
                 "IDENTITY_DATA_KEY_ARN is not set, and a TOTP seed cannot be sealed without "

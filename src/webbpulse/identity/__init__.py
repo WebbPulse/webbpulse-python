@@ -25,11 +25,14 @@ from webbpulse.identity.claims import (
     subject_dependency,
 )
 from webbpulse.identity.crypto import (
+    SCHEME_KMS_ENVELOPE,
+    SCHEME_SECRET_HKDF,
     TOTP_ENCRYPTION_PURPOSE,
     EnvelopeCipher,
     EnvelopeDecryptionFailed,
     KmsDataKeyClient,
     SealedSecret,
+    SecretMasterKeyCipher,
     encryption_context,
 )
 from webbpulse.identity.email import (
@@ -222,7 +225,7 @@ from webbpulse.identity.sessions import (
     RotationResult,
     SessionService,
 )
-from webbpulse.identity.settings import IdentitySettings, SignerKind
+from webbpulse.identity.settings import IdentitySettings, SignerKind, TotpCipherKind
 from webbpulse.identity.storage import (
     BILLING_MODE,
     CREDENTIALS_TABLE,
@@ -400,6 +403,8 @@ __all__ = [
     "RESET_LINK_PATH",
     "RESET_REQUESTED_MESSAGE",
     "RESET_REQUEST_PATH",
+    "SCHEME_KMS_ENVELOPE",
+    "SCHEME_SECRET_HKDF",
     "STEP_UP_PATH",
     "TABLES",
     "TOTP_ACTIVATE_PATH",
@@ -511,6 +516,7 @@ __all__ = [
     "RotationOutcome",
     "RotationResult",
     "SealedSecret",
+    "SecretMasterKeyCipher",
     "SesV2Client",
     "SesV2EmailSender",
     "SessionService",
@@ -520,6 +526,7 @@ __all__ = [
     "TableSpec",
     "TokenMintingDisabled",
     "TokenService",
+    "TotpCipherKind",
     "TotpFactorRecord",
     "TotpFactorStore",
     "UnparseableRequestContext",

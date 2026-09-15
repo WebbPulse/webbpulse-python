@@ -6,6 +6,7 @@ cookie attributes and token lifetimes. Secrets are never fields here.
 
 from __future__ import annotations
 
+import base64
 from datetime import timedelta
 from typing import Any, Final, Literal
 from urllib.parse import urlparse
@@ -13,11 +14,20 @@ from urllib.parse import urlparse
 from pydantic import Field, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
-__all__ = ["MAX_ACCESS_TOKEN_TTL", "MAX_SIGNING_KEYS", "IdentitySettings", "OAuthProvider", "SignerKind"]
+__all__ = [
+    "MAX_ACCESS_TOKEN_TTL",
+    "MAX_SIGNING_KEYS",
+    "IdentitySettings",
+    "OAuthProvider",
+    "SignerKind",
+    "TotpCipherKind",
+]
 
 OAuthProvider = Literal["google", "github"]
 
 SignerKind = Literal["kms", "local"]
+
+TotpCipherKind = Literal["kms", "secret"]
 
 _DEFAULT_OAUTH_PROVIDERS: Final[list[OAuthProvider]] = ["google", "github"]
 
@@ -75,6 +85,23 @@ class IdentitySettings(BaseSettings):
             "Which client signs access tokens. `kms` is every deployed environment. `local` "
             "is the in-process `LocalSigner`, for a local stack with no AWS credentials, and "
             "is refused in production."
+        ),
+    )
+    totp_cipher: TotpCipherKind = Field(
+        default="kms",
+        description=(
+            "Which cipher seals TOTP seeds. `kms` wraps a per-seed data key under "
+            "`data_key_arn`. `secret` derives a per-seed key from `totp_master_key` with "
+            "HKDF and calls no KMS. The two formats are not interchangeable: a seed sealed "
+            "under one cipher cannot be opened by the other, so switching means re-enrolment."
+        ),
+    )
+    totp_master_key: str = Field(
+        default="",
+        description=(
+            "Base64 32 byte master key TOTP seed keys are derived from, the `mfa_master_key` "
+            "entry of this environment's app secret. Required when `totp_cipher` is `secret`. "
+            "Rotating it makes every stored seed unreadable."
         ),
     )
     local_signer_seed: str = Field(
@@ -232,6 +259,29 @@ class IdentitySettings(BaseSettings):
             )
         return self
 
+    @model_validator(mode="after")
+    def _check_totp_cipher(self) -> IdentitySettings:
+        """Refuse a master key that is set but unusable.
+
+        An unset key is allowed: in a deployed environment it arrives from the app secret at
+        runtime rather than through the environment, so `MfaService` resolves it and raises
+        by name if no source has it.
+        """
+        if self.totp_cipher != "secret":
+            return self
+
+        from webbpulse.identity.crypto import MASTER_KEY_BYTES
+
+        if not self.totp_master_key:
+            return self
+        try:
+            raw = base64.b64decode(self.totp_master_key.encode("ascii"), validate=True)
+        except Exception as exc:
+            raise ValueError(f"totp_master_key is not valid base64: {exc}") from exc
+        if len(raw) != MASTER_KEY_BYTES:
+            raise ValueError(f"totp_master_key decodes to {len(raw)} bytes, expected {MASTER_KEY_BYTES}.")
+        return self
+
     @field_validator("signing_key_arns")
     @classmethod
     def _check_signing_keys(cls, value: list[str]) -> list[str]:
@@ -312,6 +362,17 @@ class IdentitySettings(BaseSettings):
         if self.refresh_reuse_grace < timedelta(0):
             raise ValueError("refresh_reuse_grace cannot be negative; zero disables the grace.")
         return self
+
+    @property
+    def totp_master_key_bytes(self) -> bytes:
+        """The decoded master key, or empty when none is set.
+
+        Validation has already proved the length, so a caller in `secret` mode can pass this
+        straight to `SecretMasterKeyCipher`.
+        """
+        if not self.totp_master_key:
+            return b""
+        return base64.b64decode(self.totp_master_key.encode("ascii"), validate=True)
 
     @property
     def local_signer_seed_value(self) -> str:

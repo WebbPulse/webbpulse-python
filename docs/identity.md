@@ -146,12 +146,25 @@ a client that forgot the field should be told that rather than shown "that code 
 valid". **This changed in 0.13.0**: both routes previously took no body at all, so a client
 must be updated to send one.
 
-**A TOTP seed is never stored in the clear.** Each one is sealed under its own KMS data key
-with `{"user_id", "purpose"}` as the encryption context, so a ciphertext moved to another
-user's row fails to decrypt, and reading a seed needs both table access and `kms:Decrypt`.
-Set `IDENTITY_DATA_KEY_ARN` to a symmetric key, distinct from the signing key. Recovery codes
-are the opposite case and are SHA-256 hashed rather than encrypted: verification only ever
-compares them.
+**A TOTP seed is never stored in the clear.** Each one is sealed under its own key with
+`{"user_id", "purpose"}` bound in, so a ciphertext moved to another user's row fails to
+decrypt. `IDENTITY_TOTP_CIPHER` picks which cipher does it:
+
+- `kms`, the default, wraps a per-seed KMS data key through `GenerateDataKey`. Set
+  `IDENTITY_DATA_KEY_ARN` to a symmetric key, distinct from the signing key. Reading a seed
+  needs both table access and `kms:Decrypt`.
+- `secret` derives a per-seed key with HKDF-SHA256 from a base64 32 byte master key. No KMS
+  key and no KMS call on the path. Reading a seed needs both table access and the app secret.
+  The key is resolved on first use from `IDENTITY_TOTP_MASTER_KEY` where it is set, and from
+  the `mfa_master_key` entry of the app secret behind `APP_SECRETS_ARN` otherwise. A deployed
+  environment should use the secret: an environment variable would put the key in the
+  function's configuration in plaintext.
+
+The two formats are not interchangeable. A stored row carries `secret_scheme` in the `secret`
+format and omits it in the `kms` format, so each cipher refuses the other's records rather
+than misreading them; switching an environment, or rotating the master key, means every
+enrolled user re-enrols. Recovery codes are the opposite case and are SHA-256 hashed rather
+than encrypted: verification only ever compares them.
 
 **The access token is returned in the JSON body and the refresh token is a cookie.** The
 access token is short-lived, ten minutes by default, and is never set as a cookie: it is

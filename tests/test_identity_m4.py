@@ -9,17 +9,21 @@ from __future__ import annotations
 import base64
 import hashlib
 import hmac
+import json
 import struct
 import time
 from contextlib import contextmanager
 from typing import TYPE_CHECKING, Any
 
 import pytest
+from pydantic import ValidationError
 
 from webbpulse.identity import (
     LOGIN_PATH,
     LOGIN_TOTP_PATH,
     RECOVERY_CODES_PATH,
+    SCHEME_KMS_ENVELOPE,
+    SCHEME_SECRET_HKDF,
     STEP_UP_PATH,
     TOTP_ACTIVATE_PATH,
     TOTP_DISABLE_PATH,
@@ -40,6 +44,7 @@ from webbpulse.identity import (
     InMemoryTotpFactorStore,
     RecoveryCodeRecord,
     SealedSecret,
+    SecretMasterKeyCipher,
     TokenService,
     TotpFactorRecord,
     build_identity_router,
@@ -1676,3 +1681,230 @@ def test_the_two_routes_have_no_limit_when_the_limiter_is_off(
             f"{prefix()}{RECOVERY_CODES_PATH}",
         ):
             assert route.dependencies == []  # type: ignore[attr-defined]
+
+
+MASTER_KEY = base64.b64encode(bytes(range(32))).decode("ascii")
+
+
+def _master_cipher() -> SecretMasterKeyCipher:
+    """A cipher over a fixed master key, for the deterministic tests below."""
+    return SecretMasterKeyCipher(base64.b64decode(MASTER_KEY))
+
+
+def test_a_master_key_sealed_seed_round_trips() -> None:
+    """A secret sealed under the derived key opens back to its plaintext for the same user."""
+    cipher = _master_cipher()
+    sealed = cipher.seal(b"the seed", user_id=USER_ID)
+    assert cipher.open(sealed, user_id=USER_ID) == b"the seed"
+
+
+def test_the_master_key_sealed_fields_never_contain_the_plaintext() -> None:
+    """No field of the stored item contains the seed, in any case."""
+    cipher = _master_cipher()
+    seed = totp_module.generate_seed()
+    sealed = cipher.seal(seed.encode("ascii"), user_id=USER_ID)
+    for value in sealed.as_item().values():
+        assert seed not in value
+        assert seed.lower() not in value.lower()
+
+
+def test_the_master_key_itself_never_appears_in_the_stored_item() -> None:
+    """The master key is never written to the row; only a salt derived per seal is."""
+    cipher = _master_cipher()
+    sealed = cipher.seal(b"the seed", user_id=USER_ID)
+    assert MASTER_KEY not in "".join(sealed.as_item().values())
+
+
+def test_a_master_key_ciphertext_moved_to_another_users_row_will_not_open() -> None:
+    """The user id is bound into the derivation, so another row derives another key."""
+    cipher = _master_cipher()
+    sealed = cipher.seal(b"the seed", user_id=USER_ID)
+    with pytest.raises(EnvelopeDecryptionFailed):
+        cipher.open(sealed, user_id="user-9999")
+
+
+def test_a_master_key_ciphertext_from_another_purpose_will_not_open_as_a_seed() -> None:
+    """The purpose is bound into the derivation the same way the envelope binds its context."""
+    cipher = _master_cipher()
+    sealed = cipher.seal(b"something else", user_id=USER_ID, purpose="other")
+    with pytest.raises(EnvelopeDecryptionFailed):
+        cipher.open(sealed, user_id=USER_ID)
+
+
+def test_tampering_with_a_master_key_ciphertext_is_detected() -> None:
+    """A flipped ciphertext byte raises, as an authenticated mode must."""
+    cipher = _master_cipher()
+    sealed = cipher.seal(b"the seed", user_id=USER_ID)
+    raw = bytearray(base64.b64decode(sealed.ciphertext))
+    raw[0] ^= 0xFF
+    flipped = SealedSecret(
+        ciphertext=base64.b64encode(bytes(raw)).decode("ascii"),
+        nonce=sealed.nonce,
+        wrapped_key=sealed.wrapped_key,
+        scheme=sealed.scheme,
+    )
+    with pytest.raises(EnvelopeDecryptionFailed):
+        cipher.open(flipped, user_id=USER_ID)
+
+
+def test_tampering_with_the_salt_is_detected() -> None:
+    """A flipped salt byte derives a different key, so the tag fails."""
+    cipher = _master_cipher()
+    sealed = cipher.seal(b"the seed", user_id=USER_ID)
+    raw = bytearray(base64.b64decode(sealed.wrapped_key))
+    raw[0] ^= 0xFF
+    flipped = SealedSecret(
+        ciphertext=sealed.ciphertext,
+        nonce=sealed.nonce,
+        wrapped_key=base64.b64encode(bytes(raw)).decode("ascii"),
+        scheme=sealed.scheme,
+    )
+    with pytest.raises(EnvelopeDecryptionFailed):
+        cipher.open(flipped, user_id=USER_ID)
+
+
+def test_every_master_key_seal_uses_a_fresh_salt_and_nonce() -> None:
+    """Ten seals of the same plaintext give ten distinct salts, nonces and ciphertexts."""
+    cipher = _master_cipher()
+    sealed = [cipher.seal(b"the seed", user_id=USER_ID) for _ in range(10)]
+    assert len({item.nonce for item in sealed}) == 10
+    assert len({item.wrapped_key for item in sealed}) == 10
+    assert len({item.ciphertext for item in sealed}) == 10
+
+
+def test_a_different_master_key_cannot_open_the_same_seed() -> None:
+    """Rotating the master key makes stored seeds unreadable, which is why rotation means re-enrolment."""
+    sealed = _master_cipher().seal(b"the seed", user_id=USER_ID)
+    other = SecretMasterKeyCipher(bytes(range(1, 33)))
+    with pytest.raises(EnvelopeDecryptionFailed):
+        other.open(sealed, user_id=USER_ID)
+
+
+def test_a_master_key_of_the_wrong_length_is_refused() -> None:
+    """The cipher refuses to construct on anything but a 32 byte key."""
+    with pytest.raises(ValueError, match="32 byte master key"):
+        SecretMasterKeyCipher(b"too short")
+
+
+def test_the_two_schemes_are_marked_and_not_interchangeable(kms: FakeKms) -> None:
+    """Each cipher refuses the other's record rather than misreading its salt as a wrapped key."""
+    envelope = EnvelopeCipher(DATA_KEY, kms)
+    master = _master_cipher()
+
+    envelope_sealed = envelope.seal(b"the seed", user_id=USER_ID)
+    master_sealed = master.seal(b"the seed", user_id=USER_ID)
+
+    assert "secret_scheme" not in envelope_sealed.as_item()
+    assert master_sealed.as_item()["secret_scheme"] == SCHEME_SECRET_HKDF
+
+    with pytest.raises(EnvelopeDecryptionFailed):
+        master.open(envelope_sealed, user_id=USER_ID)
+    with pytest.raises(EnvelopeDecryptionFailed):
+        envelope.open(master_sealed, user_id=USER_ID)
+
+
+def test_a_stored_row_round_trips_through_the_item_shape() -> None:
+    """`from_item` reads back what `as_item` wrote, scheme included."""
+    cipher = _master_cipher()
+    sealed = cipher.seal(b"the seed", user_id=USER_ID)
+    restored = SealedSecret.from_item(sealed.as_item())
+    assert restored is not None
+    assert restored == sealed
+    assert cipher.open(restored, user_id=USER_ID) == b"the seed"
+
+
+def test_a_row_written_before_the_scheme_existed_reads_as_the_envelope(kms: FakeKms) -> None:
+    """An item with no `secret_scheme` is the KMS envelope, so existing rows keep working."""
+    sealed = EnvelopeCipher(DATA_KEY, kms).seal(b"the seed", user_id=USER_ID)
+    item = sealed.as_item()
+    assert "secret_scheme" not in item
+    restored = SealedSecret.from_item(item)
+    assert restored is not None
+    assert restored.scheme == SCHEME_KMS_ENVELOPE
+
+
+def test_the_kms_cipher_stays_the_default() -> None:
+    """An environment that sets nothing keeps the KMS envelope, so adopters flip deliberately."""
+    assert make_settings().totp_cipher == "kms"
+
+
+def test_the_secret_cipher_may_take_its_master_key_from_the_app_secret(stores: IdentityStores, kms: FakeKms) -> None:
+    """An unset master key is allowed: a deployed environment resolves it from the app secret.
+
+    The failure then names both sources, rather than settings refusing an environment that
+    is actually configured correctly.
+    """
+    settings = make_settings(totp_cipher="secret")
+    service = MfaService(settings, stores, TokenService(make_settings(), kms), kms_client=kms)
+    with pytest.raises(ValueError, match="mfa_master_key"):
+        _ = service.cipher
+
+
+def test_a_master_key_that_is_not_base64_is_refused() -> None:
+    """A mistyped master key fails validation rather than deriving from rubbish."""
+    with pytest.raises(ValidationError, match="not valid base64"):
+        make_settings(totp_cipher="secret", totp_master_key="not base64 !!")
+
+
+def test_a_master_key_of_the_wrong_size_is_refused_by_settings() -> None:
+    """A 16 byte key is refused: the cipher wants 32 and says so at startup."""
+    short = base64.b64encode(bytes(16)).decode("ascii")
+    with pytest.raises(ValidationError, match="expected 32"):
+        make_settings(totp_cipher="secret", totp_master_key=short)
+
+
+def test_a_valid_master_key_decodes_to_thirty_two_bytes() -> None:
+    """The decoded accessor hands the cipher exactly what it validated."""
+    settings = make_settings(totp_cipher="secret", totp_master_key=MASTER_KEY)
+    assert len(settings.totp_master_key_bytes) == 32
+
+
+def test_the_service_builds_the_cipher_the_settings_name(stores: IdentityStores, kms: FakeKms) -> None:
+    """`MfaService.cipher` follows `totp_cipher`, which is how an environment switches."""
+    tokens = TokenService(make_settings(), kms)
+
+    kms_service = MfaService(make_settings(), stores, tokens, kms_client=kms)
+    assert isinstance(kms_service.cipher, EnvelopeCipher)
+
+    secret_settings = make_settings(totp_cipher="secret", totp_master_key=MASTER_KEY)
+    secret_service = MfaService(secret_settings, stores, tokens, kms_client=kms)
+    assert isinstance(secret_service.cipher, SecretMasterKeyCipher)
+
+
+def test_the_secret_cipher_needs_no_kms_client_or_data_key(stores: IdentityStores, kms: FakeKms) -> None:
+    """In `secret` mode no KMS call is on the enrolment path, which is the point of the change."""
+    settings = make_settings(totp_cipher="secret", totp_master_key=MASTER_KEY, data_key_arn="")
+    service = MfaService(settings, stores, TokenService(make_settings(), kms), kms_client=None)
+    sealed = service.cipher.seal(b"the seed", user_id=USER_ID)
+    assert service.cipher.open(sealed, user_id=USER_ID) == b"the seed"
+
+
+def test_the_master_key_is_read_from_the_app_secret_not_the_environment(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The key arrives from the app secret at runtime, which keeps it out of Lambda config."""
+    from webbpulse.identity.crypto import resolve_totp_master_key
+
+    monkeypatch.delenv("IDENTITY_TOTP_MASTER_KEY", raising=False)
+
+    class FakeSecrets:
+        """A Secrets Manager stub holding one app secret."""
+
+        def get_secret_value(self, *, SecretId: str) -> dict[str, str]:
+            """Return the app secret carrying the master key."""
+            assert SecretId == "arn:aws:secretsmanager:us-west-2:1:secret:app"
+            return {"SecretString": json.dumps({"mfa_master_key": MASTER_KEY})}
+
+    resolved = resolve_totp_master_key(
+        secret_arn="arn:aws:secretsmanager:us-west-2:1:secret:app",
+        client=FakeSecrets(),
+    )
+    assert resolved == MASTER_KEY
+
+
+def test_the_environment_wins_over_the_app_secret(monkeypatch: pytest.MonkeyPatch) -> None:
+    """An explicit variable takes precedence, as it does for the OAuth client secrets."""
+    from webbpulse.identity.crypto import resolve_totp_master_key
+
+    monkeypatch.setenv("IDENTITY_TOTP_MASTER_KEY", MASTER_KEY)
+    assert resolve_totp_master_key(secret_arn="") == MASTER_KEY

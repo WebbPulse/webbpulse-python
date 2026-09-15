@@ -1,7 +1,9 @@
-"""KMS envelope encryption for the one identity secret that cannot be hashed.
+"""Encryption for the one identity secret that cannot be hashed.
 
-A TOTP seed is a symmetric shared secret, so it cannot be hashed. It is sealed under a
-per-secret KMS data key with AES-256-GCM, bound to the user by the encryption context.
+A TOTP seed is a symmetric shared secret, so it cannot be hashed. Two ciphers seal it,
+both with AES-256-GCM and both binding the ciphertext to one user: `EnvelopeCipher` wraps
+a per-secret KMS data key, and `SecretMasterKeyCipher` derives a per-secret key with
+HKDF-SHA256 from a master key held in the environment's app secret.
 """
 
 from __future__ import annotations
@@ -17,12 +19,21 @@ if TYPE_CHECKING:  # pragma: no cover
 __all__ = [
     "AES_KEY_BYTES",
     "GCM_NONCE_BYTES",
+    "HKDF_INFO",
+    "HKDF_SALT_BYTES",
+    "MASTER_KEY_BYTES",
+    "MASTER_KEY_SECRET_ENTRY",
+    "SCHEME_KMS_ENVELOPE",
+    "SCHEME_SECRET_HKDF",
     "TOTP_ENCRYPTION_PURPOSE",
     "EnvelopeCipher",
     "EnvelopeDecryptionFailed",
     "KmsDataKeyClient",
     "SealedSecret",
+    "SecretMasterKeyCipher",
+    "TotpCipher",
     "encryption_context",
+    "resolve_totp_master_key",
 ]
 
 AES_KEY_BYTES: Final = 32
@@ -30,6 +41,16 @@ AES_KEY_BYTES: Final = 32
 GCM_NONCE_BYTES: Final = 12
 
 TOTP_ENCRYPTION_PURPOSE: Final = "totp"
+
+MASTER_KEY_BYTES: Final = 32
+
+HKDF_SALT_BYTES: Final = 16
+
+HKDF_INFO: Final = b"webbpulse-totp-seed-v1"
+
+SCHEME_KMS_ENVELOPE: Final = "kms-envelope"
+
+SCHEME_SECRET_HKDF: Final = "secret-hkdf-v1"
 
 
 class EnvelopeDecryptionFailed(Exception):
@@ -83,23 +104,32 @@ def encryption_context(user_id: str, *, purpose: str = TOTP_ENCRYPTION_PURPOSE) 
 
 @dataclass(frozen=True, slots=True)
 class SealedSecret:
-    """A secret encrypted under a data key that is itself encrypted under a KMS key.
+    """A sealed secret and whatever the cipher that sealed it needs to open it again.
 
-    All three base64 fields are safe to store: none is a secret on its own, and only KMS can
-    open the wrapped data key.
+    All fields are safe to store: none is a secret on its own. `wrapped_key` holds a
+    KMS-encrypted data key in the envelope format and an HKDF salt in the master key
+    format, and `scheme` says which, so a stored row is self describing.
     """
 
     ciphertext: str
     nonce: str
     wrapped_key: str
+    scheme: str = SCHEME_KMS_ENVELOPE
 
     def as_item(self) -> dict[str, str]:
-        """The three fields under the attribute names the table uses."""
-        return {
+        """The stored fields under the attribute names the table uses.
+
+        The envelope format writes no `secret_scheme`, so a row written before the
+        master key cipher existed reads back as the envelope scheme by default.
+        """
+        item = {
             "secret_ciphertext": self.ciphertext,
             "secret_nonce": self.nonce,
             "wrapped_data_key": self.wrapped_key,
         }
+        if self.scheme != SCHEME_KMS_ENVELOPE:
+            item["secret_scheme"] = self.scheme
+        return item
 
     @classmethod
     def from_item(cls, item: Mapping[str, Any]) -> SealedSecret | None:
@@ -111,9 +141,107 @@ class SealedSecret:
         ciphertext = str(item.get("secret_ciphertext", ""))
         nonce = str(item.get("secret_nonce", ""))
         wrapped = str(item.get("wrapped_data_key", ""))
+        scheme = str(item.get("secret_scheme", "") or SCHEME_KMS_ENVELOPE)
         if not ciphertext or not nonce or not wrapped:
             return None
-        return cls(ciphertext=ciphertext, nonce=nonce, wrapped_key=wrapped)
+        return cls(ciphertext=ciphertext, nonce=nonce, wrapped_key=wrapped, scheme=scheme)
+
+
+class TotpCipher(Protocol):
+    """What `MfaService` needs of whichever cipher seals TOTP seeds.
+
+    Both ciphers bind a ciphertext to one user and one purpose, so a seed cannot be moved
+    between rows or replayed as another feature's secret.
+    """
+
+    def seal(self, plaintext: bytes, *, user_id: str, purpose: str = ...) -> SealedSecret:
+        """Encrypt `plaintext` for this user."""
+        ...
+
+    def open(self, sealed: SealedSecret, *, user_id: str, purpose: str = ...) -> bytes:
+        """Decrypt a sealed secret, or raise `EnvelopeDecryptionFailed`."""
+        ...
+
+
+class SecretMasterKeyCipher:
+    """Seals a secret under a key derived from a master key with HKDF-SHA256.
+
+    The master key comes from the environment's app secret and never leaves the process.
+    Every seal derives a fresh per-secret key from a random salt, so two seeds never share
+    a key even though they share a master, and no KMS call is on the path.
+    """
+
+    def __init__(self, master_key: bytes) -> None:
+        """Bind the cipher to one master key, which must be exactly `MASTER_KEY_BYTES`."""
+        if len(master_key) != MASTER_KEY_BYTES:
+            raise ValueError(
+                f"SecretMasterKeyCipher needs a {MASTER_KEY_BYTES} byte master key, got "
+                f"{len(master_key)}. Set IdentitySettings.totp_master_key to the base64 "
+                "mfa_master_key from this environment's app secret."
+            )
+        self._master_key = master_key
+
+    def _derive(self, salt: bytes, context: Mapping[str, str]) -> bytes:
+        """Derive the per-secret key for one salt, binding the context into the info."""
+        from cryptography.hazmat.primitives import hashes
+        from cryptography.hazmat.primitives.kdf.hkdf import HKDF
+
+        info = b"\x00".join(
+            [HKDF_INFO, *(f"{k}={context[k]}".encode() for k in sorted(context))],
+        )
+        hkdf = HKDF(algorithm=hashes.SHA256(), length=AES_KEY_BYTES, salt=salt, info=info)
+        return hkdf.derive(self._master_key)
+
+    def seal(
+        self,
+        plaintext: bytes,
+        *,
+        user_id: str,
+        purpose: str = TOTP_ENCRYPTION_PURPOSE,
+    ) -> SealedSecret:
+        """Encrypt `plaintext` under a key derived for this user from a fresh salt."""
+        from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+
+        context = encryption_context(user_id, purpose=purpose)
+        salt = os.urandom(HKDF_SALT_BYTES)
+        nonce = os.urandom(GCM_NONCE_BYTES)
+        ciphertext = AESGCM(self._derive(salt, context)).encrypt(nonce, plaintext, None)
+        return SealedSecret(
+            ciphertext=_b64(ciphertext),
+            nonce=_b64(nonce),
+            wrapped_key=_b64(salt),
+            scheme=SCHEME_SECRET_HKDF,
+        )
+
+    def open(self, sealed: SealedSecret, *, user_id: str, purpose: str = TOTP_ENCRYPTION_PURPOSE) -> bytes:
+        """Decrypt a sealed secret, or raise `EnvelopeDecryptionFailed`.
+
+        The context is rebuilt from the caller's `user_id`, never from the row, and it is
+        bound into the derivation, so a ciphertext moved to another row derives a different
+        key and fails to authenticate.
+        """
+        from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+
+        if sealed.scheme != SCHEME_SECRET_HKDF:
+            raise EnvelopeDecryptionFailed(
+                f"stored secret uses scheme {sealed.scheme!r}, which this cipher cannot open"
+            )
+
+        context = encryption_context(user_id, purpose=purpose)
+        try:
+            salt = _unb64(sealed.wrapped_key)
+            nonce = _unb64(sealed.nonce)
+            ciphertext = _unb64(sealed.ciphertext)
+        except Exception as exc:
+            raise EnvelopeDecryptionFailed(f"stored secret is not valid base64: {exc}") from exc
+
+        if len(salt) != HKDF_SALT_BYTES:
+            raise EnvelopeDecryptionFailed(f"stored salt is {len(salt)} bytes, expected {HKDF_SALT_BYTES}")
+
+        try:
+            return AESGCM(self._derive(salt, context)).decrypt(nonce, ciphertext, None)
+        except Exception as exc:
+            raise EnvelopeDecryptionFailed(f"the ciphertext did not authenticate: {exc}") from exc
 
 
 class EnvelopeCipher:
@@ -179,6 +307,11 @@ class EnvelopeCipher:
         """
         from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 
+        if sealed.scheme != SCHEME_KMS_ENVELOPE:
+            raise EnvelopeDecryptionFailed(
+                f"stored secret uses scheme {sealed.scheme!r}, which this cipher cannot open"
+            )
+
         context = encryption_context(user_id, purpose=purpose)
         try:
             wrapped = _unb64(sealed.wrapped_key)
@@ -207,3 +340,37 @@ def _b64(raw: bytes) -> str:
 def _unb64(value: str) -> bytes:
     """Decode a strict ASCII base64 string back to bytes."""
     return base64.b64decode(value.encode("ascii"), validate=True)
+
+
+MASTER_KEY_SECRET_ENTRY: Final = "mfa_master_key"
+
+
+def resolve_totp_master_key(
+    *,
+    configured: str = "",
+    secret_arn: str | None = None,
+    client: Any = None,
+) -> str:
+    """The base64 TOTP master key, from the environment ahead of the app secret.
+
+    Mirrors how a product resolves its OAuth client secrets: an explicit value wins, then
+    `IDENTITY_TOTP_MASTER_KEY`, then the `mfa_master_key` entry of the app secret. Reading it
+    from the secret at runtime is what keeps the key out of the Lambda's environment, where
+    it would otherwise sit in plaintext configuration.
+
+    Returns an empty string when no source has it, which lets a caller in `kms` mode skip the
+    lookup entirely and a misconfigured `secret` mode fail settings validation by name.
+    """
+    import os
+
+    from webbpulse.security import app_secrets
+
+    if configured:
+        return configured
+
+    from_env = os.environ.get("IDENTITY_TOTP_MASTER_KEY", "")
+    if from_env:
+        return from_env
+
+    loaded = app_secrets(secret_arn, client=client)
+    return str(loaded.get(MASTER_KEY_SECRET_ENTRY, "") or "")
