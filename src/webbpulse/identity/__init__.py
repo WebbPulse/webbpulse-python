@@ -72,6 +72,12 @@ from webbpulse.identity.hooks import (
     HookNotImplemented,
     IdentityHooks,
 )
+from webbpulse.identity.local_authorizer import (
+    LOCAL_ENVIRONMENT,
+    REQUEST_CONTEXT_HEADER,
+    InProcessKeyClient,
+    LocalAuthorizerMiddleware,
+)
 from webbpulse.identity.local_signer import (
     DEFAULT_LOCAL_SEED,
     LOCAL_KEY_BITS,
@@ -344,6 +350,7 @@ __all__ = [
     "JWS_ALGORITHM",
     "KMS_KEY_SPEC",
     "KMS_SIGNING_ALGORITHM",
+    "LOCAL_ENVIRONMENT",
     "LOCAL_KEY_BITS",
     "LOCKOUT_BASE_DELAY",
     "LOCKOUT_MAX_DELAY",
@@ -386,6 +393,7 @@ __all__ = [
     "REGISTERED_CLAIMS",
     "REGISTER_PATH",
     "REMOVE_EVENT_NAME",
+    "REQUEST_CONTEXT_HEADER",
     "RESET_CONFIRM_PATH",
     "RESET_EMAIL_LIMIT",
     "RESET_IP_LIMIT",
@@ -455,6 +463,7 @@ __all__ = [
     "InMemoryRefreshTokenStore",
     "InMemoryTotpFactorStore",
     "InMemoryWebAuthnChallengeStore",
+    "InProcessKeyClient",
     "InvalidToken",
     "IssuedLink",
     "IssuedRefresh",
@@ -463,6 +472,7 @@ __all__ = [
     "KmsDataKeyClient",
     "KmsSigner",
     "LinkService",
+    "LocalAuthorizerMiddleware",
     "LocalSigner",
     "LocalSignerRefused",
     "LockoutState",

@@ -241,6 +241,18 @@ signs in as the durable local user from `E2E_USER_EMAIL` and `E2E_USER_PASSWORD`
 product seeds through its own admin seed or registration route. Read-only is still governed
 by `E2E_READ_ONLY` alone, and a local stack is one source IP bucket so the pacer is off.
 
+A local stack has no API Gateway, so nothing verifies the access token and nothing writes
+the `x-amzn-request-context` header every authorized route reads through `identity_claims`
+and `identity_subject`. Without a stand-in a perfectly valid token arrives carrying no
+claims and every write answers 401. Products add `LocalAuthorizerMiddleware` from
+`webbpulse.identity` in their composition root when `ENVIRONMENT` is local, wrapping the
+composed app: `app = LocalAuthorizerMiddleware(app, identity_settings)`. It verifies the
+bearer token in process against the key set the local signer derives, strips any inbound
+copy of the request context header so a caller can never present claims of its own, and
+publishes the verified claims in the shape the readers already expect. It refuses to be
+constructed in any other environment, so there is no deployment in which it can stand in
+for the gateway's own authorizer.
+
 What each group does:
 
 | Group | Locally |
