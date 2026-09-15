@@ -10,6 +10,7 @@ import base64
 import hashlib
 import hmac
 import json
+import os
 import struct
 import time
 from contextlib import contextmanager
@@ -1154,6 +1155,65 @@ def test_a_factor_activates_exactly_once() -> None:
     )
     assert store.activate(USER_ID, step=100) is True
     assert store.activate(USER_ID, step=101) is False
+
+
+def test_a_stored_factor_carries_the_scheme_that_sealed_it() -> None:
+    """A seed sealed by the master key cipher can still be opened after a table round trip.
+
+    The two cipher formats are not interchangeable and `open` refuses a scheme it did not
+    write, so a row that loses `secret_scheme` on the way to the table reads back as the
+    envelope scheme and every code is refused as invalid. That failure is indistinguishable
+    from a wrong code at the route, which is why it is asserted here at the boundary that
+    drops it rather than only through the flows, whose in-memory store keeps whole records
+    and so cannot lose a field.
+    """
+    from webbpulse.identity.crypto import MASTER_KEY_BYTES, SealedSecret, SecretMasterKeyCipher
+    from webbpulse.identity.storage import _totp_factor_from_item
+
+    cipher = SecretMasterKeyCipher(os.urandom(MASTER_KEY_BYTES))
+    seed = totp_module.generate_seed()
+    sealed = cipher.seal(seed.encode("ascii"), user_id=USER_ID)
+
+    stored = {
+        "user_id": USER_ID,
+        "secret_ciphertext": sealed.ciphertext,
+        "secret_nonce": sealed.nonce,
+        "wrapped_data_key": sealed.wrapped_key,
+        "created_at": "2026-09-10T00:00:00Z",
+        "activated_at": "",
+        "last_used_step": 0,
+        "secret_scheme": sealed.scheme,
+    }
+    record = _totp_factor_from_item(stored)
+    assert record.secret_scheme == sealed.scheme, "the stored row lost the scheme that sealed it"
+
+    reopened = cipher.open(
+        SealedSecret(
+            ciphertext=record.secret_ciphertext,
+            nonce=record.secret_nonce,
+            wrapped_key=record.wrapped_data_key,
+            scheme=record.secret_scheme,
+        ),
+        user_id=USER_ID,
+    )
+    assert reopened.decode("ascii") == seed
+
+
+def test_a_row_without_a_scheme_reads_back_as_the_envelope_format() -> None:
+    """A factor written before the master key cipher existed keeps working untouched."""
+    from webbpulse.identity.crypto import SCHEME_KMS_ENVELOPE
+    from webbpulse.identity.storage import _totp_factor_from_item
+
+    record = _totp_factor_from_item(
+        {
+            "user_id": USER_ID,
+            "secret_ciphertext": "c",
+            "secret_nonce": "n",
+            "wrapped_data_key": "w",
+            "created_at": "2026-09-10T00:00:00Z",
+        }
+    )
+    assert record.secret_scheme == SCHEME_KMS_ENVELOPE
 
 
 def test_the_step_watermark_only_moves_forward() -> None:

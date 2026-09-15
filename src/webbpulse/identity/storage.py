@@ -18,6 +18,7 @@ from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Any, Final, Literal, cast
 
 from webbpulse.dynamodb import now_iso
+from webbpulse.identity.crypto import SCHEME_KMS_ENVELOPE
 
 if TYPE_CHECKING:  # pragma: no cover
     from webbpulse.dynamodb import Repository
@@ -195,6 +196,10 @@ class TotpFactorRecord:
 
     An empty `activated_at` means enrolled but not confirmed, and does not gate login.
     `last_used_step` is the highest step ever accepted, and is the whole replay defence.
+
+    `secret_scheme` names the cipher that sealed the seed, because the two formats are not
+    interchangeable and a row has to say which one it is. It defaults to the envelope
+    scheme so a row written before the master key cipher existed reads back correctly.
     """
 
     user_id: str
@@ -204,6 +209,7 @@ class TotpFactorRecord:
     created_at: str
     activated_at: str = ""
     last_used_step: int = 0
+    secret_scheme: str = SCHEME_KMS_ENVELOPE
 
     @property
     def is_active(self) -> bool:
@@ -1197,6 +1203,7 @@ class DynamoTotpFactorStore(TotpFactorStore):
                 "created_at": record.created_at,
                 "activated_at": record.activated_at,
                 "last_used_step": record.last_used_step,
+                "secret_scheme": record.secret_scheme,
             }
         )
 
@@ -1531,6 +1538,7 @@ def _totp_factor_from_item(item: Mapping[str, Any]) -> TotpFactorRecord:
         created_at=str(item.get("created_at", "")),
         activated_at=str(item.get("activated_at", "")),
         last_used_step=int(item.get("last_used_step", 0)),
+        secret_scheme=str(item.get("secret_scheme", "") or SCHEME_KMS_ENVELOPE),
     )
 
 

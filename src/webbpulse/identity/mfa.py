@@ -303,6 +303,7 @@ class MfaService:
                 secret_nonce=sealed.nonce,
                 wrapped_data_key=sealed.wrapped_key,
                 created_at=now_iso(),
+                secret_scheme=sealed.scheme,
             )
         )
         return Enrolment(
@@ -401,6 +402,7 @@ class MfaService:
             ciphertext=factor.secret_ciphertext,
             nonce=factor.secret_nonce,
             wrapped_key=factor.wrapped_data_key,
+            scheme=factor.secret_scheme,
         )
         try:
             return self.cipher.open(sealed, user_id=user_id).decode("ascii")
