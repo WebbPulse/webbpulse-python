@@ -5,6 +5,26 @@ Notable changes to the `webbpulse` package. The version here is the one in
 
 This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## 0.40.0
+
+TOTP seeds can be sealed under a master key from the app secret instead of a KMS key.
+
+`IDENTITY_TOTP_CIPHER` picks the cipher. `kms` stays the default and is unchanged: a per-seed
+data key wrapped through `GenerateDataKey` under `IDENTITY_DATA_KEY_ARN`. `secret` is new and
+derives a per-seed key with HKDF-SHA256 from `IDENTITY_TOTP_MASTER_KEY`, a base64 32 byte key
+read from the environment's app secret, so an environment that uses it needs no symmetric KMS
+key and makes no KMS call when a user enrols or logs in.
+
+Both ciphers bind `{"user_id", "purpose"}` into the ciphertext, the `secret` one through the
+HKDF info rather than a KMS encryption context, so a seed moved to another row still fails to
+open. Stored rows are self describing: the `secret` format writes `secret_scheme`, the `kms`
+format omits it and reads back as the envelope, and each cipher refuses the other's records.
+The formats are not interchangeable, so switching an environment or rotating the master key
+means every enrolled user re-enrols.
+
+Settings validation refuses `secret` without a base64 32 byte master key, at startup rather
+than at the first enrolment.
+
 ## 0.39.0
 
 The local-stack authorizer moved into the shared package, and the identity router's route

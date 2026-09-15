@@ -146,12 +146,22 @@ a client that forgot the field should be told that rather than shown "that code 
 valid". **This changed in 0.13.0**: both routes previously took no body at all, so a client
 must be updated to send one.
 
-**A TOTP seed is never stored in the clear.** Each one is sealed under its own KMS data key
-with `{"user_id", "purpose"}` as the encryption context, so a ciphertext moved to another
-user's row fails to decrypt, and reading a seed needs both table access and `kms:Decrypt`.
-Set `IDENTITY_DATA_KEY_ARN` to a symmetric key, distinct from the signing key. Recovery codes
-are the opposite case and are SHA-256 hashed rather than encrypted: verification only ever
-compares them.
+**A TOTP seed is never stored in the clear.** Each one is sealed under its own key with
+`{"user_id", "purpose"}` bound in, so a ciphertext moved to another user's row fails to
+decrypt. `IDENTITY_TOTP_CIPHER` picks which cipher does it:
+
+- `kms`, the default, wraps a per-seed KMS data key through `GenerateDataKey`. Set
+  `IDENTITY_DATA_KEY_ARN` to a symmetric key, distinct from the signing key. Reading a seed
+  needs both table access and `kms:Decrypt`.
+- `secret` derives a per-seed key with HKDF-SHA256 from `IDENTITY_TOTP_MASTER_KEY`, a base64
+  32 byte key held as `mfa_master_key` in the environment's app secret. No KMS key and no KMS
+  call on the path. Reading a seed needs both table access and the app secret.
+
+The two formats are not interchangeable. A stored row carries `secret_scheme` in the `secret`
+format and omits it in the `kms` format, so each cipher refuses the other's records rather
+than misreading them; switching an environment, or rotating the master key, means every
+enrolled user re-enrols. Recovery codes are the opposite case and are SHA-256 hashed rather
+than encrypted: verification only ever compares them.
 
 **The access token is returned in the JSON body and the refresh token is a cookie.** The
 access token is short-lived, ten minutes by default, and is never set as a cookie: it is

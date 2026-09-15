@@ -14,7 +14,13 @@ from typing import TYPE_CHECKING, Any, Final
 
 from webbpulse.dynamodb import now_iso, ttl_in
 from webbpulse.identity import totp
-from webbpulse.identity.crypto import EnvelopeCipher, EnvelopeDecryptionFailed, SealedSecret
+from webbpulse.identity.crypto import (
+    EnvelopeCipher,
+    EnvelopeDecryptionFailed,
+    SealedSecret,
+    SecretMasterKeyCipher,
+    TotpCipher,
+)
 from webbpulse.identity.storage import (
     IdentityTokenRecord,
     RecoveryCodeRecord,
@@ -160,11 +166,16 @@ class MfaService:
         self._kms = kms_client
 
     @property
-    def cipher(self) -> EnvelopeCipher:
-        """Build the envelope cipher for TOTP seeds, on demand.
+    def cipher(self) -> TotpCipher:
+        """Build the configured cipher for TOTP seeds, on demand.
 
-        Not built in `__init__`, so a product without TOTP never needs `data_key_arn` set.
+        Not built in `__init__`, so a product without TOTP needs neither `data_key_arn` nor
+        `totp_master_key` set. `totp_cipher` decides which one; settings validation has
+        already proved the master key in `secret` mode.
         """
+        if self._settings.totp_cipher == "secret":
+            return SecretMasterKeyCipher(self._settings.totp_master_key_bytes)
+
         if not self._settings.data_key_arn:
             raise ValueError(
                 "IDENTITY_DATA_KEY_ARN is not set, and a TOTP seed cannot be sealed without "
