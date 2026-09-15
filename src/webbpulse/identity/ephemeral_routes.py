@@ -55,20 +55,34 @@ _REFUSED_ENVIRONMENTS: Final[frozenset[str]] = frozenset({"production", "prod"})
 
 _FastAPIRequest: Any = None
 
+if not TYPE_CHECKING:
+    JSONResponse = None
+    """Bound by `_bind_fastapi_request`. A runtime global as well as a `TYPE_CHECKING`
+    import because every route here is annotated `-> JSONResponse` under postponed
+    annotations, and FastAPI resolves that annotation against these globals when it builds
+    the OpenAPI document. Type checkers read the import instead, so the annotation keeps
+    its real type."""
+
 
 def _bind_fastapi_request() -> None:
-    """Put `fastapi.Request` in this module's globals for FastAPI's annotation lookup.
+    """Put `fastapi.Request` and `JSONResponse` in this module's globals.
 
-    With postponed annotations FastAPI resolves a handler's parameter types against the
-    module globals, and a `Request` that exists only under `TYPE_CHECKING` resolves to
-    nothing, so FastAPI reads the parameter as a required body field named `request` and
-    every call answers 422 before the handler runs.
+    With postponed annotations FastAPI resolves a handler's parameter and return types
+    against the module globals, and a name that exists only under `TYPE_CHECKING` resolves
+    to nothing. For `Request` that makes FastAPI read the parameter as a required body
+    field named `request`, so every call answers 422 before the handler runs; for
+    `JSONResponse` it leaves the return annotation unresolvable and `app.openapi()` raises
+    `PydanticUserError`.
     """
-    global _FastAPIRequest
+    global _FastAPIRequest, JSONResponse
     if _FastAPIRequest is None:
         from fastapi import Request as _Request
 
         _FastAPIRequest = _Request
+    if JSONResponse is None:
+        from fastapi.responses import JSONResponse as _Response
+
+        JSONResponse = _Response  # type: ignore[misc]
 
 
 EPHEMERAL_ROUTE_RESPONSES: Final[Mapping[tuple[str, str], dict[int, str]]] = {

@@ -5,6 +5,32 @@ Notable changes to the `webbpulse` package. The version here is the one in
 
 This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## 0.39.0
+
+The local-stack authorizer moved into the shared package, and the identity router's route
+annotations now resolve.
+
+`LocalAuthorizerMiddleware` stands in for the API Gateway JWT authorizer on a stack that has
+no gateway. Deployed, the gateway verifies the access token and the Lambda Web Adapter hands
+the function its claims in `x-amzn-request-context`; a local e2e stack has neither, so a
+valid token arrives with no claims and every authorized route answers 401. The middleware is
+pure ASGI: it strips any inbound copy of that header so a caller can never present claims of
+its own, verifies the `Authorization: Bearer` token in process against the key set the local
+signer derives, and injects the verified claims in the shape `identity_claims` and
+`identity_subject` already read. The verifier is built lazily through the new
+`InProcessKeyClient`, a kid-indexed in-memory key client, so `JwksVerifier` never fetches the
+JWKS over HTTP from the process serving it. Constructing it outside the local environment
+raises, taking the environment from `IdentitySettings.environment` unless one is passed
+explicitly. The first product copy of this lived in WebbPulse-Portfolio; every product's
+`e2e-local.yml@v3` stack now adds the shared one in its composition root instead.
+
+The identity route handlers are annotated `-> JSONResponse` under postponed annotations, and
+`JSONResponse` was visible only under `TYPE_CHECKING`, so FastAPI could not resolve the
+return annotation and `app.openapi()` raised `PydanticUserError` on any app mounting the
+identity router. `_bind_fastapi_request` in `router`, `oauth_routes`, `passkey_routes` and
+`ephemeral_routes` now binds `JSONResponse` into the module globals alongside `Request`,
+which keeps the package's rule that importing `webbpulse.identity` imports no fastapi.
+
 ## 0.38.3
 
 The ephemeral e2e user routes now verify a bearer token in process where no authorizer ran.

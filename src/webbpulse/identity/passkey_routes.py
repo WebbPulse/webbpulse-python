@@ -24,14 +24,31 @@ if TYPE_CHECKING:  # pragma: no cover
 
 _FastAPIRequest: Any = None
 
+if not TYPE_CHECKING:
+    JSONResponse = None
+    """Bound by `_bind_fastapi_request`. A runtime global as well as a `TYPE_CHECKING`
+    import because every route here is annotated `-> JSONResponse` under postponed
+    annotations, and FastAPI resolves that annotation against these globals when it builds
+    the OpenAPI document. Type checkers read the import instead, so the annotation keeps
+    its real type."""
+
 
 def _bind_fastapi_request() -> None:
-    """Put `fastapi.Request` in this module's globals for FastAPI's annotation lookup."""
-    global _FastAPIRequest
+    """Put `fastapi.Request` and `JSONResponse` in this module's globals.
+
+    FastAPI resolves a route's string annotations against the defining module's globals, so
+    a name visible only under `TYPE_CHECKING` leaves the return annotation unresolvable and
+    `app.openapi()` raises `PydanticUserError`.
+    """
+    global _FastAPIRequest, JSONResponse
     if _FastAPIRequest is None:
         from fastapi import Request as _Request
 
         _FastAPIRequest = _Request
+    if JSONResponse is None:
+        from fastapi.responses import JSONResponse as _Response
+
+        JSONResponse = _Response  # type: ignore[misc]
 
 
 __all__ = [
