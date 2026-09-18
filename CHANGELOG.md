@@ -32,7 +32,21 @@ keyed by that id, adding the de-duplication `BatchGetItem` requires and the pair
 the requesting id an unordered batch response needs. Misses are omitted, the way `get`
 answers `None`.
 
-`presigned_get` signs a bounded S3 GET, the read counterpart of `presigned_put`.
+`webbpulse.storage` gains `presigned_get`, the reading half of `presigned_put`, so a private
+bucket stays private and a browser fetches an object directly rather than through a Lambda
+that would buffer the bytes and pay for the time. It takes the same shape and client handling
+as the upload: bucket, key, `expires_in` defaulting to `DEFAULT_EXPIRES_IN` and capped at
+SigV4's `MAX_EXPIRES_IN`, an injectable client, and a region and endpoint for the client
+cached per pair. It returns a frozen `PresignedDownload` carrying `url`, `bucket`, `key` and
+`expires_in`. The upload bounds a PUT with a signed content type and content length; the GET
+equivalents are the response header overrides, so the optional `response_content_type` and
+`response_content_disposition` go into the signature as `ResponseContentType` and
+`ResponseContentDisposition`, and S3 returns them with the object while a holder of the URL
+cannot change them. Omit one and S3 serves the stored metadata. Validation mirrors the upload
+path and runs before any signing, so an empty bucket or key, an `expires_in` outside the
+range, or either override passed as an empty string is a `ValueError` rather than a URL S3
+rejects. The URL is a bearer credential for one key until it expires, which the docs say
+plainly. `webbpulse.testing.FakePresigner` covers it unchanged.
 
 ## 0.41.0
 
