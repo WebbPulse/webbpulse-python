@@ -332,7 +332,7 @@ class RateLimiter(Repository):
         The conditional update extends the live window; when the TTL has already passed the
         condition fails and the row is replaced, which opens a new window at 1.
         """
-        from botocore.exceptions import ClientError
+        from webbpulse.dynamodb import ConditionFailed
 
         current = int(now)
         key = {"pk": self._key(identity)}
@@ -347,11 +347,7 @@ class RateLimiter(Repository):
                 condition="attribute_not_exists(#ttl) OR #ttl > :now",
                 return_values="ALL_NEW",
             )
-        except ClientError as exc:
-            if _error_code(exc) != "ConditionalCheckFailedException":
-                return self._failed_open(
-                    "check", exc, limit=limit, window_seconds=window_seconds, reset_after=window_seconds
-                )
+        except ConditionFailed:
             attributes = None
         except Exception as exc:
             return self._failed_open(
@@ -415,14 +411,6 @@ class RateLimiter(Repository):
                     "error_message": str(exc),
                 },
             )
-
-
-def _error_code(error: Any) -> str:
-    """The AWS error code, read defensively so a malformed response yields ""."""
-    response = getattr(error, "response", None)
-    if not isinstance(response, dict):
-        return ""
-    return str(response.get("Error", {}).get("Code", ""))
 
 
 def rate_limit(

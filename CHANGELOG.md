@@ -5,6 +5,35 @@ Notable changes to the `webbpulse` package. The version here is the one in
 
 This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## 0.42.0
+
+Three gaps the Standupless build hit on 0.41.0, filled in the DynamoDB repository, plus a
+presigned S3 GET.
+
+`Repository.put`, `update` and `delete` now raise `ConditionFailed` when a condition
+expression does not hold, instead of letting a botocore `ClientError` out. The type, its
+docs and its 409 mapping through `install_dynamodb_error_handlers` already existed and
+nothing ever raised them, so a lost uniqueness race surfaced as an opaque 500 and each
+product wrote the same `except ClientError` decode around every conditional write. Only
+`ConditionalCheckFailedException` is translated; every other error code is re-raised
+untouched, so a throttle or an access denial stays a fault rather than becoming a conflict,
+and the original `ClientError` remains on `__cause__`. This changes behaviour for a caller
+that caught `ClientError` around a `Repository` conditional write; the identity and rate
+limiter stores that did so moved with it.
+
+`Repository.set_attributes(key, attributes)` applies a partial update, aliasing every
+attribute name against DynamoDB's reserved words. The aliases use a `#set{index}` namespace
+rather than `#n{index}`, which collides with the placeholders boto3 mints for an `Attr`
+condition from its own `#n0` counter: the name maps merge into one request, the later
+definition wins, and the update silently writes to the attribute the condition named.
+
+`Repository.get_many(ids)` batch-reads a table keyed on one attribute and returns the items
+keyed by that id, adding the de-duplication `BatchGetItem` requires and the pairing back to
+the requesting id an unordered batch response needs. Misses are omitted, the way `get`
+answers `None`.
+
+`presigned_get` signs a bounded S3 GET, the read counterpart of `presigned_put`.
+
 ## 0.41.0
 
 Five feature sets landed together: DynamoDB counters and idempotency, S3 presigned uploads,

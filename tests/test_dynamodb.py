@@ -16,6 +16,7 @@ from botocore.exceptions import ClientError
 
 from webbpulse.dynamodb import (
     TABLE_PREFIX_ENV,
+    ConditionFailed,
     Page,
     Repository,
     encode_numbers,
@@ -197,6 +198,13 @@ def items_repo(dynamodb_resource: Any) -> Repository:
 
 
 @pytest.fixture
+def users_repo(dynamodb_resource: Any) -> Repository:
+    """A repository over a `users` table keyed on `id`, for the `get_many` tests."""
+    create_table(dynamodb_resource, "users", hash_key="id")
+    return Repository("users", prefix="", region_name="us-west-2")
+
+
+@pytest.fixture
 def events_repo(dynamodb_resource: Any) -> Repository:
     """A repository over an `events` table with a range key, for pagination tests."""
     create_table(dynamodb_resource, "events", range_key="sk")
@@ -258,25 +266,96 @@ def test_delete_of_an_absent_item_is_not_an_error(items_repo: Repository) -> Non
 
 
 def test_put_with_a_condition_raises_on_a_duplicate(items_repo: Repository) -> None:
-    """A failed condition raises ConditionalCheckFailedException and leaves the item intact."""
+    """A failed condition raises `ConditionFailed` and leaves the item intact."""
     items_repo.put({"pk": "unique-1", "name": "First"}, condition=Attr("pk").not_exists())
 
-    with pytest.raises(ClientError) as excinfo:
+    with pytest.raises(ConditionFailed) as excinfo:
         items_repo.put({"pk": "unique-1", "name": "Second"}, condition=Attr("pk").not_exists())
 
-    assert excinfo.value.response["Error"]["Code"] == "ConditionalCheckFailedException"
+    assert excinfo.value.table == "items", "the failure must name the table it guarded"
+    assert "attribute_not_exists" in excinfo.value.condition, (
+        f"the rendered condition must be recorded, got {excinfo.value.condition!r}"
+    )
 
     existing = items_repo.get({"pk": "unique-1"})
     assert existing is not None
     assert existing["name"] == "First"
 
 
+def test_a_failed_condition_keeps_the_client_error_as_its_cause(items_repo: Repository) -> None:
+    """`ConditionFailed` chains the botocore error, so nothing about the failure is lost."""
+    items_repo.put({"pk": "unique-1", "name": "First"}, condition=Attr("pk").not_exists())
+
+    with pytest.raises(ConditionFailed) as excinfo:
+        items_repo.put({"pk": "unique-1", "name": "Second"}, condition=Attr("pk").not_exists())
+
+    cause = excinfo.value.__cause__
+    assert isinstance(cause, ClientError), f"the ClientError must stay as the cause, got {cause!r}"
+    assert cause.response["Error"]["Code"] == "ConditionalCheckFailedException"
+
+
+def test_a_non_condition_client_error_is_re_raised_untouched(
+    items_repo: Repository,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Only a failed condition becomes `ConditionFailed`; a throttle stays a `ClientError`.
+
+    A throttle or an access denial is a fault the caller must not mistake for a lost race,
+    which a blanket translation would hide behind a 409.
+    """
+
+    def _throttle(**kwargs: Any) -> None:
+        raise ClientError(
+            {"Error": {"Code": "ProvisionedThroughputExceededException", "Message": "slow down"}},
+            "PutItem",
+        )
+
+    monkeypatch.setattr(items_repo.table, "put_item", _throttle)
+    with pytest.raises(ClientError) as excinfo:
+        items_repo.put({"pk": "throttled"}, condition=Attr("pk").not_exists())
+    assert excinfo.value.response["Error"]["Code"] == "ProvisionedThroughputExceededException"
+
+
 def test_delete_with_a_failing_condition_raises(items_repo: Repository) -> None:
-    """A delete whose condition fails raises and leaves the item in place."""
+    """A delete whose condition fails raises `ConditionFailed` and leaves the item in place."""
     items_repo.put({"pk": "guarded", "state": "locked"})
-    with pytest.raises(ClientError):
+    with pytest.raises(ConditionFailed) as excinfo:
         items_repo.delete({"pk": "guarded"}, condition=Attr("state").eq("unlocked"))
+    assert excinfo.value.key == {"pk": "guarded"}, "a conditional delete must record the key it guarded"
     assert items_repo.get({"pk": "guarded"}) is not None
+
+
+def test_update_with_a_failing_condition_raises(items_repo: Repository) -> None:
+    """An update whose condition fails raises `ConditionFailed` and writes nothing."""
+    items_repo.put({"pk": "guarded", "state": "locked"})
+
+    with pytest.raises(ConditionFailed) as excinfo:
+        items_repo.update(
+            {"pk": "guarded"},
+            update_expression="SET #s = :s",
+            expression_names={"#s": "state"},
+            expression_values={":s": "open"},
+            condition=Attr("state").eq("unlocked"),
+        )
+
+    assert excinfo.value.key == {"pk": "guarded"}, "a conditional update must record the key it guarded"
+    stored = items_repo.get({"pk": "guarded"})
+    assert stored is not None
+    assert stored["state"] == "locked", "a refused update must leave the item untouched"
+
+
+def test_an_unconditional_write_still_raises_the_raw_client_error(
+    items_repo: Repository,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """With no condition there is no conflict to report, so the botocore error is untouched."""
+
+    def _boom(**kwargs: Any) -> None:
+        raise ClientError({"Error": {"Code": "ValidationException", "Message": "bad"}}, "PutItem")
+
+    monkeypatch.setattr(items_repo.table, "put_item", _boom)
+    with pytest.raises(ClientError):
+        items_repo.put({"pk": "whatever"})
 
 
 def test_put_many_writes_every_item(items_repo: Repository) -> None:
@@ -387,3 +466,131 @@ def test_iter_query_passes_a_start_key_through(events_repo: Repository) -> None:
         events_repo.iter_query(Key("pk").eq("session-1"), page_size=5, start_key={"pk": "session-1", "sk": "0009"})
     )
     assert [item["sk"] for item in collected] == [f"{i:04d}" for i in range(10, 15)]
+
+
+def test_set_attributes_writes_every_named_attribute(items_repo: Repository) -> None:
+    """`set_attributes` SETs each attribute and returns the stored item."""
+    items_repo.put({"pk": "widget-1", "name": "Widget", "state": "draft"})
+
+    updated = items_repo.set_attributes({"pk": "widget-1"}, {"name": "Renamed", "state": "live", "size": 3})
+
+    assert updated is not None
+    assert updated["name"] == "Renamed"
+    assert updated["state"] == "live"
+    assert updated["size"] == 3
+
+
+def test_set_attributes_aliases_reserved_words(items_repo: Repository) -> None:
+    """Every name is aliased, so a DynamoDB reserved word such as `status` is writable."""
+    items_repo.put({"pk": "widget-1"})
+
+    updated = items_repo.set_attributes({"pk": "widget-1"}, {"status": "active", "size": 2, "name": "Widget"})
+
+    assert updated is not None
+    assert updated["status"] == "active", "a reserved word must be aliased rather than rejected"
+
+
+def test_set_attributes_with_a_condition_does_not_collide_with_boto3_aliases(
+    items_repo: Repository,
+) -> None:
+    """A SET alongside an `Attr` condition writes the SET's attribute, not the condition's.
+
+    The regression this guards: aliases numbered `#n0` collide with the placeholders boto3
+    mints for a condition from its own `#n0` counter. The two maps merge into one request,
+    the later definition wins, and the update silently writes to the attribute the condition
+    named. The `#set{index}` namespace cannot collide, so `state` here must stay untouched.
+    """
+    items_repo.put({"pk": "widget-1", "state": "locked", "name": "Before"})
+
+    updated = items_repo.set_attributes(
+        {"pk": "widget-1"},
+        {"name": "After"},
+        condition=Attr("state").eq("locked"),
+    )
+
+    assert updated is not None
+    assert updated["name"] == "After", "the SET must have written the attribute it named"
+    assert updated["state"] == "locked", "the condition's attribute must not have been overwritten"
+
+
+def test_set_attributes_with_a_failing_condition_raises(items_repo: Repository) -> None:
+    """A conditional `set_attributes` that loses its race raises `ConditionFailed`."""
+    items_repo.put({"pk": "widget-1", "state": "locked", "name": "Before"})
+
+    with pytest.raises(ConditionFailed):
+        items_repo.set_attributes(
+            {"pk": "widget-1"},
+            {"name": "After"},
+            condition=Attr("state").eq("unlocked"),
+        )
+
+    stored = items_repo.get({"pk": "widget-1"})
+    assert stored is not None
+    assert stored["name"] == "Before", "a refused update must leave the item untouched"
+
+
+def test_set_attributes_with_nothing_to_set_is_a_no_op(items_repo: Repository) -> None:
+    """An empty mapping returns None rather than sending an empty UpdateExpression."""
+    items_repo.put({"pk": "widget-1", "name": "Widget"})
+    assert items_repo.set_attributes({"pk": "widget-1"}, {}) is None
+
+
+def test_set_attributes_encodes_floats(items_repo: Repository) -> None:
+    """`set_attributes` goes through `update`, so a float still stores as a Decimal."""
+    items_repo.put({"pk": "widget-1"})
+    updated = items_repo.set_attributes({"pk": "widget-1"}, {"price": 9.99})
+    assert updated is not None
+    assert updated["price"] == Decimal("9.99")
+
+
+def test_get_many_returns_items_keyed_by_id(users_repo: Repository) -> None:
+    """`get_many` pairs each item back to the id that asked for it."""
+    users_repo.put_many([{"id": f"user-{i}", "name": f"User {i}"} for i in range(3)])
+
+    found = users_repo.get_many(["user-0", "user-2"])
+
+    assert set(found) == {"user-0", "user-2"}
+    assert found["user-2"]["name"] == "User 2"
+
+
+def test_get_many_omits_misses(users_repo: Repository) -> None:
+    """An id with no row is absent from the result, the way `get` answers None."""
+    users_repo.put({"id": "user-0"})
+    found = users_repo.get_many(["user-0", "never-existed"])
+    assert set(found) == {"user-0"}, "a missing id must be omitted rather than raising"
+
+
+def test_get_many_de_duplicates_ids(users_repo: Repository) -> None:
+    """Repeated ids are collapsed, since BatchGetItem rejects a duplicated key."""
+    users_repo.put({"id": "user-0", "name": "User 0"})
+    found = users_repo.get_many(["user-0", "user-0", "user-0"])
+    assert found == {"user-0": {"id": "user-0", "name": "User 0"}}
+
+
+def test_get_many_drops_blank_ids(users_repo: Repository) -> None:
+    """A blank id is dropped, since DynamoDB rejects an empty key attribute."""
+    users_repo.put({"id": "user-0"})
+    assert set(users_repo.get_many(["user-0", ""])) == {"user-0"}
+
+
+def test_get_many_with_no_ids_is_empty(users_repo: Repository) -> None:
+    """An empty list costs no call and yields an empty mapping."""
+    assert users_repo.get_many([]) == {}
+
+
+def test_get_many_chunks_beyond_the_batch_limit(users_repo: Repository) -> None:
+    """More than `BATCH_GET_LIMIT` ids are chunked, so a long member list is one call path."""
+    wanted = [f"user-{i:03d}" for i in range(150)]
+    users_repo.put_many([{"id": user_id} for user_id in wanted])
+
+    found = users_repo.get_many(wanted)
+
+    assert len(found) == 150, f"every id across both chunks must come back, got {len(found)}"
+    assert set(found) == set(wanted)
+
+
+def test_get_many_honours_a_custom_key_attribute(items_repo: Repository) -> None:
+    """A table keyed by something other than `id` names its key attribute."""
+    items_repo.put_many([{"pk": "widget-1"}, {"pk": "widget-2"}])
+    found = items_repo.get_many(["widget-1", "widget-2"], key_attribute="pk")
+    assert set(found) == {"widget-1", "widget-2"}

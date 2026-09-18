@@ -45,6 +45,58 @@ cause is a real fault. `UnprocessedItems` joins them for a batch that stayed inc
 the retry cap. `webbpulse.http.install_dynamodb_error_handlers` renders all four, and
 [error-handlers.md](error-handlers.md#the-packages-own-dynamodb-exception-types) has the mapping.
 
+### Conditional writes
+
+`put`, `update` and `delete` each take a `condition`, and a condition that does not hold
+raises `ConditionFailed` rather than a botocore `ClientError`:
+
+```python
+from boto3.dynamodb.conditions import Attr
+from webbpulse.dynamodb import ConditionFailed
+
+try:
+    repo.put(item, condition=Attr("pk").not_exists())
+except ConditionFailed:
+    raise HTTPException(status_code=409, detail="that slug is taken")
+```
+
+Only `ConditionalCheckFailedException` is translated. Every other error code is re-raised
+untouched, because a throttle or an access denial is a fault and must not reach the caller as
+a 409. The original `ClientError` stays on `__cause__`, so nothing about the failure is lost.
+The exception records the table, the rendered condition expression and, where the call had
+one, the key it guarded, all for the log rather than the response body.
+
+This is what makes a lost uniqueness race a 409 through `install_dynamodb_error_handlers`
+without every product writing the same `except ClientError` decode around every conditional
+write.
+
+### Partial updates
+
+`set_attributes(key, attributes)` SETs each named attribute in one `update_item`, returning
+the stored item:
+
+```python
+user = repo.set_attributes({"id": user_id}, {"name": "Ada", "status": "active"})
+```
+
+Every attribute name is aliased whether or not it looks reserved, because DynamoDB's reserved
+word list runs to hundreds of ordinary words such as `name`, `status` and `size`, and an
+expression naming one directly fails at runtime rather than in review.
+
+The aliases live in a `#set{index}` namespace, which is the part worth not hand-rolling. A
+caller that numbers its own aliases `#n0`, `#n1` collides with boto3: rendering an `Attr`
+condition mints placeholders from the same `#n0` counter, the two name maps are merged into
+one request, the later definition wins, and the update silently writes to the attribute the
+condition named instead of the one the caller asked for. A conditional partial update is
+therefore safe to express here:
+
+```python
+repo.set_attributes({"id": user_id}, {"name": "Ada"}, condition=Attr("state").eq("locked"))
+```
+
+An empty mapping is a no-op returning `None`, since DynamoDB rejects an empty
+`UpdateExpression`. A failing condition raises `ConditionFailed`.
+
 ### Counters
 
 `increment(key, attribute, by=1)` adds to a numeric attribute and returns what it now holds,
@@ -128,6 +180,20 @@ than an opaque 500, because shed load is transient and worth retrying.
 
 Results come back in no particular order, and a key with no item is simply absent rather
 than being an error, because a batch read is a lookup and not an assertion.
+
+`get_many(ids)` sits on top of it for the common case of a table keyed on one attribute,
+returning the items keyed by that id:
+
+```python
+users = users_repo.get_many([m.user_id for m in memberships])
+```
+
+It adds the two things a caller otherwise redoes at every call site: de-duplicating the ids,
+since `BatchGetItem` rejects a request naming the same key twice, and pairing each item back
+to the id that asked for it, since the response comes back unordered. A missing id is omitted
+from the result the way `get` answers `None`, and blank ids are dropped rather than sent,
+since DynamoDB rejects an empty key attribute. `key_attribute` names the key when it is not
+`id`. A composite-key table has no single id to key the result by, so use `batch_get` there.
 
 ### Transactions
 

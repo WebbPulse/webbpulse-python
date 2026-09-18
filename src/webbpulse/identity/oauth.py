@@ -489,17 +489,16 @@ class DynamoOAuthLinkStore(OAuthLinkStore):
     def claim(self, record: OAuthLinkRecord) -> bool:
         """Conditionally write a link, returning `False` when the key already exists."""
         from boto3.dynamodb.conditions import Attr
-        from botocore.exceptions import ClientError
+
+        from webbpulse.dynamodb import ConditionFailed
 
         try:
             self._repo.put(
                 _link_to_item(record),
                 condition=Attr("provider_subject").not_exists(),
             )
-        except ClientError as exc:
-            if exc.response.get("Error", {}).get("Code") == "ConditionalCheckFailedException":
-                return False
-            raise
+        except ConditionFailed:
+            return False
         return True
 
     def delete_all_for_user(self, user_id: str) -> int:
