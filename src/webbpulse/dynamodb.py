@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import os
 from collections.abc import Iterator, Mapping, Sequence
+from contextlib import contextmanager
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from functools import lru_cache
@@ -151,6 +152,8 @@ _ULID_RANDOM_BYTES: Final = _ULID_RANDOM_BITS // 8
 _ULID_MAX_TIMESTAMP: Final = 1 << 48
 
 _CONDITIONAL_CHECK_FAILED: Final = "ConditionalCheckFailed"
+
+_CONDITIONAL_CHECK_FAILED_EXCEPTION: Final = "ConditionalCheckFailedException"
 
 _TRANSACTION_CANCELED: Final = "TransactionCanceledException"
 
@@ -303,6 +306,25 @@ def _apply_condition(action: dict[str, Any], condition: Any) -> None:
         values = dict(action.get("ExpressionAttributeValues", {}))
         values.update(encode_numbers(built.attribute_value_placeholders))
         action["ExpressionAttributeValues"] = values
+
+
+def _describe_condition(condition: Any) -> str:
+    """Render `condition` as a short string for a `ConditionFailed` message and log.
+
+    A `boto3.dynamodb.conditions` object has no useful `str`, so it is built into its
+    expression text. Building it can only be best effort, since a caller may pass anything
+    the resource layer accepts, and a failure to describe a condition must never replace the
+    conflict the caller actually needs to see.
+    """
+    if isinstance(condition, str):
+        return condition
+    try:
+        from boto3.dynamodb.conditions import ConditionExpressionBuilder
+
+        built = ConditionExpressionBuilder().build_expression(condition, is_key_condition=False)
+    except Exception:
+        return repr(condition)
+    return str(built.condition_expression)
 
 
 def transact_write(
@@ -482,16 +504,43 @@ class Repository:
                 return
             start_key = page.last_evaluated_key
 
+    @contextmanager
+    def _conditional(self, condition: Any, key: Key | None) -> Iterator[None]:
+        """Turn a rejected condition inside the block into `ConditionFailed`.
+
+        Every conditional write goes through here so a lost race is one exception type rather
+        than a raw `ClientError` each caller has to decode. Only
+        `ConditionalCheckFailedException` is translated; every other code is re-raised
+        untouched, since a throttle or an access denial is a fault, not a conflict. The
+        `ClientError` stays as `__cause__`, so nothing about the original failure is lost.
+        """
+        from botocore.exceptions import ClientError
+
+        try:
+            yield
+        except ClientError as exc:
+            if exc.response.get("Error", {}).get("Code") != _CONDITIONAL_CHECK_FAILED_EXCEPTION:
+                raise
+            raise ConditionFailed(self.table_name, _describe_condition(condition), key) from exc
+
     def put(self, item: Item, *, condition: Any | None = None) -> None:
         """Write one item, converting any `float` to `Decimal` on the way.
 
         Pass a `condition` such as `Attr("pk").not_exists()` to make the write a create
         rather than an upsert.
+
+        Raises:
+            ConditionFailed: When a `condition` was given and did not hold, which is the
+                ordinary outcome of losing an optimistic create rather than a fault.
         """
-        kwargs: dict[str, Any] = {"Item": encode_numbers(item)}
-        if condition is not None:
-            kwargs["ConditionExpression"] = condition
-        self.table.put_item(**kwargs)
+        encoded = encode_numbers(item)
+        kwargs: dict[str, Any] = {"Item": encoded}
+        if condition is None:
+            self.table.put_item(**kwargs)
+            return
+        kwargs["ConditionExpression"] = condition
+        with self._conditional(condition, None):
+            self.table.put_item(**kwargs)
 
     def update(
         self,
@@ -506,6 +555,9 @@ class Repository:
         """Apply an `UpdateExpression` to one item and optionally return the result.
 
         `expression_names` exists for DynamoDB reserved words such as `name` or `status`.
+
+        Raises:
+            ConditionFailed: When a `condition` was given and did not hold.
         """
         kwargs: dict[str, Any] = {
             "Key": dict(key),
@@ -519,11 +571,64 @@ class Repository:
         if condition is not None:
             kwargs["ConditionExpression"] = condition
 
-        response = self.table.update_item(**kwargs)
+        if condition is None:
+            response = self.table.update_item(**kwargs)
+        else:
+            with self._conditional(condition, key):
+                response = self.table.update_item(**kwargs)
         attributes = response.get("Attributes")
         if attributes is None:
             return None
         return dict(attributes)
+
+    def set_attributes(
+        self,
+        key: Key,
+        attributes: Mapping[str, Any],
+        *,
+        condition: Any | None = None,
+        return_values: str = "ALL_NEW",
+    ) -> Item | None:
+        """`SET` each of `attributes` on one item, aliasing every name.
+
+        The update a product otherwise hand-rolls for a partial write, and hand-rolls
+        wrongly twice over. Every attribute name is aliased whether or not it looks
+        reserved, because DynamoDB's reserved word list runs to hundreds of ordinary words
+        such as `name`, `status` and `size`, and an expression naming one directly is
+        rejected at runtime rather than caught in review.
+
+        The aliases are minted in the `#set{index}` namespace on purpose. A caller that
+        numbers its own aliases `#n0`, `#n1` collides with boto3: rendering an `Attr`
+        condition mints placeholders from the same `#n0` counter, and the two maps are
+        merged into one request where the later definition silently wins and the update
+        writes to the condition's attribute. `#set{index}` cannot collide with a generated
+        name, so a conditional partial update is safe to express.
+
+        Args:
+            key: The item's full primary key.
+            attributes: The attribute names and values to set. An empty mapping is a no-op
+                returning `None`, since DynamoDB rejects an empty `UpdateExpression`.
+            condition: An optional condition guarding the write.
+            return_values: DynamoDB's `ReturnValues`, defaulting to `ALL_NEW` so the caller
+                sees the stored item rather than issuing a second read.
+
+        Raises:
+            ConditionFailed: When a `condition` was given and did not hold.
+        """
+        values = dict(attributes)
+        if not values:
+            return None
+        names = {f"#set{index}": name for index, name in enumerate(values)}
+        expression_values = {f":set{index}": value for index, value in enumerate(values.values())}
+        assignments = ", ".join(f"#set{index} = :set{index}" for index in range(len(values)))
+        return self.update(
+            key,
+            update_expression=f"SET {assignments}",
+            expression_values=expression_values,
+            expression_names=names,
+            condition=condition,
+            return_values=return_values,
+        )
 
     def increment(self, key: Key, attribute: str, by: int = 1) -> int:
         """Atomically add `by` to a numeric attribute and return what it now holds.
@@ -558,11 +663,18 @@ class Repository:
         return int(attributes[attribute])
 
     def delete(self, key: Key, *, condition: Any | None = None) -> None:
-        """Delete one item by primary key. Deleting an absent item is not an error."""
+        """Delete one item by primary key. Deleting an absent item is not an error.
+
+        Raises:
+            ConditionFailed: When a `condition` was given and did not hold.
+        """
         kwargs: dict[str, Any] = {"Key": dict(key)}
-        if condition is not None:
-            kwargs["ConditionExpression"] = condition
-        self.table.delete_item(**kwargs)
+        if condition is None:
+            self.table.delete_item(**kwargs)
+            return
+        kwargs["ConditionExpression"] = condition
+        with self._conditional(condition, key):
+            self.table.delete_item(**kwargs)
 
     def put_many(self, items: Sequence[Item]) -> None:
         """Write many items through a batch writer, which handles retries and chunking.
@@ -712,6 +824,46 @@ class Repository:
                 request = dict(unprocessed)
         return found
 
+    def get_many(
+        self,
+        ids: Sequence[str],
+        *,
+        key_attribute: str = "id",
+        consistent: bool = False,
+        projection: str | None = None,
+        max_attempts: int = UNPROCESSED_RETRY_ATTEMPTS,
+    ) -> dict[str, Item]:
+        """Fetch many items by a single-attribute key and return them keyed by that id.
+
+        The read behind any "render these people" or "name these workspaces" screen, which
+        a caller otherwise writes as a loop of `get` calls: one round trip per row, and a
+        latency that grows with the list. `batch_get` already chunks at `BATCH_GET_LIMIT`
+        and retries unprocessed keys, and this adds the two things a caller then has to do
+        by hand every time: de-duplicating the ids, since `BatchGetItem` rejects a request
+        naming the same key twice, and pairing each item back to the id that asked for it,
+        since a batch response comes back in no particular order.
+
+        A missing id is simply absent from the result, the way `get` answers `None`, so the
+        caller decides whether a gap is an error. Blank ids are dropped rather than sent,
+        since DynamoDB rejects an empty key attribute.
+
+        Only for a table whose primary key is one attribute. A composite key has no single
+        id to key the result by, so use `batch_get` there.
+
+        Raises:
+            UnprocessedItems: When keys were still unprocessed after the last attempt.
+        """
+        wanted = [value for value in dict.fromkeys(ids) if value]
+        if not wanted:
+            return {}
+        items = self.batch_get(
+            [{key_attribute: value} for value in wanted],
+            consistent=consistent,
+            projection=projection,
+            max_attempts=max_attempts,
+        )
+        return {str(item[key_attribute]): item for item in items if key_attribute in item}
+
     def put_action(self, item: Item, *, condition: Any | None = None) -> dict[str, Any]:
         """A `TransactWriteItems` Put action for `item`, for `transact_write`."""
         action: dict[str, Any] = {"TableName": self.table_name, "Item": encode_numbers(item)}
@@ -821,7 +973,6 @@ class IdempotencyStore:
             raise ValueError(f"claim needs a positive ttl_seconds, got {ttl_seconds}.")
 
         from boto3.dynamodb.conditions import Attr
-        from botocore.exceptions import ClientError
 
         item: Item = {
             self.key_attribute: key,
@@ -830,9 +981,7 @@ class IdempotencyStore:
         }
         try:
             self.repository.put(item, condition=Attr(self.key_attribute).not_exists())
-        except ClientError as exc:
-            if exc.response.get("Error", {}).get("Code") != "ConditionalCheckFailedException":
-                raise
+        except ConditionFailed:
             return False
         return True
 

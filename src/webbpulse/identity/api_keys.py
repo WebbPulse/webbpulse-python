@@ -340,7 +340,8 @@ class DynamoApiKeyStore(ApiKeyStore):
     def revoke(self, key_hash: str, *, revoked_at: str | None = None) -> ApiKeyRecord | None:
         """Atomically mark a key revoked, returning it as it was, or `None` if already revoked."""
         from boto3.dynamodb.conditions import Attr
-        from botocore.exceptions import ClientError
+
+        from webbpulse.dynamodb import ConditionFailed
 
         try:
             old = self._repo.update(
@@ -350,10 +351,8 @@ class DynamoApiKeyStore(ApiKeyStore):
                 condition=(Attr("key_hash").exists() & (Attr("revoked_at").not_exists() | Attr("revoked_at").eq(""))),
                 return_values="ALL_OLD",
             )
-        except ClientError as exc:
-            if exc.response.get("Error", {}).get("Code") == "ConditionalCheckFailedException":
-                return None
-            raise
+        except ConditionFailed:
+            return None
         return _record_from_item(old) if old else None
 
     def touch(self, key_hash: str, *, used_at: str | None = None) -> None:

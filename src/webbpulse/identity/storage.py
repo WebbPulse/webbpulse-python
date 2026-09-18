@@ -1000,7 +1000,8 @@ class DynamoRefreshTokenStore(RefreshTokenStore):
     ) -> RefreshTokenRecord | None:
         """Atomically mark this token consumed, returning the record **as it was before**."""
         from boto3.dynamodb.conditions import Attr
-        from botocore.exceptions import ClientError
+
+        from webbpulse.dynamodb import ConditionFailed
 
         try:
             old = self._repo.update(
@@ -1015,10 +1016,8 @@ class DynamoRefreshTokenStore(RefreshTokenStore):
                 ),
                 return_values="ALL_OLD",
             )
-        except ClientError as exc:
-            if exc.response.get("Error", {}).get("Code") == "ConditionalCheckFailedException":
-                return None
-            raise
+        except ConditionFailed:
+            return None
         return _refresh_record_from_item(old) if old else None
 
     def revoke_family(self, family_id: str) -> int:
@@ -1087,7 +1086,8 @@ class DynamoRefreshTokenStore(RefreshTokenStore):
         counted. The count is therefore how many this call changed, not how many it saw.
         """
         from boto3.dynamodb.conditions import Attr
-        from botocore.exceptions import ClientError
+
+        from webbpulse.dynamodb import ConditionFailed
 
         count = 0
         for item in items:
@@ -1100,10 +1100,8 @@ class DynamoRefreshTokenStore(RefreshTokenStore):
                     expression_values={":true": True},
                     condition=Attr("revoked").not_exists() | Attr("revoked").eq(False),
                 )
-            except ClientError as exc:
-                if exc.response.get("Error", {}).get("Code") == "ConditionalCheckFailedException":
-                    continue
-                raise
+            except ConditionFailed:
+                continue
             count += 1
         return count
 
@@ -1136,7 +1134,8 @@ class DynamoIdentityTokenStore(IdentityTokenStore):
     def consume(self, token_hash: str, *, consumed_at: str | None = None) -> IdentityTokenRecord | None:
         """Atomically mark a link used, returning it as it was, or `None` if already used."""
         from boto3.dynamodb.conditions import Attr
-        from botocore.exceptions import ClientError
+
+        from webbpulse.dynamodb import ConditionFailed
 
         try:
             old = self._repo.update(
@@ -1148,10 +1147,8 @@ class DynamoIdentityTokenStore(IdentityTokenStore):
                 ),
                 return_values="ALL_OLD",
             )
-        except ClientError as exc:
-            if exc.response.get("Error", {}).get("Code") == "ConditionalCheckFailedException":
-                return None
-            raise
+        except ConditionFailed:
+            return None
         return _identity_token_from_item(old) if old else None
 
     def revoke_for_user(self, user_id: str, purpose: IdentityTokenPurpose) -> int:
@@ -1210,7 +1207,8 @@ class DynamoTotpFactorStore(TotpFactorStore):
     def activate(self, user_id: str, *, step: int, activated_at: str | None = None) -> bool:
         """Confirm a pending factor with its first verified code."""
         from boto3.dynamodb.conditions import Attr
-        from botocore.exceptions import ClientError
+
+        from webbpulse.dynamodb import ConditionFailed
 
         try:
             self._repo.update(
@@ -1221,16 +1219,15 @@ class DynamoTotpFactorStore(TotpFactorStore):
                     Attr("user_id").exists() & (Attr("activated_at").not_exists() | Attr("activated_at").eq(""))
                 ),
             )
-        except ClientError as exc:
-            if exc.response.get("Error", {}).get("Code") == "ConditionalCheckFailedException":
-                return False
-            raise
+        except ConditionFailed:
+            return False
         return True
 
     def record_use(self, user_id: str, *, step: int) -> bool:
         """Advance the replay watermark, refusing anything not strictly newer."""
         from boto3.dynamodb.conditions import Attr
-        from botocore.exceptions import ClientError
+
+        from webbpulse.dynamodb import ConditionFailed
 
         try:
             self._repo.update(
@@ -1241,10 +1238,8 @@ class DynamoTotpFactorStore(TotpFactorStore):
                     Attr("user_id").exists() & (Attr("last_used_step").not_exists() | Attr("last_used_step").lt(step))
                 ),
             )
-        except ClientError as exc:
-            if exc.response.get("Error", {}).get("Code") == "ConditionalCheckFailedException":
-                return False
-            raise
+        except ConditionFailed:
+            return False
         return True
 
     def delete(self, user_id: str) -> None:
@@ -1285,7 +1280,8 @@ class DynamoRecoveryCodeStore(RecoveryCodeStore):
     def consume(self, user_id: str, code_hash: str, *, used_at: str | None = None) -> bool:
         """Atomically spend one code, returning `False` if unknown or already spent."""
         from boto3.dynamodb.conditions import Attr
-        from botocore.exceptions import ClientError
+
+        from webbpulse.dynamodb import ConditionFailed
 
         try:
             self._repo.update(
@@ -1294,10 +1290,8 @@ class DynamoRecoveryCodeStore(RecoveryCodeStore):
                 expression_values={":now": used_at or now_iso()},
                 condition=(Attr("code_hash").exists() & (Attr("used_at").not_exists() | Attr("used_at").eq(""))),
             )
-        except ClientError as exc:
-            if exc.response.get("Error", {}).get("Code") == "ConditionalCheckFailedException":
-                return False
-            raise
+        except ConditionFailed:
+            return False
         return True
 
     def delete_for_user(self, user_id: str) -> int:
@@ -1351,7 +1345,8 @@ class DynamoPasskeyStore(PasskeyStore):
     def put(self, record: PasskeyRecord) -> None:
         """Write a new passkey, refusing a credential id already registered to anyone."""
         from boto3.dynamodb.conditions import Attr
-        from botocore.exceptions import ClientError
+
+        from webbpulse.dynamodb import ConditionFailed
 
         try:
             self._repo.put(
@@ -1371,10 +1366,8 @@ class DynamoPasskeyStore(PasskeyStore):
                 },
                 condition=Attr("credential_id").not_exists(),
             )
-        except ClientError as exc:
-            if exc.response.get("Error", {}).get("Code") == "ConditionalCheckFailedException":
-                raise KeyError(f"passkey {record.credential_id[:12]} is already registered") from exc
-            raise
+        except ConditionFailed as exc:
+            raise KeyError(f"passkey {record.credential_id[:12]} is already registered") from exc
 
     def record_use(self, user_id: str, credential_id: str, *, sign_count: int, used_at: str) -> None:
         """Advance the signature counter and the last-used stamp after a good assertion."""
@@ -1387,23 +1380,23 @@ class DynamoPasskeyStore(PasskeyStore):
     def delete(self, user_id: str, credential_id: str) -> bool:
         """Remove one passkey, returning `False` if it was not there."""
         from boto3.dynamodb.conditions import Attr
-        from botocore.exceptions import ClientError
+
+        from webbpulse.dynamodb import ConditionFailed
 
         try:
             self._repo.delete(
                 {"user_id": user_id, "credential_id": credential_id},
                 condition=Attr("credential_id").exists(),
             )
-        except ClientError as exc:
-            if exc.response.get("Error", {}).get("Code") == "ConditionalCheckFailedException":
-                return False
-            raise
+        except ConditionFailed:
+            return False
         return True
 
     def rename(self, user_id: str, credential_id: str, *, name: str) -> bool:
         """Set the label on one passkey, returning `False` if it was not there."""
         from boto3.dynamodb.conditions import Attr
-        from botocore.exceptions import ClientError
+
+        from webbpulse.dynamodb import ConditionFailed
 
         try:
             self._repo.update(
@@ -1413,10 +1406,8 @@ class DynamoPasskeyStore(PasskeyStore):
                 expression_names={"#name": "name"},
                 condition=Attr("credential_id").exists(),
             )
-        except ClientError as exc:
-            if exc.response.get("Error", {}).get("Code") == "ConditionalCheckFailedException":
-                return False
-            raise
+        except ConditionFailed:
+            return False
         return True
 
     def delete_all_for_user(self, user_id: str) -> int:
