@@ -594,3 +594,112 @@ def test_get_many_honours_a_custom_key_attribute(items_repo: Repository) -> None
     items_repo.put_many([{"pk": "widget-1"}, {"pk": "widget-2"}])
     found = items_repo.get_many(["widget-1", "widget-2"], key_attribute="pk")
     assert set(found) == {"widget-1", "widget-2"}
+
+
+def test_remove_attributes_deletes_every_named_attribute(items_repo: Repository) -> None:
+    """`remove_attributes` REMOVEs each attribute and returns what the item now holds."""
+    items_repo.put({"pk": "widget-1", "name": "Widget", "unread_at": "2026-09-17", "state": "open"})
+
+    updated = items_repo.remove_attributes({"pk": "widget-1"}, ["unread_at", "state"])
+
+    assert updated is not None
+    assert "unread_at" not in updated, "a removed attribute must be gone, not emptied"
+    assert "state" not in updated
+    assert updated["name"] == "Widget", "an attribute not named must survive untouched"
+
+
+def test_remove_attributes_leaves_a_sparse_index(items_repo: Repository) -> None:
+    """The attribute is deleted rather than set to a marker, which is what empties the index.
+
+    A sparse global secondary index holds only the items carrying its key attribute. Setting
+    that attribute to null or to an empty string keeps the item in the index and keeps it in
+    every query that reads it, so only a `REMOVE` takes it out.
+    """
+    items_repo.put({"pk": "widget-1", "unread_at": "2026-09-17"})
+
+    items_repo.remove_attributes({"pk": "widget-1"}, ["unread_at"])
+
+    stored = items_repo.get({"pk": "widget-1"})
+    assert stored is not None
+    assert "unread_at" not in stored, "the index key must be absent, since a marker still indexes"
+
+
+def test_remove_attributes_aliases_reserved_words(items_repo: Repository) -> None:
+    """Every name is aliased, so a DynamoDB reserved word such as `status` is removable."""
+    items_repo.put({"pk": "widget-1", "status": "active", "size": 2, "name": "Widget"})
+
+    updated = items_repo.remove_attributes({"pk": "widget-1"}, ["status", "size", "name"])
+
+    assert updated is not None
+    assert set(updated) == {"pk"}, "a reserved word must be aliased rather than rejected"
+
+
+def test_remove_attributes_with_a_condition_does_not_collide_with_boto3_aliases(
+    items_repo: Repository,
+) -> None:
+    """A REMOVE alongside an `Attr` condition deletes its own attribute, not the condition's.
+
+    The same collision `set_attributes` guards against: aliases numbered `#n0` meet the
+    placeholders boto3 mints for a condition from its own `#n0` counter, the maps merge, and
+    the later definition wins. The `#rm{index}` namespace cannot collide, so `state` here
+    must survive.
+    """
+    items_repo.put({"pk": "widget-1", "state": "locked", "unread_at": "2026-09-17"})
+
+    updated = items_repo.remove_attributes(
+        {"pk": "widget-1"},
+        ["unread_at"],
+        condition=Attr("state").eq("locked"),
+    )
+
+    assert updated is not None
+    assert "unread_at" not in updated, "the REMOVE must have deleted the attribute it named"
+    assert updated["state"] == "locked", "the condition's attribute must not have been removed"
+
+
+def test_remove_attributes_with_a_failing_condition_raises(items_repo: Repository) -> None:
+    """A conditional `remove_attributes` that loses its race raises `ConditionFailed`."""
+    items_repo.put({"pk": "widget-1", "state": "locked", "unread_at": "2026-09-17"})
+
+    with pytest.raises(ConditionFailed):
+        items_repo.remove_attributes(
+            {"pk": "widget-1"},
+            ["unread_at"],
+            condition=Attr("state").eq("unlocked"),
+        )
+
+    stored = items_repo.get({"pk": "widget-1"})
+    assert stored is not None
+    assert stored["unread_at"] == "2026-09-17", "a refused removal must leave the item untouched"
+
+
+def test_remove_attributes_with_nothing_to_remove_is_a_no_op(items_repo: Repository) -> None:
+    """An empty sequence returns None rather than sending an empty UpdateExpression."""
+    items_repo.put({"pk": "widget-1", "name": "Widget"})
+    assert items_repo.remove_attributes({"pk": "widget-1"}, []) is None
+
+
+def test_remove_attributes_de_duplicates_names(items_repo: Repository) -> None:
+    """A repeated name is sent once, since DynamoDB refuses an expression naming one path twice."""
+    items_repo.put({"pk": "widget-1", "unread_at": "2026-09-17"})
+
+    updated = items_repo.remove_attributes({"pk": "widget-1"}, ["unread_at", "unread_at"])
+
+    assert updated is not None
+    assert "unread_at" not in updated
+
+
+def test_remove_attributes_on_an_absent_attribute_is_not_an_error(items_repo: Repository) -> None:
+    """REMOVE on an attribute the item lacks is a no-op, which makes a redelivery harmless."""
+    items_repo.put({"pk": "widget-1", "name": "Widget"})
+
+    updated = items_repo.remove_attributes({"pk": "widget-1"}, ["unread_at"])
+
+    assert updated is not None
+    assert updated["name"] == "Widget"
+
+
+def test_remove_attributes_honours_return_values(items_repo: Repository) -> None:
+    """`return_values` reaches DynamoDB, so a caller wanting no read back pays for none."""
+    items_repo.put({"pk": "widget-1", "unread_at": "2026-09-17"})
+    assert items_repo.remove_attributes({"pk": "widget-1"}, ["unread_at"], return_values="NONE") is None

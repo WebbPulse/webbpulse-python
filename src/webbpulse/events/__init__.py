@@ -13,7 +13,8 @@ the error handlers. `webbpulse.identity.events` is built on the primitive.
 
 The producing side lives here too: `EventEnvelope` is the shape a domain event is published
 in and `enqueue` puts one on an SQS queue. `deserialize_image` reads a DynamoDB Streams
-record image back into plain Python values.
+record image back into plain Python values, and `source_table` says which table a record
+came from, for a consumer reading more than one stream.
 """
 
 from __future__ import annotations
@@ -31,6 +32,7 @@ if TYPE_CHECKING:  # pragma: no cover
     from fastapi import APIRouter, FastAPI
 
 __all__ = [
+    "APP_EVENTS_PATH_ENV",
     "BATCH_FAILURES_KEY",
     "DEFAULT_EVENTS_PATH",
     "DEFAULT_EVENT_VERSION",
@@ -51,6 +53,7 @@ __all__ = [
     "events_path",
     "record_id",
     "register_stream_consumer",
+    "source_table",
     "stream_consumer_app",
 ]
 
@@ -59,6 +62,8 @@ _log = logging.getLogger(__name__)
 DEFAULT_EVENTS_PATH: Final = "/events"
 
 EVENTS_PATH_ENV: Final = "IDENTITY_EVENTS_PATH"
+
+APP_EVENTS_PATH_ENV: Final = "APP_EVENTS_PATH"
 
 LWA_PASS_THROUGH_PATH_ENV: Final = "AWS_LWA_PASS_THROUGH_PATH"
 
@@ -252,6 +257,42 @@ def deserialize_image(record: Mapping[str, Any], image: ImageName = "NewImage") 
     return {key: deserializer.deserialize(value) for key, value in raw.items()}
 
 
+def source_table(record: Mapping[str, Any]) -> str:
+    """The table name a DynamoDB Streams record came from, read off its `eventSourceARN`.
+
+    One consumer behind two streams gets both tables' records on one route, and the record
+    itself says which table only in its source ARN, which every such consumer otherwise
+    splits by hand. The ARN is
+    `arn:aws:dynamodb:<region>:<account>:table/<name>/stream/<label>`, and the name is the
+    segment after `table/`.
+
+    The name comes back as the stream carries it, which is the physical table name and so
+    still prefixed: matching it against `webbpulse.dynamodb.table_name("views")` rather than
+    against `"views"` is what keeps a consumer working across environments.
+
+    Args:
+        record: One record from a DynamoDB Streams batch.
+
+    Raises:
+        ValueError: When the record carries no `eventSourceARN`, or one that is not a
+            DynamoDB stream ARN. A consumer discriminating on the table cannot do anything
+            useful with a record it cannot place, and guessing a table would route the record
+            to the wrong handler, so this refuses rather than returning an empty string.
+    """
+    raw = record.get("eventSourceARN")
+    if not isinstance(raw, str) or not raw:
+        raise ValueError("The record carries no eventSourceARN, so it names no table.")
+
+    prefix, separator, remainder = raw.partition(":table/")
+    if not separator or not prefix.startswith("arn:") or ":dynamodb:" not in prefix:
+        raise ValueError(f"Not a DynamoDB stream ARN, so it names no table: {raw!r}")
+
+    name = remainder.partition("/")[0]
+    if not name:
+        raise ValueError(f"The stream ARN names an empty table: {raw!r}")
+    return name
+
+
 _FastAPIRequest: Any = None
 
 
@@ -267,11 +308,18 @@ def _bind_fastapi_request() -> None:
 def events_path() -> str:
     """The path the stream route mounts at, absolute and without a trailing slash.
 
-    `IDENTITY_EVENTS_PATH` wins, then `AWS_LWA_PASS_THROUGH_PATH`, which is the adapter's
-    own variable and the one that actually decides where the invocation is posted, then
-    `/events`, which is the adapter's default.
+    `IDENTITY_EVENTS_PATH` wins, then `APP_EVENTS_PATH`, then `AWS_LWA_PASS_THROUGH_PATH`,
+    which is the adapter's own variable and the one that actually decides where the
+    invocation is posted, then `/events`, which is the adapter's default.
+
+    `APP_EVENTS_PATH` is the application-facing half of the pair the `lambda-function`
+    module emits for a wired `sqs_event_sources` or `dynamodb_stream_event_sources`: one
+    `events_path` input reaches the function as both variables, the adapter reading one and
+    the application the other, so they cannot drift apart. Reading it rather than only the
+    adapter's variable is what keeps that promise on this side, and since both come from one
+    input they agree whichever is consulted first.
     """
-    for name in (EVENTS_PATH_ENV, LWA_PASS_THROUGH_PATH_ENV):
+    for name in (EVENTS_PATH_ENV, APP_EVENTS_PATH_ENV, LWA_PASS_THROUGH_PATH_ENV):
         raw = os.environ.get(name, "").strip()
         if raw:
             return "/" + raw.strip("/")

@@ -244,3 +244,40 @@ positions, never anything the caller may not already see.
 from it, so the two can never disagree. `from_page` takes the items and
 `Page.last_evaluated_key` as arguments rather than a `Page`, so this module never imports
 `webbpulse.dynamodb` and stays usable in a service with no `dynamodb` extra installed.
+
+### An API's own plural key
+
+`CursorPage` renders its items under `items`. For an API whose list bodies each name what
+they hold, `cursor_page` builds the same page under that key:
+
+```python
+from webbpulse.http import cursor_page
+
+IssuesPage = cursor_page(IssueOut, "issues")
+
+
+@router.get("")
+async def list_issues(cursor: str | None = None) -> IssuesPage:
+    """One page of issues, newest first."""
+    start = decode_cursor(cursor, settings.cursor_key) if cursor else None
+    page = repositories().issues.query(workspace_id, start_key=start)
+    return IssuesPage.from_page([IssueOut.model_validate(item) for item in page.items],
+                                page.last_evaluated_key, settings.cursor_key)
+```
+
+The body is `{"issues": [...], "next_cursor": ...}`. The result is a real subclass of
+`CursorPage[ItemT]`, so `from_page`, `has_more` and `next_cursor` are the ones above and
+nothing is reimplemented. Only the wire name moves: the field is still `items` in Python, so
+`page.items` reads the same whichever model a route returns and a helper written against
+`CursorPage` keeps working.
+
+It is an alias rather than a renamed field, which is what keeps `items` working for every
+existing caller, and the model is constructible by either name. A response renders under the
+plural key without a route remembering `by_alias=True`, and FastAPI reads the alias for the
+OpenAPI document too, so the schema and the body agree and a generated client is right.
+
+Models are cached per item type, key and name, so a module-level
+`IssuesPage = cursor_page(IssueOut, "issues")` and the same call made again return one class.
+That matters because two structurally identical models sharing a name collide in the OpenAPI
+document and come out as `IssuesPage` and `IssuesPage1`. `model_name` overrides the default,
+which is the item type's name plus `Page`.

@@ -44,9 +44,16 @@ record's `eventID`, or its `messageId` for an SQS record.
 | `guard_gateway` | `True` | 404s a request that arrived through API Gateway. |
 | `log_event` | `"stream.batch"` | The `event` field on the per-batch log line. |
 
-`events_path()` resolves `IDENTITY_EVENTS_PATH`, then `AWS_LWA_PASS_THROUGH_PATH`, which is
-the adapter's own variable and the one that actually decides where the invocation is posted,
-then `/events`. Leave `path` unset and the route follows the adapter's configuration.
+`events_path()` resolves `IDENTITY_EVENTS_PATH`, then `APP_EVENTS_PATH`, then
+`AWS_LWA_PASS_THROUGH_PATH`, which is the adapter's own variable and the one that actually
+decides where the invocation is posted, then `/events`. Leave `path` unset and the route
+follows the adapter's configuration.
+
+`APP_EVENTS_PATH` is the application-facing half of the pair the `lambda-function` module
+emits for a wired `sqs_event_sources` or `dynamodb_stream_event_sources`: one `events_path`
+input reaches the function as both variables, the adapter reading one and the application the
+other, so the two cannot drift apart. Both come from that one input, so they agree whichever
+is consulted first.
 
 The gateway guard is on by default because a consumer is queue and stream only and has no
 reason to answer a gateway request. `arrived_through_api_gateway` reads
@@ -129,6 +136,34 @@ runs botocore's own `TypeDeserializer` over it, so numbers come back as `Decimal
 `set`, exactly as a boto3 resource read of the same item would. Pass `"OldImage"` for the row
 as it was before, which is what a `REMOVE` handler wants. A record with no such image is an
 empty mapping rather than an error, since that is a shape and not a failure.
+
+## Telling two streams apart
+
+A consumer reading two tables' streams gets both on one route, and the record says which
+table only in its source ARN:
+
+```python
+from webbpulse.dynamodb import table_name
+from webbpulse.events import deserialize_image, source_table
+
+ISSUES = table_name("issues")
+
+
+def handle(record):
+    """Fan one record out to the handler for the table it came from."""
+    if source_table(record) == ISSUES:
+        reindex_issue(deserialize_image(record))
+    else:
+        recount_view(deserialize_image(record))
+```
+
+`source_table` reads the name out of `eventSourceARN`,
+`arn:aws:dynamodb:<region>:<account>:table/<name>/stream/<label>`, which is four lines every
+multi-source consumer otherwise writes. The name comes back as the stream carries it, which
+is the physical name and so still prefixed: compare it against `table_name("issues")` rather
+than against `"issues"` and the consumer works in every environment. A record carrying no
+source ARN, or one that is not a DynamoDB stream ARN, raises `ValueError`, since a record
+that cannot be placed would otherwise be routed to the wrong handler.
 
 ## Testing a producer
 

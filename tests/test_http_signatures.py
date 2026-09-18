@@ -1,7 +1,8 @@
 """Tests for the wire helpers in `webbpulse.http`.
 
 `verify_hmac_signature` is pinned against GitHub's own `X-Hub-Signature-256` shape, and the
-cursor helpers against a client that edits what it was handed.
+cursor helpers against a client that edits what it was handed. `cursor_page` is pinned on
+both sides of the rename: the wire moves to the plural key and `page.items` does not.
 """
 
 from __future__ import annotations
@@ -13,11 +14,13 @@ import json
 from typing import Any
 
 import pytest
+from pydantic import BaseModel
 
 from webbpulse.http import (
     CursorPage,
     InvalidCursor,
     SignatureMismatch,
+    cursor_page,
     decode_cursor,
     encode_cursor,
     verify_hmac_signature,
@@ -237,3 +240,134 @@ def test_http_does_not_import_dynamodb() -> None:
             imported.add(node.module)
 
     assert not any("dynamodb" in name for name in imported)
+
+
+class _Issue(BaseModel):
+    """An item model standing in for a product's own response model."""
+
+    id: str
+
+
+class _Comment(BaseModel):
+    """A second item model, for the tests about two pages coexisting."""
+
+    body: str
+
+
+def test_a_page_renders_its_items_under_the_chosen_key() -> None:
+    """The gap this closes: a body that names what it holds rather than saying `items`."""
+    model = cursor_page(_Issue, "issues")
+
+    page = model.from_page([_Issue(id="i-1")], {"pk": "ws-1"}, KEY)
+
+    body = page.model_dump()
+    assert set(body) == {"issues", "next_cursor"}
+    assert body["issues"] == [{"id": "i-1"}]
+
+
+def test_the_field_is_still_items_in_python() -> None:
+    """Only the wire name moves, so a helper written against `CursorPage` keeps working."""
+    model = cursor_page(_Issue, "issues")
+
+    page = model.from_page([_Issue(id="i-1")], None, KEY)
+
+    assert page.items == [_Issue(id="i-1")]
+    assert isinstance(page, CursorPage)
+
+
+def test_the_cursor_behaviour_is_inherited_unchanged() -> None:
+    """`from_page`, `next_cursor` and `has_more` are the ones documented, not reimplementations."""
+    model = cursor_page(_Issue, "issues")
+
+    page = model.from_page([_Issue(id="i-1")], {"pk": "ws-1", "sk": "i-1"}, KEY)
+
+    assert page.has_more
+    assert page.next_cursor is not None
+    assert decode_cursor(page.next_cursor, KEY) == {"pk": "ws-1", "sk": "i-1"}
+
+
+def test_an_exhausted_keyed_page_issues_no_cursor() -> None:
+    """The derived `has_more` holds for a renamed page the way it does for a plain one."""
+    page = cursor_page(_Issue, "issues").from_page([], None, KEY)
+
+    assert page.next_cursor is None
+    assert not page.has_more
+
+
+def test_a_page_is_constructible_by_either_name() -> None:
+    """`populate_by_name`, so a caller building one directly need not know the alias."""
+    model = cursor_page(_Issue, "issues")
+
+    assert model(items=[_Issue(id="i-1")]).items == [_Issue(id="i-1")]
+    assert model(issues=[_Issue(id="i-1")]).items == [_Issue(id="i-1")]  # type: ignore[call-arg]
+
+
+def test_the_plain_page_still_renders_items() -> None:
+    """The existing surface is untouched, which is what makes this additive."""
+    page: CursorPage[str] = CursorPage.from_page(["a"], None, KEY)
+
+    assert set(page.model_dump()) == {"items", "next_cursor"}
+
+
+def test_the_same_request_returns_the_same_model() -> None:
+    """Two identical models with one name collide in the OpenAPI document as `IssuePage1`."""
+    assert cursor_page(_Issue, "issues") is cursor_page(_Issue, "issues")
+
+
+def test_two_item_types_sharing_a_key_are_distinct_models() -> None:
+    """The cache is keyed on the item type too, so one product's pages do not alias each other."""
+    issues: type[Any] = cursor_page(_Issue, "results")
+    comments: type[Any] = cursor_page(_Comment, "results")
+
+    assert issues is not comments
+
+
+def test_the_model_is_named_after_its_item_type() -> None:
+    """The default schema name stays unique across two pages that share a plural key."""
+    assert cursor_page(_Issue, "issues").__name__ == "_IssuePage"
+
+
+def test_an_explicit_model_name_is_used() -> None:
+    """A product naming its own schema gets that name in the OpenAPI document."""
+    assert cursor_page(_Issue, "issues", model_name="IssueListResponse").__name__ == "IssueListResponse"
+
+
+@pytest.mark.parametrize("items_key", ["", "   "])
+def test_an_empty_items_key_is_refused(items_key: str) -> None:
+    """An empty key would render a field under no name at all."""
+    with pytest.raises(ValueError, match="items key"):
+        cursor_page(_Issue, items_key)
+
+
+def test_an_items_key_colliding_with_the_cursor_is_refused() -> None:
+    """Two fields under `next_cursor` would make one of them unreachable on the wire."""
+    with pytest.raises(ValueError, match="next_cursor"):
+        cursor_page(_Issue, "next_cursor")
+
+
+def test_a_route_serves_the_plural_key_and_documents_it() -> None:
+    """End to end through FastAPI: the response body and the OpenAPI schema have to agree.
+
+    `serialize_by_alias` is what makes this hold without a route remembering `by_alias=True`,
+    and a schema saying `items` while the route sends `issues` is the failure that would make
+    a generated client wrong rather than merely ugly.
+    """
+    pytest.importorskip("fastapi")
+    from fastapi import FastAPI
+    from fastapi.testclient import TestClient
+
+    model = cursor_page(_Issue, "issues", model_name="IssuesPage")
+    app = FastAPI()
+
+    @app.get("/issues", response_model=model)
+    async def list_issues() -> Any:
+        """One page of issues."""
+        return model.from_page([_Issue(id="i-1")], {"pk": "ws-1"}, KEY)
+
+    client = TestClient(app)
+    body = client.get("/issues").json()
+    assert set(body) == {"issues", "next_cursor"}
+    assert body["issues"] == [{"id": "i-1"}]
+
+    schema = client.get("/openapi.json").json()["components"]["schemas"]["IssuesPage"]
+    assert set(schema["properties"]) == {"issues", "next_cursor"}

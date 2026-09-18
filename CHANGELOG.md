@@ -5,6 +5,68 @@ Notable changes to the `webbpulse` package. The version here is the one in
 
 This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## 0.43.0
+
+Five gaps the Standupless M3 build found on 0.42.0: a REMOVE update, stream source
+discrimination, the upload allow list, a list envelope under an API's own plural key, and the
+events path variable the platform module has been emitting all along.
+
+`Repository.remove_attributes(key, names)` is the counterpart to `set_attributes` and what a
+sparse global secondary index needs. Such an index holds only the items carrying its key
+attribute, so an item leaves one by having that attribute deleted; setting it to null or to an
+empty string keeps the item in the index and in every query that reads it, which is how an
+"unread" index ends up never emptying. Aliasing follows `set_attributes` in its own `#rm{index}`
+namespace, so a conditional removal cannot collide with the `#n{index}` placeholders boto3 mints
+for an `Attr` condition. Removing an attribute the item does not carry is a no-op to DynamoDB and
+so idempotent, an empty sequence returns `None` rather than sending an empty `UpdateExpression`,
+a repeated name is sent once because DynamoDB refuses an expression naming one path twice, and a
+failing condition raises `ConditionFailed` the way every other conditional write does.
+
+`webbpulse.events.source_table(record)` reads the table name out of a DynamoDB Streams record's
+`eventSourceARN`, so a consumer behind two streams tells them apart without hand parsing. The
+name comes back as the stream carries it, which is the physical name and still prefixed, so the
+comparison to write is against `table_name("issues")` rather than against `"issues"`. A record
+with no source ARN, or one that is not a DynamoDB stream ARN, raises `ValueError`: a record that
+cannot be placed would otherwise be routed to whichever handler happened to be first.
+
+`webbpulse.storage` gains `UPLOAD_CONTENT_TYPES`, `is_allowed_upload` and `disposition_for`,
+which every product taking an upload was about to rewrite. The allow list covers the common
+image types, PDF, plain text, CSV, JSON, zip and the six Office types in both the legacy and the
+OOXML spellings, since a browser sends whichever one the source application stamped on the file.
+What is absent is the point: `text/html`, because an HTML attachment served from the
+application's own origin is stored cross-site scripting and no downstream check makes it safe,
+and `application/octet-stream`, because it is what a browser sends when it recognises nothing, so
+admitting it admits everything. The check belongs before the signing rather than after the object
+lands, since the type goes into the signature and refusing it there is what keeps the object from
+existing at all. `disposition_for(content_type, filename)` answers `inline` for the handful of
+types a browser displays natively and `attachment` for everything else, which makes an
+unrecognised type safe by default because a downloaded file is inert while an inline one renders
+in the application's origin; `image/svg+xml` is an allowed upload and never an inline one,
+because an SVG is scripted markup. The filename is quoted per RFC 6266, with the quotes inside it
+escaped so a name cannot close the parameter and inject another, and a name that is not ASCII is
+sent twice, a transliterated `filename` and the RFC 5987 `filename*` carrying the real UTF-8
+name. Any directory separator and any control character is stripped, since the filename is a
+display name and a header value, never a path.
+
+`webbpulse.http.cursor_page(item_type, items_key)` builds a `CursorPage` whose items render
+under an API's own plural key, `{"issues": [...]}` rather than `{"items": [...]}`, which is a
+house style a product otherwise keeps by hand-rolling the envelope and losing `from_page`,
+`has_more` and the cursor with it. The result is a real subclass of `CursorPage[ItemT]`, so only
+the wire name moves: the field is still `items` in Python, `page.items` reads the same whichever
+model a route returns, and a helper written against `CursorPage` keeps working. It is an alias
+rather than a renamed field, which is what keeps `items` working for every existing caller, and
+`CursorPage` itself is unchanged on the wire. `serialize_by_alias` makes a response render under
+the plural key without a route remembering `by_alias=True`, and FastAPI reads the alias for the
+OpenAPI document too, so the schema and the body agree. Models are cached per item type, key and
+name, because two structurally identical models sharing a name collide in the OpenAPI document
+and come out as `IssuesPage` and `IssuesPage1`.
+
+`events_path()` now reads `APP_EVENTS_PATH` between `IDENTITY_EVENTS_PATH` and
+`AWS_LWA_PASS_THROUGH_PATH`. The `lambda-function` module has been emitting one `events_path`
+input as both `AWS_LWA_PASS_THROUGH_PATH`, for the adapter, and `APP_EVENTS_PATH`, for the
+application, precisely so the two cannot drift apart, and this side was reading only the
+adapter's half. Both come from the one input, so they agree whichever is consulted first.
+
 ## 0.42.0
 
 Three gaps the Standupless build hit on 0.41.0, filled in the DynamoDB repository, plus a

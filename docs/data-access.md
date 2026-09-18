@@ -97,6 +97,27 @@ repo.set_attributes({"id": user_id}, {"name": "Ada"}, condition=Attr("state").eq
 An empty mapping is a no-op returning `None`, since DynamoDB rejects an empty
 `UpdateExpression`. A failing condition raises `ConditionFailed`.
 
+### Removing attributes
+
+`remove_attributes(key, names)` is the counterpart, and what a sparse index needs:
+
+```python
+repo.remove_attributes({"pk": f"user#{user_id}", "sk": f"issue#{issue_id}"}, ["unread_at"])
+```
+
+A sparse global secondary index holds only the items carrying its key attribute, so an item
+leaves one by having that attribute **deleted**. Setting it to null or to an empty string
+keeps the item in the index and keeps it in every query that reads it, which is the bug this
+exists to stop: an "unread" index a read never empties. Aliasing follows `set_attributes`, in
+its own `#rm{index}` namespace, so a conditional removal cannot collide with the placeholders
+boto3 mints for an `Attr` condition either.
+
+Removing an attribute the item does not carry is not an error, since `REMOVE` on an absent
+attribute is a no-op to DynamoDB, which makes the call idempotent and a redelivered message
+harmless. An empty sequence is a no-op returning `None`, a repeated name is sent once because
+DynamoDB refuses an expression naming one path twice, and a failing condition raises
+`ConditionFailed`.
+
 ### Counters
 
 `increment(key, attribute, by=1)` adds to a numeric attribute and returns what it now holds,
@@ -278,6 +299,57 @@ metadata; passing either as an empty string is a `ValueError`, as are an empty b
 and an `expires_in` outside 1 to `MAX_EXPIRES_IN`. `PresignedDownload` is frozen and carries
 `url`, `bucket`, `key` and `expires_in`. The URL is a bearer credential for that one key until
 it expires, so keep the window short and keep it out of logs.
+
+### What an upload may be, and how it comes back
+
+`UPLOAD_CONTENT_TYPES` is the allow list a declared type is checked against before anything
+is signed, and `disposition_for` decides whether the download renders or saves:
+
+```python
+from webbpulse.storage import disposition_for, is_allowed_upload, presigned_get, presigned_put
+
+if not is_allowed_upload(content_type):
+    raise HTTPException(status_code=415, detail="that file type is not accepted")
+
+upload = presigned_put(bucket, key, content_type, max_bytes=10 * 1024 * 1024)
+...
+download = presigned_get(
+    bucket,
+    key,
+    response_content_type=attachment.content_type,
+    response_content_disposition=disposition_for(attachment.content_type, attachment.filename),
+)
+```
+
+The check belongs **before** the signing, not after the object lands: the type goes into the
+signature, so refusing it here is what keeps the object from existing, while a check
+afterwards is a check on something already stored under a key the application will serve.
+
+It is an allow list because a deny list is a list of the attacks already thought of. The list
+covers the common image types, PDF, plain text, CSV, JSON, zip and the six Office types in
+both the legacy and the OOXML spellings, since a browser sends whichever one the source
+application stamped on the file. What is absent is the point: `text/html`, because an HTML
+attachment served from the application's own origin is stored cross-site scripting and no
+downstream check makes it safe, and `application/octet-stream`, because it is what a browser
+sends when it recognises nothing, so admitting it admits everything and the list stops meaning
+anything. A type may still *declare* something the bytes are not, which is a separate control:
+this stops an object the application will later serve as HTML, not a PNG that is really
+something else.
+
+`disposition_for(content_type, filename)` answers `inline` for the types in
+`INLINE_CONTENT_TYPES`, the handful a browser displays natively, and `attachment` for
+everything else. Defaulting to `attachment` is what makes an unrecognised type safe, since a
+downloaded file is inert while an inline one renders in the application's origin.
+`image/svg+xml` is an allowed upload and never an inline one, because an SVG is scripted
+markup.
+
+The filename is quoted per RFC 6266. An ASCII name is a quoted string with its quotes
+escaped, so a name carrying one cannot close the parameter and inject another; a name that is
+not ASCII is sent twice, a transliterated `filename` for a legacy client and the RFC 5987
+`filename*` carrying the real UTF-8 name, which every current browser prefers. Any directory
+separator and any control character is stripped, since the filename is a display name and a
+header value, never a path, and a name with nothing left becomes `download` so the header is
+always well formed.
 
 Needs the `dynamodb` extra, which is where boto3 already lives.
 
