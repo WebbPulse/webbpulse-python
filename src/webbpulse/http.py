@@ -1,12 +1,20 @@
-"""FastAPI app factory, request id, error handlers, and the client IP.
+"""FastAPI app factory, request id, error handlers, the client IP, and the wire helpers.
 
 `create_app` builds one domain's application and `mount_all` composes several into the app
 local development and tests run. Bind the user id with `user_id_dependency`, never from a
 sync dependency, whose context Starlette's threadpool discards.
+
+`verify_hmac_signature` is the receiving half of a signed webhook and `CursorPage` with
+`encode_cursor` and `decode_cursor` is the paginated response shape, which carries a
+data-layer cursor across the wire without this module knowing what is in it.
 """
 
 from __future__ import annotations
 
+import base64
+import binascii
+import hashlib
+import hmac
 import inspect
 import json
 import logging
@@ -41,6 +49,8 @@ __all__ = [
     "REQUEST_ID_HEADER",
     "RETRY_ATTEMPT_HEADER",
     "ROUTE_KEY_HEADER",
+    "SIGNATURE_ALGORITHMS",
+    "CursorPage",
     "DynamoDBErrorHandlerOptions",
     "DynamoDBErrors",
     "ErrorContext",
@@ -49,13 +59,17 @@ __all__ = [
     "ErrorResponse",
     "ErrorSpec",
     "ExceptionMap",
+    "InvalidCursor",
     "RequestIdMiddleware",
     "RequestLoggingMiddleware",
+    "SignatureMismatch",
     "ValidationErrorDetail",
     "bind_user_id",
     "client_ip",
     "create_app",
+    "decode_cursor",
     "detailed_error_body",
+    "encode_cursor",
     "error_body",
     "error_envelope_responses",
     "health_router",
@@ -68,6 +82,7 @@ __all__ = [
     "resolve_error_envelope",
     "route_key",
     "user_id_dependency",
+    "verify_hmac_signature",
 ]
 
 _log = logging.getLogger(__name__)
@@ -1206,3 +1221,179 @@ def mount_all(
             raise ValueError(f"Mount path must start with '/', got {path!r}.")
         parent.mount(path.rstrip("/") or "/", sub_app)
     return parent
+
+
+SIGNATURE_ALGORITHMS: Final[Mapping[str, str]] = {
+    "sha1": "sha1",
+    "sha256": "sha256",
+    "sha512": "sha512",
+}
+"""The hash names `verify_hmac_signature` accepts, so a header cannot name an arbitrary one."""
+
+
+class SignatureMismatch(ValueError):
+    """A signed body did not verify under the shared secret.
+
+    A `ValueError`, so a service that maps it renders a 401 and never says which of the
+    header's shape, its algorithm or its digest was wrong. Telling a caller that much is a
+    verification oracle.
+    """
+
+
+class InvalidCursor(ValueError):
+    """An opaque cursor was missing, malformed, or not signed under the caller's key.
+
+    One error for all three, for the same reason: a caller who can tell a tampered cursor
+    from a stale one learns something about the signing key.
+    """
+
+
+def verify_hmac_signature(
+    body: bytes,
+    header_value: str | None,
+    secret: str | bytes,
+    *,
+    algorithm: str = "sha256",
+    prefix: str = "sha256=",
+) -> bool:
+    """Verify a signature header over `body`, in constant time, or raise `SignatureMismatch`.
+
+    This is GitHub's `X-Hub-Signature-256` shape, `sha256=<hex>`, which the defaults match,
+    and it is also the shape `webbpulse.events.webhooks` sends. Pass `prefix=""` for a scheme
+    that sends a bare hex digest. The comparison runs through `hmac.compare_digest` on the
+    digest bytes, so neither the length of the presented value nor how many leading
+    characters matched leaks through the time it takes.
+
+    Returns `True` on a match and never returns `False`: a caller that forgets to check a
+    boolean is the failure mode this guards against, so a mismatch raises. For a webhook
+    signed over a timestamp and the body together, verify
+    `webbpulse.events.webhooks.signed_message(timestamp, body)` here rather than `body`, and
+    check the timestamp with `within_replay_window` before doing any work.
+    """
+    digestmod = SIGNATURE_ALGORITHMS.get(algorithm.lower())
+    if digestmod is None:
+        raise SignatureMismatch("Unsupported signature algorithm.")
+    if not header_value:
+        raise SignatureMismatch("The signature header is missing.")
+
+    presented = header_value.strip()
+    if prefix:
+        if not presented.startswith(prefix):
+            raise SignatureMismatch("The signature header is not in the expected form.")
+        presented = presented[len(prefix) :]
+
+    key = secret.encode() if isinstance(secret, str) else secret
+    expected = hmac.new(key, body, getattr(hashlib, digestmod)).digest()
+    try:
+        presented_bytes = bytes.fromhex(presented)
+    except ValueError as exc:
+        raise SignatureMismatch("The signature is not hex.") from exc
+
+    if not hmac.compare_digest(expected, presented_bytes):
+        raise SignatureMismatch("The signature does not match.")
+    return True
+
+
+def encode_cursor(state: Mapping[str, Any], key: str | bytes) -> str:
+    """One opaque, tamper-evident cursor carrying `state` across the wire.
+
+    The state is serialised compactly with sorted keys, so the same state always encodes to
+    the same string, then signed with HMAC-SHA256 under `key` and packed as urlsafe base64
+    with the padding stripped. The result is opaque and safe in a query string, and a client
+    that edits it gets `InvalidCursor` from `decode_cursor` rather than a page of somebody
+    else's rows.
+
+    It is signed, not encrypted: a client can decode what is in it, so a cursor carries keys
+    and positions, never anything the caller may not already see.
+    """
+    payload = json.dumps(dict(state), separators=(",", ":"), sort_keys=True).encode()
+    signature = hmac.new(_cursor_key(key), payload, hashlib.sha256).digest()[:16]
+    return _b64encode(payload + b"." + signature)
+
+
+def decode_cursor(cursor: str, key: str | bytes) -> dict[str, Any]:
+    """Read a cursor `encode_cursor` produced, or raise `InvalidCursor`.
+
+    Every failure, a cursor that is not base64, not JSON, not an object, or not signed under
+    `key`, raises the same error with the same message, so nothing about the key is learnable
+    by feeding cursors in.
+    """
+    try:
+        raw = _b64decode(cursor)
+    except (ValueError, binascii.Error) as exc:
+        raise InvalidCursor("The cursor is not valid.") from exc
+
+    payload, separator, signature = raw.rpartition(b".")
+    if not separator:
+        raise InvalidCursor("The cursor is not valid.")
+
+    expected = hmac.new(_cursor_key(key), payload, hashlib.sha256).digest()[:16]
+    if not hmac.compare_digest(expected, signature):
+        raise InvalidCursor("The cursor is not valid.")
+
+    try:
+        state = json.loads(payload)
+    except ValueError as exc:
+        raise InvalidCursor("The cursor is not valid.") from exc
+    if not isinstance(state, dict):
+        raise InvalidCursor("The cursor is not valid.")
+    return state
+
+
+def _cursor_key(key: str | bytes) -> bytes:
+    """The signing key as bytes, refusing an empty one rather than signing under nothing."""
+    material = key.encode() if isinstance(key, str) else key
+    if not material:
+        raise ValueError("A cursor signing key is required.")
+    return material
+
+
+def _b64encode(raw: bytes) -> str:
+    """Urlsafe base64 without padding, which is what keeps a cursor clean in a query string."""
+    return base64.urlsafe_b64encode(raw).decode().rstrip("=")
+
+
+def _b64decode(value: str) -> bytes:
+    """Read unpadded urlsafe base64, restoring the padding the encoder stripped."""
+    padded = value + "=" * (-len(value) % 4)
+    return base64.urlsafe_b64decode(padded.encode())
+
+
+class CursorPage[ItemT](BaseModel):
+    """One page of results and the opaque cursor for the next, as a response body.
+
+    Generic in the item type, so a route returns `CursorPage[PostOut]` and FastAPI documents
+    the item schema rather than a bare object. `next_cursor` is `None` exactly when the
+    result set is exhausted, and `has_more` is derived from it, so the two can never disagree.
+
+    `from_page` bridges `webbpulse.dynamodb.Page` without this module importing that one:
+    it takes the items and the `last_evaluated_key` as arguments, so `http` stays usable in a
+    service with no `dynamodb` extra installed and the data layer keeps knowing nothing about
+    the wire.
+    """
+
+    items: list[ItemT]
+    next_cursor: str | None = None
+
+    @property
+    def has_more(self) -> bool:
+        """Whether another page exists, which is exactly whether a cursor was issued."""
+        return self.next_cursor is not None
+
+    @classmethod
+    def from_page(
+        cls,
+        items: Sequence[ItemT],
+        last_evaluated_key: Mapping[str, Any] | None,
+        key: str | bytes,
+    ) -> CursorPage[ItemT]:
+        """Build a page from a data-layer result and its raw cursor.
+
+        `last_evaluated_key` is `Page.last_evaluated_key` straight from the repository. It is
+        signed into an opaque cursor here, so the key shape never reaches a client and a
+        client cannot hand one back that it made up.
+        """
+        return cls(
+            items=list(items),
+            next_cursor=encode_cursor(dict(last_evaluated_key), key) if last_evaluated_key else None,
+        )

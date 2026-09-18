@@ -57,16 +57,17 @@ its dev dependencies.
 | `webbpulse.log_context` | `set_request_id`, `set_user_id`, `task_context`, `bind_context`, `LogContextFilter`: request and correlation context on ContextVars | [logging-and-metrics.md](docs/logging-and-metrics.md) |
 | `webbpulse.metrics` | `emit`, `timed`, `MetricsEmitter`, `metrics_enabled_from_env`: CloudWatch Embedded Metric Format on stdout | [logging-and-metrics.md](docs/logging-and-metrics.md) |
 | `webbpulse.otel` | `configure_tracing`, `instrument_fastapi`, `TailSamplingSpanProcessor`: tracing with errors always sampled | [tracing.md](docs/tracing.md), [tracing-sampling.md](docs/tracing-sampling.md) |
-| `webbpulse.http` | `create_app`, `mount_all`, `health_router`, `RequestIdMiddleware`, `user_id_dependency`, and the shared error envelope | [http.md](docs/http.md), [error-handlers.md](docs/error-handlers.md) |
-| `webbpulse.events` | `stream_consumer_app`, `register_stream_consumer`, `events_path`: the one route a DynamoDB Streams or SQS consumer serves behind the Web Adapter | [events.md](docs/events.md) |
-| `webbpulse.messages` | `STATUS_MESSAGES`, `refusal`, `forbidden`, `unauthenticated`, `rate_limited`: the user-facing sentence each refusal renders | [error-handlers.md](docs/error-handlers.md) |
+| `webbpulse.http` | `create_app`, `mount_all`, `health_router`, `RequestIdMiddleware`, `user_id_dependency`, the shared error envelope, `verify_hmac_signature`, and `CursorPage` with `encode_cursor` and `decode_cursor` | [http.md](docs/http.md), [error-handlers.md](docs/error-handlers.md) |
+| `webbpulse.events` | `stream_consumer_app`, `register_stream_consumer`, `events_path`: the one route a DynamoDB Streams or SQS consumer serves behind the Web Adapter; `EventEnvelope`, `enqueue` and `deserialize_image` on the producing side | [events.md](docs/events.md) |
+| `webbpulse.events.webhooks` | `WebhookDispatcher`, `WebhookSender`, `RetryPolicy`, `signature_headers`: signed outbound webhooks with jittered retries and a dead-letter hook | [webhooks.md](docs/webhooks.md) |
+| `webbpulse.messages` | `STATUS_MESSAGES`, `refusal`, `forbidden`, `unauthenticated`, `rate_limited`: the user-facing sentence each refusal renders; `extract_mentions` for `@handle` mentions in Markdown | [error-handlers.md](docs/error-handlers.md) |
 | `webbpulse.dynamodb` | `Repository`, `Page`, `table_name`, `ttl_at`, `ttl_in`, `encode_numbers`, `new_ulid`, `IdempotencyStore`, and the `DynamoError` family | [data-access.md](docs/data-access.md) |
 | `webbpulse.storage` | `presigned_put`, `PresignedUpload`: a presigned S3 PUT bounded by a signed content type and content length | [data-access.md](docs/data-access.md) |
 | `webbpulse.ratelimit` | `rate_limit`, `rate_limit_middleware`, `LimitClass`, `classify`, a fixed window limiter on one DynamoDB table, failing open | [data-access.md](docs/data-access.md) |
 | `webbpulse.security` | `hash_password`, `verify_password`, `needs_rehash`, `create_token`, `decode_token`, `bearer_claims` | [security.md](docs/security.md) |
 | `webbpulse.identity` | App-managed identity: password, session, email link, TOTP, OAuth and passkey flows, plus a KMS-backed `TokenService` and a JWKS | [identity.md](docs/identity.md), [the standard](docs/identity-standard.md) |
 | `webbpulse.lambda_entry` | `run_uvicorn`, `is_lambda`, `resolve_port`: the AWS Lambda Web Adapter entrypoint, with no Mangum and no handler | [packaging.md](docs/packaging.md) |
-| `webbpulse.testing` | Pytest fixtures: `test_client`, `create_table`, `rate_limit_table`, `make_request_context_headers`, `FakeKms`, `FakeIdempotencyStore`, `FakePresigner` | [packaging.md](docs/packaging.md) |
+| `webbpulse.testing` | Pytest fixtures: `test_client`, `create_table`, `rate_limit_table`, `make_request_context_headers`, `FakeKms`, `FakeIdempotencyStore`, `FakePresigner`, `FakeQueue`, `FakeWebhookSender` | [packaging.md](docs/packaging.md) |
 | `webbpulse.e2e` | A pytest plugin and generic post-deploy suite: route cut, coverage, reachability, identity, frontend and hygiene against a real stage | [e2e.md](docs/e2e.md) |
 
 ## Wiring a FastAPI domain Lambda
@@ -267,7 +268,8 @@ app.include_router(build_identity_router(settings, hooks, stores, tokens=tokens)
 | [docs/identity-passkeys.md](docs/identity-passkeys.md) | WebAuthn registration, passwordless sign-in and credential management |
 | [docs/http.md](docs/http.md) | `create_app` and the error envelope shapes |
 | [docs/error-handlers.md](docs/error-handlers.md) | DynamoDB and custom exception handlers |
-| [docs/events.md](docs/events.md) | The stream and queue consumer route |
+| [docs/events.md](docs/events.md) | The stream and queue consumer route, and publishing an event |
+| [docs/webhooks.md](docs/webhooks.md) | Signed outbound webhooks: the scheme, the retries and the fake |
 | [docs/data-access.md](docs/data-access.md) | The repository base, counters, ULIDs, idempotency claims, presigned uploads and the rate limiter |
 | [docs/logging-and-metrics.md](docs/logging-and-metrics.md) | JSON logging, log context and EMF metrics |
 | [docs/tracing.md](docs/tracing.md) | Tracing setup |

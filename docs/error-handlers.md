@@ -200,3 +200,25 @@ the test suite and a plain `docker run` want the whole surface on one port, and 
 it from the very same app objects rather than from a second wiring that can drift. Each
 mount path must be the prefix API Gateway routes to that domain's function, so a path that
 works locally works in production.
+
+## Mentions in user-authored text
+
+`extract_mentions` reads the `@handle` mentions out of a Markdown body, in order, without
+repeats and without the `@`:
+
+```python
+from webbpulse.messages import extract_mentions
+
+for handle in extract_mentions(comment.body):
+    notify(handle, comment)
+```
+
+Code is not prose: a fenced block, an indented block and an inline span are all blanked
+before the scan, so a decorator in a Python sample or an `@media` rule in a CSS one does not
+notify anybody. An email address and a path segment do not read as mentions either, since
+neither addresses a person.
+
+Comparison is case insensitive and the first spelling wins, so `@Ada` then `@ada` is one
+mention rendered as the author wrote it. A handle is a letter or a digit followed by up to 38
+more with underscores and hyphens; a longer run matches nothing rather than being truncated,
+because truncating it would notify a real, different person.

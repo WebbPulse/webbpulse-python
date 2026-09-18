@@ -10,6 +10,10 @@ mapping retries only the records that raised.
 `register_stream_consumer` is the primitive and mounts that route on a router.
 `stream_consumer_app` is the entrypoint-shaped wrapper that also brings the root routes and
 the error handlers. `webbpulse.identity.events` is built on the primitive.
+
+The producing side lives here too: `EventEnvelope` is the shape a domain event is published
+in and `enqueue` puts one on an SQS queue. `deserialize_image` reads a DynamoDB Streams
+record image back into plain Python values.
 """
 
 from __future__ import annotations
@@ -17,8 +21,11 @@ from __future__ import annotations
 import json
 import logging
 import os
+import uuid
 from collections.abc import Callable, Collection, Mapping, Sequence
-from typing import TYPE_CHECKING, Any, Final
+from dataclasses import dataclass, field
+from datetime import UTC, datetime
+from typing import TYPE_CHECKING, Any, Final, Literal, Protocol
 
 if TYPE_CHECKING:  # pragma: no cover
     from fastapi import APIRouter, FastAPI
@@ -26,13 +33,20 @@ if TYPE_CHECKING:  # pragma: no cover
 __all__ = [
     "BATCH_FAILURES_KEY",
     "DEFAULT_EVENTS_PATH",
+    "DEFAULT_EVENT_VERSION",
     "EVENTS_PATH_ENV",
     "FAILURE_ITEM_KEY",
     "LWA_PASS_THROUGH_PATH_ENV",
     "BatchHandler",
+    "EnqueueResult",
+    "EventEnvelope",
+    "ImageName",
+    "QueueClient",
     "RecordHandler",
     "arrived_through_api_gateway",
     "batch_item_failures",
+    "deserialize_image",
+    "enqueue",
     "event_records",
     "events_path",
     "record_id",
@@ -57,6 +71,186 @@ type RecordHandler = Callable[[Mapping[str, Any]], None]
 
 type BatchHandler = Callable[[Mapping[str, Any]], Mapping[str, list[dict[str, str]]]]
 """Handles a whole event, returning the batch item failure envelope itself."""
+
+type ImageName = Literal["NewImage", "OldImage"]
+"""Which side of a DynamoDB Streams record to read, the one after or the one before."""
+
+DEFAULT_EVENT_VERSION: Final = 1
+
+
+class QueueClient(Protocol):
+    """The one SQS call `enqueue` makes.
+
+    A Protocol, so a boto3 SQS client and `webbpulse.testing.FakeQueue` both satisfy it
+    without inheritance.
+    """
+
+    def send_message(self, **kwargs: Any) -> Mapping[str, Any]:
+        """Send one message, returning at least `MessageId`."""
+        ...
+
+
+@dataclass(frozen=True, slots=True)
+class EventEnvelope:
+    """One domain event, in the shape every consumer can read without knowing the producer.
+
+    `name` is the dotted event name, such as `"user.deleted"`, and `version` is that name's
+    schema version, so a consumer can refuse a payload it was not written for. `scope` is the
+    workspace or tenant the event belongs to and is what a FIFO queue groups on by default,
+    which keeps one tenant's ordering independent of another's. `occurred_at` defaults to now
+    in UTC and `event_id` to a fresh uuid4, so a producer that supplies neither still emits a
+    deduplicable, ordered event.
+    """
+
+    name: str
+    payload: Mapping[str, Any]
+    version: int = DEFAULT_EVENT_VERSION
+    scope: str | None = None
+    occurred_at: datetime = field(default_factory=lambda: datetime.now(UTC))
+    event_id: str = field(default_factory=lambda: str(uuid.uuid4()))
+
+    def to_dict(self) -> dict[str, Any]:
+        """The JSON-ready mapping, with `occurred_at` as an RFC 3339 string in UTC.
+
+        `scope` is omitted rather than sent as null when the event is not tenant scoped, so a
+        consumer's `"scope" in body` reads as "this event names a tenant".
+        """
+        body: dict[str, Any] = {
+            "event_id": self.event_id,
+            "name": self.name,
+            "version": self.version,
+            "occurred_at": _rfc3339(self.occurred_at),
+            "payload": dict(self.payload),
+        }
+        if self.scope is not None:
+            body["scope"] = self.scope
+        return body
+
+    def to_json(self) -> str:
+        """The message body `enqueue` sends, compact and with sorted keys."""
+        return json.dumps(self.to_dict(), separators=(",", ":"), sort_keys=True)
+
+    @classmethod
+    def from_dict(cls, body: Mapping[str, Any]) -> EventEnvelope:
+        """Read an envelope back from a received message body.
+
+        A missing `occurred_at`, or one that does not parse, becomes now rather than raising:
+        a consumer that cannot read the timestamp should still handle the event.
+        """
+        raw_payload = body.get("payload")
+        return cls(
+            name=str(body.get("name", "")),
+            payload=raw_payload if isinstance(raw_payload, Mapping) else {},
+            version=int(body.get("version", DEFAULT_EVENT_VERSION)),
+            scope=body["scope"] if isinstance(body.get("scope"), str) else None,
+            occurred_at=_parse_rfc3339(body.get("occurred_at")),
+            event_id=str(body.get("event_id") or uuid.uuid4()),
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class EnqueueResult:
+    """What SQS answered for one sent message."""
+
+    message_id: str
+    event_id: str
+
+
+def _rfc3339(moment: datetime) -> str:
+    """`moment` as an RFC 3339 string in UTC, with a `Z` rather than `+00:00`."""
+    aware = moment if moment.tzinfo is not None else moment.replace(tzinfo=UTC)
+    return aware.astimezone(UTC).isoformat().replace("+00:00", "Z")
+
+
+def _parse_rfc3339(raw: Any) -> datetime:
+    """Read an RFC 3339 string into an aware UTC datetime, falling back to now."""
+    if isinstance(raw, str) and raw:
+        try:
+            parsed = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+        except ValueError:
+            return datetime.now(UTC)
+        return parsed if parsed.tzinfo is not None else parsed.replace(tzinfo=UTC)
+    return datetime.now(UTC)
+
+
+def enqueue(
+    queue_url: str,
+    payload: EventEnvelope | Mapping[str, Any],
+    *,
+    client: QueueClient | None = None,
+    group_id: str | None = None,
+    dedup_id: str | None = None,
+    delay_seconds: int | None = None,
+    attributes: Mapping[str, str] | None = None,
+) -> EnqueueResult:
+    """Put one event on `queue_url` and return what SQS answered.
+
+    `payload` is an `EventEnvelope` or the mapping to wrap in one. On a FIFO queue, which is
+    a `queue_url` ending in `.fifo`, `group_id` defaults to the envelope's `scope` and
+    `dedup_id` to its `event_id`, so a retried send of the same envelope is deduplicated and
+    one tenant's events stay ordered among themselves. Both are sent only on a FIFO queue,
+    which rejects them outright on a standard one.
+
+    `client` is the SQS client to send through; it is built on first use when omitted, so
+    importing this module needs no boto3 and no credentials.
+    """
+    envelope = payload if isinstance(payload, EventEnvelope) else EventEnvelope(name="", payload=payload)
+    sqs = client if client is not None else _sqs_client()
+
+    request: dict[str, Any] = {"QueueUrl": queue_url, "MessageBody": envelope.to_json()}
+    if queue_url.endswith(".fifo"):
+        group = group_id if group_id is not None else envelope.scope
+        if group:
+            request["MessageGroupId"] = group
+        request["MessageDeduplicationId"] = dedup_id if dedup_id is not None else envelope.event_id
+    if delay_seconds is not None:
+        request["DelaySeconds"] = delay_seconds
+    if attributes:
+        request["MessageAttributes"] = {
+            key: {"DataType": "String", "StringValue": value} for key, value in attributes.items()
+        }
+
+    response = sqs.send_message(**request)
+    message_id = str(response.get("MessageId", ""))
+    _log.info(
+        "Enqueued an event.",
+        extra={
+            "event": "events.enqueued",
+            "event_name": envelope.name,
+            "event_id": envelope.event_id,
+            "message_id": message_id,
+        },
+    )
+    return EnqueueResult(message_id=message_id, event_id=envelope.event_id)
+
+
+def _sqs_client() -> Any:
+    """An SQS client built on demand, never at import time."""
+    import boto3
+
+    return boto3.client("sqs")
+
+
+def deserialize_image(record: Mapping[str, Any], image: ImageName = "NewImage") -> dict[str, Any]:
+    """One DynamoDB Streams record image as plain Python values.
+
+    A stream record carries its item in DynamoDB's attribute-value shape, `{"id": {"S": "u-1"}}`,
+    which every consumer otherwise unwraps by hand. This runs botocore's own `TypeDeserializer`
+    over it, so numbers come back as `Decimal` and sets as `set`, exactly as a boto3 resource
+    read of the same item would. A record with no such image, which is a `REMOVE` asked for its
+    `NewImage`, is an empty mapping rather than an error, since that is a shape and not a failure.
+    """
+    from boto3.dynamodb.types import TypeDeserializer
+
+    section = record.get("dynamodb")
+    if not isinstance(section, Mapping):
+        return {}
+    raw = section.get(image)
+    if not isinstance(raw, Mapping):
+        return {}
+    deserializer = TypeDeserializer()
+    return {key: deserializer.deserialize(value) for key, value in raw.items()}
+
 
 _FastAPIRequest: Any = None
 

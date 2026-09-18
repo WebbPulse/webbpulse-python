@@ -2,9 +2,11 @@
 
 Enable them with `pytest_plugins = ["webbpulse.testing"]`. They cover a moto-backed
 DynamoDB table, a `TestClient` whose requests carry a realistic API Gateway request
-context, and a locally signing KMS stand-in. Import only from tests; it needs the
-`testing` extra, and `FakeKms` additionally needs `cryptography`, which the `identity`
-extra brings in.
+context, and a locally signing KMS stand-in. `FakeIdempotencyStore`, `FakePresigner`,
+`FakeQueue` and `FakeWebhookSender` are the doubles for the seams a handler reaches the
+outside world through, so a test needs neither moto nor a socket. Import only from tests; it
+needs the `testing` extra, and `FakeKms` additionally needs `cryptography`, which the
+`identity` extra brings in.
 """
 
 from __future__ import annotations
@@ -25,6 +27,8 @@ __all__ = [
     "FakeIdempotencyStore",
     "FakeKms",
     "FakePresigner",
+    "FakeQueue",
+    "FakeWebhookSender",
     "aws_credentials",
     "create_table",
     "dynamodb_resource",
@@ -411,3 +415,102 @@ class FakePresigner:
             }
         )
         return f"{self.base_url}/{Params['Bucket']}/{Params['Key']}?X-Amz-Expires={ExpiresIn}"
+
+
+class FakeQueue:
+    """A stand-in for the SQS client `webbpulse.events.enqueue` sends through.
+
+    It records every `send_message` request whole, so a test asserts on the body that was
+    sent, on the FIFO group and deduplication ids, and on the order of the sends, rather
+    than on a mock's call object. It satisfies `webbpulse.events.QueueClient` structurally,
+    so no inheritance and no moto.
+
+    `failing` makes the next sends raise, which is how a test exercises a producer's own
+    error handling: pass the number of sends that should fail before one succeeds.
+    """
+
+    def __init__(self, *, failing: int = 0) -> None:
+        """Start with an empty log and `failing` sends set to raise."""
+        self.requests: list[dict[str, Any]] = []
+        self._failing = failing
+        self._sent = 0
+
+    def send_message(self, **kwargs: Any) -> dict[str, Any]:
+        """Record one send and answer the `MessageId` shape SQS returns.
+
+        Raises `RuntimeError` while the failure budget lasts, standing in for the
+        `ClientError` a throttled or missing queue produces.
+        """
+        self.requests.append(dict(kwargs))
+        if self._failing > 0:
+            self._failing -= 1
+            raise RuntimeError("ServiceUnavailable: the queue did not accept the message")
+        self._sent += 1
+        return {"MessageId": f"msg-{self._sent}", "MD5OfMessageBody": "0" * 32}
+
+    @property
+    def bodies(self) -> list[Any]:
+        """Every sent `MessageBody`, parsed from JSON, in the order it was sent."""
+        return [json.loads(request["MessageBody"]) for request in self.requests]
+
+    @property
+    def last_body(self) -> Any:
+        """The most recent parsed `MessageBody`, or `None` when nothing was sent."""
+        return self.bodies[-1] if self.requests else None
+
+
+class FakeWebhookSender:
+    """A stand-in for the transport `webbpulse.events.webhooks.WebhookDispatcher` posts through.
+
+    Every call is recorded on `calls` with the url, the body and the headers, so a test can
+    verify the signature the dispatcher produced by re-deriving it, and the responses are
+    scripted: `responses` is consumed one per attempt, and once it runs out `default`
+    answers the rest. That is what makes a retry test deterministic, with no sleeping and no
+    socket.
+
+    It satisfies `WebhookSender` structurally, so it needs neither `httpx` nor inheritance.
+    """
+
+    def __init__(
+        self,
+        responses: Collection[Any] = (),
+        *,
+        default: Any = None,
+    ) -> None:
+        """Hold the scripted responses and the one to answer with after they run out.
+
+        Args:
+            responses: The `WebhookResponse` values to answer with, one per attempt, in
+                order. An `int` is accepted as shorthand for a response with that status.
+            default: What to answer once `responses` is exhausted. A 200 when omitted, so a
+                fake with no script always delivers.
+        """
+        from webbpulse.events.webhooks import WebhookResponse
+
+        self.calls: list[dict[str, Any]] = []
+        self._scripted = [_as_webhook_response(item) for item in responses]
+        self._default = _as_webhook_response(default) if default is not None else WebhookResponse(status_code=200)
+
+    def post(self, url: str, *, body: bytes, headers: Mapping[str, str], timeout: float) -> Any:
+        """Record the attempt and answer the next scripted response."""
+        self.calls.append({"url": url, "body": body, "headers": dict(headers), "timeout": timeout})
+        if self._scripted:
+            return self._scripted.pop(0)
+        return self._default
+
+    @property
+    def attempts(self) -> int:
+        """How many times the dispatcher posted."""
+        return len(self.calls)
+
+    @property
+    def last_call(self) -> dict[str, Any] | None:
+        """The most recent recorded attempt, or `None` when nothing was posted."""
+        return self.calls[-1] if self.calls else None
+
+
+def _as_webhook_response(item: Any) -> Any:
+    """Read a scripted entry as a `WebhookResponse`, accepting a bare status code."""
+    from webbpulse.events.webhooks import WebhookResponse
+
+    return WebhookResponse(status_code=item) if isinstance(item, int) else item

@@ -183,3 +183,64 @@ Keep `request_id` in whatever you return. It is the only thing joining a caller'
 the CloudWatch line, and every operational runbook here assumes it is there.
 
 An unknown shape name raises `ValueError` when the app is built, not as a 500 under load.
+
+## Verifying an inbound signature
+
+`verify_hmac_signature` checks a signed body in constant time. The defaults are GitHub's
+`X-Hub-Signature-256` shape, `sha256=<hex>`, which is also what
+[webhooks.md](webhooks.md) sends:
+
+```python
+from webbpulse.http import SignatureMismatch, verify_hmac_signature
+
+try:
+    verify_hmac_signature(await request.body(), request.headers.get("X-Hub-Signature-256"), secret)
+except SignatureMismatch:
+    raise HTTPException(status_code=401, detail=unauthenticated()) from None
+```
+
+It returns `True` on a match and never returns `False`: a caller that forgets to check a
+boolean is the failure mode this guards against, so a mismatch raises. Every failure, a
+missing header, a wrong prefix, a non-hex digest and a wrong secret, raises the same
+`SignatureMismatch`, because telling a caller which one it was is a verification oracle.
+
+The comparison runs through `hmac.compare_digest` on the digest bytes, so neither the length
+of the presented value nor how many leading characters matched leaks through the time it
+takes. `algorithm=` accepts `sha1`, `sha256` and `sha512` only, so a header cannot name an
+arbitrary hash, and `prefix=""` covers a sender that ships a bare hex digest.
+
+For a webhook signed over a timestamp and the body together, verify
+`webbpulse.events.webhooks.signed_message(timestamp, body)` rather than `body`, and check
+the timestamp with `within_replay_window` before doing any work.
+
+## Paginated responses
+
+`CursorPage` is the response body for a paginated route, and `encode_cursor` and
+`decode_cursor` make the data layer's position opaque on the wire:
+
+```python
+from webbpulse.http import CursorPage, decode_cursor
+
+
+@router.get("")
+async def list_posts(cursor: str | None = None) -> CursorPage[PostOut]:
+    """One page of posts, newest first."""
+    start = decode_cursor(cursor, settings.cursor_key) if cursor else None
+    page = repositories().posts.query(workspace_id, start_key=start)
+    return CursorPage.from_page([PostOut.model_validate(item) for item in page.items],
+                                page.last_evaluated_key, settings.cursor_key)
+```
+
+The state is serialised compactly with sorted keys, signed with HMAC-SHA256 under the
+caller's key, and packed as urlsafe base64 with the padding stripped, so it is opaque, safe
+in a query string, and tamper evident. A client that edits it gets `InvalidCursor` rather
+than a page of somebody else's rows, and every failure raises that same error with the same
+message so nothing about the key is learnable by feeding cursors in.
+
+It is signed, not encrypted: a client can decode what is in it, so a cursor carries keys and
+positions, never anything the caller may not already see.
+
+`next_cursor` is `None` exactly when the result set is exhausted, and `has_more` is derived
+from it, so the two can never disagree. `from_page` takes the items and
+`Page.last_evaluated_key` as arguments rather than a `Page`, so this module never imports
+`webbpulse.dynamodb` and stays usable in a service with no `dynamodb` extra installed.

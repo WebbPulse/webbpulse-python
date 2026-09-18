@@ -144,3 +144,72 @@ def test_the_client_fixture_renders_error_envelopes_rather_than_raising(
     response = test_client(app).get("/boom")
     assert response.status_code == 500
     assert response.json()["success"] is False
+
+
+def test_the_fake_queue_records_requests_and_answers_message_ids() -> None:
+    """A producer test asserts on the body that was sent, not on a mock's call object."""
+    from webbpulse.testing import FakeQueue
+
+    queue = FakeQueue()
+
+    first = queue.send_message(QueueUrl="q", MessageBody='{"a":1}')
+    second = queue.send_message(QueueUrl="q", MessageBody='{"a":2}')
+
+    assert first["MessageId"] == "msg-1"
+    assert second["MessageId"] == "msg-2"
+    assert queue.bodies == [{"a": 1}, {"a": 2}]
+    assert queue.last_body == {"a": 2}
+
+
+def test_the_fake_queue_spends_its_failure_budget_then_succeeds() -> None:
+    """That is how a test exercises a producer's own retry or error handling."""
+    from webbpulse.testing import FakeQueue
+
+    queue = FakeQueue(failing=2)
+
+    for _ in range(2):
+        with pytest.raises(RuntimeError):
+            queue.send_message(QueueUrl="q", MessageBody="{}")
+
+    assert queue.send_message(QueueUrl="q", MessageBody="{}")["MessageId"] == "msg-1"
+    assert len(queue.requests) == 3
+
+
+def test_an_empty_fake_queue_reports_no_last_body() -> None:
+    """Inspecting a queue nothing was sent through must not raise."""
+    from webbpulse.testing import FakeQueue
+
+    assert FakeQueue().last_body is None
+
+
+def test_the_fake_webhook_sender_scripts_responses_then_falls_back() -> None:
+    """Scripted responses are consumed one per attempt, and `default` answers the rest."""
+    from webbpulse.events.webhooks import WebhookResponse
+    from webbpulse.testing import FakeWebhookSender
+
+    sender = FakeWebhookSender([503, WebhookResponse(status_code=500)], default=200)
+
+    first = sender.post("https://e.test", body=b"{}", headers={"A": "1"}, timeout=1.0)
+    second = sender.post("https://e.test", body=b"{}", headers={}, timeout=1.0)
+    third = sender.post("https://e.test", body=b"{}", headers={}, timeout=1.0)
+
+    assert [first.status_code, second.status_code, third.status_code] == [503, 500, 200]
+    assert sender.attempts == 3
+    assert sender.calls[0]["headers"] == {"A": "1"}
+
+
+def test_an_unscripted_fake_webhook_sender_always_delivers() -> None:
+    """A fake with no script is the happy path, so a test need not spell it out."""
+    from webbpulse.testing import FakeWebhookSender
+
+    sender = FakeWebhookSender()
+
+    assert sender.post("https://e.test", body=b"{}", headers={}, timeout=1.0).delivered
+    assert sender.last_call is not None
+
+
+def test_an_unused_fake_webhook_sender_reports_no_last_call() -> None:
+    """Inspecting a sender nothing was posted through must not raise."""
+    from webbpulse.testing import FakeWebhookSender
+
+    assert FakeWebhookSender().last_call is None
