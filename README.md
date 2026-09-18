@@ -184,6 +184,7 @@ where the data lives.
 | `LoginAttemptStore` | ABC | `src/webbpulse/identity/lockout.py` | Failed login attempts behind the progressive lockout |
 | `OAuthStateStore` | ABC | `src/webbpulse/identity/oauth.py` | The in-flight authorization state |
 | `OAuthLinkStore` | ABC | `src/webbpulse/identity/oauth.py` | The provider-to-user attachment |
+| `ApiKeyStore` | ABC | `src/webbpulse/identity/api_keys.py` | Long-lived machine keys, stored as hashes. `DynamoApiKeyStore` and `InMemoryApiKeyStore` ship |
 | `EmailSender` | ABC | `src/webbpulse/identity/email.py` | Sending mail. `SesV2EmailSender` and `RecordingEmailSender` ship |
 | `KmsClient` | Protocol | `src/webbpulse/identity/tokens.py` | The KMS surface `TokenService` signs with, so a test can substitute one |
 | `KmsDataKeyClient` | Protocol | `src/webbpulse/identity/crypto.py` | The KMS surface `EnvelopeCipher` seals TOTP seeds with |

@@ -1692,11 +1692,12 @@ class TableSpec:
 
 
 def _build_tables() -> tuple[TableSpec, ...]:
-    """Build the ten identity table specs, resolving the names each module owns.
+    """Build the eleven identity table specs, resolving the names each module owns.
 
-    The OAuth and lockout table names live in sibling modules that import this one, so they
-    are resolved here rather than at import time.
+    The API key, OAuth and lockout table names live in sibling modules that import this one,
+    so they are resolved here rather than at import time.
     """
+    from webbpulse.identity.api_keys import API_KEY_TABLE
     from webbpulse.identity.lockout import LOGIN_ATTEMPTS_TABLE
     from webbpulse.identity.oauth import OAUTH_LINK_USER_INDEX, OAUTH_LINKS_TABLE, OAUTH_STATES_TABLE
 
@@ -1776,6 +1777,7 @@ def _build_tables() -> tuple[TableSpec, ...]:
             hash_key="provider_subject",
             global_secondary_indexes=(TableIndex(name=OAUTH_LINK_USER_INDEX, hash_key="user_id"),),
         ),
+        API_KEY_TABLE,
     )
 
 
