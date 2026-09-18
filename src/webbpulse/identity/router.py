@@ -21,6 +21,8 @@ if TYPE_CHECKING:  # pragma: no cover
     from webbpulse.identity.email import EmailSender
     from webbpulse.identity.hooks import IdentityHooks
     from webbpulse.identity.lockout import LoginAttemptStore
+    from webbpulse.identity.oauth_server import ConsentRenderer, TenantResolver
+    from webbpulse.identity.oauth_server_storage import OAuthServerStores
     from webbpulse.identity.service import TokenService
     from webbpulse.identity.settings import IdentitySettings
     from webbpulse.identity.tokens import KmsClient
@@ -151,6 +153,9 @@ def build_identity_router(
     email_sender: EmailSender | None = None,
     limiter_enabled: bool | None = None,
     oauth_client_secrets: Mapping[str, str] | None = None,
+    oauth_server_stores: OAuthServerStores | None = None,
+    consent_renderer: ConsentRenderer | None = None,
+    tenant_resolver: TenantResolver | None = None,
 ) -> APIRouter:
     """The identity router for a product, mounted with no prefix.
 
@@ -183,10 +188,20 @@ def build_identity_router(
 
     router = APIRouter(tags=["identity"])
 
+    discovery_body = tokens.discovery()
+    if settings.mcp_oauth_enabled:
+        from webbpulse.identity.oauth_server import extend_discovery_document
+
+        discovery_body = extend_discovery_document(discovery_body, settings)
+
     @router.get(f"{prefix}{DISCOVERY_PATH}", include_in_schema=False)
     async def discovery_document() -> JSONResponse:
-        """Serve the OpenID discovery document with its long cache header."""
-        return JSONResponse(tokens.discovery(), headers={"Cache-Control": DISCOVERY_CACHE_CONTROL})
+        """Serve the OpenID discovery document with its long cache header.
+
+        Carries the authorization server's endpoints as well when `mcp_oauth_enabled` is
+        on, so a client that finds this document first needs no second discovery step.
+        """
+        return JSONResponse(discovery_body, headers={"Cache-Control": DISCOVERY_CACHE_CONTROL})
 
     @router.get(f"{prefix}{JWKS_PATH}", include_in_schema=False)
     async def jwks_document() -> JSONResponse:
@@ -230,8 +245,103 @@ def build_identity_router(
             oauth_client_secrets=oauth_client_secrets,
         )
 
+    if settings.mcp_oauth_enabled:
+        _mount_oauth_server(
+            router,
+            prefix=prefix,
+            settings=settings,
+            hooks=hooks,
+            stores=resolved_stores,
+            oauth_server_stores=oauth_server_stores,
+            tokens=tokens,
+            attempts=attempts,
+            email_sender=email_sender,
+            limiter_enabled=limiter_enabled,
+            kms_client=kms_client,
+            consent_renderer=consent_renderer,
+            tenant_resolver=tenant_resolver,
+        )
+
     _declare_identity_responses(router, prefix)
     return router
+
+
+def _mount_oauth_server(
+    router: APIRouter,
+    *,
+    prefix: str,
+    settings: IdentitySettings,
+    hooks: IdentityHooks | None,
+    stores: IdentityStores,
+    oauth_server_stores: OAuthServerStores | None,
+    tokens: TokenService,
+    attempts: LoginAttemptStore | None,
+    email_sender: EmailSender | None,
+    limiter_enabled: bool,
+    kms_client: Any,
+    consent_renderer: ConsentRenderer | None,
+    tenant_resolver: TenantResolver | None,
+) -> None:
+    """Mount the OAuth 2.1 authorization server, behind `mcp_oauth_enabled`.
+
+    Refuses rather than silently mounting nothing when the flag is on and the stores are
+    absent: a deployment that advertises an authorization server in its discovery document
+    and then answers 404 on `/authorize` is worse than one that fails at startup.
+    """
+    from webbpulse.identity.oauth_server import build_oauth_server_router
+
+    if oauth_server_stores is None:
+        raise ValueError(
+            "mcp_oauth_enabled is on but build_identity_router was given no "
+            "`oauth_server_stores`. The authorization server needs its client, code and "
+            "consent stores, and mounting the discovery documents without them would "
+            "advertise endpoints that answer 404."
+        )
+
+    flows = None
+    if hooks is not None and stores.credentials is not None and stores.refresh_tokens is not None:
+        from webbpulse.identity.flows import IdentityFlows
+
+        flows = IdentityFlows(
+            settings,
+            hooks,
+            stores,
+            tokens,
+            attempts=attempts,
+            email_sender=email_sender,
+            kms_client=kms_client,
+        )
+
+    def limits(*specs: tuple[str, tuple[int, int], str]) -> list[Any]:
+        """The rate limit dependencies for one authorization server route."""
+        if not limiter_enabled:
+            return []
+        from fastapi import Depends
+
+        from webbpulse.ratelimit import identity_from_ip, rate_limit
+
+        return [
+            Depends(rate_limit(identity_from_ip, limit=limit, window_seconds=window, namespace=namespace))
+            for namespace, (limit, window), _ in specs
+        ]
+
+    def subject_resolver(request: Request) -> str:
+        """The signed-in user for an authorization request, by the shared claims path."""
+        return _subject_from_request(request, tokens)
+
+    router.include_router(
+        build_oauth_server_router(
+            settings,
+            flows,
+            oauth_server_stores,
+            tokens=tokens,
+            prefix=prefix,
+            consent_renderer=consent_renderer,
+            tenant_resolver=tenant_resolver,
+            limits=limits,
+            subject_resolver=subject_resolver,
+        )
+    )
 
 
 def _declare_identity_responses(router: APIRouter, prefix: str) -> None:

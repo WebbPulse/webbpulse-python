@@ -16,6 +16,7 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 
 __all__ = [
     "MAX_ACCESS_TOKEN_TTL",
+    "MAX_AUTHORIZATION_CODE_TTL",
     "MAX_SIGNING_KEYS",
     "IdentitySettings",
     "OAuthProvider",
@@ -35,9 +36,17 @@ MAX_ACCESS_TOKEN_TTL: Final = timedelta(hours=1)
 
 MAX_SIGNING_KEYS: Final = 4
 
+MAX_AUTHORIZATION_CODE_TTL: Final = timedelta(minutes=10)
+
 _PLAINTEXT_ISSUER_ENVIRONMENTS: Final[frozenset[str]] = frozenset({"local", "test"})
 
 _LOCAL_SIGNER_REFUSED_ENVIRONMENTS: Final[frozenset[str]] = frozenset({"production", "prod"})
+
+_DEFAULT_MCP_SCOPES: Final[list[str]] = ["mcp:read", "mcp:write"]
+
+_REGISTERED_CLAIM_NAMES: Final[frozenset[str]] = frozenset(
+    {"iss", "sub", "aud", "exp", "iat", "nbf", "jti", "typ", "sid"}
+)
 
 
 class IdentitySettings(BaseSettings):
@@ -204,6 +213,71 @@ class IdentitySettings(BaseSettings):
     google_client_id: str = Field(default="")
     github_client_id: str = Field(default="")
 
+    mcp_oauth_enabled: bool = Field(
+        default=False,
+        description=(
+            "Mount the OAuth 2.1 authorization server routes, so a remote MCP server can "
+            "accept Claude, an editor or any other MCP client. Off by default: it opens "
+            "dynamic client registration and an interactive consent screen, which a product "
+            "that hosts no MCP resource should never expose."
+        ),
+    )
+    mcp_resource_url: str = Field(
+        default="",
+        description=(
+            "The canonical URL of this product's MCP resource, the RFC 8707 `resource` a "
+            "client must ask for and the `aud` its access token carries. Required when "
+            "`mcp_oauth_enabled` is on, and the only value the server will bind a token to."
+        ),
+    )
+    mcp_scopes_supported: list[str] = Field(
+        default_factory=lambda: _DEFAULT_MCP_SCOPES.copy(),
+        description=(
+            "The scopes `/authorize` will grant. A request naming anything outside this list "
+            "is refused rather than narrowed, so a client never believes it holds a scope "
+            "the server dropped."
+        ),
+    )
+    mcp_registration_enabled: bool = Field(
+        default=True,
+        description=(
+            "Accept RFC 7591 dynamic client registration on `/register`. On by default "
+            "because an MCP client that cannot register cannot connect at all; turning it "
+            "off leaves `mcp_clients` as the only way in."
+        ),
+    )
+    mcp_clients: list[dict[str, Any]] = Field(
+        default_factory=list,
+        description=(
+            "Pre-registered first-party clients, each a mapping with `client_id` and "
+            "`redirect_uris`. They are never TTL reclaimed and need no registration call."
+        ),
+    )
+    mcp_tenant_claim: str = Field(
+        default="tenant_id",
+        description=(
+            "The claim name the consented tenant is written to. A product whose authorizer "
+            "and `claims_for` already name a workspace claim sets this to that name, so an "
+            "MCP token and a browser token carry the tenant in the same place."
+        ),
+    )
+    mcp_authorization_code_ttl: timedelta = Field(
+        default=timedelta(seconds=60),
+        description=(
+            "How long an authorization code lives. One minute: the code is exchanged "
+            "immediately by a client that already holds the verifier, so a longer window "
+            "only widens the interception opportunity."
+        ),
+    )
+    mcp_client_ttl: timedelta = Field(
+        default=timedelta(days=90),
+        description=(
+            "How long a dynamically registered client record survives without being used. "
+            "A client that still authorizes is refreshed on each `/token`, so this reclaims "
+            "only the registrations nothing ever came back for."
+        ),
+    )
+
     oauth_redirect_uris: list[str] = Field(
         default_factory=list,
         description=(
@@ -280,6 +354,67 @@ class IdentitySettings(BaseSettings):
             raise ValueError(f"totp_master_key is not valid base64: {exc}") from exc
         if len(raw) != MASTER_KEY_BYTES:
             raise ValueError(f"totp_master_key decodes to {len(raw)} bytes, expected {MASTER_KEY_BYTES}.")
+        return self
+
+    @model_validator(mode="after")
+    def _check_mcp_oauth(self) -> IdentitySettings:
+        """Refuse an authorization server that cannot name the resource it protects.
+
+        The `resource` indicator is what stops a token minted for this product being
+        replayed against another, so an empty one would defeat the audience binding
+        entirely rather than merely leaving a field blank.
+        """
+        if not self.mcp_oauth_enabled:
+            return self
+        if not self.mcp_resource_url:
+            raise ValueError(
+                "mcp_oauth_enabled is on and mcp_resource_url is empty. Every token this "
+                "server issues is bound to that resource as its audience, and a client must "
+                "name it as the RFC 8707 `resource`, so there is nothing to issue without it."
+            )
+        parsed = urlparse(self.mcp_resource_url)
+        if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+            raise ValueError(f"mcp_resource_url must be an absolute http(s) URL, got {self.mcp_resource_url!r}.")
+        if parsed.fragment:
+            raise ValueError(
+                f"mcp_resource_url must have no fragment, got {self.mcp_resource_url!r}. RFC 8707 "
+                "compares the resource indicator as a whole string, and a fragment is never sent."
+            )
+        if parsed.scheme == "http" and self.environment.strip().lower() not in _PLAINTEXT_ISSUER_ENVIRONMENTS:
+            raise ValueError(
+                f"mcp_resource_url {self.mcp_resource_url!r} is plaintext http in environment "
+                f"{self.environment!r}. A bearer token bound to an http resource is read by "
+                "anything on the path between the client and it."
+            )
+        if not self.mcp_scopes_supported:
+            raise ValueError(
+                "mcp_scopes_supported is empty, so `/authorize` could grant nothing and every "
+                "authorization would be refused."
+            )
+        for client in self.mcp_clients:
+            if not client.get("client_id"):
+                raise ValueError("Every entry in mcp_clients needs a non-empty `client_id`.")
+            if not client.get("redirect_uris"):
+                raise ValueError(
+                    f"Pre-registered client {client.get('client_id')!r} lists no redirect_uris. A client "
+                    "with none can never complete an authorization, because the redirect is matched exactly."
+                )
+        if not self.mcp_tenant_claim:
+            raise ValueError("mcp_tenant_claim must name the claim the consented tenant is written to.")
+        if self.mcp_tenant_claim in _REGISTERED_CLAIM_NAMES:
+            raise ValueError(
+                f"mcp_tenant_claim {self.mcp_tenant_claim!r} is a registered JWT claim, which "
+                "`mint_access_token` drops rather than honours, so the tenant would silently "
+                "vanish from every token this server issues."
+            )
+        if self.mcp_authorization_code_ttl <= timedelta(0):
+            raise ValueError("mcp_authorization_code_ttl must be positive.")
+        if self.mcp_authorization_code_ttl > MAX_AUTHORIZATION_CODE_TTL:
+            raise ValueError(
+                f"mcp_authorization_code_ttl of {self.mcp_authorization_code_ttl} exceeds the "
+                f"{MAX_AUTHORIZATION_CODE_TTL} cap. A code is redeemed within seconds by a client "
+                "that already holds the verifier, so a long-lived one is only an interception window."
+            )
         return self
 
     @field_validator("signing_key_arns")
