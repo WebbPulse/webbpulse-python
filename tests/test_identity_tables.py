@@ -12,6 +12,8 @@ from typing import Any
 import pytest
 
 from webbpulse.identity import (
+    API_KEY_USER_INDEX,
+    API_KEYS_TABLE,
     BILLING_MODE,
     CREDENTIALS_TABLE,
     IDENTITY_TOKENS_TABLE,
@@ -105,15 +107,22 @@ MODULE_TABLES: dict[str, dict[str, Any]] = {
         "global_secondary_indexes": [("user_id-index", "user_id", None, "ALL")],
         "ttl_attribute": None,
     },
+    "api-keys": {
+        "attributes": [("key_hash", "S"), ("user_id", "S"), ("created_at", "S")],
+        "hash_key": "key_hash",
+        "range_key": None,
+        "global_secondary_indexes": [("user_id-created_at-index", "user_id", "created_at", "ALL")],
+        "ttl_attribute": None,
+    },
 }
 
 BY_NAME = {spec.logical_name: spec for spec in TABLES}
 
 
 def test_every_module_table_is_present_and_no_others() -> None:
-    """`TABLES` holds exactly the ten tables the module provisions, each once."""
+    """`TABLES` holds exactly the eleven tables the module provisions, each once."""
     assert sorted(BY_NAME) == sorted(MODULE_TABLES)
-    assert len(TABLES) == len(BY_NAME) == 10
+    assert len(TABLES) == len(BY_NAME) == 11
 
 
 def test_logical_names_are_the_package_constants() -> None:
@@ -130,6 +139,7 @@ def test_logical_names_are_the_package_constants() -> None:
             WEBAUTHN_CHALLENGES_TABLE,
             OAUTH_STATES_TABLE,
             OAUTH_LINKS_TABLE,
+            API_KEYS_TABLE,
         }
     )
 
@@ -140,6 +150,7 @@ def test_index_names_are_the_package_constants() -> None:
     assert refresh == {REFRESH_FAMILY_INDEX, REFRESH_USER_INDEX}
     assert [index.name for index in BY_NAME[PASSKEYS_TABLE].global_secondary_indexes] == [PASSKEY_CREDENTIAL_INDEX]
     assert [index.name for index in BY_NAME[OAUTH_LINKS_TABLE].global_secondary_indexes] == [OAUTH_LINK_USER_INDEX]
+    assert [index.name for index in BY_NAME[API_KEYS_TABLE].global_secondary_indexes] == [API_KEY_USER_INDEX]
 
 
 @pytest.mark.parametrize("logical", sorted(MODULE_TABLES))

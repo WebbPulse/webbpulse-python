@@ -230,3 +230,71 @@ no AWS credentials at all.
 
 Federated sign-in is documented in [identity-oauth.md](identity-oauth.md) and passkeys in
 [identity-passkeys.md](identity-passkeys.md).
+
+## API keys and scope enforcement
+
+`webbpulse.identity.api_keys` mints long-lived credentials for machine callers, and
+`webbpulse.identity.scopes` guards routes on what a caller may do. A key is minted once,
+shown once, and stored only as a SHA-256 hash with a short clear-text prefix for display, so
+a leaked table authenticates as nobody.
+
+```python
+from webbpulse.identity import DynamoApiKeyStore, mint_api_key
+
+store = DynamoApiKeyStore(repository)
+minted = mint_api_key(
+    user_id=user.id,
+    tenant_id=tenant.id,
+    scopes=["issues:read", "issues:write"],
+    name="CI deploy key",
+    store=store,
+)
+return {"key": minted.plaintext, "prefix": minted.record.prefix}
+```
+
+`minted.plaintext` is the only time the key exists outside the caller's own storage. Put it
+in that one response and nowhere else, least of all a log line.
+
+A key is a delegation, never a promotion. The scopes on a record are the ceiling its minter
+held at mint time, and membership changes afterwards, so a request must intersect the two:
+
+```python
+from webbpulse.identity import effective_scopes
+
+granted = effective_scopes(record.scopes, live_scopes_for(record.user_id))
+```
+
+Without that intersection a key outlives the role it was minted under, which is how a removed
+admin keeps admin access through a key nobody remembers. `claims_or_api_key` does it for you
+when given a `live_scopes` callable, and that is the form to reach for.
+
+`claims_or_api_key` returns the same `AuthorizerClaims` a JWT would, so a route cannot tell a
+key from a signed-in person and there is no second authorization path to keep in step. It
+tries the authorizer first and only falls back to a bearer value carrying the `wpk_` prefix,
+so adding it never weakens a route that already had an authorizer. Every failure is the same
+401: a missing credential, an unknown, revoked or expired key, and a membership lookup that
+raises are indistinguishable to the caller.
+
+```python
+from fastapi import Depends
+
+from webbpulse.identity import claims_or_api_key, require_scopes
+
+claims = claims_or_api_key(store=store, live_scopes=live_scopes_for_key)
+
+
+@router.post("/issues", dependencies=[Depends(require_scopes("issues:write", claims_dependency=claims))])
+def create_issue() -> Issue: ...
+```
+
+`require_scopes` needs every scope it names, never any one of them, and refuses with a 403
+carrying `webbpulse.messages.forbidden` and the `INSUFFICIENT_SCOPE` code. The missing names
+are not in the body: naming them tells a caller what to go and acquire. `is_api_key_actor`
+reads the `actor_kind` claim for the route that must refuse a key outright, such as changing a
+password or minting another key, because a key must never mint its own successor.
+
+The `api-keys` table is in `TABLES` alongside every other identity table, so the platform
+identity module provisions it with the rest. It carries no TTL deliberately: expiry is checked
+on the read path, because a key that vanished from the table would be indistinguishable from
+one that never existed, and an expired key its owner can still see and delete is the better
+operator experience.
