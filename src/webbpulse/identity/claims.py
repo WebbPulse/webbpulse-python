@@ -33,6 +33,28 @@ __all__ = [
 
 _log = logging.getLogger(__name__)
 
+if not TYPE_CHECKING:
+    Request = None
+    """Bound by `_bind_fastapi_request`. A runtime global as well as a `TYPE_CHECKING`
+    import because the dependencies built here are annotated `request: Request` under
+    postponed annotations, and FastAPI resolves that against these globals. Left unbound it
+    reads the parameter as a query field and answers 422 instead of running."""
+
+
+def _bind_fastapi_request() -> None:
+    """Put `fastapi.Request` in this module's globals, as `router` does for its routes.
+
+    FastAPI resolves a dependency's string annotations against the defining module's
+    globals, so a name visible only under `TYPE_CHECKING` is not there when it builds the
+    signature.
+    """
+    global Request
+    if Request is None:
+        from fastapi import Request as _Request
+
+        Request = _Request  # type: ignore[misc]
+
+
 INTEGER_CLAIMS: Final[frozenset[str]] = frozenset({"exp", "iat", "nbf", "auth_time"})
 
 BOOLEAN_CLAIMS: Final[frozenset[str]] = frozenset({"email_verified"})
@@ -272,6 +294,8 @@ def authorizer_claims(
     """
     from fastapi import HTTPException
 
+    _bind_fastapi_request()
+
     if local_fallback is not None and environment.strip().lower() in _REFUSED_ENVIRONMENTS:
         raise ValueError(
             f"local_fallback is refused in environment {environment!r}. A missing "
@@ -398,6 +422,8 @@ def subject_dependency(*, required: bool = True) -> Any:
         An `async def` dependency suitable for `Depends`.
     """
     from fastapi import HTTPException
+
+    _bind_fastapi_request()
 
     async def dependency(request: Request) -> str:
         """Return the verified subject, or raise a 401 when one is required."""
