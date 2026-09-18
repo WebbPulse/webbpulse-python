@@ -17,7 +17,7 @@ from fastapi import APIRouter, FastAPI, HTTPException
 from fastapi.testclient import TestClient
 from pydantic import BaseModel
 
-from webbpulse.dynamodb import ConditionFailed, DynamoError, ItemNotFound, TransactionCanceled
+from webbpulse.dynamodb import ConditionFailed, DynamoError, ItemNotFound, TransactionCanceled, UnprocessedItems
 from webbpulse.http import (
     DYNAMODB_ERROR_MESSAGES,
     DynamoDBErrorHandlerOptions,
@@ -80,6 +80,11 @@ def _router() -> APIRouter:
     async def duplicate() -> None:
         """Raise the package's condition failed error."""
         raise ConditionFailed("test-users", "attribute_not_exists(id)", {"id": "abc"})
+
+    @router.get("/unprocessed")
+    async def unprocessed() -> None:
+        """Raise a batch that still had items outstanding after the retry cap."""
+        raise UnprocessedItems("test-users", 7, 4)
 
     @router.get("/canceled-conditional")
     async def canceled_conditional() -> None:
@@ -270,6 +275,12 @@ class TestDynamoDbErrorHandlers:
         "message": "Internal server error.",
         "error_code": "INTERNAL_ERROR",
     }
+    UNPROCESSED: ClassVar[dict[str, Any]] = {
+        "success": False,
+        "status": 503,
+        "message": "The service is busy. Try again shortly.",
+        "error_code": "SERVICE_UNAVAILABLE",
+    }
 
     def test_item_not_found_is_404(self, detailed: TestClient) -> None:
         """Item not found renders as a 404 naming neither the table nor the key."""
@@ -284,6 +295,27 @@ class TestDynamoDbErrorHandlers:
         assert response.status_code == 409
         assert_exact(response.json(), self.CONFLICT)
         assert "attribute_not_exists" not in response.text
+
+    def test_unprocessed_items_is_503(self, detailed: TestClient) -> None:
+        """An exhausted batch is shed load, so it renders retryable rather than as a 500."""
+        response = detailed.get("/unprocessed")
+        assert response.status_code == 503
+        assert_exact(response.json(), self.UNPROCESSED)
+
+    def test_unprocessed_items_tells_the_caller_when_to_retry(self, detailed: TestClient) -> None:
+        """`Retry-After` ships with it, the way the throttling handler answers."""
+        response = detailed.get("/unprocessed")
+        assert response.headers["retry-after"] == "1"
+
+    def test_unprocessed_items_names_neither_the_table_nor_the_count(self, detailed: TestClient) -> None:
+        """The table and how much was left are log detail, never body detail.
+
+        The count is checked through the message rather than the raw text, since a bare
+        digit collides with the request id.
+        """
+        response = detailed.get("/unprocessed")
+        assert "test-users" not in response.text
+        assert response.json()["message"] == DYNAMODB_ERROR_MESSAGES["unprocessed"]
 
     def test_transaction_cancelled_by_condition_is_409(self, detailed: TestClient) -> None:
         """A cancellation caused by a failed condition reads as an ordinary lost race."""
@@ -373,7 +405,7 @@ class TestDynamoDbErrorHandlers:
         assert response.json()["message"] == "Internal server error"
 
     def test_an_overridden_message_leaves_the_others_alone(self) -> None:
-        """Pinning one message keeps the package default for the other two."""
+        """Pinning one message keeps the package default for the other three."""
         app = FastAPI()
         register_error_handlers(app, error_envelope="detailed")
         install_dynamodb_error_handlers(app, error_envelope="detailed", not_found_message="Gone")
@@ -383,6 +415,7 @@ class TestDynamoDbErrorHandlers:
         assert client.get("/missing").json()["message"] == "Gone"
         assert client.get("/duplicate").json()["message"] == DYNAMODB_ERROR_MESSAGES["conflict"]
         assert client.get("/canceled-other").json()["message"] == DYNAMODB_ERROR_MESSAGES["internal"]
+        assert client.get("/unprocessed").json()["message"] == DYNAMODB_ERROR_MESSAGES["unprocessed"]
 
 
 class TestDynamoDbOptionsForwarding:
@@ -392,13 +425,15 @@ class TestDynamoDbOptionsForwarding:
         not_found_message="Resource not found",
         conflict_message="Resource already exists or was modified concurrently",
         internal_error_message="Internal server error",
+        unprocessed_message="Too busy right now",
     )
 
     def _assert_pinned(self, client: TestClient) -> None:
-        """Every one of the three messages is the consumer's, not the package's."""
+        """Every one of the four messages is the consumer's, not the package's."""
         assert client.get("/missing").json()["message"] == "Resource not found"
         assert client.get("/duplicate").json()["message"] == "Resource already exists or was modified concurrently"
         assert client.get("/canceled-other").json()["message"] == "Internal server error"
+        assert client.get("/unprocessed").json()["message"] == "Too busy right now"
 
     def test_register_error_handlers_forwards_the_options(self) -> None:
         """`dynamodb_errors` takes the options in place of `True` and forwards every field."""
@@ -434,6 +469,7 @@ class TestDynamoDbOptionsForwarding:
         assert client.get("/missing").json()["message"] == DYNAMODB_ERROR_MESSAGES["not_found"]
         assert client.get("/duplicate").json()["message"] == DYNAMODB_ERROR_MESSAGES["conflict"]
         assert client.get("/canceled-other").json()["message"] == DYNAMODB_ERROR_MESSAGES["internal"]
+        assert client.get("/unprocessed").json()["message"] == DYNAMODB_ERROR_MESSAGES["unprocessed"]
 
     def test_the_options_are_frozen(self) -> None:
         """The options carry no mutable state a consumer could change after installation."""
@@ -465,13 +501,17 @@ class TestDefaultDynamoDbMessagesUnchanged:
         assert DYNAMODB_ERROR_MESSAGES["conflict"] == "The resource was modified by another request. Try again."
         assert DYNAMODB_ERROR_MESSAGES["internal"] == "Internal server error."
 
+    def test_the_unprocessed_wording_matches_the_throttling_handler(self) -> None:
+        """Both render shed load, so a caller cannot tell which path produced the 503."""
+        assert DYNAMODB_ERROR_MESSAGES["unprocessed"] == "The service is busy. Try again shortly."
+
 
 class TestDynamoDbExceptionTypes:
     """The exception types themselves, which consumers raise."""
 
     def test_every_type_shares_one_base(self) -> None:
         """One `except DynamoError` or one map entry covers the whole hierarchy."""
-        for exc_type in (ItemNotFound, ConditionFailed, TransactionCanceled):
+        for exc_type in (ItemNotFound, ConditionFailed, TransactionCanceled, UnprocessedItems):
             assert issubclass(exc_type, DynamoError)
 
     def test_item_not_found_records_the_table_and_key(self) -> None:
@@ -479,6 +519,11 @@ class TestDynamoDbExceptionTypes:
         exc = ItemNotFound("users", {"id": "abc"})
         assert (exc.table, exc.key) == ("users", {"id": "abc"})
         assert "users" in str(exc)
+
+    def test_unprocessed_items_records_the_count_and_the_attempts(self) -> None:
+        """How much was left and how hard it tried are kept for the log, not the body."""
+        exc = UnprocessedItems("users", 7, 4)
+        assert (exc.table, exc.count, exc.attempts) == ("users", 7, 4)
 
     def test_condition_failed_records_its_condition(self) -> None:
         """The condition expression is kept as an attribute, for the log."""

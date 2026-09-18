@@ -115,7 +115,7 @@ does not, `webbpulse.dynamodb` now defines them, so a repository can raise the p
 types and the handlers come with them:
 
 ```python
-from webbpulse.dynamodb import ConditionFailed, ItemNotFound, TransactionCanceled
+from webbpulse.dynamodb import ConditionFailed, ItemNotFound, TransactionCanceled, UnprocessedItems
 
 app = create_app([posts_router], dynamodb_error_handlers=True)
 # or, for an app not built by create_app:
@@ -129,11 +129,12 @@ install_dynamodb_error_handlers(app)
 | `ItemNotFound` | 404 | The table and the key are recorded on the exception for the log and never reach the body, because a key can be a user id or an email address. |
 | `ConditionFailed` | 409 | A lost race on an optimistic write. The condition expression stays in the log. |
 | `TransactionCanceled` | 409 or 500 | Inspected, not assumed: 409 when `conditional_check_failed`, 500 otherwise, matching the botocore branch. |
+| `UnprocessedItems` | 503 with `Retry-After` | A batch that still had `UnprocessedItems` or `UnprocessedKeys` outstanding after the retry cap is DynamoDB shedding load, which is transient. A 500 would tell the caller not to retry and page someone for capacity working as designed. The table, the count and the attempts stay in the log. |
 
-All three subclass `DynamoError`, so one `except DynamoError` or one `exception_map` entry
+All four subclass `DynamoError`, so one `except DynamoError` or one `exception_map` entry
 covers the hierarchy, and a service's own subclass inherits the nearest handler without
-needing an entry. `not_found_message`, `conflict_message` and `internal_error_message` change
-the wording without writing a handler.
+needing an entry. `not_found_message`, `conflict_message`, `internal_error_message` and
+`unprocessed_message` change the wording without writing a handler.
 
 A service with its own wording passes a `DynamoDBErrorHandlerOptions` in place of `True`,
 which both flags forward, so it does not have to drop to the bare installer to configure the
@@ -154,6 +155,8 @@ app = create_app(
 Each field left unset keeps the package default from `DYNAMODB_ERROR_MESSAGES`, so
 `DynamoDBErrorHandlerOptions()` is the same as `True`. `internal_error_message` is the wording
 the non-conditional `TransactionCanceled` branch renders, which until 0.24.0 was fixed.
+`unprocessed_message` defaults to the same sentence the throttling handler in
+`install_dynamodb_handlers` renders, so a caller cannot tell which path produced the 503.
 
 This needs no extra. The types are plain exceptions and importing them pulls in no botocore,
 which is the difference from `install_dynamodb_handlers`: that one handles the raw

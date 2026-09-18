@@ -22,7 +22,9 @@ if TYPE_CHECKING:  # pragma: no cover
     from mypy_boto3_dynamodb.service_resource import Table
 
 __all__ = [
+    "FakeIdempotencyStore",
     "FakeKms",
+    "FakePresigner",
     "aws_credentials",
     "create_table",
     "dynamodb_resource",
@@ -329,3 +331,83 @@ def rsa_key() -> Any:
     from cryptography.hazmat.primitives.asymmetric import rsa
 
     return rsa.generate_private_key(public_exponent=65537, key_size=2048)
+
+
+class FakeIdempotencyStore:
+    """An in-process stand-in for `webbpulse.dynamodb.IdempotencyStore`, without a table.
+
+    It answers `claim` and `release` with the same signatures, so a handler typed against the
+    real store takes this one with no adapter. Claims are held in a dict with the monotonic
+    deadline each was taken under, and expiry is evaluated on read: unlike DynamoDB's TTL,
+    which deletes on its own schedule, this one forgets a key the moment its window passes, so
+    a test asserting that a replay after expiry wins need not sleep on a background sweeper.
+
+    `claims` records every key `claim` was called with, winners and losers alike, which is what
+    a test asserting that a handler claimed before doing the work reads.
+    """
+
+    def __init__(self, *, now: Any | None = None) -> None:
+        """Start with nothing claimed, optionally over a caller-supplied clock.
+
+        Args:
+            now: A zero-argument callable returning seconds as a float, defaulting to
+                `time.monotonic`. Pass one to drive expiry forward without sleeping.
+        """
+        import time
+
+        self._now = now if now is not None else time.monotonic
+        self._deadlines: dict[str, float] = {}
+        self.claims: list[str] = []
+
+    def claim(self, key: str, ttl_seconds: float) -> bool:
+        """Claim `key`, answering whether this caller won, exactly as the real store does.
+
+        Raises:
+            ValueError: When `ttl_seconds` is not positive, matching the real store.
+        """
+        if ttl_seconds <= 0:
+            raise ValueError(f"claim needs a positive ttl_seconds, got {ttl_seconds}.")
+        self.claims.append(key)
+        moment = self._now()
+        deadline = self._deadlines.get(key)
+        if deadline is not None and deadline > moment:
+            return False
+        self._deadlines[key] = moment + ttl_seconds
+        return True
+
+    def release(self, key: str) -> None:
+        """Drop a claim. Releasing a key nobody claimed is not an error."""
+        self._deadlines.pop(key, None)
+
+
+class FakePresigner:
+    """A stand-in for the S3 client `webbpulse.storage.presigned_put` signs with.
+
+    It returns a deterministic URL rather than a signed one and records the arguments it was
+    asked to sign, which is the assertion worth making: a presigned PUT's guard lives entirely
+    in the `Params` that go into the signature, so a test proves the content type and the
+    length were signed in rather than merely returned as headers.
+    """
+
+    def __init__(self, base_url: str = "https://s3.example.invalid") -> None:
+        """Hold the host the generated URLs are built under and start with no calls."""
+        self.base_url = base_url
+        self.calls: list[dict[str, Any]] = []
+
+    def generate_presigned_url(
+        self,
+        ClientMethod: str,
+        Params: dict[str, Any],
+        ExpiresIn: int,
+        HttpMethod: str | None = None,
+    ) -> str:
+        """Record the request and answer a URL naming the bucket and key it authorises."""
+        self.calls.append(
+            {
+                "ClientMethod": ClientMethod,
+                "Params": dict(Params),
+                "ExpiresIn": ExpiresIn,
+                "HttpMethod": HttpMethod,
+            }
+        )
+        return f"{self.base_url}/{Params['Bucket']}/{Params['Key']}?X-Amz-Expires={ExpiresIn}"

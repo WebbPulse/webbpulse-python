@@ -35,7 +35,7 @@ The base install carries only `pydantic` and `pydantic-settings`. Everything els
 
 | Extra | Pulls in | Needed by |
 | --- | --- | --- |
-| `dynamodb` | `boto3`, `botocore` | `webbpulse.dynamodb`, `webbpulse.ratelimit`, secret loading in `webbpulse.config` |
+| `dynamodb` | `boto3`, `botocore` | `webbpulse.dynamodb`, `webbpulse.ratelimit`, `webbpulse.storage`, secret loading in `webbpulse.config` |
 | `fastapi` | `fastapi`, `starlette`, `uvicorn` | `webbpulse.http`, `webbpulse.lambda_entry`, the `webbpulse.ratelimit` dependency |
 | `otel` | the OpenTelemetry SDK, the OTLP HTTP exporter, the FastAPI and botocore instrumentations | `webbpulse.otel` |
 | `aws-otel` | the AWS OpenTelemetry distro | the SigV4 signed X-Ray exporter |
@@ -60,12 +60,13 @@ its dev dependencies.
 | `webbpulse.http` | `create_app`, `mount_all`, `health_router`, `RequestIdMiddleware`, `user_id_dependency`, and the shared error envelope | [http.md](docs/http.md), [error-handlers.md](docs/error-handlers.md) |
 | `webbpulse.events` | `stream_consumer_app`, `register_stream_consumer`, `events_path`: the one route a DynamoDB Streams or SQS consumer serves behind the Web Adapter | [events.md](docs/events.md) |
 | `webbpulse.messages` | `STATUS_MESSAGES`, `refusal`, `forbidden`, `unauthenticated`, `rate_limited`: the user-facing sentence each refusal renders | [error-handlers.md](docs/error-handlers.md) |
-| `webbpulse.dynamodb` | `Repository`, `Page`, `table_name`, `ttl_at`, `ttl_in`, `encode_numbers`, and the `DynamoError` family | [data-access.md](docs/data-access.md) |
+| `webbpulse.dynamodb` | `Repository`, `Page`, `table_name`, `ttl_at`, `ttl_in`, `encode_numbers`, `new_ulid`, `IdempotencyStore`, and the `DynamoError` family | [data-access.md](docs/data-access.md) |
+| `webbpulse.storage` | `presigned_put`, `PresignedUpload`: a presigned S3 PUT bounded by a signed content type and content length | [data-access.md](docs/data-access.md) |
 | `webbpulse.ratelimit` | `rate_limit`, `rate_limit_middleware`, `LimitClass`, `classify`, a fixed window limiter on one DynamoDB table, failing open | [data-access.md](docs/data-access.md) |
 | `webbpulse.security` | `hash_password`, `verify_password`, `needs_rehash`, `create_token`, `decode_token`, `bearer_claims` | [security.md](docs/security.md) |
 | `webbpulse.identity` | App-managed identity: password, session, email link, TOTP, OAuth and passkey flows, plus a KMS-backed `TokenService` and a JWKS | [identity.md](docs/identity.md), [the standard](docs/identity-standard.md) |
 | `webbpulse.lambda_entry` | `run_uvicorn`, `is_lambda`, `resolve_port`: the AWS Lambda Web Adapter entrypoint, with no Mangum and no handler | [packaging.md](docs/packaging.md) |
-| `webbpulse.testing` | Pytest fixtures: `test_client`, `create_table`, `rate_limit_table`, `make_request_context_headers`, `FakeKms` | [packaging.md](docs/packaging.md) |
+| `webbpulse.testing` | Pytest fixtures: `test_client`, `create_table`, `rate_limit_table`, `make_request_context_headers`, `FakeKms`, `FakeIdempotencyStore`, `FakePresigner` | [packaging.md](docs/packaging.md) |
 | `webbpulse.e2e` | A pytest plugin and generic post-deploy suite: route cut, coverage, reachability, identity, frontend and hygiene against a real stage | [e2e.md](docs/e2e.md) |
 
 ## Wiring a FastAPI domain Lambda
@@ -267,7 +268,7 @@ app.include_router(build_identity_router(settings, hooks, stores, tokens=tokens)
 | [docs/http.md](docs/http.md) | `create_app` and the error envelope shapes |
 | [docs/error-handlers.md](docs/error-handlers.md) | DynamoDB and custom exception handlers |
 | [docs/events.md](docs/events.md) | The stream and queue consumer route |
-| [docs/data-access.md](docs/data-access.md) | The repository base and the rate limiter |
+| [docs/data-access.md](docs/data-access.md) | The repository base, counters, ULIDs, idempotency claims, presigned uploads and the rate limiter |
 | [docs/logging-and-metrics.md](docs/logging-and-metrics.md) | JSON logging, log context and EMF metrics |
 | [docs/tracing.md](docs/tracing.md) | Tracing setup |
 | [docs/tracing-sampling.md](docs/tracing-sampling.md) | The tail sampler and the Lambda flush |
