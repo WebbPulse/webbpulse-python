@@ -18,6 +18,7 @@ import pytest
 from webbpulse.identity.claims import (
     GATE_CLAIMS_KEY,
     AuthorizerClaims,
+    authorizer_claims,
     gate_claims,
     identity_claims,
     identity_subject,
@@ -185,3 +186,51 @@ def test_the_required_subject_dependency_refuses_an_unauthenticated_request() ->
 def test_an_optional_subject_dependency_answers_empty() -> None:
     """With `required=False` an absent subject is `""` and the route decides."""
     assert asyncio.run(subject_dependency(required=False)(make_request({}))) == ""
+
+
+def _mounted(dependency: Any, key: str = "subject") -> Any:
+    """A one-route app whose only argument is `dependency`, returning a client for it."""
+    from fastapi import Depends, FastAPI
+    from fastapi.testclient import TestClient
+
+    app = FastAPI()
+
+    @app.get("/who")
+    def who(resolved: Any = Depends(dependency)) -> dict[str, Any]:
+        """Echo whatever the dependency resolved."""
+        return {key: resolved if isinstance(resolved, str) else dict(resolved)}
+
+    return TestClient(app, raise_server_exceptions=False)
+
+
+def test_the_subject_dependency_runs_behind_a_mounted_route() -> None:
+    """Mounted on a real app the dependency reads the request rather than a query field.
+
+    FastAPI resolves `request: Request` against this module's globals under postponed
+    annotations, so a name visible only under `TYPE_CHECKING` leaves the parameter read as
+    a query field and every call answers 422 without the dependency ever running.
+    """
+    response = _mounted(subject_dependency()).get("/who", headers=native_header(NATIVE_CLAIMS))
+    assert response.status_code == 200
+    assert response.json() == {"subject": "user-abc-123"}
+
+
+def test_a_mounted_subject_dependency_still_refuses_an_unauthenticated_request() -> None:
+    """The 401 survives the mount: an absent authorizer is not a validation error."""
+    response = _mounted(subject_dependency()).get("/who")
+    assert response.status_code == 401
+    assert response.headers["www-authenticate"] == "Bearer"
+
+
+def test_an_optional_subject_dependency_answers_empty_behind_a_route() -> None:
+    """With `required=False` a mounted route sees `""` rather than a 422."""
+    response = _mounted(subject_dependency(required=False)).get("/who")
+    assert response.status_code == 200
+    assert response.json() == {"subject": ""}
+
+
+def test_the_claims_dependency_runs_behind_a_mounted_route() -> None:
+    """`authorizer_claims` is annotated the same way and resolves the same globals."""
+    response = _mounted(authorizer_claims(), key="claims").get("/who", headers=native_header(NATIVE_CLAIMS))
+    assert response.status_code == 200
+    assert response.json()["claims"]["sub"] == "user-abc-123"
