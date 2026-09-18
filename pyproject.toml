@@ -47,7 +47,7 @@ Source = "https://github.com/WebbPulse/webbpulse-python"
 [dependency-groups]
 dev = [
   "webbpulse[aws-otel,dynamodb,e2e,fastapi,identity,oauth,otel,passkeys,security,testing]",
-  "boto3-stubs[dynamodb,kms,secretsmanager]",
+  "boto3-stubs[dynamodb,kms,s3,secretsmanager]",
   "botocore-stubs",
   "mypy>=1.13",
   "pytest-cov>=6",

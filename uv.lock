@@ -284,6 +284,9 @@ dynamodb = [
 kms = [
     { name = "mypy-boto3-kms" },
 ]
+s3 = [
+    { name = "mypy-boto3-s3" },
+]
 secretsmanager = [
     { name = "mypy-boto3-secretsmanager" },
 ]
@@ -1159,6 +1162,15 @@ source = { registry = "https://pypi.org/simple" }
 sdist = { url = "https://files.pythonhosted.org/packages/56/a5/a63234e7787019443c52f720afea57cf1a1d22a6e8e077b3c6a3916fdd98/mypy_boto3_kms-1.43.12.tar.gz", hash = "sha256:a4d23f018422a79bc4a886676f63eba548a98b06f5dcd0395e424d7c472eb340", size = 30688, upload-time = "2026-05-20T20:01:23.801Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/36/17/9d36757acee0987ef78220d1868f1ceb0cf458928444f5a81e98a4de3b44/mypy_boto3_kms-1.43.12-py3-none-any.whl", hash = "sha256:4a74f7b4aa9fcce9a1021ad2586059f2374a4b89baa251e57e6acc16282fd782", size = 39009, upload-time = "2026-05-20T20:01:20.104Z" },
+]
+
+[[package]]
+name = "mypy-boto3-s3"
+version = "1.43.93"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/97/3b/8ca4c299090b3a7fe97c6db8e17a6d7db92cb9b456804e59426ddea84824/mypy_boto3_s3-1.43.93.tar.gz", hash = "sha256:858e1ffe738ece3fa83ebc2b50f19aa53d0d69c1084739b37ec671b060713192", size = 79411, upload-time = "2026-09-11T19:44:36.959Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/2a/f1/7ebc5d419bda7ab80dba0e59d5484a70229e617cf346665882f70fa499c3/mypy_boto3_s3-1.43.93-py3-none-any.whl", hash = "sha256:52be1672a8b65ff3a1f779b46f7ed4fab85e78f15b353ce7eb5e20a9f15e7b9b", size = 86721, upload-time = "2026-09-11T19:44:35.263Z" },
 ]
 
 [[package]]
@@ -2666,7 +2678,7 @@ testing = [
 
 [package.dev-dependencies]
 dev = [
-    { name = "boto3-stubs", extra = ["dynamodb", "kms", "secretsmanager"] },
+    { name = "boto3-stubs", extra = ["dynamodb", "kms", "s3", "secretsmanager"] },
     { name = "botocore-stubs" },
     { name = "mypy" },
     { name = "pytest-cov" },
@@ -2710,7 +2722,7 @@ provides-extras = ["aws-otel", "dynamodb", "e2e", "fastapi", "identity", "oauth"
 
 [package.metadata.requires-dev]
 dev = [
-    { name = "boto3-stubs", extras = ["dynamodb", "kms", "secretsmanager"] },
+    { name = "boto3-stubs", extras = ["dynamodb", "kms", "s3", "secretsmanager"] },
     { name = "botocore-stubs" },
     { name = "mypy", specifier = ">=1.13" },
     { name = "pytest-cov", specifier = ">=6" },

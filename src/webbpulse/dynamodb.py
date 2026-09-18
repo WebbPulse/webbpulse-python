@@ -20,16 +20,19 @@ __all__ = [
     "BATCH_GET_LIMIT",
     "TABLE_PREFIX_ENV",
     "TRANSACT_WRITE_LIMIT",
+    "ULID_LENGTH",
     "UNPROCESSED_RETRY_ATTEMPTS",
     "UNPROCESSED_RETRY_BASE_DELAY",
     "ConditionFailed",
     "DynamoError",
+    "IdempotencyStore",
     "ItemNotFound",
     "Page",
     "Repository",
     "TransactionCanceled",
     "UnprocessedItems",
     "encode_numbers",
+    "new_ulid",
     "now_iso",
     "reset_resource_cache",
     "table_name",
@@ -130,6 +133,23 @@ sustained throttling, so an unbounded loop is a hang rather than a retry.
 UNPROCESSED_RETRY_BASE_DELAY: Final = 0.05
 """The first backoff pause, in seconds. Each attempt doubles it."""
 
+ULID_LENGTH: Final = 26
+"""How many characters a ULID renders as, fixed so string ordering is time ordering.
+
+Twenty-six base32 digits hold 130 bits for a 128-bit value, so the leading digit carries only
+the top two bits and never exceeds `7`. Encoding from 125 bits instead would drop the low
+three and break ordering inside a millisecond.
+"""
+
+_CROCKFORD_BASE32: Final = "0123456789ABCDEFGHJKMNPQRSTVWXYZ"
+"""Crockford's alphabet, which drops I, L, O and U so a transcribed id cannot be misread."""
+
+_ULID_RANDOM_BITS: Final = 80
+
+_ULID_RANDOM_BYTES: Final = _ULID_RANDOM_BITS // 8
+
+_ULID_MAX_TIMESTAMP: Final = 1 << 48
+
 _CONDITIONAL_CHECK_FAILED: Final = "ConditionalCheckFailed"
 
 _TRANSACTION_CANCELED: Final = "TransactionCanceledException"
@@ -160,6 +180,37 @@ def ttl_in(seconds: float) -> int:
     never an access control.
     """
     return ttl_at(datetime.now(UTC) + timedelta(seconds=seconds))
+
+
+def new_ulid(moment: datetime | None = None) -> str:
+    """A ULID: 26 Crockford base32 characters that sort lexicographically by time.
+
+    The first 48 bits are the millisecond timestamp and the remaining 80 are random, so
+    string ordering is time ordering and two ids minted in the same millisecond still differ.
+    That is what a UUID4 range key cannot do, and it is why a sort key built from a ULID needs
+    no separate timestamp attribute.
+
+    Implemented here rather than taken from a `ulid` package, since the whole encoding is
+    twelve lines and the package deliberately carries no dependency it does not need. Crockford
+    base32 excludes I, L, O and U, so a transcribed id cannot be misread.
+
+    Args:
+        moment: The aware datetime the id records, defaulting to now. A naive one is rejected,
+            the way `ttl_at` rejects one, since its offset is ambiguous.
+
+    Raises:
+        ValueError: When `moment` is naive, or falls outside the 48 bits the format holds.
+    """
+    when = moment if moment is not None else datetime.now(UTC)
+    if when.tzinfo is None:
+        raise ValueError("new_ulid requires an aware datetime; a naive one is ambiguous.")
+    milliseconds = int(when.timestamp() * 1000)
+    if not 0 <= milliseconds < _ULID_MAX_TIMESTAMP:
+        raise ValueError(f"new_ulid takes a moment inside the 48-bit ULID epoch, got {when.isoformat()}.")
+    value = (milliseconds << _ULID_RANDOM_BITS) | int.from_bytes(os.urandom(_ULID_RANDOM_BYTES), "big")
+    shifts = range((ULID_LENGTH - 1) * 5, -1, -5)
+    digits = [_CROCKFORD_BASE32[(value >> shift) & 0x1F] for shift in shifts]
+    return "".join(digits)
 
 
 def table_name(logical_name: str, prefix: str | None = None) -> str:
@@ -474,6 +525,38 @@ class Repository:
             return None
         return dict(attributes)
 
+    def increment(self, key: Key, attribute: str, by: int = 1) -> int:
+        """Atomically add `by` to a numeric attribute and return what it now holds.
+
+        One `update_item` with `ADD`, which creates the item and treats an absent attribute as
+        zero, so a counter needs no seeding and two concurrent callers cannot both read 9 and
+        write 10. The read-modify-write a caller would otherwise hand-roll loses increments
+        under any concurrency at all.
+
+        The returned value is the counter after this call, which makes the helper an allocator:
+        the number it hands back belongs to this caller alone. Nothing rolls it back, so a
+        caller that fails after allocating leaves a gap, and the sequence is
+        gap-tolerant rather than gap-free. A gap-free sequence costs a lock.
+
+        `by` may be negative, which decrements. Zero is refused, since it reads as an increment
+        and does nothing.
+
+        Raises:
+            ValueError: When `by` is zero.
+        """
+        if by == 0:
+            raise ValueError("increment needs a non-zero amount; zero would be a no-op that reads as a counter bump.")
+        attributes = self.update(
+            key,
+            update_expression="ADD #attribute :by",
+            expression_names={"#attribute": attribute},
+            expression_values={":by": by},
+            return_values="UPDATED_NEW",
+        )
+        if attributes is None:
+            raise DynamoError(f"{self.table_name}: update_item returned no attributes for {attribute}")
+        return int(attributes[attribute])
+
     def delete(self, key: Key, *, condition: Any | None = None) -> None:
         """Delete one item by primary key. Deleting an absent item is not an error."""
         kwargs: dict[str, Any] = {"Key": dict(key)}
@@ -693,3 +776,70 @@ class Repository:
             endpoint_url=self._endpoint_url,
             client_request_token=client_request_token,
         )
+
+
+class IdempotencyStore:
+    """One-shot claims on a key, so a retried delivery does the work exactly once.
+
+    `claim` is a conditional put on the key's absence: the first caller wins and every later
+    one is told it lost, which is the whole decision a handler needs when SQS, EventBridge or
+    a payment webhook delivers the same message twice. The claim carries a TTL, so the table
+    forgets a key once replays are no longer plausible rather than growing forever.
+
+    The window is the honest limit. A TTL is reclaimed on DynamoDB's own schedule, so a
+    delivery arriving after expiry is processed again; size `ttl_seconds` past the longest
+    retry the producer will make. A winner that then crashes has still claimed the key, so
+    this makes a duplicate a no-op, not a job a second worker picks up.
+    """
+
+    def __init__(
+        self,
+        repository: Repository,
+        *,
+        key_attribute: str = "pk",
+        ttl_attribute: str = "expires_at",
+        claimed_at_attribute: str = "claimed_at",
+    ) -> None:
+        """Wrap one repository, naming the key, TTL and timestamp attributes it writes."""
+        self.repository = repository
+        self.key_attribute = key_attribute
+        self.ttl_attribute = ttl_attribute
+        self.claimed_at_attribute = claimed_at_attribute
+
+    def claim(self, key: str, ttl_seconds: float) -> bool:
+        """Claim `key` for this caller, answering whether it won.
+
+        True means nobody had claimed it and the caller owns the work. False means a live
+        claim already exists and this delivery is a duplicate to drop. A claim whose TTL has
+        passed may still be present, since DynamoDB deletes on its own schedule, and it holds
+        the key until it goes: expiry is the reclaim, never a guarantee of promptness.
+
+        Raises:
+            ValueError: When `ttl_seconds` is not positive, which would claim nothing.
+        """
+        if ttl_seconds <= 0:
+            raise ValueError(f"claim needs a positive ttl_seconds, got {ttl_seconds}.")
+
+        from boto3.dynamodb.conditions import Attr
+        from botocore.exceptions import ClientError
+
+        item: Item = {
+            self.key_attribute: key,
+            self.ttl_attribute: ttl_in(ttl_seconds),
+            self.claimed_at_attribute: now_iso(),
+        }
+        try:
+            self.repository.put(item, condition=Attr(self.key_attribute).not_exists())
+        except ClientError as exc:
+            if exc.response.get("Error", {}).get("Code") != "ConditionalCheckFailedException":
+                raise
+            return False
+        return True
+
+    def release(self, key: str) -> None:
+        """Drop a claim, letting the next delivery of `key` win.
+
+        For a handler that failed after claiming and wants the retry to do the work rather
+        than wait out the TTL. Releasing a key nobody claimed is not an error.
+        """
+        self.repository.delete({self.key_attribute: key})

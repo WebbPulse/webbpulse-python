@@ -1,7 +1,7 @@
 # Data access and rate limiting
 
-The DynamoDB repository base, the application secrets wrapper and the shared rate limiter.
-Back to the
+The DynamoDB repository base, presigned S3 uploads, the application secrets wrapper and the
+shared rate limiter. Back to the
 [README](../README.md).
 
 ## `webbpulse.dynamodb`
@@ -41,8 +41,63 @@ control.
 body should carry: the table and key, the condition expression, the cancellation reasons.
 `TransactionCanceled.conditional_check_failed` is the one decision worth not guessing at,
 since a cancellation caused by a failed condition is an ordinary lost race and every other
-cause is a real fault. `webbpulse.http.install_dynamodb_error_handlers` renders all three,
-and [error-handlers.md](error-handlers.md#the-packages-own-dynamodb-exception-types) has the mapping.
+cause is a real fault. `UnprocessedItems` joins them for a batch that stayed incomplete after
+the retry cap. `webbpulse.http.install_dynamodb_error_handlers` renders all four, and
+[error-handlers.md](error-handlers.md#the-packages-own-dynamodb-exception-types) has the mapping.
+
+### Counters
+
+`increment(key, attribute, by=1)` adds to a numeric attribute and returns what it now holds,
+in one `update_item` with `ADD` and `UPDATED_NEW`:
+
+```python
+number = repo.increment({"pk": "issue-key#WEB"}, "next")
+```
+
+`ADD` treats an absent item and an absent attribute as zero, so a counter needs no seeding.
+The number handed back belongs to this caller alone, which makes the helper an allocator
+rather than a reading: the read-modify-write a caller would otherwise write loses increments
+the moment two requests overlap. Nothing rolls an allocation back, so a caller that fails
+after allocating leaves a gap and the sequence is gap-tolerant, not gap-free. A gap-free
+sequence costs a lock, and an issue key does not need one. `by` may be negative, which
+decrements; zero is a `ValueError` rather than a silent no-op.
+
+### Sortable ids
+
+`new_ulid()` returns 26 Crockford base32 characters whose first 48 bits are the millisecond
+timestamp and whose remaining 80 are random, so string ordering is time ordering:
+
+```python
+repo.put({"pk": f"org#{org_id}", "sk": f"event#{new_ulid()}", ...})
+```
+
+That is what a UUID4 sort key cannot do, and it is why a range key built from a ULID needs no
+separate timestamp attribute to sort on. Two ids minted in the same millisecond still differ.
+It is implemented in the package rather than pulled from a `ulid` dependency, since the whole
+encoding is a dozen lines. Passing a naive datetime is a `ValueError`, the way `ttl_at`
+rejects one.
+
+### Idempotency
+
+`IdempotencyStore` wraps a repository and turns a key into a one-shot claim, so a redelivered
+message does the work exactly once:
+
+```python
+store = IdempotencyStore(Repository("claims"))
+if not store.claim(f"order#{message_id}", ttl_seconds=86_400):
+    return
+```
+
+`claim` is a conditional put on the key's absence: the first caller is told `True` and every
+later one `False`, which is the whole decision a handler needs when SQS, EventBridge or a
+payment webhook delivers twice. The claim carries a TTL, so the table forgets a key once
+replays stop being plausible rather than growing forever; size `ttl_seconds` past the longest
+retry the producer will make, because a delivery arriving after expiry is processed again. A
+winner that then crashes has still claimed the key, so this makes a duplicate a no-op and not
+a job a second worker picks up — `release(key)` is there for a handler that failed after
+claiming and wants the retry to proceed rather than wait out the TTL. The key, TTL and
+timestamp attribute names are all configurable. `webbpulse.testing.FakeIdempotencyStore` is
+the in-process stand-in, and it evaluates expiry on read so a test need not sleep.
 
 ### Scanning
 
@@ -67,7 +122,9 @@ and only the outstanding ones are resent. The retry count is capped at
 `UNPROCESSED_RETRY_ATTEMPTS` (5, overridable per call with `max_attempts`); once it is
 exhausted the call raises `UnprocessedItems` carrying the table, the number of keys still
 outstanding and the attempts made. A `while UnprocessedKeys:` loop with no cap is a hang
-under sustained throttling, not a slow success, which is why the cap is not optional.
+under sustained throttling, not a slow success, which is why the cap is not optional. Behind
+`install_dynamodb_error_handlers` that exception renders as a 503 with `Retry-After` rather
+than an opaque 500, because shed load is transient and worth retrying.
 
 Results come back in no particular order, and a key with no item is simply absent rather
 than being an error, because a batch read is a lookup and not an assertion.
@@ -98,6 +155,43 @@ An empty action list is a no-op, so a caller that assembled actions conditionall
 check. `client_request_token` makes a retry idempotent for ten minutes. A cancellation
 raises `TransactionCanceled` with its `CancellationReasons`, and
 `conditional_check_failed` separates the ordinary lost race from a real fault.
+
+## `webbpulse.storage`
+
+`presigned_put` mints a URL a browser PUTs an object to directly, so a file never travels
+through a Lambda that would have to buffer it and pay for the time:
+
+```python
+from webbpulse.storage import presigned_put
+
+upload = presigned_put(
+    bucket=settings.uploads_bucket,
+    key=f"avatars/{user_id}.png",
+    content_type="image/png",
+    max_bytes=2 * 1024 * 1024,
+)
+return {"url": upload.url, "headers": upload.headers}
+```
+
+The content type and the ceiling go **into** the signature as `ContentType` and
+`ContentLength`, which is the whole point. An unbounded presigned PUT lets whoever holds the
+URL store an object of any size and any type under a key the application will later serve,
+and neither a check in the frontend nor a check after the upload prevents it. Because the
+guard is signed, S3 rejects a request that declares anything else with a 403 at the header
+rather than after the body, so the ceiling costs no transfer. It is a ceiling the client
+declares, not a byte count S3 measures.
+
+`PresignedUpload` is frozen and carries `url`, `headers`, `bucket`, `key`, `max_bytes` and
+`expires_in`, so a route hands the whole thing to the frontend and repeats nothing. The
+headers are not advisory: a client that omits or changes one is refused. `expires_in`
+defaults to `DEFAULT_EXPIRES_IN` (900 seconds) and is capped at SigV4's own seven-day
+`MAX_EXPIRES_IN`; anything outside 1 to that is a `ValueError` before signing, as are an
+empty bucket, key or content type and a non-positive `max_bytes`. The client is cached per
+region and endpoint with `s3v4` pinned, since a URL signed with v2 is rejected outright in
+newer regions. `webbpulse.testing.FakePresigner` records what it was asked to sign, which is
+the assertion worth making.
+
+Needs the `dynamodb` extra, which is where boto3 already lives.
 
 ## `webbpulse.security` application secrets
 

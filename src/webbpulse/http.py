@@ -724,6 +724,7 @@ def register_error_handlers(
             not_found_message=options.not_found_message,
             conflict_message=options.conflict_message,
             internal_error_message=options.internal_error_message,
+            unprocessed_message=options.unprocessed_message,
         )
 
 
@@ -966,6 +967,7 @@ DYNAMODB_ERROR_MESSAGES: Final[Mapping[str, str]] = {
     "not_found": "The requested resource was not found.",
     "conflict": "The resource was modified by another request. Try again.",
     "internal": "Internal server error.",
+    "unprocessed": "The service is busy. Try again shortly.",
 }
 
 
@@ -981,6 +983,7 @@ class DynamoDBErrorHandlerOptions:
     not_found_message: str | None = None
     conflict_message: str | None = None
     internal_error_message: str | None = None
+    unprocessed_message: str | None = None
 
 
 type DynamoDBErrors = bool | DynamoDBErrorHandlerOptions
@@ -994,18 +997,20 @@ def install_dynamodb_error_handlers(
     not_found_message: str | None = None,
     conflict_message: str | None = None,
     internal_error_message: str | None = None,
+    unprocessed_message: str | None = None,
 ) -> None:
     """Install handlers for `webbpulse.dynamodb`'s own exception types.
 
-    `ItemNotFound` renders as a 404, `ConditionFailed` as a 409, and `TransactionCanceled` as a
-    409 when any cancellation reason is a failed condition and a 500 otherwise. Opt in, and
-    needs no extra: the types live in `webbpulse.dynamodb` and importing them pulls in no
-    botocore. Pair it with `install_dynamodb_handlers` when raw `ClientError` can also escape.
+    `ItemNotFound` renders as a 404, `ConditionFailed` as a 409, `UnprocessedItems` as a 503
+    with `Retry-After`, and `TransactionCanceled` as a 409 when any cancellation reason is a
+    failed condition and a 500 otherwise. Opt in, and needs no extra: the types live in
+    `webbpulse.dynamodb` and importing them pulls in no botocore. Pair it with
+    `install_dynamodb_handlers` when raw `ClientError` can also escape.
 
-    The three message arguments pin a consumer's own wording; each one left `None` keeps the
+    The four message arguments pin a consumer's own wording; each one left `None` keeps the
     package default.
     """
-    from webbpulse.dynamodb import ConditionFailed, ItemNotFound, TransactionCanceled
+    from webbpulse.dynamodb import ConditionFailed, ItemNotFound, TransactionCanceled, UnprocessedItems
 
     renderer = resolve_error_envelope(error_envelope)
     if renderer is _render_detailed:
@@ -1014,6 +1019,7 @@ def install_dynamodb_error_handlers(
     not_found = not_found_message or DYNAMODB_ERROR_MESSAGES["not_found"]
     conflict = conflict_message or DYNAMODB_ERROR_MESSAGES["conflict"]
     internal = internal_error_message or DYNAMODB_ERROR_MESSAGES["internal"]
+    unprocessed = unprocessed_message or DYNAMODB_ERROR_MESSAGES["unprocessed"]
 
     def _body(status_code: int, message: str, request: Request, exc: BaseException) -> Any:
         """Render one repository failure through the configured envelope."""
@@ -1049,6 +1055,22 @@ def install_dynamodb_error_handlers(
         """Render a rejected conditional write as a 409, leaving the condition in the log."""
         _log.warning("DynamoDB condition failed.", extra=_log_extra(request, exc))
         return JSONResponse(status_code=409, content=_body(409, conflict, request, exc))
+
+    @app.exception_handler(UnprocessedItems)
+    async def _unprocessed_items(request: Request, exc: UnprocessedItems) -> JSONResponse:
+        """Render an exhausted batch as a 503 with `Retry-After`, the way throttling renders.
+
+        A batch that still had keys or items outstanding after the retry cap is DynamoDB
+        shedding load, which is transient and retryable. A 500 would tell the caller not to
+        bother retrying and would page someone for capacity working as designed.
+        """
+        extra = {**_log_extra(request, exc), "unprocessed_count": exc.count, "attempts": exc.attempts}
+        _log.warning("DynamoDB left a batch unprocessed.", extra=extra)
+        return JSONResponse(
+            status_code=503,
+            content=_body(503, unprocessed, request, exc),
+            headers={"Retry-After": str(DYNAMODB_RETRY_AFTER_SECONDS)},
+        )
 
     @app.exception_handler(TransactionCanceled)
     async def _transaction_canceled(request: Request, exc: TransactionCanceled) -> JSONResponse:
