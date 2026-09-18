@@ -1,8 +1,8 @@
 """Tests for the producing half of `webbpulse.events`.
 
 Covers the envelope's wire shape and its round trip, what `enqueue` sends on a standard
-queue against a FIFO one, and `deserialize_image` over the attribute-value shapes a
-DynamoDB Streams record actually carries.
+queue against a FIFO one, `deserialize_image` over the attribute-value shapes a DynamoDB
+Streams record actually carries, and `source_table` over the ARNs it carries them under.
 """
 
 from __future__ import annotations
@@ -19,6 +19,7 @@ from webbpulse.events import (
     EventEnvelope,
     deserialize_image,
     enqueue,
+    source_table,
 )
 from webbpulse.testing import FakeQueue
 
@@ -242,3 +243,67 @@ def test_the_old_image_is_selectable() -> None:
 def test_a_missing_image_is_an_empty_mapping_not_an_error(record: Any) -> None:
     """A `REMOVE` asked for its `NewImage` is a shape, not a failure."""
     assert deserialize_image(record) == {}
+
+
+VIEWS_STREAM_ARN = (
+    "arn:aws:dynamodb:us-west-2:432410731887:table/webbpulse-staging-views/stream/2026-09-17T00:00:00.000"
+)
+
+ISSUES_STREAM_ARN = (
+    "arn:aws:dynamodb:us-west-2:432410731887:table/webbpulse-staging-issues/stream/2026-09-17T00:00:00.000"
+)
+
+
+def test_the_table_name_comes_off_the_stream_arn() -> None:
+    """The segment after `table/` is the name, and the stream label after it is not part of it."""
+    assert source_table({"eventSourceARN": VIEWS_STREAM_ARN}) == "webbpulse-staging-views"
+
+
+def test_two_streams_on_one_route_are_told_apart() -> None:
+    """The reason the helper exists: one consumer behind two streams discriminates on this."""
+    records = [{"eventSourceARN": VIEWS_STREAM_ARN}, {"eventSourceARN": ISSUES_STREAM_ARN}]
+
+    assert [source_table(record) for record in records] == [
+        "webbpulse-staging-views",
+        "webbpulse-staging-issues",
+    ]
+
+
+def test_the_name_comes_back_prefixed_as_the_stream_carries_it() -> None:
+    """The physical table name, so a consumer matches it against `table_name(...)` and not a logical one."""
+    assert source_table({"eventSourceARN": VIEWS_STREAM_ARN}).startswith("webbpulse-staging-")
+
+
+def test_a_record_with_no_source_arn_is_refused() -> None:
+    """A record that names no table cannot be routed, and guessing one would route it wrongly."""
+    with pytest.raises(ValueError, match="no eventSourceARN"):
+        source_table({"eventName": "INSERT"})
+
+
+@pytest.mark.parametrize(
+    "arn",
+    [
+        "arn:aws:sqs:us-west-2:432410731887:events",
+        "arn:aws:dynamodb:us-west-2:432410731887:stream/2026-09-17T00:00:00.000",
+        "webbpulse-staging-views",
+        "table/webbpulse-staging-views",
+        "",
+    ],
+)
+def test_anything_that_is_not_a_dynamodb_stream_arn_is_refused(arn: str) -> None:
+    """An SQS ARN, a truncated one and a bare name each raise rather than yielding a guess."""
+    with pytest.raises(ValueError):
+        source_table({"eventSourceARN": arn})
+
+
+@pytest.mark.parametrize("value", [None, 123, ["arn"]])
+def test_a_non_string_source_arn_is_refused(value: Any) -> None:
+    """A malformed record raises rather than being parsed as whatever it happens to be."""
+    with pytest.raises(ValueError, match="no eventSourceARN"):
+        source_table({"eventSourceARN": value})
+
+
+def test_an_arn_naming_an_empty_table_is_refused() -> None:
+    """`table//stream/...` names nothing, so it is a failure rather than an empty string."""
+    with pytest.raises(ValueError, match="empty table"):
+        source_table({"eventSourceARN": "arn:aws:dynamodb:us-west-2:432410731887:table//stream/2026"})

@@ -630,6 +630,56 @@ class Repository:
             return_values=return_values,
         )
 
+    def remove_attributes(
+        self,
+        key: Key,
+        names: Sequence[str],
+        *,
+        condition: Any | None = None,
+        return_values: str = "ALL_NEW",
+    ) -> Item | None:
+        """`REMOVE` each of `names` from one item, aliasing every name.
+
+        The counterpart to `set_attributes`, and the update a sparse global secondary index
+        needs. DynamoDB indexes only the items that carry the index's key attribute, so an
+        item leaves a sparse index by having that attribute deleted and not by having it set
+        to null or to an empty string, either of which keeps the item in the index and keeps
+        it in every query that reads it. Writing a marker where a `REMOVE` belongs is the
+        mistake this exists to stop: an "unread" index that a read never empties.
+
+        Aliasing follows `set_attributes` for the same reason, in its own `#rm{index}`
+        namespace, so a conditional removal cannot collide with the `#n{index}` placeholders
+        boto3 mints while rendering an `Attr` condition.
+
+        Removing an attribute the item does not have is not an error, since `REMOVE` on an
+        absent attribute is a no-op to DynamoDB, which makes the call idempotent and a second
+        delivery of the same message harmless.
+
+        Args:
+            key: The item's full primary key.
+            names: The attribute names to remove. An empty sequence is a no-op returning
+                `None`, since DynamoDB rejects an empty `UpdateExpression`. A name repeated
+                is sent once, because DynamoDB refuses an expression naming one path twice.
+            condition: An optional condition guarding the write.
+            return_values: DynamoDB's `ReturnValues`, defaulting to `ALL_NEW` so the caller
+                sees what the item now holds rather than issuing a second read.
+
+        Raises:
+            ConditionFailed: When a `condition` was given and did not hold.
+        """
+        wanted = list(dict.fromkeys(names))
+        if not wanted:
+            return None
+        aliases = {f"#rm{index}": name for index, name in enumerate(wanted)}
+        removals = ", ".join(f"#rm{index}" for index in range(len(wanted)))
+        return self.update(
+            key,
+            update_expression=f"REMOVE {removals}",
+            expression_names=aliases,
+            condition=condition,
+            return_values=return_values,
+        )
+
     def increment(self, key: Key, attribute: str, by: int = 1) -> int:
         """Atomically add `by` to a numeric attribute and return what it now holds.
 

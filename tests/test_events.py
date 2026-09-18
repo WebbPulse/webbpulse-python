@@ -12,6 +12,7 @@ from typing import TYPE_CHECKING, Any
 import pytest
 
 from webbpulse.events import (
+    APP_EVENTS_PATH_ENV,
     DEFAULT_EVENTS_PATH,
     EVENTS_PATH_ENV,
     LWA_PASS_THROUGH_PATH_ENV,
@@ -57,14 +58,41 @@ def _remove(event_id: str, user_id: str) -> dict[str, Any]:
 
 
 def test_the_path_prefers_the_explicit_variable(monkeypatch: pytest.MonkeyPatch) -> None:
-    """`IDENTITY_EVENTS_PATH` wins, then the adapter's own, then `/events`."""
+    """`IDENTITY_EVENTS_PATH` wins, then `APP_EVENTS_PATH`, then the adapter's own, then `/events`."""
     assert events_path() == DEFAULT_EVENTS_PATH
 
     monkeypatch.setenv(LWA_PASS_THROUGH_PATH_ENV, "/stream")
     assert events_path() == "/stream"
 
+    monkeypatch.setenv(APP_EVENTS_PATH_ENV, "/app-events")
+    assert events_path() == "/app-events"
+
     monkeypatch.setenv(EVENTS_PATH_ENV, "purge/")
     assert events_path() == "/purge"
+
+
+def test_the_platform_modules_application_variable_is_read(monkeypatch: pytest.MonkeyPatch) -> None:
+    """`APP_EVENTS_PATH` is the half of the pair the application is meant to read.
+
+    The `lambda-function` module emits one `events_path` input as both
+    `AWS_LWA_PASS_THROUGH_PATH`, for the adapter, and `APP_EVENTS_PATH`, for the application,
+    so the two cannot drift. Reading only the adapter's variable left the application half of
+    that promise unkept and the route mounted at the default while the adapter posted
+    elsewhere.
+    """
+    monkeypatch.setenv(APP_EVENTS_PATH_ENV, "consume/")
+
+    assert events_path() == "/consume"
+
+
+def test_the_route_mounts_at_the_application_variable(monkeypatch: pytest.MonkeyPatch) -> None:
+    """End to end: a function wired by the module serves where the adapter posts."""
+    monkeypatch.setenv(APP_EVENTS_PATH_ENV, "/events-app")
+    app = stream_consumer_app(lambda record: None, title="Views consumer")
+
+    with TestClient(app) as client:
+        assert client.post("/events-app", json=_stream_event()).status_code == 200
+        assert client.post(DEFAULT_EVENTS_PATH, json=_stream_event()).status_code == 404
 
 
 def test_the_route_mounts_at_the_resolved_path(monkeypatch: pytest.MonkeyPatch) -> None:

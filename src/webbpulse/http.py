@@ -6,7 +6,8 @@ sync dependency, whose context Starlette's threadpool discards.
 
 `verify_hmac_signature` is the receiving half of a signed webhook and `CursorPage` with
 `encode_cursor` and `decode_cursor` is the paginated response shape, which carries a
-data-layer cursor across the wire without this module knowing what is in it.
+data-layer cursor across the wire without this module knowing what is in it. `cursor_page`
+builds the same page under an API's own plural key.
 """
 
 from __future__ import annotations
@@ -28,7 +29,7 @@ from fastapi import APIRouter, Depends, FastAPI, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field, create_model
 from starlette.exceptions import HTTPException as StarletteHTTPException
 from starlette.middleware.base import BaseHTTPMiddleware, RequestResponseEndpoint
 from starlette.responses import Response
@@ -67,6 +68,7 @@ __all__ = [
     "bind_user_id",
     "client_ip",
     "create_app",
+    "cursor_page",
     "decode_cursor",
     "detailed_error_body",
     "encode_cursor",
@@ -1370,7 +1372,13 @@ class CursorPage[ItemT](BaseModel):
     it takes the items and the `last_evaluated_key` as arguments, so `http` stays usable in a
     service with no `dynamodb` extra installed and the data layer keeps knowing nothing about
     the wire.
+
+    The items render under `items`. An API whose list bodies each name their own plural key
+    builds its model with `cursor_page` instead, which aliases that one field and changes
+    nothing else.
     """
+
+    model_config = ConfigDict(populate_by_name=True, serialize_by_alias=True)
 
     items: list[ItemT]
     next_cursor: str | None = None
@@ -1397,3 +1405,88 @@ class CursorPage[ItemT](BaseModel):
             items=list(items),
             next_cursor=encode_cursor(dict(last_evaluated_key), key) if last_evaluated_key else None,
         )
+
+
+_CURSOR_PAGE_MODELS: dict[tuple[type, str, str], type[CursorPage[Any]]] = {}
+"""Every model `cursor_page` has built, so the same request returns the same class.
+
+FastAPI names an OpenAPI schema after the model class, and two distinct classes with one
+name are emitted as `IssuesPage` and `IssuesPage1`, which a generated client then exposes as
+two unrelated types for one response body.
+"""
+
+
+def cursor_page[ItemT](
+    item_type: type[ItemT],
+    items_key: str,
+    *,
+    model_name: str | None = None,
+) -> type[CursorPage[ItemT]]:
+    """A `CursorPage` whose items render under `items_key` rather than under `items`.
+
+    For an API whose list bodies each name what they hold, `{"issues": [...]}` rather than
+    `{"items": [...]}`, which is a house style a product otherwise keeps by hand-rolling the
+    envelope and losing `from_page`, `has_more` and the cursor along with it:
+
+    ```python
+    IssuesPage = cursor_page(IssueOut, "issues")
+
+
+    @router.get("")
+    async def list_issues(cursor: str | None = None) -> IssuesPage:
+        start = decode_cursor(cursor, settings.cursor_key) if cursor else None
+        page = repositories().issues.query(workspace_id, start_key=start)
+        return IssuesPage.from_page(
+            [IssueOut.model_validate(item) for item in page.items],
+            page.last_evaluated_key,
+            settings.cursor_key,
+        )
+    ```
+
+    The result is a real subclass of `CursorPage[ItemT]`, so `from_page`, `has_more` and
+    `next_cursor` are the ones documented above and nothing is reimplemented. Only the wire
+    name moves: the field is still `items` in Python, so `page.items` reads the same whichever
+    model a route returns, and a helper written against `CursorPage` keeps working.
+
+    This is an alias rather than a renamed field, which is what keeps `items` working for
+    every existing caller. `populate_by_name` is on, so the model is constructible by either
+    name, and `serialize_by_alias` makes a response render under the plural key without a
+    route remembering `by_alias=True`. FastAPI reads the alias for the OpenAPI document too,
+    so the schema shows `issues` and the generated client matches what the route actually
+    sends.
+
+    Models are cached per `(item_type, items_key, model_name)`, so a module-level
+    `IssuesPage = cursor_page(IssueOut, "issues")` and the same call inside a route return
+    one class. That matters for FastAPI: two structurally identical models with one name
+    collide in the OpenAPI document and are emitted as `IssuesPage` and `IssuesPage1`.
+
+    Args:
+        item_type: The item model, which is what `CursorPage[ItemT]` is parameterised with.
+        items_key: The wire name for the items, such as `"issues"` or `"comments"`.
+        model_name: The generated class's name, and so its OpenAPI schema name. Defaults to
+            the item type's name plus `Page`, `IssueOutPage`, which stays unique across two
+            pages of different types sharing a plural key.
+
+    Raises:
+        ValueError: When `items_key` is empty or is `next_cursor`, which would collide with
+            the cursor field and render one of the two unreachable.
+    """
+    key = items_key.strip()
+    if not key:
+        raise ValueError("cursor_page needs an items key; an empty one would render no field name.")
+    if key == "next_cursor":
+        raise ValueError("cursor_page cannot render items under 'next_cursor'; it is already the cursor field.")
+
+    name = model_name if model_name is not None else f"{item_type.__name__}Page"
+    cache_key = (item_type, key, name)
+    cached = _CURSOR_PAGE_MODELS.get(cache_key)
+    if cached is not None:
+        return cached
+
+    model = create_model(
+        name,
+        __base__=CursorPage[item_type],  # type: ignore[valid-type]
+        items=(list[item_type], Field(alias=key)),  # type: ignore[valid-type]
+    )
+    _CURSOR_PAGE_MODELS[cache_key] = model
+    return model
