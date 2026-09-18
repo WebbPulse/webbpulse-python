@@ -79,3 +79,74 @@ app = stream_consumer_app(handle, title="Users delete consumer", per_record=Fals
 
 `batch_item_failures(["evt-2"])` builds that envelope, and `event_records(event)` and
 `record_id(record)` are the two readers a batch handler needs.
+
+## Producing an event
+
+`EventEnvelope` is the shape a domain event is published in, and `enqueue` puts one on an
+SQS queue. A consumer reads `name` and `version` to decide whether it was written for this
+payload, and `scope` names the workspace or tenant the event belongs to.
+
+```python
+from webbpulse.events import EventEnvelope, enqueue
+
+enqueue(
+    settings.events_queue_url,
+    EventEnvelope(name="post.created", version=1, scope=workspace_id, payload={"post_id": post.id}),
+)
+```
+
+`occurred_at` defaults to now in UTC and `event_id` to a fresh uuid4, so a producer that
+supplies neither still emits a deduplicable, ordered event. The body is compact JSON with
+sorted keys, which is what makes it reproducible enough to sign or to take a dedup id over.
+An event with no `scope` omits the field rather than sending null, so a consumer's
+`"scope" in body` reads as "this event names a tenant".
+
+On a FIFO queue, which is a `queue_url` ending in `.fifo`, `group_id` defaults to the
+envelope's `scope` and `dedup_id` to its `event_id`, so one tenant's events stay ordered
+among themselves and a retried send of the same envelope is deduplicated. Neither is sent on
+a standard queue, which rejects them outright. Pass `group_id=` or `dedup_id=` to override,
+`delay_seconds=` for a delayed send, and `attributes=` for string message attributes.
+
+`enqueue` builds its SQS client on first use, so importing the module needs no boto3 and no
+credentials, and `client=` takes one you already hold. It does not swallow an SQS failure:
+the producer decides what an unsent event means.
+
+## Reading a stream record
+
+```python
+from webbpulse.events import deserialize_image
+
+
+def handle(record):
+    """Reindex the row that changed."""
+    item = deserialize_image(record)
+    search.index(item["id"], item["title"])
+```
+
+A stream record carries its item in DynamoDB's attribute-value shape,
+`{"id": {"S": "u-1"}}`, which every consumer otherwise unwraps by hand. `deserialize_image`
+runs botocore's own `TypeDeserializer` over it, so numbers come back as `Decimal` and sets as
+`set`, exactly as a boto3 resource read of the same item would. Pass `"OldImage"` for the row
+as it was before, which is what a `REMOVE` handler wants. A record with no such image is an
+empty mapping rather than an error, since that is a shape and not a failure.
+
+## Testing a producer
+
+`webbpulse.testing.FakeQueue` satisfies the `QueueClient` protocol structurally, so a
+producer test needs no moto.
+
+```python
+from webbpulse.testing import FakeQueue
+
+
+def test_publishing_a_post_enqueues_the_event():
+    queue = FakeQueue()
+
+    publish(post, client=queue)
+
+    assert queue.last_body["name"] == "post.created"
+    assert queue.requests[0]["MessageGroupId"] == "ws-1"
+```
+
+`requests` holds every send whole, `bodies` parses them, and `FakeQueue(failing=2)` makes
+the next two sends raise, which is how a test exercises a producer's own error handling.

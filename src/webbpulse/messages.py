@@ -4,16 +4,22 @@ Copy only. The envelope, `ErrorSpec` and the exception map stay in `webbpulse.ht
 reads `STATUS_MESSAGES` from here for its per-status defaults. A product keeps its own
 response shape and takes the sentence inside `detail` from these helpers, so three wordings
 for 403 and four for 429 across the org collapse to one each.
+
+`extract_mentions` is the other user-facing text concern that had a copy per product: who a
+comment or a post body addresses.
 """
 
 from __future__ import annotations
 
+import re
 from typing import Final
 
 __all__ = [
     "DEFAULT_MESSAGE",
+    "MENTION_PATTERN",
     "STATUS_MESSAGES",
     "conflict",
+    "extract_mentions",
     "forbidden",
     "not_found",
     "rate_limited",
@@ -123,3 +129,47 @@ def rate_limited(*, retry_after: int | None = None, scope: str | None = None) ->
     if retry_after == 1:
         return f"{subject} Try again in 1 second."
     return f"{subject} Try again in {retry_after} seconds."
+
+
+MENTION_PATTERN: Final = re.compile(r"(?<![\w@/])@([A-Za-z0-9][A-Za-z0-9_-]{0,38})\b")
+"""One `@handle`: a letter or digit, then up to 38 more with underscores and hyphens.
+
+The lookbehind is what stops an email address, a path segment and a `@@` from reading as a
+mention, since none of those addresses anybody.
+"""
+
+_CODE_SPAN_OR_BLOCK: Final = re.compile(
+    r"(?P<fence>^[ \t]*(?P<ticks>`{3,}|~{3,})[^\n]*\n.*?(?:^[ \t]*(?P=ticks)[^\n]*$|\Z))"
+    r"|(?P<indented>(?:^(?: {4}|\t)[^\n]*$\n?)+)"
+    r"|(?P<span>(?P<open>`+)(?:(?!(?P=open)).)*?(?P=open))",
+    re.DOTALL | re.MULTILINE,
+)
+"""A fenced block, an indented block, or an inline code span, whichever comes first."""
+
+
+def extract_mentions(markdown: str) -> list[str]:
+    """The `@handle` mentions in `markdown`, in order, without repeats and without the `@`.
+
+    Code is not prose: a fenced block, an indented block and an inline span are all blanked
+    before the scan, so a decorator in a Python sample or an `@media` rule in a CSS one does
+    not notify anybody. Comparison is case insensitive, and the first spelling of a handle is
+    the one returned, so `@Ada` then `@ada` is one mention rendered as the author wrote it.
+    """
+    if not markdown or "@" not in markdown:
+        return []
+
+    prose = _CODE_SPAN_OR_BLOCK.sub(_blank, markdown)
+    seen: set[str] = set()
+    mentions: list[str] = []
+    for match in MENTION_PATTERN.finditer(prose):
+        handle = match.group(1)
+        folded = handle.casefold()
+        if folded not in seen:
+            seen.add(folded)
+            mentions.append(handle)
+    return mentions
+
+
+def _blank(match: re.Match[str]) -> str:
+    """Replace a code run with its own newlines, so line structure survives the scan."""
+    return "\n" * match.group(0).count("\n")
