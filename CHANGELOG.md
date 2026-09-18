@@ -5,6 +5,76 @@ Notable changes to the `webbpulse` package. The version here is the one in
 
 This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## 0.41.0
+
+Five feature sets landed together: DynamoDB counters and idempotency, S3 presigned uploads,
+API keys with scope enforcement, the producing side of events with signed webhooks, and an
+OAuth 2.1 authorization server for remote MCP servers.
+
+`Repository.increment(key, attribute, by=1)` allocates from a DynamoDB counter in a single
+`ADD` update and returns the new value, creating the item if absent, for gap-tolerant issue
+key sequences. `new_ulid()` mints a lexicographically time-sortable ULID with no new runtime
+dependency. `IdempotencyStore.claim(key, ttl_seconds)` wins or loses a one-shot claim through
+a conditional put with a TTL, so a redelivered message does the work once, with
+`FakeIdempotencyStore` in `webbpulse.testing`. `UnprocessedItems` now renders as a 503 with
+`Retry-After` through `install_dynamodb_error_handlers`, configurable with
+`unprocessed_message`, instead of an opaque 500. The new `webbpulse.storage` module adds
+`presigned_put`, signing a bounded S3 PUT whose content type and content length are inside the
+signature, with `FakePresigner` alongside it.
+
+Added `webbpulse.identity.api_keys` and `webbpulse.identity.scopes`. API keys are minted once
+and stored only as a SHA-256 hash with a display prefix, verified through an `ApiKeyStore` with
+DynamoDB and in-memory implementations, and revoked by plaintext or hash. A verified key adapts
+to the same `AuthorizerClaims` the gateway produces, so one authorization path serves both
+callers. `effective_scopes` intersects a key's stored ceiling with its minter's live membership,
+keeping a key from outliving the role it was minted under. `claims_or_api_key` accepts either
+credential and fails closed, and `require_scopes` refuses a caller missing any named scope with
+a 403 in the package's error envelope. The `api-keys` table joins `TABLES` for the platform
+identity module to provision.
+
+`webbpulse.events` gains the producing side: `EventEnvelope` is the shape a domain event is
+published in, `enqueue` puts one on an SQS queue, defaulting the FIFO group to the envelope's
+scope and the deduplication id to its event id, and `deserialize_image` reads a DynamoDB Streams
+record image back into plain Python values through botocore's own `TypeDeserializer`. The new
+`webbpulse.events.webhooks` dispatches outbound signed webhooks: HMAC-SHA256 over the timestamp
+and the body together under `X-Webhook-Signature` and `X-Webhook-Timestamp`, a replay window, a
+bounded retry policy with jittered exponential backoff that retries transport failures and the
+not-now statuses but never a permanent 4xx, and a dead-letter hook called once when every attempt
+has failed. `webbpulse.http` gains `verify_hmac_signature`, the receiving half of that scheme and
+of GitHub's `X-Hub-Signature-256`, which compares in constant time and raises `SignatureMismatch`
+rather than returning a boolean a caller can forget to check, plus `CursorPage` with
+`encode_cursor` and `decode_cursor` for opaque, tamper-evident pagination cursors that bridge
+`dynamodb.Page` without `http` importing `dynamodb`. `webbpulse.messages.extract_mentions` returns
+the ordered unique `@handle` mentions in a Markdown body, ignoring code spans and code blocks.
+`webbpulse.testing` gains `FakeQueue` and `FakeWebhookSender`. `events` is a package now so
+`events.webhooks` sits beside the consumer route it complements, and its public surface is
+unchanged.
+
+Added an OAuth 2.1 authorization server for hosting a remote MCP server, in
+`webbpulse.identity.oauth_server`, mounted by `build_identity_router` behind `mcp_oauth_enabled`
+and off by default. It implements the MCP authorization spec (2025-06-18) over RFC 8414, 9728,
+7591, 7636, 8707 and 7009: authorization server and protected resource metadata, an authorization
+code grant with PKCE S256 required and an RFC 8707 `resource` bound into the token audience, a
+consent step that binds the token to one tenant, dynamic client registration for public clients,
+and revocation. Tokens are the same RS256 access tokens `TokenService` already mints, so an
+existing API Gateway JWT authorizer and `coerce_claims` handle them unchanged. Turning the flag on
+also extends the OIDC discovery document with `authorization_endpoint`, `token_endpoint`,
+`registration_endpoint`, `code_challenge_methods_supported`, `scopes_supported` and
+`response_types_supported`. New stores `OAuthClientStore`, `AuthorizationCodeStore` and
+`ConsentStore` ship with DynamoDB and in-memory implementations and a separate
+`OAUTH_SERVER_TABLES`, so a product that leaves the flag off provisions nothing extra.
+
+The claims dependencies answer again. `identity.claims` imported `Request` only under
+`TYPE_CHECKING`, so under postponed annotations FastAPI could not resolve `request: Request` on
+the dependencies `subject_dependency` and `authorizer_claims` build, read the parameter as a query
+field, and every route depending on either answered 422 before the dependency ran. Both now bind
+`fastapi.Request` into the module globals through `_bind_fastapi_request`, as `router` and the
+other route modules do, and are covered by requests through a test client rather than by direct
+calls alone.
+
+The only dependency change is dev-time: `boto3-stubs` gains the `s3` extra for mypy. There is no
+new runtime dependency, `webbpulse.storage` using the boto3 already in the `dynamodb` extra.
+
 ## 0.40.0
 
 TOTP seeds can be sealed under a master key from the app secret instead of a KMS key.
