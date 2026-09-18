@@ -1,8 +1,10 @@
-"""Presigned S3 uploads, so a browser sends a file to S3 and never through a Lambda.
+"""Presigned S3 uploads and downloads, so a browser moves a file to and from S3 and never
+through a Lambda.
 
 `presigned_put` mints a URL the client PUTs to directly, bounded by a content type and a
-content length the signature itself covers. Nothing opens a connection at import. Needs the
-`dynamodb` extra, which is where boto3 lives.
+content length the signature itself covers. `presigned_get` mints the reading half, a URL
+that authorises one object for a bounded window with optional response headers signed in.
+Nothing opens a connection at import. Needs the `dynamodb` extra, which is where boto3 lives.
 """
 
 from __future__ import annotations
@@ -17,8 +19,10 @@ if TYPE_CHECKING:  # pragma: no cover
 __all__ = [
     "DEFAULT_EXPIRES_IN",
     "MAX_EXPIRES_IN",
+    "PresignedDownload",
     "PresignedUpload",
     "S3Presigner",
+    "presigned_get",
     "presigned_put",
     "reset_client_cache",
 ]
@@ -31,7 +35,7 @@ MAX_EXPIRES_IN: Final = 604_800
 
 
 class S3Presigner(Protocol):
-    """The one S3 call `presigned_put` makes, typed structurally.
+    """The one S3 call the presigners make, typed structurally.
 
     The signature is boto3's, so a real client satisfies it with no adapter and a test can
     pass a one-method fake.
@@ -62,6 +66,21 @@ class PresignedUpload:
     bucket: str
     key: str
     max_bytes: int
+    expires_in: int
+
+
+@dataclass(frozen=True, slots=True)
+class PresignedDownload:
+    """A presigned GET and what it authorises.
+
+    The URL carries its own authorisation, so anyone holding it reads the object until it
+    expires. Treat it as a bearer credential for one key: hand it to the client that asked,
+    keep `expires_in` short, and never log it or store it beside the record it belongs to.
+    """
+
+    url: str
+    bucket: str
+    key: str
     expires_in: int
 
 
@@ -157,3 +176,70 @@ def presigned_put(
         max_bytes=max_bytes,
         expires_in=expires_in,
     )
+
+
+def presigned_get(
+    bucket: str,
+    key: str,
+    expires_in: int = DEFAULT_EXPIRES_IN,
+    *,
+    response_content_type: str | None = None,
+    response_content_disposition: str | None = None,
+    client: S3Presigner | None = None,
+    region_name: str | None = None,
+    endpoint_url: str | None = None,
+) -> PresignedDownload:
+    """Mint a presigned `GET` for one object, valid for a bounded window.
+
+    This is the reading half of `presigned_put`: a private bucket stays private and a browser
+    still fetches the object directly, so the bytes never pass through a Lambda that would
+    buffer them and pay for the time. The URL authorises exactly one key and nothing else, and
+    it is a bearer credential until it expires, so the window is the whole guard.
+
+    The optional response headers are signed in the same way the upload's bounds are, as
+    `ResponseContentType` and `ResponseContentDisposition`. S3 then returns them with the
+    object, which is how a stored key serves under a human filename or is forced to download
+    rather than render inline. Because they are inside the signature, a holder of the URL
+    cannot change them to have S3 serve the same bytes under a different type.
+
+    Args:
+        bucket: The source bucket.
+        key: The object key the URL authorises, and only that key.
+        expires_in: Seconds the URL stays valid, at most `MAX_EXPIRES_IN`.
+        response_content_type: A `Content-Type` S3 returns with the object, signed in.
+        response_content_disposition: A `Content-Disposition` S3 returns with the object,
+            signed in, for a download filename or an attachment.
+        client: An S3 client or a fake. Defaults to one cached per region and endpoint.
+        region_name: Region for the default client.
+        endpoint_url: Endpoint for the default client, for a local S3 stand-in.
+
+    Raises:
+        ValueError: When `bucket` or `key` is empty, when either response header is given as
+            an empty string, or when `expires_in` is outside 1 to `MAX_EXPIRES_IN`. Each would
+            mint a URL that S3 rejects or that names nothing, so it is refused before signing.
+    """
+    if not bucket:
+        raise ValueError("presigned_get needs a bucket name.")
+    if not key:
+        raise ValueError("presigned_get needs an object key.")
+    if response_content_type is not None and not response_content_type:
+        raise ValueError("response_content_type was given as empty; omit it instead.")
+    if response_content_disposition is not None and not response_content_disposition:
+        raise ValueError("response_content_disposition was given as empty; omit it instead.")
+    if not 1 <= expires_in <= MAX_EXPIRES_IN:
+        raise ValueError(f"expires_in must be between 1 and {MAX_EXPIRES_IN} seconds, got {expires_in}.")
+
+    params: dict[str, Any] = {"Bucket": bucket, "Key": key}
+    if response_content_type is not None:
+        params["ResponseContentType"] = response_content_type
+    if response_content_disposition is not None:
+        params["ResponseContentDisposition"] = response_content_disposition
+
+    presigner = client if client is not None else _client(region_name, endpoint_url)
+    url = presigner.generate_presigned_url(
+        ClientMethod="get_object",
+        Params=params,
+        ExpiresIn=expires_in,
+        HttpMethod="GET",
+    )
+    return PresignedDownload(url=url, bucket=bucket, key=key, expires_in=expires_in)

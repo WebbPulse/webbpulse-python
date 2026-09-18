@@ -257,6 +257,28 @@ region and endpoint with `s3v4` pinned, since a URL signed with v2 is rejected o
 newer regions. `webbpulse.testing.FakePresigner` records what it was asked to sign, which is
 the assertion worth making.
 
+`presigned_get` is the reading half, so a private bucket stays private and a browser still
+fetches the object directly:
+
+```python
+from webbpulse.storage import presigned_get
+
+download = presigned_get(
+    bucket=settings.uploads_bucket,
+    key=f"avatars/{user_id}.png",
+    response_content_disposition='attachment; filename="avatar.png"',
+)
+return {"url": download.url}
+```
+
+`response_content_type` and `response_content_disposition` are optional and go into the
+signature as `ResponseContentType` and `ResponseContentDisposition`, so S3 returns them with
+the object and a holder of the URL cannot change them. Omit one and S3 serves the stored
+metadata; passing either as an empty string is a `ValueError`, as are an empty bucket or key
+and an `expires_in` outside 1 to `MAX_EXPIRES_IN`. `PresignedDownload` is frozen and carries
+`url`, `bucket`, `key` and `expires_in`. The URL is a bearer credential for that one key until
+it expires, so keep the window short and keep it out of logs.
+
 Needs the `dynamodb` extra, which is where boto3 already lives.
 
 ## `webbpulse.security` application secrets
