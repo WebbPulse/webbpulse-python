@@ -426,6 +426,7 @@ from webbpulse.identity.tokens import (
 )
 from webbpulse.identity.users import (
     EMAIL_INDEX,
+    USERS_TABLE_SPEC,
     DynamoUsersRepository,
     User,
     new_user_id,
@@ -584,6 +585,7 @@ __all__ = [
     "UNAUTHENTICATED_ERROR_CODE",
     "USERS_KEY_ATTRIBUTE_ENV",
     "USERS_TABLE",
+    "USERS_TABLE_SPEC",
     "VERIFY_CONFIRM_PATH",
     "VERIFY_EMAIL_LIMIT",
     "VERIFY_IP_LIMIT",

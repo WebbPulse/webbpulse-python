@@ -17,7 +17,7 @@ from typing import TYPE_CHECKING, Any, Final, cast
 
 from pydantic import BaseModel, Field
 
-from webbpulse.identity.storage import USERS_TABLE
+from webbpulse.identity.storage import USERS_TABLE, TableAttribute, TableIndex, TableSpec
 
 if TYPE_CHECKING:  # pragma: no cover
     from collections.abc import Mapping, Sequence
@@ -252,28 +252,11 @@ def users_repository(
     )
 
 
-def _users_table_spec() -> Any:
-    """The `TableSpec` for the users table, built lazily to keep the import graph one way."""
-    from webbpulse.identity.storage import TableAttribute, TableIndex, TableSpec
-
-    return TableSpec(
-        logical_name=USERS_TABLE,
-        attributes=(TableAttribute("id", "S"), TableAttribute("email_lower", "S")),
-        hash_key="id",
-        global_secondary_indexes=(TableIndex(name=EMAIL_INDEX, hash_key="email_lower"),),
-    )
-
-
-def __getattr__(name: str) -> Any:
-    """Resolve `USERS_TABLE_SPEC` on first access, so the storage import stays lazy."""
-    if name == "USERS_TABLE_SPEC":
-        spec = _users_table_spec()
-        globals()["USERS_TABLE_SPEC"] = spec
-        return spec
-    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
-
-
-if TYPE_CHECKING:  # pragma: no cover
-    from webbpulse.identity.storage import TableSpec
-
-    USERS_TABLE_SPEC: TableSpec
+USERS_TABLE_SPEC: Final = TableSpec(
+    logical_name=USERS_TABLE,
+    attributes=(TableAttribute("id", "S"), TableAttribute("email_lower", "S")),
+    hash_key="id",
+    global_secondary_indexes=(TableIndex(name=EMAIL_INDEX, hash_key="email_lower"),),
+)
+"""The `users` table as `create_identity_tables` creates it: keyed by `id`, indexed by
+`email_lower`, no TTL."""
