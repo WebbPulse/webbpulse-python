@@ -76,7 +76,8 @@ the `tables` default in `platform-modules/aws//modules/identity` exactly. Each c
 environment's prefix, and `time_to_live_request(prefix)`, which is `None` for a table with
 no TTL. Billing is always `PAY_PER_REQUEST`. A local bootstrap walks it rather than
 hand-writing the shapes per repo, so a key schema cannot drift from what Terraform
-provisions; `users` is not among them, because it belongs to the product's own domain.
+provisions; `users` is not among them, because it belongs to the product's own domain,
+though `create_identity_tables` in section 4.5 creates it alongside them by default.
 `tests/test_identity_tables.py` pins every name, key, index and TTL against a literal copy
 of the module.
 
@@ -129,3 +130,163 @@ Recovery codes are **hashed, not encrypted** (`hash_recovery_code`). They are hi
 (`RECOVERY_CODE_BYTES` = 12, `RECOVERY_CODE_COUNT` = 10 per set), so SHA-256 with a
 constant-time comparison replaces bcrypt, and codes are **single use**.
 `normalise_recovery_code` canonicalises input before hashing.
+
+### 4.5 Mounting it: the shared DynamoDB glue
+
+Three products were hand-writing the same four things to put this data model behind the
+router: a `package_glue.py` assembling nine stores, a users repository, an `IdentityHooks`
+implementation, and a create-tables loop. All four are in the package now, so a product
+supplies its `claims_for` override and its table prefix and nothing else.
+
+```python
+from webbpulse.identity import (
+    DynamoUsersHooks,
+    build_dynamo_router,
+    create_identity_tables,
+    dynamo_stores,
+    users_repository,
+)
+```
+
+**`dynamo_stores(prefix=None, *, region_name=None, endpoint_url=None) -> IdentityStores`**
+builds all nine `Dynamo*Store` instances from the package's own table constants. Nothing
+touches AWS: each repository resolves its table on first use, so a cold Lambda import stays
+free. `dynamo_login_attempts` builds the lockout store, which `build_identity_router` takes
+as its own argument rather than as a field of `IdentityStores`.
+
+**`build_dynamo_router(settings, hooks, *, prefix=None, service="identity", version="", ...)`**
+wraps `build_identity_router` with the stores, the login attempt store and the signing client
+built from `prefix` and `settings`. Every other argument `build_identity_router` takes is
+passed straight through, so a product that mounts the OAuth authorization server
+(`oauth_server_stores`, `consent_renderer`, `tenant_resolver`) or supplies `email_sender` and
+`oauth_client_secrets` loses nothing by adopting it. `stores`, `attempts` and `kms_client`
+override what would be built, which is how a test substitutes in-memory stores.
+
+The router carries the issuer's own path, so mount it with **no prefix of its own**: a prefix
+would double every path to `/api/auth/api/auth/...`.
+
+**`User` and `DynamoUsersRepository`** are the shared account row: `id`, `email`,
+`display_name`, `email_verified`, `disabled`, `is_admin`, `created_at`, with `email_lower`
+written alongside the address so the `email_lower-index` GSI (`EMAIL_INDEX`) can resolve a
+lowercased address to its user. `update` aliases every attribute name, because DynamoDB
+reserves ordinary words such as `name` and `status`; setting `email` rewrites `email_lower`
+in the same call, so the index can never disagree with the row. `delete` is idempotent and
+`get_many` is one `BatchGetItem` behind a member list.
+
+Two ways to name the physical table, matching the two patterns in the estate:
+
+```python
+users_repository(prefix="standupless-staging")          # -> standupless-staging-users
+users_repository(table_name="control-plane-prod-users")  # the stack named it outright
+```
+
+Passing both is a `ValueError` rather than a precedence rule, since the two would disagree.
+A product with extra fields subclasses `User` and passes it as `model=`; the repository is
+generic over the model, so the subclass round-trips without a second repository.
+
+**`DynamoUsersHooks(BaseIdentityHooks)`** implements every hook over that repository:
+`may_authenticate` (disabled -> `ACCOUNT_DISABLED`, unverified -> `EMAIL_NOT_VERIFIED`, both
+behind one `REFUSAL_MESSAGE` so the difference cannot enumerate addresses), `load_user_by_id`,
+`load_user_by_email`, `create_user`, `mark_email_verified`, `delete_user`, `on_user_created`,
+`has_other_sign_in_method` and `user_repository`. `claims_for` inherits `BaseIdentityHooks`'s
+empty mapping, which is correct for a product with no roles, and is the one hook a product
+with roles overrides.
+
+**`create_identity_tables(client, prefix="", *, skip_existing=True, include_users=True)`**
+walks `TABLES`, creates each table and applies its declared TTL through
+`update_time_to_live`, because TTL is not part of `CreateTable`. It returns the names it
+created. `users` is included by default; pass `include_users=False` for a product whose own
+stack or script names that table. For a local stack or a test suite only: in AWS these
+tables belong to `platform-modules/aws//modules/identity`.
+
+For tests, `webbpulse.testing` adds an `identity_tables` fixture creating all of them under
+no prefix in moto, and `assert_users_repository_contract(repository)`, a reusable contract a
+product runs against its own repository: round trip, case-insensitive address lookup, an
+update that keeps the index in step, `KeyError` for an absent row, `get_many` skipping what
+is gone, and an idempotent delete.
+
+#### Migration for adopters
+
+`package_glue.py` loses the store assembly. Before:
+
+```python
+def build_router(settings: "Settings") -> "APIRouter":
+    from webbpulse.dynamodb import Repository
+    from webbpulse.identity import (
+        CREDENTIALS_TABLE, ..., DynamoCredentialStore, ..., IdentityStores,
+        build_identity_router, signing_client,
+    )
+
+    def repository(logical_name: str) -> Repository:
+        return Repository(
+            logical_name,
+            prefix=settings.dynamodb_table_prefix,
+            endpoint_url=settings.DYNAMODB_ENDPOINT_URL or None,
+        )
+
+    identity_settings = build_identity_settings(settings)
+    stores = IdentityStores(
+        credentials=DynamoCredentialStore(repository(CREDENTIALS_TABLE)),
+        ...  # eight more
+    )
+    return build_identity_router(
+        identity_settings,
+        ProductIdentityHooks(),
+        stores,
+        kms_client=signing_client(identity_settings),
+        service="product-identity",
+        version=IDENTITY_ROUTER_VERSION,
+        attempts=DynamoLoginAttemptStore(repository(LOGIN_ATTEMPTS_TABLE)),
+        email_sender=build_email_sender(identity_settings),
+        oauth_client_secrets=build_oauth_client_secrets(settings),
+    )
+```
+
+After:
+
+```python
+def build_router(settings: "Settings") -> "APIRouter":
+    from webbpulse.identity import build_dynamo_router
+
+    from app.domains.identity.identity_hooks import ProductIdentityHooks
+
+    identity_settings = build_identity_settings(settings)
+    return build_dynamo_router(
+        identity_settings,
+        ProductIdentityHooks(prefix=settings.dynamodb_table_prefix),
+        prefix=settings.dynamodb_table_prefix,
+        endpoint_url=settings.DYNAMODB_ENDPOINT_URL or None,
+        service="product-identity",
+        version=IDENTITY_ROUTER_VERSION,
+        email_sender=build_email_sender(identity_settings),
+        oauth_client_secrets=build_oauth_client_secrets(settings),
+    )
+```
+
+`identity_hooks.py` becomes the `claims_for` override. Before, ~135 lines implementing nine
+hooks over a local `UserRepository`. After:
+
+```python
+from webbpulse.identity import DynamoUsersHooks, User
+
+
+class ProductIdentityHooks(DynamoUsersHooks[User]):
+    """This product's hooks: the shared users hooks plus its own claims."""
+
+    def claims_for(self, user: Mapping[str, Any]) -> Mapping[str, Any]:
+        """The roles list and the display name."""
+        roles: list[str] = [ADMIN_ROLE] if user.get("is_admin") else []
+        return {"roles": roles, "display_name": user.get("display_name", "")}
+```
+
+A product that also stamps a `scope` claim adds it to the same mapping; one whose account
+row carries further sign-in flags overrides `may_authenticate`, calls `super()` first and
+adds its own refusals; one with a legacy passkey or OAuth table overrides
+`has_other_sign_in_method`.
+
+The local `app/common/db/.../users.py` (`User`, `UserRepository`, `EMAIL_INDEX`, `_as_item`,
+`_as_user`) is deleted in favour of the package's, and the local create-tables loop over
+`webbpulse.identity.storage.TABLES` is replaced by one `create_identity_tables(client, prefix)`
+call. A product whose account row is genuinely its own -- extra fields, a second unique index,
+a non-UUID id -- keeps its repository and adopts only `dynamo_stores`, `build_dynamo_router`
+and `create_identity_tables`.

@@ -34,12 +34,14 @@ __all__ = [
     "FakeQueue",
     "FakeWebhookSender",
     "assert_entrypoint_isolation",
+    "assert_users_repository_contract",
     "aws_credentials",
     "create_table",
     "dynamodb_reset_hooks",
     "dynamodb_resource",
     "entrypoint_imports",
     "fake_kms",
+    "identity_tables",
     "make_request_context_headers",
     "rate_limit_table",
     "rsa_key",
@@ -201,6 +203,73 @@ def rate_limit_table(dynamodb_resource: Any) -> Table:
     from webbpulse.ratelimit import TTL_ATTRIBUTE
 
     return create_table(dynamodb_resource, _RATE_LIMIT_TABLE, ttl_attribute=TTL_ATTRIBUTE)
+
+
+@pytest.fixture
+def identity_tables(dynamodb_resource: Any) -> Any:
+    """Every identity table plus `users`, created under no prefix in the moto mock.
+
+    The tables `webbpulse.identity.glue.create_identity_tables` builds, so a test drives the
+    same schema a deployed service does. Yields the DynamoDB client they were created with,
+    for a test that needs a second call against it.
+    """
+    from webbpulse.identity.glue import create_identity_tables
+
+    client = dynamodb_resource.meta.client
+    create_identity_tables(client, "")
+    return client
+
+
+def assert_users_repository_contract(repository: Any, *, email: str = "Someone@Example.COM") -> None:
+    """Assert one users repository satisfies the shared contract, or raise `AssertionError`.
+
+    The behaviour every product's `users` table owes the identity hooks: a row that round
+    trips, a case-insensitive address lookup, an update that keeps the lookup index in step,
+    a `KeyError` for an absent row, a batch read that skips what is gone, and a delete that
+    is idempotent. A product with its own repository calls this from one test rather than
+    restating the six.
+
+    `repository` is anything with `webbpulse.identity.DynamoUsersRepository`'s methods, so a
+    product's own class qualifies without importing this package's model.
+    """
+    from webbpulse.identity.users import User
+
+    stored = repository.create(User(id="contract-1", email=email, display_name="Someone"))
+    assert stored.id == "contract-1"
+
+    found = repository.get("contract-1")
+    assert found is not None, "A created user must be readable by id."
+    assert found.display_name == "Someone"
+    assert found.email_verified is False
+
+    assert repository.get_by_email(email.lower()) is not None, "The address lookup must ignore case."
+    assert repository.get_by_email(email.upper()) is not None, "The address lookup must ignore case."
+    assert repository.get_by_email(f"  {email}  ") is not None, "The address lookup must ignore space."
+    assert repository.get_by_email("nobody@example.com") is None
+    assert repository.get_by_email("") is None
+
+    verified = repository.update("contract-1", email_verified=True)
+    assert verified.email_verified is True
+
+    moved = repository.update("contract-1", email="Moved@Example.COM")
+    assert moved.email_lower == "moved@example.com"
+    assert repository.get_by_email("moved@example.com") is not None
+    assert repository.get_by_email(email) is None, "The index must not still carry the old address."
+
+    try:
+        repository.update("missing", display_name="Nobody")
+    except KeyError:
+        pass
+    else:  # pragma: no cover
+        raise AssertionError("update must raise KeyError for a row that is not there.")
+
+    many = repository.get_many(["contract-1", "missing"])
+    assert set(many) == {"contract-1"}, "get_many must skip an id that is gone."
+
+    assert repository.get("") is None
+    assert repository.delete("contract-1") is True
+    assert repository.delete("contract-1") is False, "delete must be idempotent."
+    assert repository.get("contract-1") is None
 
 
 def make_request_context_headers(

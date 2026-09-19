@@ -63,6 +63,12 @@ from webbpulse.identity.crypto import (
     SecretMasterKeyCipher,
     encryption_context,
 )
+from webbpulse.identity.dynamo_hooks import (
+    ACCOUNT_DISABLED,
+    EMAIL_NOT_VERIFIED,
+    REFUSAL_MESSAGE,
+    DynamoUsersHooks,
+)
 from webbpulse.identity.email import (
     EmailMessage,
     EmailSender,
@@ -97,6 +103,12 @@ from webbpulse.identity.flows import (
     MfaChallengeRequired,
     PurgeResult,
     RateLimited,
+)
+from webbpulse.identity.glue import (
+    build_dynamo_router,
+    create_identity_tables,
+    dynamo_login_attempts,
+    dynamo_stores,
 )
 from webbpulse.identity.hooks import (
     AuthenticationRefused,
@@ -412,6 +424,14 @@ from webbpulse.identity.tokens import (
     mint_test_token,
     public_jwk_from_kms,
 )
+from webbpulse.identity.users import (
+    EMAIL_INDEX,
+    USERS_TABLE_SPEC,
+    DynamoUsersRepository,
+    User,
+    new_user_id,
+    users_repository,
+)
 from webbpulse.identity.verification import (
     CONFIRMATION_FAILED_MESSAGE,
     RESET_LINK_PATH,
@@ -431,6 +451,7 @@ from webbpulse.identity.verifier import (
 
 __all__ = [
     "ACCESS_TOKEN_TYPE",
+    "ACCOUNT_DISABLED",
     "ACTOR_API_KEY",
     "ACTOR_CLAIM",
     "ALLOWED_FETCH_SITES",
@@ -466,6 +487,8 @@ __all__ = [
     "DIGEST_MESSAGE_TYPE",
     "DISCOVERY_CACHE_CONTROL",
     "DISCOVERY_PATH",
+    "EMAIL_INDEX",
+    "EMAIL_NOT_VERIFIED",
     "EMAIL_UNAVAILABLE_MESSAGE",
     "EVENTS_PATH_ENV",
     "FORBIDDEN_ERROR_CODE",
@@ -529,6 +552,7 @@ __all__ = [
     "REFRESH_TOKENS_TABLE",
     "REFRESH_USER_INDEX",
     "REFRESH_USER_INDEX_ENV",
+    "REFUSAL_MESSAGE",
     "REGISTERED_CLAIMS",
     "REGISTER_CLIENT_IP_LIMIT",
     "REGISTER_CLIENT_PATH",
@@ -561,6 +585,7 @@ __all__ = [
     "UNAUTHENTICATED_ERROR_CODE",
     "USERS_KEY_ATTRIBUTE_ENV",
     "USERS_TABLE",
+    "USERS_TABLE_SPEC",
     "VERIFY_CONFIRM_PATH",
     "VERIFY_EMAIL_LIMIT",
     "VERIFY_IP_LIMIT",
@@ -598,6 +623,8 @@ __all__ = [
     "DynamoRecoveryCodeStore",
     "DynamoRefreshTokenStore",
     "DynamoTotpFactorStore",
+    "DynamoUsersHooks",
+    "DynamoUsersRepository",
     "DynamoWebAuthnChallengeStore",
     "EmailMessage",
     "EmailSendFailed",
@@ -700,6 +727,7 @@ __all__ = [
     "TotpFactorRecord",
     "TotpFactorStore",
     "UnparseableRequestContext",
+    "User",
     "WebAuthnChallengeRecord",
     "WebAuthnChallengeStore",
     "arrived_through_api_gateway",
@@ -707,6 +735,7 @@ __all__ = [
     "bearer_credential",
     "build_authorization_server_metadata",
     "build_discovery_document",
+    "build_dynamo_router",
     "build_identity_router",
     "build_jwks",
     "build_oauth_server_router",
@@ -717,10 +746,13 @@ __all__ = [
     "claims_scopes",
     "coerce_claims",
     "constant_time_equals",
+    "create_identity_tables",
     "default_consent_renderer",
     "describe_expiry",
     "discovery_jwks_uri",
     "display_prefix",
+    "dynamo_login_attempts",
+    "dynamo_stores",
     "effective_scopes",
     "email_key",
     "encryption_context",
@@ -749,6 +781,7 @@ __all__ = [
     "new_attempt",
     "new_pkce_verifier",
     "new_token",
+    "new_user_id",
     "normalise_password",
     "normalise_recovery_code",
     "pkce_challenge",
@@ -768,6 +801,7 @@ __all__ = [
     "signing_client",
     "subject_dependency",
     "users_key_attribute",
+    "users_repository",
     "validate_redirect_uri",
     "verify_api_key",
 ]
