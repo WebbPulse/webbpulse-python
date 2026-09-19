@@ -41,6 +41,22 @@ pays no import cost for the rest of the package.
 `configure_logging` already took `stream=` as of 0.8.0, so the stdout-to-stderr redirection
 both products wrap locally needs no package change.
 
+`webbpulse.testing.create_table` now takes the raw `CreateTable` pieces a table needs beyond
+a hash key, a range key and a TTL: `attribute_definitions`, `global_secondary_indexes`,
+`stream_specification`, and `request` for a whole keyword mapping, such as the one
+`webbpulse.identity.storage.TableSpec.create_table_request` builds. Keys in `request` win
+over the ones the helper builds and `TableName` is always the `name` argument, so a product
+whose tables carry indexes or streams creates them through the helper and still gets the
+waiting and the TTL, which `CreateTable` never covers. The existing keyword-only signature is
+unchanged.
+
+`webbpulse.testing.dynamodb_reset_hooks` is a new overridable fixture yielding the callables
+`dynamodb_resource` runs on setup and teardown. The package's own `reset_resource_cache`
+always runs first and is not in the list, which is empty by default. A product that memoises
+its own boto3 resource returns its reset from an override in its `conftest.py` and deletes
+the wrapper fixture it needed before, and everything depending on `dynamodb_resource` picks
+the override up.
+
 ## 0.44.0
 
 Three gaps the Standupless M5 build found on 0.43.0: an HKDF the products were hand-rolling,

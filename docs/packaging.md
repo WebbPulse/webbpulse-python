@@ -86,7 +86,8 @@ pytest_plugins = ["webbpulse.testing"]
 | --- | --- |
 | `aws_credentials` | Placeholder credentials and region, so a mis-scoped mock cannot reach a real account |
 | `dynamodb_resource` | A moto-mocked DynamoDB resource, with the package's cached resource cleared on both sides |
-| `create_table(...)` | One on-demand table with an optional range key and TTL |
+| `dynamodb_reset_hooks` | Override it to have `dynamodb_resource` clear a product's own memoised resource too |
+| `create_table(...)` | One on-demand table, with an optional range key, TTL, GSIs, stream or whole request |
 | `rate_limit_table` | The `rate-limits` table shaped exactly as Terraform creates it |
 | `test_client(app, source_ip=...)` | A `TestClient` whose requests carry a realistic API Gateway request context |
 | `make_request_context_headers(...)` | That header on its own, in either payload shape |
@@ -101,6 +102,54 @@ answers for any key id, or a mapping of key id to key for a rotation test. It re
 a deleted key does, reports a `key_spec`, and `der_for(key_id)` returns exactly the bytes
 `kid_for_der` hashes. `MessageType="DIGEST"` is honoured: the message is signed as the
 digest it already is, never hashed again.
+
+### Tables with indexes, streams, or a request a product already builds
+
+`create_table` shapes the common case from keyword arguments, and takes raw `CreateTable`
+pieces for everything else: `attribute_definitions` for the attributes an index keys on,
+`global_secondary_indexes`, `stream_specification`, and `request` for a whole keyword
+mapping. Keys in `request` win over the ones the helper builds, `TableName` is always the
+`name` argument, and the waiting and the TTL still happen, so a product holding its own
+specs stops hand-rolling both:
+
+```python
+create_table(
+    dynamodb_resource,
+    "projects",
+    attribute_definitions=[{"AttributeName": "owner", "AttributeType": "S"}],
+    global_secondary_indexes=[
+        {
+            "IndexName": "by-owner",
+            "KeySchema": [{"AttributeName": "owner", "KeyType": "HASH"}],
+            "Projection": {"ProjectionType": "ALL"},
+        }
+    ],
+    stream_specification={"StreamEnabled": True, "StreamViewType": "NEW_AND_OLD_IMAGES"},
+)
+
+create_table(dynamodb_resource, spec.table_name(prefix), request=spec.create_table_request(prefix))
+```
+
+TTL is never part of `CreateTable`, so `ttl_attribute` stays a keyword argument and applies
+alongside a `request` mapping.
+
+### Resetting a product's own memoised resource
+
+`dynamodb_resource` clears the package's cached resource on both sides of the mock. A
+product that memoises its own boto3 resource has one more cache to drop, and rather than
+wrapping the fixture it overrides `dynamodb_reset_hooks`, which yields the callables the
+fixture runs on setup and teardown:
+
+```python
+@pytest.fixture
+def dynamodb_reset_hooks() -> list[Callable[[], None]]:
+    from app.common.db.dynamo.client import reset_clients
+
+    return [reset_clients]
+```
+
+The package's own reset always runs first and is not in the list. Anything depending on
+`dynamodb_resource`, `rate_limit_table` included, picks the override up.
 
 `test_client` is the one worth knowing about. Without the injected context header a
 `TestClient` request has no API Gateway context at all, so `client_ip` falls back to the

@@ -67,6 +67,99 @@ def test_create_table_enables_ttl_when_asked(dynamodb_resource: Any) -> None:
     assert spec["AttributeName"] == "expires_at"
 
 
+def test_create_table_builds_a_global_secondary_index(dynamodb_resource: Any) -> None:
+    """A GSI and its extra attribute definitions come through and are queryable."""
+    table = create_table(
+        dynamodb_resource,
+        "indexed",
+        attribute_definitions=[{"AttributeName": "owner", "AttributeType": "S"}],
+        global_secondary_indexes=[
+            {
+                "IndexName": "by-owner",
+                "KeySchema": [{"AttributeName": "owner", "KeyType": "HASH"}],
+                "Projection": {"ProjectionType": "ALL"},
+            }
+        ],
+    )
+    table.put_item(Item={"pk": "a", "owner": "alice"})
+    from boto3.dynamodb.conditions import Key as KeyCondition
+
+    result = table.query(IndexName="by-owner", KeyConditionExpression=KeyCondition("owner").eq("alice"))
+    assert result["Count"] == 1
+
+
+def test_create_table_enables_a_stream(dynamodb_resource: Any) -> None:
+    """`stream_specification` is passed through, so a consumer test has a stream to read."""
+    create_table(
+        dynamodb_resource,
+        "streamed",
+        stream_specification={"StreamEnabled": True, "StreamViewType": "NEW_AND_OLD_IMAGES"},
+    )
+    described = dynamodb_resource.meta.client.describe_table(TableName="streamed")["Table"]
+    assert described["StreamSpecification"]["StreamViewType"] == "NEW_AND_OLD_IMAGES"
+
+
+def test_create_table_accepts_a_whole_request_mapping(dynamodb_resource: Any) -> None:
+    """A caller's own `CreateTable` mapping wins over the built defaults, under `name`."""
+    table = create_table(
+        dynamodb_resource,
+        "wholesale",
+        request={
+            "TableName": "ignored",
+            "KeySchema": [{"AttributeName": "id", "KeyType": "HASH"}],
+            "AttributeDefinitions": [{"AttributeName": "id", "AttributeType": "N"}],
+        },
+    )
+    assert table.name == "wholesale"
+    assert table.key_schema == [{"AttributeName": "id", "KeyType": "HASH"}]
+    table.put_item(Item={"id": 1})
+    assert table.get_item(Key={"id": 1})["Item"]["id"] == 1
+
+
+def test_create_table_keeps_a_ttl_alongside_a_request_mapping(dynamodb_resource: Any) -> None:
+    """TTL is a separate call, so it still applies when the request mapping is used."""
+    create_table(
+        dynamodb_resource,
+        "wholesale-expiring",
+        ttl_attribute="expires_at",
+        request={"TableClass": "STANDARD"},
+    )
+    described = dynamodb_resource.meta.client.describe_time_to_live(TableName="wholesale-expiring")
+    assert described["TimeToLiveDescription"]["AttributeName"] == "expires_at"
+
+
+def test_create_table_deduplicates_attribute_definitions(dynamodb_resource: Any) -> None:
+    """Redeclaring a key attribute overrides it rather than sending DynamoDB a duplicate."""
+    table = create_table(
+        dynamodb_resource,
+        "renumbered",
+        hash_key="pk",
+        attribute_definitions=[{"AttributeName": "pk", "AttributeType": "N"}],
+    )
+    table.put_item(Item={"pk": 7})
+    assert table.get_item(Key={"pk": 7})["Item"]["pk"] == 7
+
+
+def test_dynamodb_reset_hooks_default_to_nothing(dynamodb_reset_hooks: list[Any]) -> None:
+    """The overridable fixture is empty by default, so the package reset is the only one."""
+    assert dynamodb_reset_hooks == []
+
+
+def test_dynamodb_resource_runs_reset_hooks_on_both_sides() -> None:
+    """An overridden hook runs once before the mock opens and once after it closes."""
+    calls: list[str] = []
+
+    from webbpulse.testing import dynamodb_resource as fixture
+
+    generator = fixture.__wrapped__(None, [lambda: calls.append("reset")])  # type: ignore[attr-defined]
+    resource = next(generator)
+    assert calls == ["reset"]
+    create_table(resource, "hooked")
+    with pytest.raises(StopIteration):
+        next(generator)
+    assert calls == ["reset", "reset"]
+
+
 def test_the_rate_limit_table_matches_the_module_constants(rate_limit_table: Any) -> None:
     """The fixture table's name, key schema and TTL attribute match `webbpulse.ratelimit`."""
     from webbpulse.ratelimit import RATE_LIMIT_TABLE, TTL_ATTRIBUTE
