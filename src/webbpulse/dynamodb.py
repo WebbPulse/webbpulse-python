@@ -11,7 +11,7 @@ from collections.abc import Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
-from functools import lru_cache
+from functools import lru_cache, wraps
 from typing import TYPE_CHECKING, Any, Final
 
 if TYPE_CHECKING:  # pragma: no cover
@@ -24,11 +24,13 @@ __all__ = [
     "ULID_LENGTH",
     "UNPROCESSED_RETRY_ATTEMPTS",
     "UNPROCESSED_RETRY_BASE_DELAY",
+    "WRITE_METHODS",
     "ConditionFailed",
     "DynamoError",
     "IdempotencyStore",
     "ItemNotFound",
     "Page",
+    "ReadOnlyTable",
     "Repository",
     "TransactionCanceled",
     "UnprocessedItems",
@@ -241,6 +243,27 @@ def encode_numbers(value: Any) -> Any:
     return value
 
 
+class ReadOnlyTable(PermissionError):
+    """A write reached a repository built with `read_only=True`.
+
+    Raised in tests and local runs, so a code path that writes to a table the function only
+    holds a read grant on fails the suite instead of returning an AccessDenied in staging.
+    The message names the table, the method, and whatever hint the caller registered. It is
+    a `PermissionError` and deliberately not a `DynamoError`, so a broad data-layer handler
+    cannot swallow the mistake it exists to expose.
+    """
+
+    def __init__(self, table: str, method: str, hint: str | None = None) -> None:
+        """Name the table and the refused write, with the caller's hint when there is one."""
+        message = f"{method}() on the {table!r} table, which this caller only reads."
+        if hint:
+            message = f"{message} {hint}"
+        super().__init__(message)
+        self.table = table
+        self.method = method
+        self.hint = hint
+
+
 class Page:
     """One page of query or scan results plus the cursor for the next one.
 
@@ -399,6 +422,11 @@ class Repository:
 
     Subclass it per domain and add the queries that domain needs. The table resource is
     resolved on first access, so constructing a repository at module scope stays free.
+
+    `read_only=True` mirrors a function whose IAM policy grants only reads on the table:
+    reads go through untouched and every write in `WRITE_METHODS` raises `ReadOnlyTable`
+    before a client is built, so the mismatch fails a unit test rather than surfacing as a
+    DynamoDB AccessDenied in staging.
     """
 
     logical_name: str = ""
@@ -410,8 +438,14 @@ class Repository:
         prefix: str | None = None,
         region_name: str | None = None,
         endpoint_url: str | None = None,
+        read_only: bool = False,
+        read_only_hint: str | None = None,
     ) -> None:
-        """Resolve the physical table name and defer creating the table resource."""
+        """Resolve the physical table name and defer creating the table resource.
+
+        `read_only_hint` is appended to the `ReadOnlyTable` message, so the product can say
+        which registry entry and which Terraform grant have to move together.
+        """
         resolved = logical_name or self.logical_name
         if not resolved:
             raise ValueError("A Repository needs a logical table name, as a class attribute or an argument.")
@@ -419,7 +453,14 @@ class Repository:
         self.table_name = table_name(resolved, prefix)
         self._region_name = region_name
         self._endpoint_url = endpoint_url
+        self._read_only = read_only
+        self._read_only_hint = read_only_hint
         self._table: Table | None = None
+
+    @property
+    def read_only(self) -> bool:
+        """Whether this repository refuses writes."""
+        return self._read_only
 
     @property
     def table(self) -> Table:
@@ -978,6 +1019,51 @@ class Repository:
             endpoint_url=self._endpoint_url,
             client_request_token=client_request_token,
         )
+
+
+WRITE_METHODS: Final[tuple[str, ...]] = (
+    "condition_check",
+    "delete",
+    "delete_action",
+    "delete_many",
+    "increment",
+    "put",
+    "put_action",
+    "put_many",
+    "remove_attributes",
+    "set_attributes",
+    "transact_write",
+    "update",
+    "update_action",
+)
+
+
+def _install_write_guards() -> None:
+    """Wrap every name in `WRITE_METHODS` so a read-only repository refuses it.
+
+    The guard lives on `Repository` itself rather than on a subclass, so a repository a
+    product subclasses inherits it without having to be rebuilt read only, and the check
+    is one attribute test on the normal path.
+    """
+    for method in WRITE_METHODS:
+        original = getattr(Repository, method)
+        setattr(Repository, method, _guarded(original, method))
+
+
+def _guarded(original: Any, method: str) -> Any:
+    """`original`, refusing to run when the repository was built read only."""
+
+    @wraps(original)
+    def guard(self: Repository, *args: Any, **kwargs: Any) -> Any:
+        """Raise `ReadOnlyTable` on a read-only repository, else call through."""
+        if self._read_only:
+            raise ReadOnlyTable(self.table_name, method, self._read_only_hint)
+        return original(self, *args, **kwargs)
+
+    return guard
+
+
+_install_write_guards()
 
 
 class IdempotencyStore:

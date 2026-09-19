@@ -5,6 +5,42 @@ Notable changes to the `webbpulse` package. The version here is the one in
 
 This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## Unreleased
+
+Two generic helpers the Standupless and Terraform-runner builds were each keeping a local
+copy of.
+
+`Repository(..., read_only=True)` in `webbpulse.dynamodb` makes every write raise the new
+`ReadOnlyTable`, a `PermissionError` that is deliberately not a `DynamoError`, so a
+broad data-layer handler cannot swallow it. It mirrors a
+function whose IAM policy grants only reads on a table, so a route that writes where it
+holds no grant fails a unit test instead of returning an AccessDenied in staging. The
+refusal names the table and the method and appends the caller's `read_only_hint`, so the
+message can point at the registry entry and the Terraform grant that have to move together.
+The guarded names are exported as `WRITE_METHODS`, and the guard is installed on
+`Repository` itself, so a product subclass inherits it. A test classifies every public
+method on the class as a read or a write, so a new write method cannot be added without
+being guarded. The refusal happens before the table resource is resolved, so no credentials
+are needed to refuse. The flag is opt in and defaults to `False`, so no existing caller
+changes.
+
+This replaces Standupless's local `ReadOnlyRepository` and `ReadOnlyTable` in
+`backend/app/common/db/dynamo/base.py` with zero behaviour change. Delete the local
+`ReadOnlyTable`, `WRITE_METHODS`, `ReadOnlyRepository` and `_refusing`, import
+`ReadOnlyTable` from `webbpulse.dynamodb`, and have `_package_repository` pass
+`read_only=read_only` with the product's existing sentence as `read_only_hint` rather than
+choosing a class. The local guard list and the package's are the same thirteen methods.
+
+`Redactor` in `webbpulse.logging` masks registered secret values in text before it is
+emitted, for a process that streams output it does not control. Registration is longest
+first, so a secret containing a shorter registered one is masked whole; empty values and
+anything shorter than `MIN_REDACTABLE_LENGTH` (4) are ignored. `webbpulse.logging` imports
+nothing beyond the standard library, now held by test, so a runner that wants only this
+pays no import cost for the rest of the package.
+
+`configure_logging` already took `stream=` as of 0.8.0, so the stdout-to-stderr redirection
+both products wrap locally needs no package change.
+
 ## 0.44.0
 
 Three gaps the Standupless M5 build found on 0.43.0: an HKDF the products were hand-rolling,

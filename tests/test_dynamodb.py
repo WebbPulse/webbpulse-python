@@ -16,8 +16,11 @@ from botocore.exceptions import ClientError
 
 from webbpulse.dynamodb import (
     TABLE_PREFIX_ENV,
+    WRITE_METHODS,
     ConditionFailed,
+    DynamoError,
     Page,
+    ReadOnlyTable,
     Repository,
     encode_numbers,
     now_iso,
@@ -703,3 +706,118 @@ def test_remove_attributes_honours_return_values(items_repo: Repository) -> None
     """`return_values` reaches DynamoDB, so a caller wanting no read back pays for none."""
     items_repo.put({"pk": "widget-1", "unread_at": "2026-09-17"})
     assert items_repo.remove_attributes({"pk": "widget-1"}, ["unread_at"], return_values="NONE") is None
+
+
+_READ_METHODS: frozenset[str] = frozenset(
+    {
+        "batch_get",
+        "get",
+        "get_many",
+        "iter_query",
+        "iter_scan",
+        "query",
+        "scan",
+    }
+)
+
+
+def _public_methods() -> frozenset[str]:
+    """Every public callable declared on `Repository` itself."""
+    return frozenset(name for name, value in vars(Repository).items() if not name.startswith("_") and callable(value))
+
+
+def test_write_methods_covers_every_public_method_that_is_not_a_read() -> None:
+    """Every public `Repository` method is classified, so a new write cannot slip past.
+
+    Enumerated from the class rather than restated, so adding a method to `Repository`
+    without listing it in `WRITE_METHODS` or `_READ_METHODS` fails here.
+    """
+    unclassified = _public_methods() - set(WRITE_METHODS) - _READ_METHODS
+    assert not unclassified, (
+        f"new public Repository methods are unclassified: {sorted(unclassified)}. "
+        "Add each to WRITE_METHODS in webbpulse.dynamodb if it writes, or to _READ_METHODS here."
+    )
+
+
+def test_every_write_method_is_guarded_on_a_read_only_repository() -> None:
+    """Each name in `WRITE_METHODS` raises `ReadOnlyTable` before any client is built."""
+    repository = Repository("guarded", read_only=True)
+
+    for method in WRITE_METHODS:
+        with pytest.raises(ReadOnlyTable) as raised:
+            getattr(repository, method)()
+        assert raised.value.method == method, f"{method} must report its own name"
+        assert raised.value.table == repository.table_name, f"{method} must name the table"
+
+
+def test_read_only_refusal_names_the_table_and_the_callers_hint() -> None:
+    """The message carries the table, the method and the caller-supplied hint."""
+    repository = Repository("posts", read_only=True, read_only_hint="Move it to the write grant.")
+
+    with pytest.raises(ReadOnlyTable) as raised:
+        repository.put({"pk": "a"})
+
+    message = str(raised.value)
+    assert repository.table_name in message, f"the table must be named, got {message!r}"
+    assert "put()" in message, f"the refused method must be named, got {message!r}"
+    assert "Move it to the write grant." in message, f"the hint must be carried, got {message!r}"
+    assert raised.value.hint == "Move it to the write grant."
+
+
+def test_read_only_refusal_omits_a_hint_that_was_not_supplied() -> None:
+    """Without a hint the message is still complete, and `hint` is `None`."""
+    with pytest.raises(ReadOnlyTable) as raised:
+        Repository("posts", read_only=True).delete({"pk": "a"})
+
+    assert raised.value.hint is None, "an unsupplied hint must stay None"
+    assert str(raised.value).endswith("only reads."), f"got {str(raised.value)!r}"
+
+
+def test_read_only_is_a_permission_error_but_not_a_dynamo_error() -> None:
+    """A broad data-layer handler must not swallow the mistake the guard exists to expose."""
+    assert issubclass(ReadOnlyTable, PermissionError)
+    assert not issubclass(ReadOnlyTable, DynamoError)
+
+
+def test_a_read_only_repository_refuses_before_touching_the_network() -> None:
+    """No table resource is built, which is what makes the guard safe without credentials."""
+    repository = Repository("posts", read_only=True)
+
+    with pytest.raises(ReadOnlyTable):
+        repository.put({"pk": "a"})
+
+    assert repository._table is None, "the refusal must happen before the table is resolved"
+
+
+def test_reads_pass_through_a_read_only_repository(dynamodb_resource: Any) -> None:
+    """A read-only repository reads exactly like a normal one."""
+    create_table(dynamodb_resource, "readable")
+    Repository("readable").put({"pk": "a", "value": 1})
+
+    repository = Repository("readable", read_only=True)
+
+    assert repository.read_only is True
+    assert repository.get({"pk": "a"}) == {"pk": "a", "value": Decimal(1)}
+    assert repository.query(Key("pk").eq("a")).count == 1
+
+
+def test_a_repository_is_writable_by_default(dynamodb_resource: Any) -> None:
+    """The flag is opt-in, so every existing caller is unaffected."""
+    create_table(dynamodb_resource, "writable")
+    repository = Repository("writable")
+
+    assert repository.read_only is False
+    repository.put({"pk": "a"})
+    assert repository.get({"pk": "a"}) == {"pk": "a"}
+
+
+def test_read_only_applies_to_a_product_subclass(dynamodb_resource: Any) -> None:
+    """A domain subclass inherits the guard, since it lives on `Repository` itself."""
+
+    class Posts(Repository):
+        """A product repository over the posts table."""
+
+        logical_name = "posts"
+
+    with pytest.raises(ReadOnlyTable):
+        Posts(read_only=True).put({"pk": "a"})

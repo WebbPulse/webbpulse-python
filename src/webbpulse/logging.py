@@ -10,17 +10,63 @@ from __future__ import annotations
 import json
 import logging
 import sys
+from collections.abc import Iterable
 from datetime import UTC, datetime
 from typing import Any, Final, Literal, TextIO
 
 __all__ = [
+    "MIN_REDACTABLE_LENGTH",
+    "REDACTED",
     "TEXT_LOG_FORMAT",
     "FormatterSpec",
     "JsonFormatter",
+    "Redactor",
     "TextFormatter",
     "configure_logging",
     "get_logger",
 ]
+
+REDACTED: Final = "[redacted]"
+MIN_REDACTABLE_LENGTH: Final = 4
+
+
+class Redactor:
+    """Masks registered secret values in text before it is emitted.
+
+    A process that streams someone else's output, such as a Terraform runner, knows the
+    secrets it injected but not where they will surface, so it registers them once and
+    scrubs every line. Replacement is longest first, so a secret that contains a shorter
+    registered one is masked whole rather than leaving a readable tail. Values shorter than
+    `MIN_REDACTABLE_LENGTH`, and empty ones, are ignored: they match too much ordinary text
+    to be worth masking. This holds no dependency beyond the standard library, so a process
+    that wants nothing else from the package can import it cheaply.
+    """
+
+    def __init__(self, secrets: Iterable[str] = ()) -> None:
+        """Register `secrets` to mask, ignoring the ones too short to be meaningful."""
+        self._secrets: list[str] = []
+        self.extend(secrets)
+
+    def add(self, secret: str | None) -> None:
+        """Register one more value to mask, ignoring an empty or very short one."""
+        if not secret or len(secret) < MIN_REDACTABLE_LENGTH:
+            return
+        if secret not in self._secrets:
+            self._secrets.append(secret)
+            self._secrets.sort(key=len, reverse=True)
+
+    def extend(self, secrets: Iterable[str]) -> None:
+        """Register several values to mask."""
+        for secret in secrets:
+            self.add(secret)
+
+    def scrub(self, text: str) -> str:
+        """Return `text` with every registered value replaced by `REDACTED`."""
+        for secret in self._secrets:
+            if secret in text:
+                text = text.replace(secret, REDACTED)
+        return text
+
 
 _RESERVED: Final[frozenset[str]] = frozenset(
     {
