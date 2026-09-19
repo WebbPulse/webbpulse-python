@@ -53,6 +53,30 @@ request context in a text line uses `LogContextFilter` and a `%(request_id)s` in
 format string. A bad selector raises before the existing handlers are torn down, so a typo
 does not leave the root logger with nothing attached.
 
+### `Redactor`
+
+A process that streams someone else's output, such as a Terraform runner, knows the secrets
+it injected but not where they will surface. `Redactor` registers those values once and
+masks them on the way out:
+
+```python
+from webbpulse.logging import Redactor
+
+redactor = Redactor([token, password])
+redactor.add(another_secret)
+sink.write(redactor.scrub(line))
+```
+
+Replacement is longest first, so a secret that contains a shorter registered one is masked
+whole rather than leaving a readable tail. Empty values and anything shorter than
+`MIN_REDACTABLE_LENGTH` (4) are ignored, since they match too much ordinary text to be
+worth masking. The placeholder is `REDACTED`, `"[redacted]"`.
+
+This is a scrubbing helper, not a logging handler: it is applied by the caller to text it is
+about to emit. `webbpulse.logging` imports nothing beyond the standard library, which the
+suite holds by test, so a process wanting only `Redactor` pays no import cost for the rest
+of the package.
+
 ## `webbpulse.log_context`
 
 Two context variables, `request_id` and `user_id`, and the helpers that bind them. The

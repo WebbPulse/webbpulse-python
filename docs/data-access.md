@@ -172,6 +172,37 @@ claiming and wants the retry to proceed rather than wait out the TTL. The key, T
 timestamp attribute names are all configurable. `webbpulse.testing.FakeIdempotencyStore` is
 the in-process stand-in, and it evaluates expiry on read so a test need not sleep.
 
+### Read-only repositories
+
+A function whose IAM policy grants only reads on a table should fail the same way in a unit
+test as it would in staging. `read_only=True` makes every write raise `ReadOnlyTable`
+before a client is built:
+
+```python
+from webbpulse.dynamodb import ReadOnlyTable, Repository
+
+users = Repository(
+    "users",
+    read_only=True,
+    read_only_hint="Move it from read_tables to tables in terraform/lambda_domains.tf.",
+)
+
+users.get({"pk": "user#1"})       # reads pass through
+users.put({"pk": "user#1"})       # raises ReadOnlyTable
+```
+
+The message names the table and the refused method, and appends `read_only_hint` when the
+caller supplied one, so the error can point at the registry entry and the Terraform grant
+that have to move together. `ReadOnlyTable` subclasses both `DynamoError` and
+`PermissionError`.
+
+The guarded names are `WRITE_METHODS`, and the guard is installed on `Repository` itself,
+so a product subclass inherits it. The package's own suite classifies every public method
+on the class as a read or a write, so a new write method added to `Repository` without
+being listed fails that test rather than silently escaping the guard. The refusal happens
+before the table resource is resolved, so a read-only repository needs no credentials to
+refuse.
+
 ### Scanning
 
 `scan` returns the same `Page` as `query`, and `iter_scan` follows `LastEvaluatedKey` the

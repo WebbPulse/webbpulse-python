@@ -10,6 +10,7 @@ import io
 import json
 import logging
 import re
+import subprocess
 import sys
 from datetime import datetime
 from typing import Any
@@ -18,7 +19,10 @@ from unittest import mock
 import pytest
 
 from webbpulse.logging import (
+    MIN_REDACTABLE_LENGTH,
+    REDACTED,
     JsonFormatter,
+    Redactor,
     TextFormatter,
     configure_logging,
     get_logger,
@@ -332,3 +336,101 @@ def test_the_text_formatter_accepts_a_format_string() -> None:
     """`TextFormatter` uses its default layout, or a format string when given one."""
     assert TextFormatter().format(_record()).endswith("INFO     app.api hello")
     assert TextFormatter("%(message)s").format(_record()) == "hello"
+
+
+def test_redactor_masks_a_registered_value() -> None:
+    """A registered secret is replaced wherever it appears."""
+    redactor = Redactor(["hunter2000"])
+
+    assert redactor.scrub("token=hunter2000 done") == f"token={REDACTED} done"
+
+
+def test_redactor_masks_every_occurrence() -> None:
+    """Repeats of one secret are all replaced, not just the first."""
+    redactor = Redactor(["swordfish"])
+
+    assert redactor.scrub("swordfish and swordfish") == f"{REDACTED} and {REDACTED}"
+
+
+def test_redactor_replaces_longest_first() -> None:
+    """A secret containing a shorter registered one is masked whole.
+
+    Shortest first would mask the inner value and leave the rest of the longer secret
+    readable, which is the bug the ordering exists to prevent.
+    """
+    redactor = Redactor(["abcd", "abcdefgh"])
+
+    assert redactor.scrub("value=abcdefgh") == f"value={REDACTED}"
+
+
+def test_redactor_replaces_longest_first_whatever_the_registration_order() -> None:
+    """Registering the long value first gives the same result."""
+    redactor = Redactor(["abcdefgh", "abcd"])
+
+    assert redactor.scrub("value=abcdefgh") == f"value={REDACTED}"
+
+
+@pytest.mark.parametrize("value", ["", None, "a", "abc"])
+def test_redactor_ignores_empty_and_very_short_values(value: str | None) -> None:
+    """Short values match too much ordinary text, so they are never registered."""
+    redactor = Redactor()
+    redactor.add(value)
+
+    assert redactor.scrub("abc a text") == "abc a text"
+
+
+def test_redactor_registers_a_value_at_the_minimum_length() -> None:
+    """The threshold is inclusive, so a four character secret is masked."""
+    redactor = Redactor()
+    redactor.add("abcd")
+
+    assert len("abcd") == MIN_REDACTABLE_LENGTH
+    assert redactor.scrub("x=abcd") == f"x={REDACTED}"
+
+
+def test_redactor_ignores_a_duplicate_registration() -> None:
+    """Registering the same value twice does not double its replacement."""
+    redactor = Redactor(["repeated"])
+    redactor.add("repeated")
+
+    assert redactor.scrub("repeated") == REDACTED
+
+
+def test_redactor_extend_registers_several_values() -> None:
+    """`extend` takes any iterable of values."""
+    redactor = Redactor()
+    redactor.extend(["first-secret", "second-secret"])
+
+    assert redactor.scrub("first-secret second-secret") == f"{REDACTED} {REDACTED}"
+
+
+def test_redactor_leaves_text_without_a_secret_untouched() -> None:
+    """Text carrying nothing registered is returned unchanged."""
+    redactor = Redactor(["absent-value"])
+
+    assert redactor.scrub("nothing to hide") == "nothing to hide"
+
+
+def test_redactor_starts_empty() -> None:
+    """A redactor with no registered values is a pass through."""
+    assert Redactor().scrub("plain text") == "plain text"
+
+
+def test_importing_logging_pulls_in_no_heavy_dependency() -> None:
+    """`webbpulse.logging` stays cheap for a process that wants only `Redactor`.
+
+    A runner that depends on none of the rest of the package imports this module, so a
+    `fastapi` or `boto3` import creeping in here would be a real cost to it.
+    """
+    heavy = "{'fastapi', 'boto3', 'botocore', 'starlette', 'pydantic'}"
+    source = (
+        f"import sys; import webbpulse.logging; print(sorted(m for m in sys.modules if m.split('.')[0] in {heavy}))"
+    )
+    result = subprocess.run(
+        [sys.executable, "-c", source],
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+
+    assert result.stdout.strip() == "[]", f"webbpulse.logging pulled in {result.stdout.strip()}"
