@@ -35,7 +35,7 @@ import pytest
 
 from webbpulse.http import ROUTE_KEY_HEADER
 
-from .access_log import AccessLogLookup
+from .access_log import AccessLogEntry, AccessLogLookup, log_field
 from .browser import (
     ROOT_SELECTORS,
     BrowserFailure,
@@ -45,7 +45,8 @@ from .browser import (
     sign_in,
     sign_out,
 )
-from .client import E2EClient, RateLimitExhausted
+from .client import E2EClient, RateLimitExhausted, RequestRecord
+from .coverage import RouteCoverage, measure_coverage
 from .ephemeral import create_ephemeral_user, describe_delete_failure
 from .frontend import fetch_bundle, missing_allowed_headers, shell_looks_like_an_app
 from .gateway import (
@@ -82,20 +83,24 @@ from .xdist import worker_id
 
 __all__ = [
     "RouteProbe",
+    "TestAccessLogHealth",
     "TestBrowser",
     "TestCoverage",
     "TestFrontend",
     "TestHygiene",
     "TestIdentity",
     "TestReachability",
+    "TestRouteCoverage",
     "TestRouteCut",
     "journey_id",
     "operation_id",
     "probe_every_route",
     "pytest_generate_tests",
+    "route_coverage",
     "route_id",
     "route_probes",
     "route_spec_id",
+    "uncovered_routes",
 ]
 
 GATEWAY_404_BODY = "Not Found"
@@ -145,6 +150,15 @@ def pytest_generate_tests(metafunc: pytest.Metafunc) -> None:
     instead of the first assertion that tripped.
     """
     browser_names = ("declared_route", "protected_route", "guest_only_route", "journey")
+    wanted = (*browser_names, "live_route", "operation")
+    names = [name for name in wanted if name in metafunc.fixturenames]
+    if not names:
+        return
+    from . import environment_for_collection
+
+    if environment_for_collection() is None:
+        _parametrise_without_an_environment(metafunc, names)
+        return
     if any(name in metafunc.fixturenames for name in browser_names):
         _parametrise_browser_cases(metafunc)
     if not any(name in metafunc.fixturenames for name in ("live_route", "operation")):
@@ -156,6 +170,20 @@ def pytest_generate_tests(metafunc: pytest.Metafunc) -> None:
     if "operation" in metafunc.fixturenames:
         operations = inputs.operations
         metafunc.parametrize("operation", operations, ids=[operation_id(op) for op in operations])
+
+
+def _parametrise_without_an_environment(metafunc: pytest.Metafunc, names: Sequence[str]) -> None:
+    """Parametrise every derived case with one skipped placeholder, collecting nothing live.
+
+    Without `E2E_*` there is no gateway to read and no OpenAPI document to derive from, and
+    raising here would fail collection of the product's whole test tree rather than of the
+    e2e suite alone. A single placeholder per fixture keeps the cases collected and reported
+    as skipped, which is what an unconfigured shell should see.
+    """
+    from . import NO_ENVIRONMENT_REASON
+
+    for name in names:
+        metafunc.parametrize(name, [pytest.param(None, marks=pytest.mark.skip(reason=NO_ENVIRONMENT_REASON))])
 
 
 def _parametrise_browser_cases(metafunc: pytest.Metafunc) -> None:
@@ -1162,6 +1190,194 @@ class TestHygiene:
     def test_created_resources_are_tracked(self, created_resources: list[Any]) -> None:
         """The `created_resources` list exists for products to append to."""
         assert isinstance(created_resources, list)
+
+
+class TestAccessLogHealth:
+    """Group 8: the gateway's own record of this run carries no sign of a broken integration.
+
+    Every group above asserts what one request answered. This one reads what the gateway
+    logged for the whole run and looks for the shapes that mean a request was answered by
+    something other than the function it was meant to reach. Those shapes are invisible to a
+    per-case assertion: a route that is missing at the edge answers a plausible status, and
+    a suite that only asserts statuses reports it as a product behaviour rather than as
+    infrastructure that is not wired.
+
+    Skipped where `access_log_group` is unset, which is a local stack and anything else with
+    no CloudWatch access log to read.
+    """
+
+    def test_the_access_log_carries_this_runs_requests(
+        self,
+        suite_requests: Sequence[RequestRecord],
+        access_log_health: Sequence[AccessLogEntry],
+    ) -> None:
+        """At least one of this run's requests was correlated, so the sweep proves something.
+
+        Without this the three cases below pass vacuously on an empty sweep, which is exactly
+        what a wrong log group name or a broken correlation produces, and a green group would
+        then mean the sweep never ran rather than that it found nothing wrong.
+        """
+        attempted = [record for record in suite_requests if record.request_id]
+        if not attempted:
+            pytest.skip("this run recorded no request ids, so there is nothing to correlate")
+        assert access_log_health, (
+            f"none of this run's {len(attempted)} requests were found in the access log. "
+            "Either the log group is not the one this stage writes to, or delivery is "
+            "lagging further than the scan window. The sweep below would pass on an empty "
+            "set, so it is reported here as a failure rather than as a clean sweep."
+        )
+
+    def test_no_request_was_answered_with_a_server_error(self, access_log_health: Sequence[AccessLogEntry]) -> None:
+        """No request this run made was answered 5xx.
+
+        A 5xx is the gateway or the function failing rather than the product refusing, and a
+        case that asserts only `!= 200` passes straight through one.
+        """
+        failures = [entry for entry in access_log_health if entry.status >= 500]
+        assert not failures, "requests answered 5xx:\n" + _describe(failures)
+
+    def test_no_rejection_came_from_a_healthy_integration(self, access_log_health: Sequence[AccessLogEntry]) -> None:
+        """No 401 or 403 was logged against an integration that answered 200.
+
+        The gateway records its own status and the integration's separately. A 401 whose
+        integration answered 200 was not the function refusing: the authorizer rejected the
+        request, and the function never saw it. That is the shape of a gate or authorizer
+        misconfiguration, and it reads exactly like a product permission check from outside.
+        """
+        rejected = [
+            entry for entry in access_log_health if entry.status in (401, 403) and entry.integration_status == 200
+        ]
+        assert not rejected, (
+            "requests the authorizer rejected although the integration answered 200:\n"
+            + _describe(rejected)
+            + "\nThe function never saw these. This is the authorizer or the gate refusing, "
+            "not the product."
+        )
+
+    def test_every_request_matched_a_declared_route(self, access_log_health: Sequence[AccessLogEntry]) -> None:
+        """No request fell through without matching a declared route key.
+
+        An empty route key is the gateway answering by itself because nothing matched, which
+        is what a path that no prefix covers looks like from the edge. `OPTIONS` is excluded
+        because a preflight is answered by the CORS configuration rather than by a route.
+        """
+        unmatched = [
+            entry for entry in access_log_health if not entry.matched_a_route and entry.method.upper() != "OPTIONS"
+        ]
+        assert not unmatched, (
+            "requests that matched no declared route key:\n"
+            + _describe(unmatched)
+            + "\nThe gateway answered these itself, so the path reaches no function at all."
+        )
+
+    def test_no_integration_reported_an_error(self, access_log_health: Sequence[AccessLogEntry]) -> None:
+        """No entry carries an integration error message.
+
+        Read through `log_field`, because the gateway renders an unset context variable as a
+        literal `-` rather than omitting it, and a plain truthiness check reads that as an
+        error on every healthy request.
+        """
+        errored = [
+            (entry, message)
+            for entry in access_log_health
+            if (message := log_field(entry.raw, "errorMessage", "integrationErrorMessage"))
+        ]
+        assert not errored, "requests whose integration reported an error:\n" + "\n".join(
+            f"  {entry.method} {entry.path} ({entry.request_id}): {message}" for entry, message in errored
+        )
+
+
+class TestRouteCoverage:
+    """Group 9: every route the deployment serves was exercised, or is allowlisted with a reason.
+
+    The inverse of every other group. They ask whether the routes that were exercised
+    behaved; this asks which served routes nothing touched, so a route added without a test
+    fails here rather than shipping unexercised and green.
+
+    The product supplies only its allowlist, through `pytest_e2e_uncovered_routes`. The
+    matching, the staleness check and the reason check are the plugin's.
+    """
+
+    def test_the_run_recorded_requests_to_correlate(self, suite_requests: Sequence[RequestRecord]) -> None:
+        """This run made requests, so the coverage below is measured against something.
+
+        A run that recorded nothing would report every route as uncovered, which is a broken
+        suite rather than a coverage gap and should not read as one.
+        """
+        assert suite_requests, (
+            "this run recorded no requests at all, so coverage cannot be measured. Every "
+            "route would report as uncovered, which would be a broken suite rather than a "
+            "real gap."
+        )
+
+    def test_every_served_route_was_exercised_or_is_allowlisted(self, route_coverage: RouteCoverage) -> None:
+        """Every operation the deployment serves was either reached or knowingly excused."""
+        assert not route_coverage.uncovered, (
+            f"{len(route_coverage.uncovered)} served routes were never exercised by this run:\n"
+            + "\n".join(f"  {method} {path}" for method, path in route_coverage.uncovered)
+            + "\nAdd a case that reaches each, or name it in pytest_e2e_uncovered_routes with "
+            "the reason it is not worth covering."
+        )
+
+    def test_the_coverage_allowlist_is_not_stale(self, route_coverage: RouteCoverage) -> None:
+        """No allowlist entry names a route the deployment no longer serves.
+
+        An allowlist that outlives its route quietly excuses nothing while looking like it
+        excuses something, and the next real gap inherits its reason.
+        """
+        assert not route_coverage.stale, (
+            "pytest_e2e_uncovered_routes names routes this deployment does not serve:\n"
+            + "\n".join(f"  {method} {path}" for method, path in route_coverage.stale)
+            + "\nRemove them: the gap they excused is gone."
+        )
+
+    def test_every_allowlist_entry_carries_a_reason(self, uncovered_routes: Mapping[tuple[str, str], str]) -> None:
+        """Every allowlisted route says why, so the exception can be reviewed later."""
+        unexplained = sorted(pair for pair, reason in uncovered_routes.items() if not str(reason).strip())
+        assert not unexplained, (
+            "these allowlist entries carry no reason:\n"
+            + "\n".join(f"  {method} {path}" for method, path in unexplained)
+            + "\nAn exception with no reason cannot be reviewed or retired."
+        )
+
+
+def _describe(entries: Sequence[AccessLogEntry]) -> str:
+    """One indented line per entry, naming what the gateway logged about it."""
+    return "\n".join(
+        f"  {entry.method} {entry.path} status={entry.status} "
+        f"integration={entry.integration_status} route_key={entry.route_key or '(none)'} "
+        f"({entry.request_id})"
+        for entry in entries
+    )
+
+
+@pytest.fixture(scope="session")
+def uncovered_routes(request: pytest.FixtureRequest, e2e_env: Any) -> Mapping[tuple[str, str], str]:
+    """The product's coverage allowlist, or an empty mapping when it declares none.
+
+    Normalised to uppercase methods here so a product may spell them either way.
+    """
+    declared = request.config.hook.pytest_e2e_uncovered_routes(env=e2e_env)
+    if not declared:
+        return {}
+    return {(str(method).upper(), str(path)): str(reason) for (method, path), reason in dict(declared).items()}
+
+
+@pytest.fixture(scope="session")
+def route_coverage(
+    openapi_operations: Sequence[Operation],
+    suite_requests: Sequence[RequestRecord],
+    uncovered_routes: Mapping[tuple[str, str], str],
+) -> RouteCoverage:
+    """This run's coverage of the deployed operations, measured once for the group.
+
+    The served routes come from the deployed OpenAPI document rather than from the gateway's
+    route table, because the table is prefix routes with `{proxy+}` catch-alls and says
+    nothing about which operations sit behind them.
+    """
+    served = [(operation.method, operation.path) for operation in openapi_operations]
+    requests = [(record.method, record.path) for record in suite_requests]
+    return measure_coverage(served, requests, uncovered_routes)
 
 
 class TestBrowser:

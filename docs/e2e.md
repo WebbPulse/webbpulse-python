@@ -14,7 +14,7 @@ e2e = ["webbpulse[e2e]"]
 
 ## What it checks
 
-The generic suite runs in seven groups, each parametrised so one route, one operation or one
+The generic suite runs in nine groups, each parametrised so one route, one operation or one
 journey is one junit case:
 
 | Group | Asks |
@@ -26,6 +26,8 @@ journey is one junit case:
 | `TestFrontend` | The web origin serves the app shell, an unknown path renders it too, the bundle references this environment's API and no legacy route name, and the CORS preflight allows the headers the shared client sends. It goes through the staging gate on signed cookies, not the origin header |
 | `TestBrowser` | A real browser signs in and out through the UI, every protected route bounces an anonymous visitor, every guest-only route bounces a signed-in one, every declared route paints with no console error and no failed API call, and every declared journey runs. An anonymous visit's own 401 or 403 is exempt in both collectors, because the browser reports one such response twice, and the auth client's cold-load session probe is exempt whoever is visiting |
 | `TestHygiene` | Names carry the run prefix, the cleanup hook is registered, and created resources are tracked |
+| `TestAccessLogHealth` | The gateway's own log of this run carries no 5xx, no 401 or 403 whose integration answered 200, no request that matched no route key, and no integration error message. Guarded so an empty sweep fails rather than passing vacuously. Skipped where no access log group is configured |
+| `TestRouteCoverage` | Every operation the deployment serves was exercised by this run, or is named in `pytest_e2e_uncovered_routes` with the reason it is not. An allowlist entry for a route that is no longer served fails as stale |
 
 Two of those deserve their reasons stated, because both have shipped as green before.
 
@@ -90,6 +92,13 @@ the route.
 
 Every variable is read once, at the start of the session. A missing one fails immediately and
 names every variable that is unset, rather than failing each test with a connection error.
+
+A shell with nothing set at all is treated differently from a half-configured one. With
+`E2E_ENVIRONMENT` unset the suite is collected and every case skips, because that is a
+product running its whole test tree rather than an e2e run wired wrong, and a collection
+error there would break `pytest` and `--collect-only` across the repository. Set anything but
+not everything and the run still fails naming the missing variables, because skipping past a
+wiring mistake is how a suite goes quietly green against nothing.
 
 | Variable | Meaning |
 | --- | --- |
@@ -264,6 +273,8 @@ What each group does:
 | `TestFrontend` | Runs. The bundle check asserts against the local API base URL and the CORS preflight runs against the local backend. There is no gate cookie to mint, so `gate_cookies` is None |
 | `TestBrowser` | Runs, against the preview server |
 | `TestHygiene` | Runs |
+| `TestAccessLogHealth` | Skipped whole. There is no CloudWatch access log locally, and the sweep reads the gateway's own record of the run, which nothing else substitutes |
+| `TestRouteCoverage` | Runs. Coverage is measured against the product's own OpenAPI document, so it is the same question locally as it is post deploy |
 
 A green local run does not prove the route cut, the gateway's own precedence and CORS, the
 authorizer, the access gate, per domain isolation or the stream consumers. Those are gateway
@@ -287,6 +298,10 @@ and deployment concerns and they stay in the post deploy run, which is the requi
 | `openapi_document`, `openapi_operations` | The product's document and its operations |
 | `access_log` | Find an access log entry by request id: the window scan first, then a bounded wait. Skips on a local stack, which has no access log |
 | `route_probes` | Every live route probed once, up front, so the group waits out one delivery lag rather than one per route |
+| `suite_requests` | Every request this run made, gathered from the shared record the clients all append to, so a whole-run check sees everything without any case registering itself |
+| `access_log_health` | This run's own access log entries, correlated by request id from one forced window scan. Skips where `E2E_ACCESS_LOG_GROUP` is unset |
+| `uncovered_routes` | The product's coverage allowlist, from `pytest_e2e_uncovered_routes`, with methods normalised to uppercase |
+| `route_coverage` | What this run covered, left uncovered, allowlisted and what is stale, measured against the deployed operations |
 | `http` | A plain client for the web origin, carrying no API gate header |
 | `cors_request_headers` | The header names the shared TypeScript client sends |
 | `created_resources` | A list this run appends to, handed to the cleanup hook at the end |
@@ -375,6 +390,14 @@ from webbpulse.e2e import (
     Record,
     RouteSpec,
 )
+
+
+def pytest_e2e_uncovered_routes(env):
+    """The routes this product knowingly leaves unexercised, and why."""
+    return {
+        ("POST", "/api/attachments"): "needs a real multipart upload, covered by unit tests",
+        ("GET", "/api/github/callback"): "reached only by GitHub's own redirect",
+    }
 
 
 def pytest_e2e_login_form(env):

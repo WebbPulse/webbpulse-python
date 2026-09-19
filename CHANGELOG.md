@@ -41,6 +41,38 @@ pays no import cost for the rest of the package.
 `configure_logging` already took `stream=` as of 0.8.0, so the stdout-to-stderr redirection
 both products wrap locally needs no package change.
 
+Two whole-run checks in `webbpulse.e2e`, from the Standupless test hardening build, plus the
+collection fix that build needed locally.
+
+`TestAccessLogHealth` sweeps the gateway's own access log for this run and fails on four
+shapes a per-case assertion cannot see: any 5xx, any 401 or 403 whose `integrationStatus` is
+200, any non-`OPTIONS` request that matched no route key, and any integration error message.
+The middle one is the one that matters most: a rejection the function never saw is the
+authorizer or the gate refusing, and from outside it reads exactly like a product permission
+check. The error message is read through `log_field`, so the literal `-` the gateway renders
+for an unset context variable is not reported as an error on every healthy request. The
+group is guarded by `test_the_access_log_carries_this_runs_requests`, which fails when
+nothing correlated, because an empty sweep is what a wrong log group produces and the four
+checks below would all pass on it. It skips where `E2E_ACCESS_LOG_GROUP` is unset.
+
+`TestRouteCoverage` asks the inverse of every other group: which served operations nothing
+exercised. Concrete request paths are matched back to templated routes by specificity, the
+way API Gateway matches them, so `/api/issues/7/comments` is credited to
+`/api/issues/{issue_id}/comments` rather than to `/api/issues/{issue_id}`. Products supply
+only their allowlist, through the new `pytest_e2e_uncovered_routes` hook; the matching, the
+staleness check and the empty-reason check are the package's. An entry naming a route the
+deployment no longer serves fails as stale, so an allowlist cannot outlive the gap it
+excuses. Both groups read the run through the new `suite_requests` fixture, which is the
+shared record every client already appends to, so no case has to register itself.
+
+A shell with no `E2E_*` set now collects and skips instead of erroring. `pytest_generate_tests`
+and `e2e_env` both went through `E2EEnvironment.from_environ()`, which raises, so any
+`pytest` or `--collect-only` over a product's whole tree died at collection naming variables
+the run never needed, and each product was working around it locally. `environment_for_collection()`
+returns None for a wholly unset shell and the suite parametrises a skipped placeholder. A
+partially configured shell still raises, because that is a wiring mistake and skipping past
+one is how a suite goes green against nothing.
+
 ## 0.44.0
 
 Three gaps the Standupless M5 build found on 0.43.0: an HKDF the products were hand-rolling,
