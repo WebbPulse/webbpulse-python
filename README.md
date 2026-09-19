@@ -58,6 +58,7 @@ its dev dependencies.
 | `webbpulse.metrics` | `emit`, `timed`, `MetricsEmitter`, `metrics_enabled_from_env`: CloudWatch Embedded Metric Format on stdout | [logging-and-metrics.md](docs/logging-and-metrics.md) |
 | `webbpulse.otel` | `configure_tracing`, `instrument_fastapi`, `TailSamplingSpanProcessor`: tracing with errors always sampled | [tracing.md](docs/tracing.md), [tracing-sampling.md](docs/tracing-sampling.md) |
 | `webbpulse.http` | `create_app`, `mount_all`, `health_router`, `RequestIdMiddleware`, `user_id_dependency`, the shared error envelope, `verify_hmac_signature`, and `CursorPage` with `cursor_page`, `encode_cursor` and `decode_cursor` | [http.md](docs/http.md), [error-handlers.md](docs/error-handlers.md) |
+| `webbpulse.composition` | `Domain`, `DomainRegistry`, `build_domain_app`, `domain_entrypoint`, `configure_tracing`, `check_secrets`, `local_authorizer`, `scope_for`: the domain registry and the one builder both composition roots go through | [composition.md](docs/composition.md) |
 | `webbpulse.events` | `stream_consumer_app`, `register_stream_consumer`, `events_path`: the one route a DynamoDB Streams or SQS consumer serves behind the Web Adapter; `EventEnvelope`, `enqueue`, `deserialize_image` and `source_table` on the producing side | [events.md](docs/events.md) |
 | `webbpulse.events.webhooks` | `WebhookDispatcher`, `WebhookSender`, `RetryPolicy`, `signature_headers`: signed outbound webhooks with jittered retries and a dead-letter hook | [webhooks.md](docs/webhooks.md) |
 | `webbpulse.messages` | `STATUS_MESSAGES`, `refusal`, `forbidden`, `unauthenticated`, `rate_limited`: the user-facing sentence each refusal renders; `extract_mentions` for `@handle` mentions in Markdown | [error-handlers.md](docs/error-handlers.md) |
@@ -68,7 +69,7 @@ its dev dependencies.
 | `webbpulse.identity` | App-managed identity: password, session, email link, TOTP, OAuth and passkey flows, plus a KMS-backed `TokenService` and a JWKS | [identity.md](docs/identity.md), [the standard](docs/identity-standard.md) |
 | `webbpulse.identity.oauth_server` | An OAuth 2.1 authorization server for hosting a remote MCP server: discovery, PKCE code grant, dynamic registration, consent | [oauth-server.md](docs/oauth-server.md) |
 | `webbpulse.lambda_entry` | `run_uvicorn`, `is_lambda`, `resolve_port`: the AWS Lambda Web Adapter entrypoint, with no Mangum and no handler | [packaging.md](docs/packaging.md) |
-| `webbpulse.testing` | Pytest fixtures: `test_client`, `create_table`, `rate_limit_table`, `make_request_context_headers`, `FakeKms`, `FakeIdempotencyStore`, `FakePresigner`, `FakeQueue`, `FakeWebhookSender` | [packaging.md](docs/packaging.md) |
+| `webbpulse.testing` | Pytest fixtures: `test_client`, `create_table`, `rate_limit_table`, `make_request_context_headers`, `FakeKms`, `FakeIdempotencyStore`, `FakePresigner`, `FakeQueue`, `FakeWebhookSender`; `assert_entrypoint_isolation` for the per-domain image check | [packaging.md](docs/packaging.md) |
 | `webbpulse.e2e` | A pytest plugin and generic post-deploy suite: route cut, coverage, reachability, identity, frontend and hygiene against a real stage | [e2e.md](docs/e2e.md) |
 
 ## Wiring a FastAPI domain Lambda

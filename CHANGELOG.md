@@ -78,6 +78,33 @@ in through `share_token_capability`.
 The `share-tokens` table is ahead of the identity terraform module; `docs/identity.md`
 holds the exact table contract and the Standupless migration.
 
+`webbpulse.composition` is the layer above `create_app` that three products each kept a
+near-identical copy of. It adds `Domain` and `DomainRegistry` for the descriptor a product
+declares, `build_domain_app` for the one builder both composition roots go through,
+`domain_entrypoint` returning the `(build_app, main)` pair a per-domain `entrypoint.py`
+binds, plus `configure_logging`, `configure_tracing`, `check_secrets`, `local_authorizer`,
+`RepositoryScope` and `scope_for`. `webbpulse.testing` gains `assert_entrypoint_isolation`
+and `entrypoint_imports`, the subprocess check both products test today, parameterised by
+the registry.
+
+Three choices are load-bearing. `Domain.load_routers` is a callable, not a list of routers,
+because importing the registry must import no domain package and that lazy import is what
+keeps one domain's image free of the others' code. `configure_tracing` sits behind
+`OTEL_EXPORTER_OTLP_TRACES_ENDPOINT`, because with that unset the exporter falls back to
+this region's X-Ray endpoint and a function with no X-Ray grant then retries a 403 on every
+export for the life of the process, in silence. `configure` hooks run before the routers
+and `after_routers` after, so product middleware sits inside the CORS and request id
+middleware while anything needing the finished route table still sees it.
+
+`Domain.tables`, `read_tables` and `bundle_for` are not folded in: they resolve through a
+product's own registry and bundle type, so they stay in the product and read `scope_for`.
+
+### Migration for adopters
+
+Before and after for a `wiring.py`, an `entrypoint.py` and the isolation test are in
+[composition.md](docs/composition.md#migration-for-adopters), with what each of the three
+products keeps locally. The Dockerfile CMD does not change.
+
 ## 0.44.0
 
 Three gaps the Standupless M5 build found on 0.43.0: an HKDF the products were hand-rolling,
