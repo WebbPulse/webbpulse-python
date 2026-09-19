@@ -27,8 +27,8 @@ import pytest
 
 from webbpulse.config import rate_limits_apply
 
-from .access_log import AccessLogLookup
-from .client import DEFAULT_PER_MINUTE, E2EClient
+from .access_log import AccessLogEntry, AccessLogLookup
+from .client import DEFAULT_PER_MINUTE, E2EClient, RequestRecord
 from .ephemeral import (
     CREATE_PATH,
     Credentials,
@@ -69,6 +69,7 @@ __all__ = [
     "LOCAL_ACCESS_LOG_REASON",
     "LOCAL_ENVIRONMENT",
     "LOCAL_GATEWAY_REASON",
+    "NO_ENVIRONMENT_REASON",
     "READ_ONLY_REASON",
     "SHARED_STATE_GROUP",
     "WRITES_MARKER",
@@ -87,7 +88,10 @@ __all__ = [
     "MissingEnvironment",
     "Record",
     "RouteSpec",
+    "access_log_health",
+    "environment_for_collection",
     "pytest_addhooks",
+    "suite_requests",
 ]
 
 pytest_plugins = ["webbpulse.e2e.gate", "webbpulse.e2e.browser"]
@@ -109,6 +113,11 @@ _GATEWAY_REQUIRED = ("E2E_API_ID", "E2E_ACCESS_LOG_GROUP")
 LOCAL_GATEWAY_REASON = "gateway only, runs post deploy"
 
 LOCAL_ACCESS_LOG_REASON = "the access log is gateway only, runs post deploy"
+
+NO_ENVIRONMENT_REASON = (
+    "E2E_ENVIRONMENT is unset, so the suite has no deployed stage to run against. "
+    "The reusable e2e.yml workflow sets the E2E_* variables; locally, see docs/e2e.md."
+)
 
 _USER_REQUIRED = ("E2E_USER_EMAIL", "E2E_USER_PASSWORD")
 
@@ -396,6 +405,28 @@ def _owning_group(item: pytest.Item) -> str:
     return "" if cls is None else str(cls.__name__)
 
 
+def environment_for_collection(
+    environ: Mapping[str, str] | None = None,
+) -> E2EEnvironment | None:
+    """The environment if `E2E_*` is set, or None when it is not, never raising.
+
+    Collection happens before any fixture runs and before pytest can report a skip, so a
+    `pytest_generate_tests` that parametrises from the environment raises `MissingEnvironment`
+    at collection on any shell that has not exported `E2E_*`. That turns an unconfigured
+    local run, and every `--collect-only` on a product's whole test tree, into a collection
+    error naming variables the run never needed.
+
+    Returning None instead lets the caller parametrise a placeholder and mark it skipped, so
+    the cases are collected, named and reported as skipped for want of an environment. Only
+    the unconfigured case is absorbed: a partially or wrongly configured environment still
+    raises, because that is a wiring mistake the run should fail on rather than skip past.
+    """
+    source = os.environ if environ is None else environ
+    if not source.get("E2E_ENVIRONMENT", "").strip():
+        return None
+    return E2EEnvironment.from_environ(source)
+
+
 def _read_only_from_environ() -> bool:
     """Whether `E2E_READ_ONLY` is set, readable at collection with no fixture."""
     return _truthy(os.environ.get("E2E_READ_ONLY", ""))
@@ -408,8 +439,18 @@ def _local_from_environ() -> bool:
 
 @pytest.fixture(scope="session")
 def e2e_env() -> E2EEnvironment:
-    """The environment under test, parsed from `E2E_*`."""
-    return E2EEnvironment.from_environ()
+    """The environment under test, parsed from `E2E_*`, or a skip when there is none.
+
+    An unconfigured shell skips rather than erroring, so running a product's whole test tree
+    without the e2e variables reports the suite as skipped for want of an environment rather
+    than as dozens of errors about a fixture. A partially configured one still raises,
+    because that is a wiring mistake and skipping past it is how a suite goes quietly green
+    against nothing.
+    """
+    env = environment_for_collection()
+    if env is None:
+        pytest.skip(NO_ENVIRONMENT_REASON)
+    return env
 
 
 @pytest.fixture(scope="session")
@@ -746,6 +787,53 @@ def access_log(e2e_env: E2EEnvironment, request: pytest.FixtureRequest) -> Acces
         pytest.skip(LOCAL_ACCESS_LOG_REASON)
     boto3_session = request.getfixturevalue("boto3_session")
     return AccessLogLookup(boto3_session.client("logs"), e2e_env.access_log_group)
+
+
+@pytest.fixture(scope="session")
+def suite_requests(anon: E2EClient) -> Sequence[RequestRecord]:
+    """Every request this run made, gathered once the rest of the session has finished.
+
+    Requested by the health and coverage cases, which run last. `with_token` hands each
+    clone the same `records` list, so the anonymous client's list is the whole run's,
+    authenticated requests included, and one fixture sees everything without any case
+    having to register itself.
+
+    The list is live rather than copied, so a case that reads it during the run sees what
+    has been sent so far rather than a stale snapshot.
+    """
+    return anon.records
+
+
+@pytest.fixture(scope="session")
+def access_log_health(
+    e2e_env: E2EEnvironment,
+    access_log: AccessLogLookup,
+    suite_requests: Sequence[RequestRecord],
+) -> Sequence[AccessLogEntry]:
+    """The access log entries for this run's own requests, correlated by request id.
+
+    Scanned as one window rather than one lookup per request: the run's entries all land in
+    the same delivery window, so a single forced scan costs one CloudWatch read for the
+    whole suite where per-id lookups would cost hundreds.
+
+    Only this run's ids are returned. The log group carries every request the stage served,
+    including other suites and real traffic, and failing this run for someone else's 5xx
+    would make the check unactionable.
+    """
+    if not e2e_env.access_log_group:
+        pytest.skip(
+            "E2E_ACCESS_LOG_GROUP is unset, so there is no access log to sweep. The sweep "
+            "reads the gateway's own record of this run, which nothing else can substitute."
+        )
+    access_log.scan_window(force=True)
+    entries = []
+    for record in suite_requests:
+        if not record.request_id:
+            continue
+        entry = access_log.read_one(record.request_id)
+        if entry is not None:
+            entries.append(entry)
+    return tuple(entries)
 
 
 @pytest.fixture(scope="session")

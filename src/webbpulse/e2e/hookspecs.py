@@ -20,6 +20,7 @@ __all__ = [
     "pytest_e2e_journeys",
     "pytest_e2e_login_form",
     "pytest_e2e_routes",
+    "pytest_e2e_uncovered_routes",
 ]
 
 
@@ -67,4 +68,19 @@ def pytest_e2e_journeys(env: Any) -> Any:
     `created_resources` and the product's own `pytest_e2e_cleanup` deletes it. Browser
     journeys may mutate in both environments, which is exactly why the recording is
     mandatory.
+    """
+
+
+@pytest.hookspec(firstresult=True)
+def pytest_e2e_uncovered_routes(env: Any) -> Any:
+    """Return the routes this product knowingly leaves unexercised, or None for none.
+
+    A mapping of `(method, path)` to the reason that pair is not worth covering, where the
+    path is the route as the OpenAPI document spells it, template braces and all. The
+    coverage case asserts that every served route was either exercised by this run or named
+    here, so a route added without a test fails rather than passing unnoticed, and a reason
+    that stops being true fails as a stale entry rather than silently excusing a gap.
+
+    Only the allowlist is the product's: the matching, the staleness check and the empty
+    reason check are the plugin's, so a product supplies the exceptions and nothing else.
     """

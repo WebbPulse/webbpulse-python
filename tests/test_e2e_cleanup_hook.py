@@ -151,12 +151,26 @@ class TestFailureHandling:
 
 
 class TestEnvironmentRefusal:
-    """Tests for the plugin refusing to run against an unconfigured environment."""
+    """Tests for how the plugin reacts to an unconfigured and to a half-configured shell.
 
-    def test_an_unset_environment_fails_the_test_rather_than_erroring_obscurely(
-        self, pytester: pytest.Pytester
+    The two cases are deliberately different. Nothing set at all is a shell that never meant
+    to run the e2e suite, most often a product running its whole test tree, and that skips.
+    Something set but not everything is a wiring mistake, and skipping past one is how a
+    suite goes quietly green against nothing, so that still fails and names the variables.
+    """
+
+    def test_an_unset_environment_skips_rather_than_erroring(self, pytester: pytest.Pytester) -> None:
+        """With nothing set, the cases are collected and skipped for want of an environment."""
+        pytester.makeconftest('pytest_plugins = ["webbpulse.e2e"]')
+        pytester.makepyfile(test_one="def test_nothing(e2e_env): pass")
+        result = pytester.runpytest_inprocess("-p", "no:cacheprovider")
+        result.assert_outcomes(skipped=1)
+
+    def test_a_partial_environment_still_fails_naming_the_variables(
+        self, pytester: pytest.Pytester, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        """With nothing set, the run fails naming the variables instead of on a connection error."""
+        """A half-wired run fails on the missing names rather than skipping past them."""
+        monkeypatch.setenv("E2E_ENVIRONMENT", "staging")
         pytester.makeconftest('pytest_plugins = ["webbpulse.e2e"]')
         pytester.makepyfile(test_one="def test_nothing(e2e_env): pass")
         result = pytester.runpytest_inprocess("-p", "no:cacheprovider")
