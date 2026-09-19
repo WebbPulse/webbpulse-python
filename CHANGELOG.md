@@ -105,6 +105,30 @@ Before and after for a `wiring.py`, an `entrypoint.py` and the isolation test ar
 [composition.md](docs/composition.md#migration-for-adopters), with what each of the three
 products keeps locally. The Dockerfile CMD does not change.
 
+The DynamoDB glue three products were hand-writing to mount `webbpulse.identity` is in the
+package: a product's glue is now its `claims_for` override and its table prefix.
+`webbpulse.identity.dynamo_stores(prefix, *, region_name=None, endpoint_url=None)` builds the
+`IdentityStores` from the package's own table constants, `dynamo_login_attempts` the lockout
+store, and `build_dynamo_router(settings, hooks, *, prefix=None, ...)` is
+`build_identity_router` with those stores and the signing client built for you; every other
+argument passes through and `stores`, `attempts` and `kms_client` override what would be built.
+Neither factory makes an AWS call at import.
+
+`webbpulse.identity.users` holds the shared account row, `User`, and `DynamoUsersRepository`,
+generic over the model so a product with extra fields passes a subclass. `update` aliases every
+attribute name and rewrites `email_lower` whenever `email` is set. `users_repository` accepts
+either `prefix` or `table_name`, and both is a `ValueError`. `User.email` is a plain `str`, not
+`EmailStr`, so `email-validator` stays out of every Lambda.
+
+`DynamoUsersHooks(BaseIdentityHooks)` implements every hook over that repository except
+`claims_for`, with `ACCOUNT_DISABLED` and `EMAIL_NOT_VERIFIED` behind one `REFUSAL_MESSAGE`.
+`create_identity_tables(client, prefix="", *, skip_existing=True, include_users=True)` creates
+every identity table and applies each TTL, for a local stack or a test suite. `webbpulse.testing`
+gains the `identity_tables` fixture and `assert_users_repository_contract(repository)`.
+
+Nothing here changes behaviour. The before-and-after for `package_glue.py`, `identity_hooks.py`
+and `users.py` is in [identity-data-model.md](docs/identity-data-model.md) section 4.5.
+
 ## 0.44.0
 
 Three gaps the Standupless M5 build found on 0.43.0: an HKDF the products were hand-rolling,
