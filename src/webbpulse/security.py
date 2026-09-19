@@ -7,6 +7,8 @@ than read from the token header. What the claims mean is left to the caller.
 
 from __future__ import annotations
 
+import hashlib
+import hmac
 import json
 import logging
 import os
@@ -18,6 +20,7 @@ __all__ = [
     "BCRYPT_MAX_BYTES",
     "DEFAULT_ALGORITHM",
     "DEFAULT_ROUNDS",
+    "HASH_LENGTH",
     "ExpiredToken",
     "InvalidToken",
     "TokenError",
@@ -26,6 +29,9 @@ __all__ = [
     "bearer_claims",
     "create_token",
     "decode_token",
+    "derive_key",
+    "expand_key",
+    "extract_key",
     "flatten_secret",
     "hash_password",
     "load_app_secrets",
@@ -35,6 +41,9 @@ __all__ = [
 ]
 
 BCRYPT_MAX_BYTES: Final = 72
+
+HASH_LENGTH: Final = hashlib.sha256().digest_size
+"""The output size of the hash HKDF runs over here, which bounds a derivation at 255 times it."""
 
 DEFAULT_ROUNDS: int = 12
 
@@ -68,6 +77,96 @@ class InvalidToken(TokenError):
     The specific reason stays off the message, so a service echoing it tells an attacker
     nothing about which check failed.
     """
+
+
+def extract_key(master: bytes, salt: bytes = b"") -> bytes:
+    """The HKDF-Extract step of RFC 5869 over SHA-256: one pseudorandom key from `master`.
+
+    Extract is a plain HMAC with the salt as the key and the input keying material as the
+    message, which concentrates whatever entropy `master` holds into a uniform
+    `HASH_LENGTH` byte value. An empty salt is RFC 5869's own default and hashes as
+    `HASH_LENGTH` zero bytes, which is what makes an unsalted derivation reproducible.
+
+    Args:
+        master: The input keying material. Any length, including empty.
+        salt: An optional non-secret salt. Defaults to the RFC's zero-filled one.
+
+    Returns:
+        The `HASH_LENGTH` byte pseudorandom key to expand from.
+    """
+    return hmac.new(salt or bytes(HASH_LENGTH), master, hashlib.sha256).digest()
+
+
+def expand_key(prk: bytes, info: bytes, length: int) -> bytes:
+    """The HKDF-Expand step of RFC 5869 over SHA-256: `length` bytes bound to `info`.
+
+    Separate from `extract_key` because a caller whose input is already a uniform random
+    key, such as one read from a secret store, may skip extraction, and because the two
+    halves are what the RFC's own test vectors exercise. `derive_key` is the pair and is
+    what product code should reach for.
+
+    Args:
+        prk: The pseudorandom key, normally `extract_key`'s result.
+        info: The context binding this derivation apart from any other under the same key.
+        length: How many bytes to return, at most 255 times `HASH_LENGTH`.
+
+    Returns:
+        Exactly `length` bytes.
+
+    Raises:
+        ValueError: When `length` is negative or over the RFC's 255 block ceiling, which is
+            the point past which the block counter wraps and the output silently repeats.
+    """
+    if length < 0:
+        raise ValueError(f"A derived key cannot be {length} bytes long.")
+    if length > 255 * HASH_LENGTH:
+        raise ValueError(
+            f"HKDF over SHA-256 cannot produce more than {255 * HASH_LENGTH} bytes, and {length} "
+            "was asked for. Derive a shorter key, or derive several under different info."
+        )
+    output = bytearray()
+    block = b""
+    counter = 1
+    while len(output) < length:
+        block = hmac.new(prk, block + info + bytes([counter]), hashlib.sha256).digest()
+        output += block
+        counter += 1
+    return bytes(output[:length])
+
+
+def derive_key(master: bytes, info: str, length: int = 32, *, salt: bytes = b"") -> bytes:
+    """Derive one key from a master key and a context string, with HKDF-SHA256.
+
+    RFC 5869 in full: extract `master` into a pseudorandom key, then expand that to
+    `length` bytes bound to `info`. Two different `info` strings under one master give
+    independent keys, so a product stores one secret and derives a key per purpose, and
+    leaking one derived key says nothing about another or about the master.
+
+    `info` is text because it is a context label rather than key material, and it is encoded
+    as UTF-8. Version it and include everything the key is scoped to, in a fixed order, so
+    two scopes can never render the same string: `"acme.webhook.v1:<webhook_id>:<salt>"`
+    rather than a bare id.
+
+    The default empty `salt` is deliberate. HKDF is defined with an optional salt and the
+    derivation is reproducible without one, which is what a key that must be re-derived on
+    every request needs. Pass a random `salt` and store it alongside the ciphertext only
+    when every derivation is a fresh one, as sealing a secret is.
+
+    Args:
+        master: The master key. High entropy random bytes, never a password: HKDF is a
+            key derivation function, not a password hash, and does no stretching.
+        info: The context this key is scoped to.
+        length: How many bytes to return. Defaults to 32, which is an AES-256 or an
+            HMAC-SHA256 key.
+        salt: An optional non-secret salt, stored with whatever the key protects.
+
+    Returns:
+        Exactly `length` bytes.
+
+    Raises:
+        ValueError: When `length` is negative or over 255 times `HASH_LENGTH`.
+    """
+    return expand_key(extract_key(master, salt), info.encode("utf-8"), length)
 
 
 def _truncate(password: str) -> bytes:

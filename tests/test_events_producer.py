@@ -2,7 +2,8 @@
 
 Covers the envelope's wire shape and its round trip, what `enqueue` sends on a standard
 queue against a FIFO one, `deserialize_image` over the attribute-value shapes a DynamoDB
-Streams record actually carries, and `source_table` over the ARNs it carries them under.
+Streams record actually carries, `source_table` over the ARNs it carries them under, and
+`record_sequence` over the numbers a consumer orders and dedupes on.
 """
 
 from __future__ import annotations
@@ -19,6 +20,7 @@ from webbpulse.events import (
     EventEnvelope,
     deserialize_image,
     enqueue,
+    record_sequence,
     source_table,
 )
 from webbpulse.testing import FakeQueue
@@ -307,3 +309,67 @@ def test_an_arn_naming_an_empty_table_is_refused() -> None:
     """`table//stream/...` names nothing, so it is a failure rather than an empty string."""
     with pytest.raises(ValueError, match="empty table"):
         source_table({"eventSourceARN": "arn:aws:dynamodb:us-west-2:432410731887:table//stream/2026"})
+
+
+def test_a_sequence_number_comes_back_as_an_integer() -> None:
+    """The stream carries a decimal string and this returns the `int` a comparison needs."""
+    assert record_sequence({"dynamodb": {"SequenceNumber": "100000000000000000001"}}) == 100000000000000000001
+
+
+def test_a_sequence_number_beyond_64_bits_keeps_every_digit() -> None:
+    """Python `int` is arbitrary precision, so a long stream number is exact and not rounded."""
+    raw = "1" + "0" * 40 + "7"
+    assert record_sequence({"dynamodb": {"SequenceNumber": raw}}) == int(raw)
+
+
+def test_sequence_numbers_order_numerically_rather_than_lexically() -> None:
+    """`"100"` is after `"99"` as an integer, which is the ordering bug this call removes."""
+    later = record_sequence({"dynamodb": {"SequenceNumber": "100"}})
+    earlier = record_sequence({"dynamodb": {"SequenceNumber": "99"}})
+    assert later > earlier
+
+
+def test_an_already_applied_record_is_recognised_by_its_sequence() -> None:
+    """A redelivered record carries the same number, so a consumer can skip it."""
+    record = {"eventID": "e-1", "dynamodb": {"SequenceNumber": "42"}}
+    assert record_sequence(record) == record_sequence(dict(record))
+
+
+def test_a_record_with_no_dynamodb_section_is_refused() -> None:
+    """An SQS record has no sequence number, and zero would replay everything already applied."""
+    with pytest.raises(ValueError, match="no dynamodb section"):
+        record_sequence({"messageId": "m-1"})
+
+
+def test_a_record_with_no_sequence_number_is_refused() -> None:
+    """A DynamoDB section missing the number is a malformed record rather than a zero."""
+    with pytest.raises(ValueError, match="not a number"):
+        record_sequence({"dynamodb": {"Keys": {}}})
+
+
+@pytest.mark.parametrize("value", [None, ["1"], {"N": "1"}, True])
+def test_a_non_numeric_sequence_number_is_refused(value: Any) -> None:
+    """Anything that is not a string or an integer raises, including a bool masquerading as one."""
+    with pytest.raises(ValueError, match="not a number"):
+        record_sequence({"dynamodb": {"SequenceNumber": value}})
+
+
+def test_a_sequence_number_that_is_not_decimal_is_refused() -> None:
+    """A string that is not a decimal integer raises rather than becoming a partial parse."""
+    with pytest.raises(ValueError, match="not a decimal integer"):
+        record_sequence({"dynamodb": {"SequenceNumber": "12ab"}})
+
+
+def test_an_integer_sequence_number_is_accepted() -> None:
+    """A hand-built test record may carry an `int`, and that is the same number."""
+    assert record_sequence({"dynamodb": {"SequenceNumber": 42}}) == 42
+
+
+def test_the_sequence_sits_beside_the_image_on_one_record() -> None:
+    """One record answers both calls, which is what a consumer reads together."""
+    record = {
+        "eventName": "MODIFY",
+        "dynamodb": {"SequenceNumber": "7", "NewImage": {"id": {"S": "i-1"}}},
+    }
+    assert record_sequence(record) == 7
+    assert deserialize_image(record) == {"id": "i-1"}

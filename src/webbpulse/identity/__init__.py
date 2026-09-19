@@ -86,6 +86,7 @@ from webbpulse.identity.events import (
     users_key_attribute,
 )
 from webbpulse.identity.flows import (
+    EMAIL_UNAVAILABLE_MESSAGE,
     INVALID_CREDENTIALS_MESSAGE,
     PASSWORD_CREDENTIAL_TYPE,
     AuthResult,
@@ -433,6 +434,7 @@ __all__ = [
     "DIGEST_MESSAGE_TYPE",
     "DISCOVERY_CACHE_CONTROL",
     "DISCOVERY_PATH",
+    "EMAIL_UNAVAILABLE_MESSAGE",
     "EVENTS_PATH_ENV",
     "FORBIDDEN_ERROR_CODE",
     "GATE_CLAIMS_KEY",

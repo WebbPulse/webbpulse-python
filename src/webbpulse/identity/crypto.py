@@ -182,15 +182,19 @@ class SecretMasterKeyCipher:
         self._master_key = master_key
 
     def _derive(self, salt: bytes, context: Mapping[str, str]) -> bytes:
-        """Derive the per-secret key for one salt, binding the context into the info."""
-        from cryptography.hazmat.primitives import hashes
-        from cryptography.hazmat.primitives.kdf.hkdf import HKDF
+        """Derive the per-secret key for one salt, binding the context into the info.
+
+        `webbpulse.security` holds the one HKDF-SHA256 in the package, so this and a
+        product's own derivation cannot drift apart. The output is byte for byte what the
+        `cryptography` HKDF this used to call produced for the same master, salt and info,
+        so no stored seed needs rewrapping.
+        """
+        from webbpulse.security import expand_key, extract_key
 
         info = b"\x00".join(
             [HKDF_INFO, *(f"{k}={context[k]}".encode() for k in sorted(context))],
         )
-        hkdf = HKDF(algorithm=hashes.SHA256(), length=AES_KEY_BYTES, salt=salt, info=info)
-        return hkdf.derive(self._master_key)
+        return expand_key(extract_key(self._master_key, salt), info, AES_KEY_BYTES)
 
     def seal(
         self,

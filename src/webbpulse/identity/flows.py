@@ -67,6 +67,13 @@ INVALID_CREDENTIALS_MESSAGE: Final = "Invalid email or password."
 
 PASSWORD_CREDENTIAL_TYPE: Final = "password"
 
+EMAIL_UNAVAILABLE_MESSAGE: Final = "Email could not be sent right now. Try again in a few minutes."
+"""The 503 body for a send that failed on a path that reports one.
+
+Fixed text, naming neither the address nor the provider's reason, so the response is the
+same shape and the same words whatever account was asked about.
+"""
+
 REGISTRATION_VIA: Final = "password"
 
 EPHEMERAL_VIA: Final = "e2e-ephemeral"
@@ -1146,21 +1153,39 @@ class IdentityFlows:
         """Send one rendered message.
 
         `best_effort` separates the paths that tolerate a send failure from the paths that
-        report one: a deliberate resend must not answer 200 having sent nothing.
+        report one: a deliberate resend must not answer 200 having sent nothing. A
+        best-effort failure is logged and the flow continues; a reported one becomes a 503
+        carrying `EMAIL_UNAVAILABLE`, which is the honest status for a provider that is down
+        and is retryable, where the 500 this used to surface says the service is broken and
+        invites no retry.
+
+        The refusal is built from nothing but the failure. Its message, `error_code` and
+        status are fixed strings, so the body is identical whichever address was asked for
+        and a caller cannot read an account's existence out of a mail outage. The provider's
+        own reason stays in the log.
         """
         from webbpulse.identity.email import EmailSendFailed
 
         assert self._email is not None
+        purpose = message.tags.get("purpose", "unknown")
         try:
             self._email.send(message)
-        except EmailSendFailed:
+        except EmailSendFailed as exc:
             if not best_effort:
-                raise
+                _log.warning(
+                    "Could not send an identity email; the flow refused.",
+                    extra={"event": "email.send_failed", "purpose": purpose, "reported": True},
+                )
+                raise LoginRejected(
+                    EMAIL_UNAVAILABLE_MESSAGE,
+                    error_code="EMAIL_UNAVAILABLE",
+                    status_code=503,
+                ) from exc
             _log.warning(
                 "Could not send an identity email; the flow continued.",
                 extra={
                     "event": "email.send_failed",
-                    "purpose": message.tags.get("purpose", "unknown"),
+                    "purpose": purpose,
                 },
             )
 
