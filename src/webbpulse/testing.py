@@ -13,7 +13,7 @@ from __future__ import annotations
 
 import json
 import os
-from collections.abc import Collection, Iterator, Mapping
+from collections.abc import Callable, Collection, Iterator, Mapping
 from typing import TYPE_CHECKING, Any
 
 import pytest
@@ -31,6 +31,7 @@ __all__ = [
     "FakeWebhookSender",
     "aws_credentials",
     "create_table",
+    "dynamodb_reset_hooks",
     "dynamodb_resource",
     "fake_kms",
     "make_request_context_headers",
@@ -69,21 +70,48 @@ def aws_credentials() -> Iterator[None]:
 
 
 @pytest.fixture
-def dynamodb_resource(aws_credentials: None) -> Iterator[Any]:
+def dynamodb_reset_hooks() -> list[Callable[[], None]]:
+    """The cache-clearing callables `dynamodb_resource` runs on setup and teardown.
+
+    The package's own `reset_resource_cache` is always run and is not in this list. A product
+    that memoises its own boto3 resource overrides this fixture to add its reset, so its
+    conftest drops the wrapper fixture it would otherwise have needed:
+
+    ```python
+    @pytest.fixture
+    def dynamodb_reset_hooks() -> list[Callable[[], None]]:
+        from app.db.client import reset_clients
+
+        return [reset_clients]
+    ```
+
+    Each hook runs once before the mock opens and once after it closes, in the order given.
+    """
+    return []
+
+
+@pytest.fixture
+def dynamodb_resource(aws_credentials: None, dynamodb_reset_hooks: list[Callable[[], None]]) -> Iterator[Any]:
     """A moto-mocked DynamoDB service resource.
 
-    The cached resource in `webbpulse.dynamodb` is cleared on both sides, so no client
-    leaks into or out of the mock.
+    The cached resource in `webbpulse.dynamodb` is cleared on both sides, along with every
+    callable `dynamodb_reset_hooks` yields, so no client leaks into or out of the mock.
     """
     import boto3
     from moto import mock_aws
 
     from webbpulse.dynamodb import reset_resource_cache
 
-    reset_resource_cache()
+    def reset() -> None:
+        """Clear the package's cached resource and then every caller-supplied cache."""
+        reset_resource_cache()
+        for hook in dynamodb_reset_hooks:
+            hook()
+
+    reset()
     with mock_aws():
         yield boto3.resource("dynamodb", region_name="us-west-2")
-    reset_resource_cache()
+    reset()
 
 
 def create_table(
@@ -93,24 +121,60 @@ def create_table(
     hash_key: str = "pk",
     range_key: str | None = None,
     ttl_attribute: str | None = None,
+    attribute_definitions: Collection[Mapping[str, str]] = (),
+    global_secondary_indexes: Collection[Mapping[str, Any]] = (),
+    stream_specification: Mapping[str, Any] | None = None,
+    request: Mapping[str, Any] | None = None,
 ) -> Table:
-    """Create one on-demand table and wait for it to exist.
+    """Create one on-demand table, wait for it to exist and apply its TTL.
 
-    Attribute definitions cover only the key attributes, since DynamoDB rejects a
-    definition for anything that is not part of a key or an index.
+    The keyword arguments shape the common case. `request` is the escape hatch for anything
+    they do not cover: a product holding a whole `CreateTable` keyword mapping, such as the
+    one `webbpulse.identity.storage.TableSpec.create_table_request` builds, passes it whole
+    and still gets the waiting and the TTL this helper does. Its keys win over the ones built
+    here, so `request={"BillingMode": "PROVISIONED", ...}` overrides the default billing mode,
+    and `TableName` is always `name`.
+
+    Args:
+        resource: A DynamoDB service resource, usually the `dynamodb_resource` fixture.
+        name: The table name, which overrides any `TableName` in `request`.
+        hash_key: The partition key attribute, typed `S`.
+        range_key: The sort key attribute, typed `S`, or `None` for a hash-only table.
+        ttl_attribute: Enables time to live on this attribute after the table exists. TTL is
+            not part of `CreateTable`, so it is a second call either way.
+        attribute_definitions: Extra `AttributeDefinitions` entries, for attributes an index
+            keys on. They are merged with the key attributes, later entries winning, since
+            DynamoDB rejects a name defined twice.
+        global_secondary_indexes: `GlobalSecondaryIndexes` entries, passed through as given.
+        stream_specification: The `StreamSpecification`, for a table a consumer test reads a
+            stream from.
+        request: Any further `CreateTable` keyword arguments, merged over everything above.
+
+    Returns:
+        The created `Table`, ready to use.
     """
-    attributes: list[dict[str, str]] = [{"AttributeName": hash_key, "AttributeType": "S"}]
+    attributes: dict[str, dict[str, str]] = {hash_key: {"AttributeName": hash_key, "AttributeType": "S"}}
     schema: list[dict[str, str]] = [{"AttributeName": hash_key, "KeyType": "HASH"}]
     if range_key:
-        attributes.append({"AttributeName": range_key, "AttributeType": "S"})
+        attributes[range_key] = {"AttributeName": range_key, "AttributeType": "S"}
         schema.append({"AttributeName": range_key, "KeyType": "RANGE"})
+    for definition in attribute_definitions:
+        attributes[definition["AttributeName"]] = dict(definition)
 
-    table = resource.create_table(
-        TableName=name,
-        KeySchema=schema,
-        AttributeDefinitions=attributes,
-        BillingMode="PAY_PER_REQUEST",
-    )
+    kwargs: dict[str, Any] = {
+        "KeySchema": schema,
+        "AttributeDefinitions": list(attributes.values()),
+        "BillingMode": "PAY_PER_REQUEST",
+    }
+    if global_secondary_indexes:
+        kwargs["GlobalSecondaryIndexes"] = [dict(index) for index in global_secondary_indexes]
+    if stream_specification is not None:
+        kwargs["StreamSpecification"] = dict(stream_specification)
+    if request:
+        kwargs.update(request)
+    kwargs["TableName"] = name
+
+    table = resource.create_table(**kwargs)
     table.wait_until_exists()
     if ttl_attribute:
         resource.meta.client.update_time_to_live(
