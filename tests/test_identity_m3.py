@@ -13,6 +13,7 @@ import pytest
 
 from webbpulse.identity import (
     CONFIRMATION_FAILED_MESSAGE,
+    EMAIL_UNAVAILABLE_MESSAGE,
     RESET_CONFIRM_PATH,
     RESET_LINK_PATH,
     RESET_REQUEST_PATH,
@@ -1324,3 +1325,182 @@ def test_the_rate_limits_match_section_5_1() -> None:
     assert RESET_IP_LIMIT == (10, 3600)
     assert VERIFY_EMAIL_LIMIT == (3, 3600)
     assert VERIFY_IP_LIMIT == (10, 3600)
+
+
+@pytest.fixture
+def failing_sender() -> RecordingEmailSender:
+    """A recording sender whose every send raises `EmailSendFailed`, as a provider outage does."""
+    return RecordingEmailSender(fail=True)
+
+
+@pytest.fixture
+def failing_flows(
+    kms: FakeKms,
+    hooks: FakeHooks,
+    stores: IdentityStores,
+    attempts: InMemoryLoginAttemptStore,
+    failing_sender: RecordingEmailSender,
+) -> IdentityFlows:
+    """Identity flows wired to a sender that cannot send."""
+    settings = make_settings()
+    return IdentityFlows(
+        settings,
+        hooks,
+        stores,
+        TokenService(settings, kms),
+        attempts=attempts,
+        email_sender=failing_sender,
+    )
+
+
+@pytest.fixture
+def failing_client(
+    kms: FakeKms,
+    hooks: FakeHooks,
+    stores: IdentityStores,
+    attempts: InMemoryLoginAttemptStore,
+    failing_sender: RecordingEmailSender,
+) -> Iterator[TestClient]:
+    """A `TestClient` over the identity router with a sender that cannot send."""
+    from webbpulse.http import register_error_handlers
+
+    settings = make_settings()
+    app = FastAPI()
+    register_error_handlers(app, error_codes=True)
+    app.include_router(
+        build_identity_router(
+            settings,
+            hooks,
+            stores,
+            kms_client=kms,
+            attempts=attempts,
+            email_sender=failing_sender,
+            limiter_enabled=False,
+        )
+    )
+    with TestClient(app, base_url="https://api.example.com") as test_client:
+        yield test_client
+
+
+def test_a_reset_send_failure_is_a_503_rather_than_a_500(
+    failing_flows: IdentityFlows, hooks: FakeHooks, stores: IdentityStores
+) -> None:
+    """`request_password_reset` maps `EmailSendFailed` to a 503 the caller can retry."""
+    seed_account(hooks, stores)
+
+    with pytest.raises(LoginRejected) as caught:
+        failing_flows.request_password_reset(EMAIL)
+
+    assert caught.value.status_code == 503
+    assert caught.value.error_code == "EMAIL_UNAVAILABLE"
+
+
+def test_a_verification_resend_failure_is_the_same_503(
+    failing_flows: IdentityFlows, hooks: FakeHooks, stores: IdentityStores
+) -> None:
+    """The deliberate resend reports the same refusal, since it also sends non best effort."""
+    seed_account(hooks, stores)
+
+    with pytest.raises(LoginRejected) as caught:
+        failing_flows.request_verification(EMAIL)
+
+    assert caught.value.status_code == 503
+    assert caught.value.error_code == "EMAIL_UNAVAILABLE"
+
+
+def test_the_send_failure_refusal_names_neither_the_address_nor_the_provider(
+    failing_flows: IdentityFlows, hooks: FakeHooks, stores: IdentityStores
+) -> None:
+    """The message is a fixed string, so it leaks no address and no provider reason."""
+    seed_account(hooks, stores)
+
+    with pytest.raises(LoginRejected) as caught:
+        failing_flows.request_password_reset(EMAIL)
+
+    assert caught.value.message == EMAIL_UNAVAILABLE_MESSAGE
+    assert EMAIL not in caught.value.message
+    assert "RecordingEmailSender" not in caught.value.message
+
+
+def test_the_send_failure_refusal_is_the_same_for_every_address(
+    failing_flows: IdentityFlows, hooks: FakeHooks, stores: IdentityStores
+) -> None:
+    """Two accounts give the same message, code and status, so nothing distinguishes them."""
+    seed_account(hooks, stores)
+    seed_account(hooks, stores, email="second@example.com", user_id="user-5150")
+
+    refusals = []
+    for address in (EMAIL, "second@example.com"):
+        with pytest.raises(LoginRejected) as caught:
+            failing_flows.request_password_reset(address)
+        refusals.append((caught.value.message, caught.value.error_code, caught.value.status_code))
+
+    assert refusals[0] == refusals[1]
+
+
+def test_registration_still_tolerates_a_send_failure(failing_flows: IdentityFlows, hooks: FakeHooks) -> None:
+    """Sending stays best effort where it already was: a failed welcome mail still registers."""
+    assert failing_flows.register(email=EMAIL, password=PASSWORD) is not None
+    assert hooks.by_email[EMAIL]
+
+
+def test_a_password_change_still_tolerates_a_send_failure(
+    failing_flows: IdentityFlows, hooks: FakeHooks, stores: IdentityStores
+) -> None:
+    """The password changed notice is best effort, so a send failure does not undo the change."""
+    seed_account(hooks, stores)
+    login = failing_flows.login(email=EMAIL, password=PASSWORD)
+
+    failing_flows.change_password(
+        user_id=USER_ID,
+        current_password=PASSWORD,
+        new_password=NEW_PASSWORD,
+        keep_family_id=login.family_id,
+    )
+
+    assert failing_flows.login(email=EMAIL, password=NEW_PASSWORD).access_token
+
+
+def test_the_reset_route_renders_the_503_in_the_platform_envelope(
+    failing_client: TestClient, hooks: FakeHooks, stores: IdentityStores
+) -> None:
+    """The route answers 503 with `EMAIL_UNAVAILABLE` in the shared error envelope."""
+    seed_account(hooks, stores)
+
+    response = failing_client.post(f"{prefix()}{RESET_REQUEST_PATH}", json={"email": EMAIL})
+
+    assert response.status_code == 503
+    body = response.json()
+    assert body["error_code"] == "EMAIL_UNAVAILABLE"
+    assert body["success"] is False
+    assert body["message"] == EMAIL_UNAVAILABLE_MESSAGE
+
+
+def test_an_unknown_address_still_answers_200_while_the_mailer_is_down(
+    failing_client: TestClient, hooks: FakeHooks, stores: IdentityStores
+) -> None:
+    """An address with no account never reaches a send, so it answers exactly as it always does.
+
+    The 503 says the mail provider is down, which is true of every account at once and is not
+    a fact about one address. What must not vary is the body of a given outcome, and the 503
+    body is fixed, so neither response carries the address or anything derived from it.
+    """
+    response = failing_client.post(f"{prefix()}{RESET_REQUEST_PATH}", json={"email": OTHER_EMAIL})
+
+    assert response.status_code == 200
+    assert response.json()["detail"] == RESET_REQUESTED_MESSAGE
+
+
+def test_the_503_body_is_identical_for_two_different_accounts(
+    failing_client: TestClient, hooks: FakeHooks, stores: IdentityStores
+) -> None:
+    """Byte-identical bodies for two accounts, bar the per-request id the envelope carries."""
+    seed_account(hooks, stores)
+    seed_account(hooks, stores, email="second@example.com", user_id="user-5150")
+
+    first = failing_client.post(f"{prefix()}{RESET_REQUEST_PATH}", json={"email": EMAIL}).json()
+    second = failing_client.post(f"{prefix()}{RESET_REQUEST_PATH}", json={"email": "second@example.com"}).json()
+
+    first.pop("request_id", None)
+    second.pop("request_id", None)
+    assert first == second

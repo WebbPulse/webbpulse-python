@@ -5,6 +5,55 @@ Notable changes to the `webbpulse` package. The version here is the one in
 
 This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## 0.44.0
+
+Three gaps the Standupless M5 build found on 0.43.0: an HKDF the products were hand-rolling,
+the stream sequence number a consumer dedupes on, and a mail outage answering 500.
+
+`webbpulse.security.derive_key(master, info, length=32, *, salt=b"")` is HKDF-SHA256 to
+RFC 5869, extract then expand, and it is now the one HKDF in the package: the identity TOTP
+cipher's `SecretMasterKeyCipher._derive` was calling `cryptography`'s HKDF and now composes
+the same primitive, which is byte for byte what it produced before, so no sealed seed needs
+rewrapping. One stored secret becomes a key per purpose, because two `info` strings under one
+master give independent keys and leaking one says nothing about another or about the master.
+`info` is text rather than bytes because it is a context label and not key material, and the
+advice is to version it and include everything the key is scoped to in a fixed order, so two
+scopes can never render the same string. The default salt is empty, which is the RFC's own
+zero-filled default and is what makes a key that must be re-derived on every request
+reproducible; a random salt stored beside the ciphertext belongs to a fresh derivation, as
+sealing a secret is. Over 255 times the hash length raises rather than wrapping the block
+counter and silently repeating the output, and a negative length raises rather than being an
+empty key.
+
+`extract_key` and `expand_key` are public as well, which is the part that matters for
+adoption. A product whose master key is already high-entropy random commonly hashed it and
+expanded from that with no extract step, and those keys are in production: `derive_key` does
+**not** reproduce them, because the extract step changes the output. `expand_key(sha256(
+master).digest(), info, length)` does, exactly, so an existing derivation swaps to
+`expand_key` with no key rotation and anything new starts on `derive_key`.
+
+`webbpulse.events.record_sequence(record)` reads a DynamoDB Streams record's
+`dynamodb.SequenceNumber`, which is what a consumer orders and dedupes on and which every
+consumer was otherwise reading by hand. An event source mapping retries a whole batch, so a
+handler sees a record it has already applied and skips it by storing the highest sequence
+applied per item. The value comes back as an `int` rather than the decimal string the record
+carries, because one far exceeds 64 bits: `int` is arbitrary precision so the comparison is
+exact, while string comparison orders `"100"` before `"99"` and a float loses the low digits.
+Ordering holds within one partition key only. A record with no sequence number, an SQS one
+for instance, raises `ValueError` rather than reporting zero, which would replay everything
+already applied.
+
+An identity send that the provider refuses on a path that reports failures, which is
+`request_password_reset` and the deliberate `request_verification` resend, now answers **503
+with `EMAIL_UNAVAILABLE`** instead of surfacing `EmailSendFailed` as a 500. A mail provider
+being down is retryable and is not the service being broken, and the two statuses tell a
+client different things about whether to try again. The refusal is built from nothing but the
+failure: its message is the fixed `EMAIL_UNAVAILABLE_MESSAGE`, naming neither the address
+asked about nor the provider's reason, so the body is identical for every account and a
+caller reads no account's existence out of an outage. The provider's reason stays in the log.
+Every other send is unchanged and still best effort, so a registration or a password change
+still succeeds when its notice cannot be delivered.
+
 ## 0.43.0
 
 Five gaps the Standupless M3 build found on 0.42.0: a REMOVE update, stream source

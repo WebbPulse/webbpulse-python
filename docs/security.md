@@ -84,3 +84,37 @@ it in the package's existing envelope rather than a new shape, with `error_code`
 `TOKEN_EXPIRED` or `INVALID_TOKEN` and a `WWW-Authenticate: Bearer` challenge. With
 `auto_error=False` it returns `None` instead of raising, for a route serving both anonymous
 and authenticated callers.
+
+## Deriving keys
+
+`derive_key` is HKDF-SHA256 (RFC 5869), and it is the one HKDF in the package: the identity
+TOTP cipher derives through the same primitive, so a product and the package cannot drift
+apart on it.
+
+```python
+from webbpulse.security import derive_key
+
+key = derive_key(master, f"acme.webhook.v1:{webhook_id}:{salt}")
+```
+
+One stored secret becomes a key per purpose. Two different `info` strings under one master
+give independent keys, so leaking one derived key says nothing about another or about the
+master. Version the `info` and include everything the key is scoped to, in a fixed order, so
+two scopes can never render the same string. It is text because it is a context label rather
+than key material, and it is encoded as UTF-8.
+
+`master` must be high-entropy random bytes and **never a password**: HKDF is a key
+derivation function, not a password hash, and does no stretching. Use `hash_password` for a
+password.
+
+The default `salt` is empty, which is RFC 5869's own zero-filled default and makes the
+derivation reproducible, as a key re-derived on every request needs to be. Pass a random
+`salt` and store it beside the ciphertext only when every derivation is a fresh one, as
+sealing a secret is.
+
+`extract_key` and `expand_key` are the two halves, public because a product that already
+stores keys from a hand-rolled expand-only derivation needs to keep deriving the same bytes.
+Such code hashed a master and expanded from that with no extract step, and
+`expand_key(sha256(master).digest(), info, length)` reproduces it byte for byte, where
+`derive_key` does not: `derive_key` runs the extract step, which changes the output. Move to
+`expand_key` to keep existing keys working, and to `derive_key` for anything new.

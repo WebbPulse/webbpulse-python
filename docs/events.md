@@ -165,6 +165,32 @@ than against `"issues"` and the consumer works in every environment. A record ca
 source ARN, or one that is not a DynamoDB stream ARN, raises `ValueError`, since a record
 that cannot be placed would otherwise be routed to the wrong handler.
 
+## Ordering and deduping stream records
+
+An event source mapping retries a whole batch, so a consumer sees a record it has already
+applied. `record_sequence` reads the number the stream orders and identifies records by:
+
+```python
+from webbpulse.events import deserialize_image, record_sequence
+
+
+def handle(record):
+    """Apply one change, skipping anything the projection has already seen."""
+    item = deserialize_image(record)
+    sequence = record_sequence(record)
+    if sequence <= last_applied(item["id"]):
+        return
+    reindex(item, sequence)
+```
+
+The value comes back as a Python `int` rather than the decimal string the record carries,
+because one far exceeds 64 bits: string comparison would order `"100"` before `"99"` and a
+float would lose the low digits, while `int` is arbitrary precision so the comparison is
+exact. Ordering holds **within one partition key only**: two records for different items
+carry comparable numbers that mean nothing across items. A record with no
+`dynamodb.SequenceNumber`, such as an SQS one, raises `ValueError` rather than reporting
+zero, which would replay every record already applied.
+
 ## Testing a producer
 
 `webbpulse.testing.FakeQueue` satisfies the `QueueClient` protocol structurally, so a

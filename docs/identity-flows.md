@@ -118,3 +118,10 @@ the DynamoDB TTL**, and deletes it on use. TTL MUST NOT be treated as access con
 endpoints MUST answer **identically whether or not the address exists** (5.4) and are rate
 limited per address and per IP. A failed confirmation answers with
 `CONFIRMATION_FAILED_MESSAGE`.
+
+A send that the provider refuses on one of these two request paths answers **503 with
+`EMAIL_UNAVAILABLE`**, which is retryable and true, where the 500 it used to raise says the
+service is broken. The body is a fixed message naming neither the address nor the provider's
+reason, so it is identical for every account and the reason stays in the log. Every other
+send stays best effort: a registration or a password change still succeeds when its notice
+cannot be delivered.

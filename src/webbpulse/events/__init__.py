@@ -13,8 +13,9 @@ the error handlers. `webbpulse.identity.events` is built on the primitive.
 
 The producing side lives here too: `EventEnvelope` is the shape a domain event is published
 in and `enqueue` puts one on an SQS queue. `deserialize_image` reads a DynamoDB Streams
-record image back into plain Python values, and `source_table` says which table a record
-came from, for a consumer reading more than one stream.
+record image back into plain Python values, `source_table` says which table a record came
+from, for a consumer reading more than one stream, and `record_sequence` reads the sequence
+number a consumer orders and dedupes on.
 """
 
 from __future__ import annotations
@@ -52,6 +53,7 @@ __all__ = [
     "event_records",
     "events_path",
     "record_id",
+    "record_sequence",
     "register_stream_consumer",
     "source_table",
     "stream_consumer_app",
@@ -255,6 +257,50 @@ def deserialize_image(record: Mapping[str, Any], image: ImageName = "NewImage") 
         return {}
     deserializer = TypeDeserializer()
     return {key: deserializer.deserialize(value) for key, value in raw.items()}
+
+
+def record_sequence(record: Mapping[str, Any]) -> int:
+    """The `dynamodb.SequenceNumber` of one DynamoDB Streams record, as an integer.
+
+    A stream orders the records for one partition key by this number and it only ever
+    increases within that key, so it is what a consumer compares to order two changes to one
+    item and to drop a redelivery: an event source mapping retries a whole batch, so a
+    handler sees the same record again and can skip it by storing the highest sequence it
+    has applied per item and ignoring anything at or below it.
+
+    The stream carries the value as a decimal string, and one far exceeds 64 bits, which is
+    why it comes back as a Python `int` rather than a float or the raw string: `int` is
+    arbitrary precision so the comparison is exact, while string comparison would order
+    `"100"` before `"99"` and a float would lose the low digits.
+
+    Ordering holds only within one partition key. Two records for different items carry
+    comparable numbers that mean nothing across items, so this is for per-item ordering and
+    never for a global sequence.
+
+    Args:
+        record: One record from a DynamoDB Streams batch.
+
+    Returns:
+        The sequence number.
+
+    Raises:
+        ValueError: When the record carries no `dynamodb.SequenceNumber`, or one that is not
+            a decimal integer. A consumer deduping on the sequence cannot place a record
+            without one, and treating a missing number as zero would replay every record it
+            had already applied.
+    """
+    section = record.get("dynamodb")
+    if not isinstance(section, Mapping):
+        raise ValueError("The record carries no dynamodb section, so it has no sequence number.")
+
+    raw = section.get("SequenceNumber")
+    if not isinstance(raw, str | int) or isinstance(raw, bool):
+        raise ValueError(f"The record's SequenceNumber is not a number: {raw!r}")
+
+    try:
+        return int(raw)
+    except ValueError as exc:
+        raise ValueError(f"The record's SequenceNumber is not a decimal integer: {raw!r}") from exc
 
 
 def source_table(record: Mapping[str, Any]) -> str:
