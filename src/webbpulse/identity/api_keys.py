@@ -40,6 +40,7 @@ __all__ = [
     "API_KEYS_TABLE",
     "API_KEY_PREFIX",
     "API_KEY_TABLE",
+    "API_KEY_TENANT_INDEX",
     "API_KEY_USER_INDEX",
     "KEY_BYTES",
     "PREFIX_DISPLAY_LENGTH",
@@ -58,6 +59,7 @@ __all__ = [
     "new_key",
     "revoke",
     "verify",
+    "verify_for_tenant",
 ]
 
 _log = logging.getLogger(__name__)
@@ -67,6 +69,15 @@ API_KEYS_TABLE: Final = "api-keys"
 
 API_KEY_USER_INDEX: Final = "user_id-created_at-index"
 """The GSI that lists one user's keys, newest last, for a settings page and for purge."""
+
+API_KEY_TENANT_INDEX: Final = "tenant_id-created_at-index"
+"""The GSI that lists one tenant's keys, newest last, for a multi-tenant admin page.
+
+A multi-tenant product's key list is "every key in this workspace", which the `key_hash`
+partition cannot answer and `API_KEY_USER_INDEX` answers only one person at a time. Without
+this index that listing is a scan, so a product either grew its own table beside this one or
+paid for a scan on a human-facing page. Both are what this index removes.
+"""
 
 API_KEY_PREFIX: Final = "wpk_"
 """The literal every plaintext key starts with.
@@ -224,6 +235,33 @@ class ApiKeyStore(ABC):
     def delete_all_for_user(self, user_id: str) -> int:
         """Delete every key a user holds, returning how many went. The account deletion purge."""
 
+    def list_for_tenant(self, tenant_id: str) -> list[ApiKeyRecord]:
+        """Every key issued inside one tenant, for a multi-tenant admin page.
+
+        Concrete rather than abstract so a store written before this method existed keeps
+        satisfying the protocol. The default answers empty rather than scanning, because a
+        store with no tenant index cannot answer this without reading the whole table and a
+        silent scan on a human-facing page is worse than an empty list.
+        """
+        del tenant_id
+        return []
+
+    def revoke_all_for_tenant(self, tenant_id: str, *, revoked_at: str | None = None) -> int:
+        """Revoke every live key of one tenant, returning how many were revoked.
+
+        The offboarding verb: a tenant that is suspended or deleted must stop authenticating
+        at once, and revoking is a write rather than a delete for the same reason one key's
+        revocation is, so the rows stay visible to an operator afterwards.
+
+        Built on `list_for_tenant`, so a store that cannot list a tenant revokes nothing and
+        says so by returning zero rather than appearing to have succeeded.
+        """
+        revoked = 0
+        for record in self.list_for_tenant(tenant_id):
+            if not record.is_revoked and self.revoke(record.key_hash, revoked_at=revoked_at) is not None:
+                revoked += 1
+        return revoked
+
 
 class InMemoryApiKeyStore(ApiKeyStore):
     """Dict-backed `ApiKeyStore`, keyed as the table is."""
@@ -268,6 +306,13 @@ class InMemoryApiKeyStore(ApiKeyStore):
         for key_hash in hashes:
             del self._items[key_hash]
         return len(hashes)
+
+    def list_for_tenant(self, tenant_id: str) -> list[ApiKeyRecord]:
+        """Every key of one tenant, oldest first, matching the index's sort order."""
+        return sorted(
+            (record for record in self._items.values() if record.tenant_id == tenant_id),
+            key=lambda record: record.created_at,
+        )
 
 
 FakeApiKeyStore = InMemoryApiKeyStore
@@ -391,16 +436,34 @@ class DynamoApiKeyStore(ApiKeyStore):
             return 0
         return self._repo.delete_many(keys)
 
+    def list_for_tenant(self, tenant_id: str) -> list[ApiKeyRecord]:
+        """Every key of one tenant, from `API_KEY_TENANT_INDEX`, so the read may be slightly stale.
+
+        Staleness is acceptable here and not on `get`: this is the settings page, where a key
+        minted a second ago appearing a second late is invisible, whereas a key that cannot
+        authenticate immediately after minting is a bug its owner reports.
+        """
+        from boto3.dynamodb.conditions import Key as KeyCondition
+
+        return [
+            _record_from_item(item)
+            for item in self._repo.iter_query(KeyCondition("tenant_id").eq(tenant_id), index_name=API_KEY_TENANT_INDEX)
+        ]
+
 
 API_KEY_TABLE: Final = TableSpec(
     logical_name=API_KEYS_TABLE,
     attributes=(
         TableAttribute("key_hash", "S"),
         TableAttribute("user_id", "S"),
+        TableAttribute("tenant_id", "S"),
         TableAttribute("created_at", "S"),
     ),
     hash_key="key_hash",
-    global_secondary_indexes=(TableIndex(name=API_KEY_USER_INDEX, hash_key="user_id", range_key="created_at"),),
+    global_secondary_indexes=(
+        TableIndex(name=API_KEY_USER_INDEX, hash_key="user_id", range_key="created_at"),
+        TableIndex(name=API_KEY_TENANT_INDEX, hash_key="tenant_id", range_key="created_at"),
+    ),
 )
 """The `api-keys` table spec, in the shape the platform identity module provisions it.
 
@@ -485,6 +548,39 @@ def verify(
         return None
     if touch:
         store.touch(key_hash)
+    return record
+
+
+def verify_for_tenant(
+    plaintext: str,
+    store: ApiKeyStore,
+    tenant_id: str,
+    *,
+    now: datetime | None = None,
+    touch: bool = True,
+) -> ApiKeyRecord | None:
+    """Resolve a presented plaintext against one tenant, or `None`.
+
+    `verify` plus the binding check a multi-tenant product must make: a key names exactly one
+    tenant and may never act in another, so a key minted in tenant A reaching tenant B
+    whenever its minter belongs to both is the cross-tenant reach a scoped credential exists
+    to prevent.
+
+    `None` for every refusal, tenant mismatch included, so a key cannot be walked across
+    tenant ids to learn which ones exist. A caller that wants to log the difference compares
+    `record.tenant_id` itself after a plain `verify`.
+
+    An empty `tenant_id` refuses rather than matching everything, because a caller that could
+    not resolve which tenant it is in must not be the one deciding the key may act. The key
+    is touched only on a match, so a refused presentation leaves `last_used_at` alone.
+    """
+    if not tenant_id:
+        return None
+    record = verify(plaintext, store, now=now, touch=False)
+    if record is None or not constant_time_equals(record.tenant_id, tenant_id):
+        return None
+    if touch:
+        store.touch(record.key_hash)
     return record
 
 
