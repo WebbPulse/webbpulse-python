@@ -773,10 +773,10 @@ def test_read_only_refusal_omits_a_hint_that_was_not_supplied() -> None:
     assert str(raised.value).endswith("only reads."), f"got {str(raised.value)!r}"
 
 
-def test_read_only_is_a_permission_error_and_a_dynamo_error() -> None:
-    """`ReadOnlyTable` is catchable as either, so existing handlers keep working."""
+def test_read_only_is_a_permission_error_but_not_a_dynamo_error() -> None:
+    """A broad data-layer handler must not swallow the mistake the guard exists to expose."""
     assert issubclass(ReadOnlyTable, PermissionError)
-    assert issubclass(ReadOnlyTable, DynamoError)
+    assert not issubclass(ReadOnlyTable, DynamoError)
 
 
 def test_a_read_only_repository_refuses_before_touching_the_network() -> None:

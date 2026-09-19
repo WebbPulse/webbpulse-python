@@ -243,12 +243,14 @@ def encode_numbers(value: Any) -> Any:
     return value
 
 
-class ReadOnlyTable(DynamoError, PermissionError):
+class ReadOnlyTable(PermissionError):
     """A write reached a repository built with `read_only=True`.
 
     Raised in tests and local runs, so a code path that writes to a table the function only
     holds a read grant on fails the suite instead of returning an AccessDenied in staging.
-    The message names the table, the method, and whatever hint the caller registered.
+    The message names the table, the method, and whatever hint the caller registered. It is
+    a `PermissionError` and deliberately not a `DynamoError`, so a broad data-layer handler
+    cannot swallow the mistake it exists to expose.
     """
 
     def __init__(self, table: str, method: str, hint: str | None = None) -> None:

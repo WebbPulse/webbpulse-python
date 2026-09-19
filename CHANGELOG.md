@@ -11,7 +11,8 @@ Two generic helpers the Standupless and Terraform-runner builds were each keepin
 copy of.
 
 `Repository(..., read_only=True)` in `webbpulse.dynamodb` makes every write raise the new
-`ReadOnlyTable`, which subclasses both `DynamoError` and `PermissionError`. It mirrors a
+`ReadOnlyTable`, a `PermissionError` that is deliberately not a `DynamoError`, so a
+broad data-layer handler cannot swallow it. It mirrors a
 function whose IAM policy grants only reads on a table, so a route that writes where it
 holds no grant fails a unit test instead of returning an AccessDenied in staging. The
 refusal names the table and the method and appends the caller's `read_only_hint`, so the

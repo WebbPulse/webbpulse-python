@@ -193,8 +193,8 @@ users.put({"pk": "user#1"})       # raises ReadOnlyTable
 
 The message names the table and the refused method, and appends `read_only_hint` when the
 caller supplied one, so the error can point at the registry entry and the Terraform grant
-that have to move together. `ReadOnlyTable` subclasses both `DynamoError` and
-`PermissionError`.
+that have to move together. `ReadOnlyTable` is a `PermissionError` and not a
+`DynamoError`, so a broad data-layer handler cannot swallow it.
 
 The guarded names are `WRITE_METHODS`, and the guard is installed on `Repository` itself,
 so a product subclass inherits it. The package's own suite classifies every public method
