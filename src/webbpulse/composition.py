@@ -454,6 +454,9 @@ def build_domain_app(
     Composition is `include_router` and never `mount`, which would empty the OpenAPI
     document the route-cut tests read.
 
+    A row's `extra` is passed to `create_app` under the explicit keyword arguments, which win
+    on a clash, so a caller can override one domain's default without editing its row.
+
     `configure` runs after `create_app` and before any router is included, which is where a
     product adds the middleware it wants inside the CORS and request id middleware
     `create_app` installed, since Starlette runs middleware outermost-first in the order
@@ -481,11 +484,8 @@ def build_domain_app(
     if settings is not None:
         create_app_kwargs.setdefault("settings", settings)
 
-    app = create_app(
-        instrument=False,
-        **{key: value for domain in resolved for key, value in domain.extra.items()},
-        **create_app_kwargs,
-    )
+    extras = {key: value for domain in resolved for key, value in domain.extra.items()}
+    app = create_app(instrument=False, **{**extras, **create_app_kwargs})
 
     app.state.repository_scope = scope_for(resolved)
 

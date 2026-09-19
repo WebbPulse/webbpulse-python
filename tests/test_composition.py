@@ -237,6 +237,13 @@ def test_the_extra_mapping_reaches_create_app() -> None:
     assert build_domain_app(domain, settings=Settings()).description == "from extra"
 
 
+def test_explicit_keyword_arguments_win_over_a_row_extra() -> None:
+    """A clash between a row's `extra` and a caller's keyword is not a `TypeError`."""
+    domain = Domain(name="d", load_routers=posts_router, extra={"description": "from extra"})
+    app = build_domain_app(domain, description="from caller")
+    assert app.description == "from caller"
+
+
 def test_the_configure_hooks_run_before_the_routers() -> None:
     """`configure` sees an app with no domain routes and `after_routers` sees them all."""
     seen: list[tuple[str, int]] = []
