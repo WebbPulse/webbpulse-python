@@ -4,8 +4,10 @@ Enable them with `pytest_plugins = ["webbpulse.testing"]`. They cover a moto-bac
 DynamoDB table, a `TestClient` whose requests carry a realistic API Gateway request
 context, and a locally signing KMS stand-in. `FakeIdempotencyStore`, `FakePresigner`,
 `FakeQueue` and `FakeWebhookSender` are the doubles for the seams a handler reaches the
-outside world through, so a test needs neither moto nor a socket. Import only from tests; it
-needs the `testing` extra, and `FakeKms` additionally needs `cryptography`, which the
+outside world through, so a test needs neither moto nor a socket. `assert_entrypoint_isolation`
+is the composition-layer check: it builds every domain's entrypoint in its own interpreter
+and holds that each one imports its own domain package and no other. Import only from tests;
+it needs the `testing` extra, and `FakeKms` additionally needs `cryptography`, which the
 `identity` extra brings in.
 """
 
@@ -14,6 +16,7 @@ from __future__ import annotations
 import json
 import os
 from collections.abc import Callable, Collection, Iterator, Mapping
+from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
 import pytest
@@ -24,15 +27,18 @@ if TYPE_CHECKING:  # pragma: no cover
     from mypy_boto3_dynamodb.service_resource import Table
 
 __all__ = [
+    "EntrypointImports",
     "FakeIdempotencyStore",
     "FakeKms",
     "FakePresigner",
     "FakeQueue",
     "FakeWebhookSender",
+    "assert_entrypoint_isolation",
     "aws_credentials",
     "create_table",
     "dynamodb_reset_hooks",
     "dynamodb_resource",
+    "entrypoint_imports",
     "fake_kms",
     "make_request_context_headers",
     "rate_limit_table",
@@ -578,3 +584,123 @@ def _as_webhook_response(item: Any) -> Any:
     from webbpulse.events.webhooks import WebhookResponse
 
     return WebhookResponse(status_code=item) if isinstance(item, int) else item
+
+
+@dataclass(frozen=True)
+class EntrypointImports:
+    """What one domain's entrypoint imported in a fresh interpreter.
+
+    `foreign` is the assertion that matters: the modules under `package_root` that belong to
+    some other domain. An empty `foreign` is the claim that makes N images smaller than N
+    copies of one image.
+    """
+
+    domain: str
+    module: str
+    imported: frozenset[str]
+    foreign: frozenset[str]
+
+    def __bool__(self) -> bool:
+        """Whether this entrypoint imported only its own domain."""
+        return not self.foreign
+
+
+def entrypoint_imports(
+    domain: str,
+    *,
+    module: str,
+    package: str,
+    package_root: str,
+    cwd: str | os.PathLike[str] | None = None,
+    env: Mapping[str, str] | None = None,
+    timeout: float = 180.0,
+) -> EntrypointImports:
+    """Build one domain's entrypoint in a subprocess and report what it imported.
+
+    A subprocess because the suite calling this has already imported every domain, so an
+    in-process check would read the suite's imports rather than the image's. The child runs
+    with a stripped environment, so an entrypoint that needed credentials to build would
+    fail here rather than in a cold start.
+
+    `module` is the entrypoint module to import, `package` the domain's own package under
+    `package_root`, and `package_root` the prefix every domain package shares, normally
+    `"app.domains."`. Raises `AssertionError` when the child fails, with its stderr.
+    """
+    import subprocess  # nosec B404
+    import sys
+
+    program = _ENTRYPOINT_PROBE.format(module=module, root=package_root)
+    environment = {
+        "PATH": os.environ.get("PATH", "/usr/bin:/bin"),
+        "PYTHONPATH": str(cwd) if cwd is not None else os.environ.get("PYTHONPATH", ""),
+        "PYTHONDONTWRITEBYTECODE": "1",
+    }
+    environment.update(env or {})
+    result = subprocess.run(  # nosec B603
+        [sys.executable, "-c", program],
+        cwd=str(cwd) if cwd is not None else None,
+        env=environment,
+        capture_output=True,
+        text=True,
+        timeout=timeout,
+    )
+    assert result.returncode == 0, f"building the {domain} entrypoint in a fresh interpreter failed:\n{result.stderr}"
+
+    imported = frozenset(name for name in json.loads(result.stdout.strip().splitlines()[-1]) if name)
+    own = f"{package_root}{package}"
+    foreign = frozenset(
+        name for name in imported if name != package_root.rstrip(".") and name != own and not name.startswith(f"{own}.")
+    )
+    return EntrypointImports(domain=domain, module=module, imported=imported, foreign=foreign)
+
+
+_ENTRYPOINT_PROBE = (
+    "import json, sys\n"
+    "import importlib\n"
+    "entrypoint = importlib.import_module({module!r})\n"
+    "entrypoint.build_app()\n"
+    "print(json.dumps(sorted(m for m in sys.modules if m.startswith({root!r}))))\n"
+)
+
+
+def assert_entrypoint_isolation(
+    registry: Mapping[str, Any],
+    *,
+    entrypoint_module: Callable[[str], str] | None = None,
+    package_root: str = "app.domains.",
+    module_template: str = "{root}{package}.entrypoint",
+    cwd: str | os.PathLike[str] | None = None,
+    env: Mapping[str, str] | None = None,
+    domains: Collection[str] | None = None,
+) -> dict[str, EntrypointImports]:
+    """Every domain's entrypoint imports its own domain package and no other.
+
+    The whole-registry form of `entrypoint_imports`, and what a product's
+    `tests/entrypoints/test_entrypoint_isolation.py` becomes: one call, parameterised by
+    the registry, asserting the same thing both adopting products assert today. Raises
+    `AssertionError` naming every domain that reached into another, and returns the probe
+    results so a caller can assert something further about them.
+
+    `entrypoint_module` maps a domain name to its package name, defaulting to the registry's
+    own method when it has one and to a hyphen-to-underscore translation otherwise.
+    """
+    resolve = entrypoint_module
+    if resolve is None:
+        registry_resolver = getattr(registry, "entrypoint_module", None)
+        resolve = registry_resolver if callable(registry_resolver) else (lambda name: name.replace("-", "_"))
+
+    results: dict[str, EntrypointImports] = {}
+    for domain in domains if domains is not None else registry:
+        package = resolve(domain)
+        results[domain] = entrypoint_imports(
+            domain,
+            module=module_template.format(root=package_root, package=package),
+            package=package,
+            package_root=package_root,
+            cwd=cwd,
+            env=env,
+        )
+
+    leaked = {domain: sorted(result.foreign) for domain, result in results.items() if result.foreign}
+    assert not leaked, "\n".join(f"the {domain} image also imported {modules}" for domain, modules in leaked.items())
+    return results

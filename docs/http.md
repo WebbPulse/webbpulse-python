@@ -16,6 +16,13 @@ from webbpulse.http import create_app
 app = create_app([posts_router], service_name="posts", version="1.4.0", settings=settings)
 ```
 
+A product deploying one Lambda per domain does not usually call this directly.
+[`webbpulse.composition`](composition.md) is the layer above it: a `Domain` descriptor
+whose routers load lazily, a `build_domain_app` that both composition roots go through so
+they cannot drift, and a `domain_entrypoint` that reduces a per-domain `entrypoint.py` to
+three lines. It calls `create_app` underneath, with the domain's title, service name and
+`extra` filled in from the registry row.
+
 CORS origins come from `settings` or an explicit list. When credentials are allowed the
 origin list must be exact and never `"*"`: the CORS specification forbids that pair, and it
 is the browser that rejects the response, which makes a server misconfiguration look like a
