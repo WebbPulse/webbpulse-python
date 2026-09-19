@@ -11,6 +11,7 @@ from webbpulse.identity.api_keys import (
     ACTOR_CLAIM,
     API_KEY_PREFIX,
     API_KEY_TABLE,
+    API_KEY_TENANT_INDEX,
     API_KEY_USER_INDEX,
     API_KEYS_TABLE,
     KEY_BYTES,
@@ -22,6 +23,7 @@ from webbpulse.identity.api_keys import (
     FakeApiKeyStore,
     InMemoryApiKeyStore,
     MintedApiKey,
+    TenantMismatch,
     claims_for_key,
     display_prefix,
     effective_scopes,
@@ -32,6 +34,7 @@ from webbpulse.identity.api_keys import mint as mint_api_key
 from webbpulse.identity.api_keys import new_key as new_api_key
 from webbpulse.identity.api_keys import revoke as revoke_api_key
 from webbpulse.identity.api_keys import verify as verify_api_key
+from webbpulse.identity.api_keys import verify_for_tenant as verify_api_key_for_tenant
 from webbpulse.identity.claims import (
     ARRAY_CLAIMS,
     BOOLEAN_CLAIMS,
@@ -291,10 +294,13 @@ from webbpulse.identity.scopes import (
     bearer_credential,
     claims_or_api_key,
     claims_scopes,
+    claims_tenant,
     has_scopes,
     is_api_key_actor,
     missing_scopes,
     require_scopes,
+    require_tenant,
+    tenant_matches,
 )
 from webbpulse.identity.service import (
     ACCESS_TOKEN_TYPE,
@@ -310,6 +316,33 @@ from webbpulse.identity.sessions import (
     SessionService,
 )
 from webbpulse.identity.settings import IdentitySettings, SignerKind, TotpCipherKind
+from webbpulse.identity.share_tokens import (
+    ACTOR_SHARE_TOKEN,
+    CAPABILITY_CLAIM,
+    SHARE_TOKEN_BYTES,
+    SHARE_TOKEN_PREFIX,
+    SHARE_TOKEN_SUBJECT,
+    SHARE_TOKEN_TABLE,
+    SHARE_TOKEN_TENANT_INDEX,
+    SHARE_TOKENS_TABLE,
+    DynamoShareTokenStore,
+    FakeShareTokenStore,
+    InMemoryShareTokenStore,
+    MintedShareToken,
+    ShareTokenRecord,
+    ShareTokenStore,
+    claims_for_share_token,
+    claims_or_credential,
+    hash_share_token,
+    is_share_token,
+    is_share_token_actor,
+    mint_share_token,
+    new_share_token,
+    revoke_share_token,
+    share_token_capability,
+    share_token_credential,
+    verify_share_token,
+)
 from webbpulse.identity.storage import (
     BILLING_MODE,
     CREDENTIALS_TABLE,
@@ -739,3 +772,39 @@ __all__ = [
     "validate_redirect_uri",
     "verify_api_key",
 ]
+
+__all__ += [
+    "ACTOR_SHARE_TOKEN",
+    "API_KEY_TENANT_INDEX",
+    "CAPABILITY_CLAIM",
+    "SHARE_TOKENS_TABLE",
+    "SHARE_TOKEN_BYTES",
+    "SHARE_TOKEN_PREFIX",
+    "SHARE_TOKEN_SUBJECT",
+    "SHARE_TOKEN_TABLE",
+    "SHARE_TOKEN_TENANT_INDEX",
+    "DynamoShareTokenStore",
+    "FakeShareTokenStore",
+    "InMemoryShareTokenStore",
+    "MintedShareToken",
+    "ShareTokenRecord",
+    "ShareTokenStore",
+    "TenantMismatch",
+    "claims_for_share_token",
+    "claims_or_credential",
+    "claims_tenant",
+    "hash_share_token",
+    "is_share_token",
+    "is_share_token_actor",
+    "mint_share_token",
+    "new_share_token",
+    "require_tenant",
+    "revoke_share_token",
+    "share_token_capability",
+    "share_token_credential",
+    "tenant_matches",
+    "verify_api_key_for_tenant",
+    "verify_share_token",
+]
+"""The symbols the tenant-scoped API key and share token work added, appended rather than
+merged into the list above so two parallel edits to this module do not collide."""

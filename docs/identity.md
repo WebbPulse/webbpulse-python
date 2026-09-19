@@ -298,3 +298,162 @@ identity module provisions it with the rest. It carries no TTL deliberately: exp
 on the read path, because a key that vanished from the table would be indistinguishable from
 one that never existed, and an expired key its owner can still see and delete is the better
 operator experience.
+
+### Tenant-scoped keys
+
+A key already names the tenant it acts inside, and `claims_for_key` puts it on the claims as
+`tenant_id`, so a product can fail closed on a mismatch. Two things make that practical.
+
+`list_for_tenant` and `revoke_all_for_tenant` answer "every key in this workspace" and stop a
+tenant authenticating at once, through the `tenant_id-created_at-index` GSI. The `key_hash`
+partition cannot answer either without a scan, which is why a multi-tenant product otherwise
+grew its own key table beside this one. Both are concrete rather than abstract on
+`ApiKeyStore`, so a store written before they existed still satisfies the protocol; the
+default answers empty rather than scanning, because a silent scan on a settings page is worse
+than an empty list.
+
+```python
+from webbpulse.identity import verify_api_key_for_tenant
+
+record = verify_api_key_for_tenant(presented, store, workspace_id)
+```
+
+`verify_api_key_for_tenant` is `verify` plus the binding check: a key minted in one tenant
+must never reach another, which is the cross-tenant reach a scoped credential exists to
+prevent. It answers `None` for a mismatch, like every other refusal, so a key cannot be walked
+across tenant ids to learn which ones exist. An empty tenant refuses rather than matching
+everything: a caller that could not work out which tenant it is in must not be the one
+deciding a key may act.
+
+On a route, either spelling does it. `claims_or_api_key(tenant=...)` checks inline, and
+`require_tenant("workspace_id", claims_dependency=...)` wraps a claims dependency that already
+exists. Both refuse with the same 401 an unknown credential gets rather than a 403, because a
+403 would confirm the tenant in the path exists.
+
+```python
+claims = claims_or_api_key(
+    store=store,
+    live_scopes=live_scopes_for_key,
+    tenant=lambda request: request.path_params["workspace_id"],
+)
+```
+
+`claims_tenant` reads the binding off any claims object and `tenant_matches` decides one
+against a tenant id, answering true for claims carrying no tenant at all: a session JWT is
+unbound, because a person's authority is their membership read fresh in whichever tenant the
+path names, and an unbound credential is not one bound somewhere else.
+
+## Share tokens
+
+`webbpulse.identity.share_tokens` is the third credential kind, beside a session JWT and an
+API key. A share token opens a public read-only link: holding it is the whole of the
+authorization, there is no account behind it, and it grants exactly what its stored row says.
+
+The payload is opaque to the package. A product decides what a token opens and reads it back
+out of `record.capability`, so this is not an issue tracker's share link, an album's share
+link or a report's share link, but all three.
+
+```python
+from webbpulse.identity import DynamoShareTokenStore, mint_share_token
+
+store = DynamoShareTokenStore(repository)
+minted = mint_share_token(
+    tenant_id=workspace.id,
+    capability={"kind": "issue", "issue_id": issue.id, "project_id": issue.project_id},
+    name="Design review",
+    created_by=user.id,
+    expires_in=timedelta(days=30),
+    store=store,
+)
+return {"url": f"https://{host}/shared/{minted.plaintext}"}
+```
+
+`minted.plaintext` is the only time the token exists outside the store, exactly as with an API
+key: 256 bits of CSPRNG entropy behind a `wps_` prefix, stored only as its SHA-256 and with no
+clear-text fragment at all. Because the token normally lives in a URL it will reach browser
+history and referrer headers, which is what `expires_in` and the revocation verb are for.
+
+Keep the capability closed. It is the whole of what the token grants, so a bound that would
+otherwise be a filter applied after the fact belongs in the row: name the one resource rather
+than a query that could later widen.
+
+`verify_share_token` answers `None` for every refusal, unknown, revoked and expired alike,
+because the reader is anonymous and telling those apart says whether a guessed value ever
+existed. `revoke_share_token` takes either the plaintext or the stored hash, and a store
+offers `list_for_tenant`, `revoke_all_for_tenant` and `delete_all_for_tenant` for the settings
+page and the tenant purge.
+
+`claims_or_credential` resolves all three kinds into one claims object, in the order JWT, API
+key, share token, so the weakest is consulted only where neither stronger one arrived and
+adding it cannot weaken a route that had an authorizer. It reads the token from the bearer
+header or from the path, since a share link is a URL a browser opens and a browser cannot set
+a header.
+
+```python
+from fastapi import Depends
+
+from webbpulse.identity import claims_or_credential, share_token_capability
+
+resolver = claims_or_credential(store=key_store, share_store=share_store, live_scopes=live)
+
+
+@router.get("/shared/{token}")
+def read_shared(claims: AuthorizerClaims = Depends(resolver)) -> SharedTarget:
+    capability = share_token_capability(claims)
+    ...
+```
+
+A share token's claims carry `sub` of `"share"`, the tenant, the capability and an `actor_kind`
+of `share_token`, and deliberately no `scope`: `require_scopes` therefore refuses one outright,
+which is the right default. A route that means to admit a share says so by reading
+`share_token_capability`, which answers an empty mapping for a JWT and for a key, so it can be
+read unconditionally. `is_share_token_actor` is there for the route that must refuse one.
+
+The `share-tokens` table is in `TABLES` with the rest. Unlike `api-keys` it does carry a TTL on
+`expires_at`: a share is a link a person hands out and forgets, so the table would otherwise
+grow without bound and there is no owner for whom an expired share staying visible is worth
+anything. Expiry is still enforced on the read path, because the sweep is not prompt.
+
+### Terraform the identity module still needs
+
+The `api-keys` tenant index ships in `platform-modules/aws//modules/identity` behind
+`api_keys_table_enabled`. The `share-tokens` table is ahead of the module until it gains a
+matching flag; until then a product using share tokens has no table at all.
+
+`api-keys` carries one attribute and one GSI beyond its `key_hash` hash key:
+
+| | |
+| --- | --- |
+| attribute | `tenant_id` (`S`) |
+| index name | `tenant_id-created_at-index` |
+| hash key | `tenant_id` |
+| range key | `created_at` |
+| projection | `ALL` |
+
+`share-tokens` is a new table:
+
+| | |
+| --- | --- |
+| attributes | `token_hash` (`S`), `tenant_id` (`S`), `created_at` (`S`) |
+| hash key | `token_hash` |
+| range key | none |
+| index name | `tenant_id-created_at-index` |
+| index hash key | `tenant_id` |
+| index range key | `created_at` |
+| projection | `ALL` |
+| TTL attribute | `expires_at` |
+| billing | `PAY_PER_REQUEST` |
+
+Adding a GSI to a live `api-keys` table is an online operation and no data has to be
+backfilled: every row already carries `tenant_id`, because `mint` has always written it, so
+rows appear in the new index as it builds.
+
+### Migrating a product-local copy
+
+Standupless keeps two shims this module replaces once the tables exist. `WorkspaceApiKeyStore`
+and its `key_hash-index` go away: `ApiKeyRepository.list_for_workspace` becomes
+`store.list_for_tenant(workspace_id)`, and `_check_tenant_binding` becomes `tenant_matches`
+or `claims_or_api_key(tenant=...)`. `share_links.py` becomes `DynamoShareTokenStore`, with
+`target_type`, `target_id`, `project_id` and `title` moving into `capability` and the
+`ws_target-index` dropped. Existing `shr_` links do not migrate, since the package hashes
+`wps_` tokens; re-mint them or read the old table until they expire.

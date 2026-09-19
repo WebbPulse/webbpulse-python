@@ -57,6 +57,27 @@ its own boto3 resource returns its reset from an override in its `conftest.py` a
 the wrapper fixture it needed before, and everything depending on `dynamodb_resource` picks
 the override up.
 
+Tenant-scoped API keys and share tokens, the two credential gaps the Standupless M6 build
+had rebuilt product-side.
+
+`webbpulse.identity.api_keys`: the `api-keys` spec gains a `tenant_id` attribute and the
+`tenant_id-created_at-index` GSI, `ApiKeyStore` gains concrete `list_for_tenant` and
+`revoke_all_for_tenant` (default empty, never a scan), and `verify_for_tenant`, exported as
+`verify_api_key_for_tenant`, refuses a key presented against another tenant with `None`. In
+`scopes`, `claims_or_api_key(tenant=...)`, `require_tenant`, `claims_tenant` and
+`tenant_matches` enforce the binding on a route; a mismatch is a 401, not a 403, so it never
+confirms that a tenant exists. Session JWTs carry no tenant and count as unbound.
+
+`webbpulse.identity.share_tokens` is a third credential kind: a `wps_` bearer with 256 bits
+of entropy, stored as its SHA-256, whose authority is one opaque `capability` mapping.
+`mint_share_token`, `verify_share_token`, `revoke_share_token`, `claims_or_credential` (JWT,
+then API key, then share token) and `share_token_capability` ship with in-memory and
+DynamoDB stores. A share carries no `scope`, so `require_scopes` refuses it and a route opts
+in through `share_token_capability`.
+
+The `share-tokens` table is ahead of the identity terraform module; `docs/identity.md`
+holds the exact table contract and the Standupless migration.
+
 ## 0.44.0
 
 Three gaps the Standupless M5 build found on 0.43.0: an HKDF the products were hand-rolling,

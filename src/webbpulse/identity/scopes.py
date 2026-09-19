@@ -19,6 +19,7 @@ from typing import TYPE_CHECKING, Any, Final
 from webbpulse.identity.api_keys import (
     ACTOR_API_KEY,
     ACTOR_CLAIM,
+    TENANT_CLAIM,
     ApiKeyRecord,
     ApiKeyStore,
     claims_for_key,
@@ -38,10 +39,13 @@ __all__ = [
     "bearer_credential",
     "claims_or_api_key",
     "claims_scopes",
+    "claims_tenant",
     "has_scopes",
     "is_api_key_actor",
     "missing_scopes",
     "require_scopes",
+    "require_tenant",
+    "tenant_matches",
 ]
 
 _log = logging.getLogger(__name__)
@@ -111,6 +115,28 @@ def claims_scopes(claims: Mapping[str, Any]) -> tuple[str, ...]:
     return ()
 
 
+def claims_tenant(claims: Mapping[str, Any]) -> str:
+    """The tenant a credential is bound to, or `""` for one that names none.
+
+    A verified API key always carries it, because `claims_for_key` stamps the record's own
+    `tenant_id`. A session JWT normally does not: a person's authority is their membership,
+    read fresh in whichever tenant the path names, so an empty answer here is the ordinary
+    case and not a fault.
+    """
+    return str(claims.get(TENANT_CLAIM, "") or "").strip()
+
+
+def tenant_matches(claims: Mapping[str, Any], tenant_id: str) -> bool:
+    """Whether a tenant-bound credential may act inside `tenant_id`.
+
+    True for claims carrying no tenant, which is the session case: an unbound credential is
+    not a credential bound to somewhere else. False whenever a bound one names a different
+    tenant, which is the check that keeps a key minted in one tenant out of every other.
+    """
+    bound = claims_tenant(claims)
+    return not bound or bound == tenant_id
+
+
 def missing_scopes(claims: Mapping[str, Any], required: Iterable[str]) -> tuple[str, ...]:
     """Which of `required` the claims do not carry, sorted, for a refusal to name."""
     held = set(claims_scopes(claims))
@@ -141,6 +167,7 @@ def claims_or_api_key(
     live_scopes: Callable[[ApiKeyRecord], Iterable[str]]
     | Callable[[ApiKeyRecord], Awaitable[Iterable[str]]]
     | None = None,
+    tenant: Callable[[Request], str] | None = None,
 ) -> Any:
     """Build the dependency returning verified claims from either credential.
 
@@ -160,6 +187,12 @@ def claims_or_api_key(
             carry the intersection of that with the key's own set through `effective_scopes`.
             May be `def` or `async def`. **Leaving it `None` means the key's stored scopes are
             trusted as-is**, which is only safe where membership cannot change.
+        tenant: Reads the tenant this request is addressed to, normally out of the path, for a
+            multi-tenant product. Any credential bound to a different tenant is refused with
+            the same 401 as an unknown one, so a key cannot be walked across tenant ids to
+            learn which exist. `None` leaves the binding unchecked, which is right only for a
+            single-tenant product; a multi-tenant one that leaves it `None` must make the
+            check itself against `claims_tenant`.
 
     Returns:
         An `async def` dependency suitable for `Depends`.
@@ -174,7 +207,7 @@ def claims_or_api_key(
             _log.warning("Authorizer claims unreadable: %s", exc, exc_info=exc)
             raise _unauthenticated() from exc
         if claims is not None:
-            return claims
+            return _tenant_checked(claims, request)
 
         if store is None:
             raise _unauthenticated()
@@ -191,7 +224,7 @@ def claims_or_api_key(
             raise _unauthenticated()
 
         if live_scopes is None:
-            return claims_for_key(record)
+            return _tenant_checked(claims_for_key(record), request)
         try:
             resolved = live_scopes(record)
             if inspect.isawaitable(resolved):
@@ -199,7 +232,26 @@ def claims_or_api_key(
         except Exception as exc:
             _log.warning("Could not load live scopes for an API key: %s", exc, exc_info=exc)
             raise _unauthenticated() from exc
-        return claims_for_key(record, scopes=effective_scopes(record.scopes, resolved))
+        return _tenant_checked(claims_for_key(record, scopes=effective_scopes(record.scopes, resolved)), request)
+
+    def _tenant_checked(claims: AuthorizerClaims, request: Request) -> AuthorizerClaims:
+        """The claims, once their tenant binding covers the tenant this request addresses.
+
+        A resolver that raises is a 401 rather than an unchecked pass: failing to learn which
+        tenant a request is in is exactly the case where a bound credential must not be let
+        through.
+        """
+        if tenant is None:
+            return claims
+        try:
+            wanted = tenant(request)
+        except Exception as exc:
+            _log.warning("Could not resolve the tenant for a request: %s", exc, exc_info=exc)
+            raise _unauthenticated() from exc
+        if not tenant_matches(claims, wanted):
+            _log.warning("Refusing a credential bound to another tenant.")
+            raise _unauthenticated()
+        return claims
 
     dependency.__name__ = "claims_or_api_key"
     dependency.__doc__ = "The verified claims for this request, from the authorizer or a presented API key."
@@ -252,6 +304,42 @@ def require_scopes(*required: str, claims_dependency: Any | None = None) -> Any:
 
     dependency.__name__ = "require_scopes"
     dependency.__doc__ = f"Requires the scopes {', '.join(wanted) or '(none)'} on this request's claims."
+    return dependency
+
+
+def require_tenant(path_param: str = "tenant_id", *, claims_dependency: Any | None = None) -> Any:
+    """Build a dependency refusing a credential bound to a tenant other than the one in the path.
+
+    The standalone form of what `claims_or_api_key(tenant=...)` does inline, for a route that
+    already has its claims dependency and wants the binding checked without rebuilding it.
+
+    The refusal is the same 401 an unknown credential gets rather than a 403, deliberately: a
+    403 would confirm that the tenant in the path exists, which turns a key into a way to
+    enumerate tenants.
+
+    Args:
+        path_param: The path parameter naming the tenant, such as `"workspace_id"`.
+        claims_dependency: The dependency producing the claims to check, defaulting to
+            `claims_or_api_key()` with no store.
+
+    Returns:
+        An `async def` dependency suitable for `Depends`, returning the claims it checked.
+    """
+    from fastapi import Depends
+
+    _bind_fastapi_request()
+    resolver = claims_dependency if claims_dependency is not None else claims_or_api_key()
+
+    async def dependency(request: Request, claims: AuthorizerClaims = Depends(resolver)) -> AuthorizerClaims:
+        """Return the claims when their tenant binding covers the path, or raise a 401."""
+        wanted = str(request.path_params.get(path_param, "") or "").strip()
+        if not tenant_matches(claims, wanted):
+            _log.warning("Refusing a credential bound to another tenant on %s.", path_param)
+            raise _unauthenticated()
+        return claims
+
+    dependency.__name__ = "require_tenant"
+    dependency.__doc__ = f"Requires this request's credential to be bound to the {path_param} in the path."
     return dependency
 
 
