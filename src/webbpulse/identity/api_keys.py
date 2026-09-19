@@ -51,7 +51,6 @@ __all__ = [
     "FakeApiKeyStore",
     "InMemoryApiKeyStore",
     "MintedApiKey",
-    "TenantMismatch",
     "claims_for_key",
     "effective_scopes",
     "hash_key",
@@ -552,16 +551,6 @@ def verify(
     return record
 
 
-class TenantMismatch(Exception):
-    """A verified key was presented against a tenant it was not minted inside.
-
-    Its own exception rather than a `None` so a caller cannot conflate it with an unknown
-    key: the two deserve the same answer to the caller, and quite different log lines to an
-    operator, because one is a typo and the other is a credential being walked across
-    tenants.
-    """
-
-
 def verify_for_tenant(
     plaintext: str,
     store: ApiKeyStore,
@@ -578,18 +567,20 @@ def verify_for_tenant(
     to prevent.
 
     `None` for every refusal, tenant mismatch included, so a key cannot be walked across
-    tenant ids to learn which ones exist. A caller that wants to log the difference passes
-    `tenant_id` and catches nothing; it compares `record.tenant_id` itself after a plain
-    `verify`, or raises `TenantMismatch` from its own code.
+    tenant ids to learn which ones exist. A caller that wants to log the difference compares
+    `record.tenant_id` itself after a plain `verify`.
 
     An empty `tenant_id` refuses rather than matching everything, because a caller that could
-    not resolve which tenant it is in must not be the one deciding the key may act.
+    not resolve which tenant it is in must not be the one deciding the key may act. The key
+    is touched only on a match, so a refused presentation leaves `last_used_at` alone.
     """
     if not tenant_id:
         return None
-    record = verify(plaintext, store, now=now, touch=touch)
+    record = verify(plaintext, store, now=now, touch=False)
     if record is None or not constant_time_equals(record.tenant_id, tenant_id):
         return None
+    if touch:
+        store.touch(record.key_hash)
     return record
 
 

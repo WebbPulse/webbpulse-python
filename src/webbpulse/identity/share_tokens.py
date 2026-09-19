@@ -526,7 +526,7 @@ def revoke_share_token(
     return store.revoke(token_hash, revoked_at=revoked_at)
 
 
-def claims_for_share_token(record: ShareTokenRecord, *, scopes: Mapping[str, Any] | None = None) -> AuthorizerClaims:
+def claims_for_share_token(record: ShareTokenRecord) -> AuthorizerClaims:
     """Build the gateway's own `AuthorizerClaims` shape for a verified share token.
 
     The same shape a JWT and an API key produce, so a route reached by all three has one
@@ -537,15 +537,9 @@ def claims_for_share_token(record: ShareTokenRecord, *, scopes: Mapping[str, Any
     that means to admit a share says so by reading `share_token_capability` rather than by a
     scope the token happens to hold.
 
-    Args:
-        record: The verified token.
-        scopes: Unused, and present only so this reads the same way as `claims_for_key` at a
-            call site. Passing it changes nothing.
-
     Returns:
         Claims carrying the fixed subject, the tenant, the capability and `actor_kind`.
     """
-    del scopes
     from webbpulse.identity.api_keys import ACTOR_CLAIM, TENANT_CLAIM
 
     return AuthorizerClaims(
