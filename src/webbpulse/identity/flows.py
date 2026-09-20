@@ -534,10 +534,11 @@ class IdentityFlows:
         session_id: str,
         code: str,
     ) -> AuthResult:
-        """Re-authenticate inside an existing session, returning a fresher access token.
+        """Re-authenticate inside an existing session with a TOTP or recovery code.
 
         No new refresh family and no cookie change: what changes is `auth_time` and `amr`.
         The result carries an empty `refresh_token` and the caller's existing `family_id`.
+        `step_up_with_passkey` is the same step taken with a WebAuthn assertion instead.
         """
         service = self._require_mfa()
         user = self._hooks.load_user_by_id(user_id)
@@ -554,6 +555,64 @@ class IdentityFlows:
         _log.info(
             "Step-up authentication succeeded.",
             extra={"event": "mfa.step_up", "user_id": user_id, "method": method},
+        )
+        return AuthResult(
+            access_token=access,
+            expires_in=int(self._settings.access_token_ttl.total_seconds()),
+            user=user,
+            refresh_token="",
+            family_id=session_id,
+        )
+
+    def begin_passkey_step_up(self, *, user_id: str) -> RegistrationChallenge:
+        """Options for re-authenticating inside a session with a registered passkey.
+
+        Not gated on `passkeys_passwordless`: that flag decides whether a passkey is a way
+        into an account, while this is re-authentication by a caller who is already in one.
+        The challenge is scoped to the subject and demands user verification.
+        """
+        service = self._require_passkeys()
+        user = self._hooks.load_user_by_id(user_id)
+        if user is None:
+            raise LoginRejected("No such account.", error_code="USER_NOT_FOUND", status_code=404)
+        self._hooks.may_authenticate(user)
+        return service.begin_step_up(user_id)
+
+    def step_up_with_passkey(
+        self,
+        *,
+        user_id: str,
+        session_id: str,
+        challenge_id: str,
+        credential: Mapping[str, Any],
+    ) -> AuthResult:
+        """Re-authenticate inside an existing session with a passkey assertion.
+
+        The same result as `step_up`: no new refresh family and no cookie change, a fresher
+        `auth_time`, and an `amr` naming the factors the gesture proved. The assertion must
+        answer a challenge minted for this subject, with this subject's own credential, and
+        must report user verification.
+        """
+        service = self._require_passkeys()
+        user = self._hooks.load_user_by_id(user_id)
+        if user is None:
+            from webbpulse.identity.passkeys import PasskeyRejected
+
+            raise PasskeyRejected()
+
+        self._hooks.may_authenticate(user)
+        from webbpulse.identity.passkeys import AMR_PASSKEY
+
+        service.finish_step_up(user_id, challenge_id=challenge_id, credential=credential)
+        access = self._mint_access(
+            user,
+            session_id=session_id,
+            amr=[AMR_PASSWORD, AMR_PASSKEY],
+            auth_time=int(time.time()),
+        )
+        _log.info(
+            "Step-up authentication succeeded.",
+            extra={"event": "mfa.step_up", "user_id": user_id, "method": AMR_PASSKEY},
         )
         return AuthResult(
             access_token=access,

@@ -107,7 +107,7 @@ BILLING_MODE: Final = "PAY_PER_REQUEST"
 
 type IdentityTokenPurpose = Literal["verify_email", "reset_password", "mfa_ticket"]
 
-type WebAuthnChallengePurpose = Literal["register", "login"]
+type WebAuthnChallengePurpose = Literal["register", "login", "step_up"]
 
 TOKEN_BYTES: Final = 32
 
@@ -258,7 +258,8 @@ class WebAuthnChallengeRecord:
     """One outstanding WebAuthn challenge, spent by the ceremony that follows it.
 
     A table rather than a signed token, because single use is a property of storage.
-    `user_id` is empty for a passwordless login challenge.
+    `user_id` is empty for a passwordless login challenge, and set for a registration or a
+    step-up challenge, both of which are scoped to one subject.
     """
 
     challenge_id: str
@@ -1556,7 +1557,7 @@ def _passkey_from_item(item: Mapping[str, Any]) -> PasskeyRecord:
 def _webauthn_challenge_from_item(item: Mapping[str, Any]) -> WebAuthnChallengeRecord:
     """Build a `WebAuthnChallengeRecord` from a DynamoDB item, rejecting an unknown purpose."""
     purpose = str(item.get("purpose", ""))
-    if purpose not in {"register", "login"}:
+    if purpose not in {"register", "login", "step_up"}:
         raise ValueError(
             f"Unknown WebAuthn challenge purpose {purpose!r} on challenge {str(item.get('challenge_id', ''))[:8]}."
         )

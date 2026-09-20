@@ -7,6 +7,33 @@ This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## Unreleased
 
+Step-up re-authentication now takes a passkey as well as a TOTP or recovery code, for a
+product that wants a confirm button gated on a fresh WebAuthn gesture rather than a code
+typed out of an app.
+
+`POST {prefix}/step-up/passkey/options` is the new route, bearer authenticated and rate
+limited like the passkey login options route. It answers the same `{challenge_id, publicKey}`
+shape, but the challenge is scoped: `allowCredentials` is the subject's own registered
+passkeys and `userVerification` is `required`, so a discoverable credential belonging to
+somebody else cannot answer it. It is deliberately not gated on `passkeys_passwordless`,
+which decides whether a passkey is a way *into* an account and says nothing about
+re-authenticating inside one. A subject with no passkey gets `PASSKEY_NONE_REGISTERED` as a
+404, an honest answer because the caller is asking about their own account, and a deployment
+with passkeys off keeps the existing `PASSKEYS_DISABLED` 501.
+
+`POST {prefix}/step-up` keeps taking `{"code": "..."}` unchanged and now also takes
+`{"challenge_id": "...", "credential": {...}}`. The assertion must answer a step-up challenge
+minted for this subject, present a credential this subject owns, and report user
+verification; each of the three is refused with the envelope the passkey login verify route
+already uses. A body carrying neither field, or both, is the existing 422 rather than a
+silent preference for one factor. Success is byte for byte the code path's body, with `amr`
+`["pwd", "swk"]` plus `mfa`, a fresh `auth_time`, no new refresh family and no cookie.
+
+Behind them, `PasskeyService.begin_step_up` and `finish_step_up`, `IdentityFlows`
+`begin_passkey_step_up` and `step_up_with_passkey`, and a third `step_up` value on the
+`webauthn-challenges` table's `purpose` attribute, which keeps the three ceremonies apart so
+a login challenge can never be spent as a re-authentication. `IdentityFlows.step_up` is
+unchanged, and `STEP_UP_PASSKEY_OPTIONS_PATH` is exported from `webbpulse.identity`.
 Five gaps `webbpulse.composition` and its isolation check hit on the first product to
 migrate onto them. All five are source-compatible: every default is the behaviour that
 shipped, so an adopter changing nothing sees no change.

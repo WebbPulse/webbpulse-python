@@ -252,6 +252,7 @@ from webbpulse.identity.oauth_server_storage import (
 from webbpulse.identity.passkey_routes import (
     PASSKEY_AVAILABILITY_CACHE_CONTROL,
     PASSKEY_AVAILABILITY_PATH,
+    STEP_UP_PASSKEY_OPTIONS_PATH,
     register_passkey_availability,
 )
 from webbpulse.identity.passkeys import (
@@ -576,6 +577,7 @@ __all__ = [
     "REVOKE_PATH",
     "SCHEME_KMS_ENVELOPE",
     "SCHEME_SECRET_HKDF",
+    "STEP_UP_PASSKEY_OPTIONS_PATH",
     "STEP_UP_PATH",
     "TABLES",
     "TENANT_CLAIM",

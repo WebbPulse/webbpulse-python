@@ -81,7 +81,7 @@ gateway builds the discovery URL as `issuer + "/.well-known/openid-configuration
 | `POST /api/auth/totp/activate` | Confirms an enrolment with its first code and returns recovery codes |
 | `POST /api/auth/totp/disable` | Removes the factor and every recovery code with it, on a `code` |
 | `POST /api/auth/recovery-codes` | Replaces the set on a `code`, invalidating every previous code |
-| `POST /api/auth/step-up` | Re-authenticates inside the session for a fresher `auth_time` |
+| `POST /api/auth/step-up` | Re-authenticates inside the session for a fresher `auth_time`, on a code or a passkey assertion |
 | `GET /api/auth/oauth/providers` | The providers this deployment can sign a user in with, anonymous |
 | `GET /api/auth/oauth/{provider}/start` | Mints a state and redirects the browser to the provider |
 | `GET /api/auth/oauth/callback` | Spends the state, verifies the provider's answer, issues the token pair |
@@ -93,6 +93,7 @@ gateway builds the discovery URL as `issuer + "/.well-known/openid-configuration
 | `POST /api/auth/passkeys/register/verify` | Verifies the attestation and stores the credential |
 | `POST /api/auth/login/passkey/options` | WebAuthn authentication options, anonymous |
 | `POST /api/auth/login/passkey/verify` | Verifies the assertion and issues the same token pair as `/login` |
+| `POST /api/auth/step-up/passkey/options` | Assertion options scoped to the caller's own passkeys, for a step-up |
 | `GET /api/auth/passkeys` | The caller's own passkeys |
 | `PATCH /api/auth/passkeys/{credential_id}` | Renames one of the caller's passkeys |
 | `DELETE /api/auth/passkeys/{credential_id}` | Removes one of the caller's passkeys |
