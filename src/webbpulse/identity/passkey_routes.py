@@ -1,6 +1,6 @@
-"""The seven passkey HTTP routes, plus the unconditional availability route.
+"""The eight passkey HTTP routes, plus the unconditional availability route.
 
-The seven mount onto the identity router when both passkey tables exist;
+The eight mount onto the identity router when both passkey tables exist;
 `GET /passkeys/availability` mounts in every deployment through its own function.
 """
 
@@ -64,6 +64,7 @@ __all__ = [
     "PASSKEY_REGISTER_OPTIONS_PATH",
     "PASSKEY_REGISTER_VERIFY_PATH",
     "PASSKEY_ROUTE_RESPONSES",
+    "STEP_UP_PASSKEY_OPTIONS_PATH",
     "register_passkey_availability",
     "register_passkey_routes",
 ]
@@ -76,6 +77,8 @@ LOGIN_PASSKEY_VERIFY_PATH = "/login/passkey/verify"
 
 PASSKEYS_PATH = "/passkeys"
 PASSKEY_ITEM_PATH = "/passkeys/{credential_id}"
+
+STEP_UP_PASSKEY_OPTIONS_PATH = "/step-up/passkey/options"
 
 PASSKEY_AVAILABILITY_PATH = "/passkeys/availability"
 
@@ -134,7 +137,7 @@ def register_passkey_routes(
     success_body: Callable[[Any], dict[str, Any]],
     set_refresh_cookie: Callable[[JSONResponse, str], JSONResponse],
 ) -> None:
-    """Add the seven passkey routes. Call only when `flows.passkeys` is not `None`.
+    """Add the eight passkey routes. Call only when `flows.passkeys` is not `None`.
 
     The caller gates the mount so the OpenAPI document describes only what the deployment
     can actually do.
@@ -270,6 +273,31 @@ def register_passkey_routes(
             return rejected(request, exc)
         return set_refresh_cookie(JSONResponse(success_body(result)), result.refresh_token)
 
+    @router.post(
+        f"{prefix}{STEP_UP_PASSKEY_OPTIONS_PATH}",
+        dependencies=limits(("passkey-options", PASSKEY_OPTIONS_LIMIT, "ip")),
+    )
+    async def step_up_passkey_options(
+        request: _FastAPIRequest, payload: dict[str, Any] = Body(default_factory=dict)
+    ) -> JSONResponse:
+        """Issue an assertion challenge scoped to the signed-in caller's own passkeys.
+
+        Re-authentication rather than sign-in, so it is not gated on passwordless login.
+        The body is ignored and may be empty.
+        """
+        _ = payload
+        try:
+            subject = require_subject(request)
+        except LoginRejected as exc:
+            return rejected(request, exc)
+        try:
+            challenge = await run_sync(lambda: flows.begin_passkey_step_up(user_id=subject))
+        except PasskeyRejected as exc:
+            return passkey_refused(request, exc)
+        except LoginRejected as exc:
+            return rejected(request, exc)
+        return JSONResponse({"challenge_id": challenge.challenge_id, "publicKey": challenge.options})
+
     @router.get(f"{prefix}{PASSKEYS_PATH}")
     async def list_passkeys(request: _FastAPIRequest) -> JSONResponse:
         """Every passkey enrolled on the authenticated account."""
@@ -345,6 +373,12 @@ PASSKEY_ROUTE_RESPONSES: Final[dict[tuple[str, str], dict[int, str]]] = {
         401: "The assertion was refused",
         403: "Passwordless sign in is closed on this deployment",
         429: "Too many attempts from this address",
+    },
+    ("POST", STEP_UP_PASSKEY_OPTIONS_PATH): {
+        401: "No bearer token was presented",
+        404: "No passkey is registered on this account, or no such account",
+        429: "Too many attempts from this address",
+        501: "Passkeys are not configured on this deployment",
     },
     ("GET", PASSKEYS_PATH): {401: "No bearer token was presented"},
     ("PATCH", PASSKEY_ITEM_PATH): {

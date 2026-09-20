@@ -97,6 +97,29 @@ oracle that needs no password. Passwordless sign-in is gated on `passkeys_passwo
 with it off, both login routes refuse and a passkey is a managed credential and a second
 factor but not an entry point.
 
+**`POST /step-up/passkey/options` scopes its challenge, and is not a sign-in route.** A
+step-up proves the holder of this session is still present, so its options carry the
+subject's **own** `allowCredentials` rather than an empty list, and `userVerification` is
+`required` rather than preferred: a re-authentication that a discoverable credential
+belonging to somebody else could answer would prove nothing about this session, and one
+without a fresh human gesture would prove nothing about presence. Verification enforces
+ownership against the stored row before any signature is checked, so a credential registered
+to another account is refused rather than silently accepted.
+
+This route is deliberately **not** gated on `passkeys_passwordless`. That flag decides
+whether a passkey is a way into an account, and a caller who is already inside one is not
+asking that question. A deployment can therefore run with passwordless sign-in closed and
+still gate a destructive action on a passkey gesture. A subject with no passkey registered
+gets `PASSKEY_NONE_REGISTERED` as a 404, which is an honest answer rather than an oracle
+because the caller is asking about their own account; a deployment with passkeys off keeps
+the `PASSKEYS_DISABLED` 501 every other passkey route answers.
+
+`POST /step-up` takes either body: `{"code": ...}` for a TOTP or recovery code, unchanged,
+or `{"challenge_id": ..., "credential": ...}` for an assertion. Neither and both are the same
+422, so a client that sent both is told what it sent rather than being told which of its two
+factors was wrong. The passkey path mints `amr` `["pwd", "swk", "mfa"]` and a fresh
+`auth_time`, keeps the session, and sets no cookie, exactly as the code path does.
+
 **The last passkey cannot be deleted by a user with no password.** Less a rule about passkeys
 than about not stranding somebody outside their own account, and it applies only to the last
 one: two passkeys, delete either. "Has a password" is read from the `credentials` store,

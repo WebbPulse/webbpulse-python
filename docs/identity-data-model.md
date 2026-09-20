@@ -61,8 +61,10 @@ Attributes beyond the keys:
   `revoke_all_for_user` raise, which `SessionService` reports as nothing revoked.
 - **`identity-tokens`** (verification and reset): `purpose`, `user_id`, `created_at`,
   `consumed_at`, `expires_at`.
-- **`webauthn-challenges`**: `user_id` (absent for a discoverable-credential login),
-  `challenge`, `ceremony`, `expires_at` (`CHALLENGE_TTL_SECONDS` = 300).
+- **`webauthn-challenges`**: `user_id` (absent for a discoverable-credential login, present
+  for a registration or a step-up), `challenge`, `purpose` (`register`, `login` or
+  `step_up`, which is what keeps the three ceremonies from answering each other),
+  `expires_at` (`CHALLENGE_TTL_SECONDS` = 300).
 - **`oauth-states`**: `pkce_verifier`, `provider`, `mode`, `return_to`, `expires_at`
   (`OAUTH_STATE_TTL_SECONDS` = 600).
 - **`login-attempts`**: `identity_key` is `email#<lower>` or `ip#<addr>`; `outcome`, `user_id`,

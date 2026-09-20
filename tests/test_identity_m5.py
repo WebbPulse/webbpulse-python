@@ -7,6 +7,7 @@ import hashlib
 import json
 import os
 import struct
+import time
 from typing import TYPE_CHECKING, Any
 
 import pytest
@@ -16,6 +17,8 @@ from webbpulse.identity import (
     LOGIN_TOTP_PATH,
     PASSKEY_CREDENTIAL_INDEX,
     PASSKEYS_TABLE,
+    STEP_UP_PASSKEY_OPTIONS_PATH,
+    STEP_UP_PATH,
     WEBAUTHN_CHALLENGES_TABLE,
     AuthenticationRefused,
     BaseIdentityHooks,
@@ -38,7 +41,13 @@ from webbpulse.identity import (
     normalise_password,
 )
 from webbpulse.identity import totp as totp_module
-from webbpulse.identity.flows import PASSWORD_CREDENTIAL_TYPE, IdentityFlows, MfaChallengeRequired
+from webbpulse.identity.flows import (
+    PASSWORD_CREDENTIAL_TYPE,
+    IdentityFlows,
+    LoginRejected,
+    MfaChallengeRequired,
+)
+from webbpulse.identity.mfa import AMR_PASSWORD, MfaRejected
 from webbpulse.identity.oauth_routes import OAUTH_PROVIDERS_CACHE_CONTROL
 from webbpulse.identity.passkey_routes import (
     LOGIN_PASSKEY_OPTIONS_PATH,
@@ -1648,3 +1657,480 @@ class TestDeclaredResponses:
                 continue
             for status_code, body in route.responses.items():
                 assert body.get("description"), f"{route.path} declares {status_code} with no description"
+
+
+def _claims_of(token: str) -> dict[str, Any]:
+    """The payload of a JWT, without verifying it. For asserting on claims only."""
+    payload = token.split(".")[1]
+    padded = payload + "=" * (-len(payload) % 4)
+    result: dict[str, Any] = json.loads(base64.urlsafe_b64decode(padded))
+    return result
+
+
+def _step_up_ceremony(
+    service: PasskeyService,
+    authenticator: SoftAuthenticator,
+    *,
+    user_id: str = USER_ID,
+) -> tuple[str, dict[str, Any]]:
+    """Mint a step-up challenge for a subject and answer it with an authenticator."""
+    challenge = service.begin_step_up(user_id)
+    return challenge.challenge_id, authenticator.assertion(_challenge_of(challenge.options))
+
+
+class TestStepUpService:
+    """`PasskeyService.begin_step_up` and `finish_step_up`: scope, ownership and UV."""
+
+    def test_round_trip_identifies_the_subject(self, passkeys: PasskeyService) -> None:
+        """A subject's own passkey answers their own step-up challenge."""
+        authenticator, record = enrol_passkey(passkeys)
+        challenge_id, assertion = _step_up_ceremony(passkeys, authenticator)
+        result = passkeys.finish_step_up(USER_ID, challenge_id=challenge_id, credential=assertion)
+        assert result.user_id == USER_ID
+        assert result.credential_id == record.credential_id
+        assert result.user_verified is True
+
+    def test_the_result_claims_both_passkey_factors(self, passkeys: PasskeyService) -> None:
+        """A step-up assertion earns the same `amr` a user-verified login earns."""
+        authenticator, _ = enrol_passkey(passkeys)
+        challenge_id, assertion = _step_up_ceremony(passkeys, authenticator)
+        result = passkeys.finish_step_up(USER_ID, challenge_id=challenge_id, credential=assertion)
+        assert result.amr == [AMR_PASSKEY, AMR_PIN]
+
+    def test_options_list_only_the_subjects_credentials(self, passkeys: PasskeyService) -> None:
+        """`allowCredentials` is the subject's own passkeys, never a discoverable request."""
+        _, record = enrol_passkey(passkeys)
+        enrol_passkey(passkeys, user_id="user-0002", name="Other key")
+        challenge = passkeys.begin_step_up(USER_ID)
+        listed = {entry["id"] for entry in challenge.options["allowCredentials"]}
+        assert listed == {record.credential_id}
+
+    def test_options_require_user_verification(self, passkeys: PasskeyService) -> None:
+        """Step-up demands a verifying gesture rather than merely preferring one."""
+        enrol_passkey(passkeys)
+        challenge = passkeys.begin_step_up(USER_ID)
+        assert challenge.options["userVerification"] == "required"
+
+    def test_a_subject_with_no_passkey_is_a_modelled_refusal(self, passkeys: PasskeyService) -> None:
+        """No enrolled passkey is `PASSKEY_NONE_REGISTERED`, a 404 about the caller's own account."""
+        with pytest.raises(PasskeyRejected) as caught:
+            passkeys.begin_step_up(USER_ID)
+        assert caught.value.error_code == "PASSKEY_NONE_REGISTERED"
+        assert caught.value.status_code == 404
+
+    def test_the_challenge_is_single_use(self, passkeys: PasskeyService) -> None:
+        """A step-up challenge cannot be answered twice."""
+        authenticator, _ = enrol_passkey(passkeys)
+        challenge_id, assertion = _step_up_ceremony(passkeys, authenticator)
+        passkeys.finish_step_up(USER_ID, challenge_id=challenge_id, credential=assertion)
+        with pytest.raises(PasskeyRejected):
+            passkeys.finish_step_up(USER_ID, challenge_id=challenge_id, credential=assertion)
+
+    def test_a_login_challenge_cannot_satisfy_a_step_up(self, passkeys: PasskeyService) -> None:
+        """The purpose check keeps sign-in and re-authentication apart."""
+        authenticator, _ = enrol_passkey(passkeys)
+        challenge = passkeys.begin_login(user_id=USER_ID)
+        assertion = authenticator.assertion(_challenge_of(challenge.options))
+        with pytest.raises(PasskeyRejected) as caught:
+            passkeys.finish_step_up(USER_ID, challenge_id=challenge.challenge_id, credential=assertion)
+        assert caught.value.error_code == "PASSKEY_CHALLENGE_INVALID"
+
+    def test_a_step_up_challenge_cannot_satisfy_a_login(self, passkeys: PasskeyService) -> None:
+        """And the check holds in the other direction, so a re-auth is not a sign-in."""
+        authenticator, _ = enrol_passkey(passkeys)
+        challenge_id, assertion = _step_up_ceremony(passkeys, authenticator)
+        with pytest.raises(PasskeyRejected):
+            passkeys.finish_login(challenge_id=challenge_id, credential=assertion)
+
+    def test_another_subjects_challenge_is_refused(self, passkeys: PasskeyService) -> None:
+        """A challenge minted for one subject cannot be spent by another."""
+        authenticator, _ = enrol_passkey(passkeys)
+        enrol_passkey(passkeys, user_id="user-0002", name="Other key")
+        challenge = passkeys.begin_step_up("user-0002")
+        assertion = authenticator.assertion(_challenge_of(challenge.options))
+        with pytest.raises(PasskeyRejected):
+            passkeys.finish_step_up(USER_ID, challenge_id=challenge.challenge_id, credential=assertion)
+
+    def test_another_subjects_credential_is_refused(self, passkeys: PasskeyService) -> None:
+        """A credential registered to somebody else never answers this subject's challenge."""
+        other, _ = enrol_passkey(passkeys, user_id="user-0002", name="Other key")
+        enrol_passkey(passkeys)
+        challenge = passkeys.begin_step_up(USER_ID)
+        assertion = other.assertion(_challenge_of(challenge.options))
+        with pytest.raises(PasskeyRejected):
+            passkeys.finish_step_up(USER_ID, challenge_id=challenge.challenge_id, credential=assertion)
+
+    def test_an_unverified_assertion_is_refused(self, passkeys: PasskeyService) -> None:
+        """An authenticator reporting no user verification cannot step a session up."""
+        authenticator, _ = enrol_passkey(passkeys, user_verified=False)
+        challenge_id, assertion = _step_up_ceremony(passkeys, authenticator)
+        with pytest.raises(PasskeyRejected):
+            passkeys.finish_step_up(USER_ID, challenge_id=challenge_id, credential=assertion)
+
+    def test_an_unknown_credential_is_refused(self, passkeys: PasskeyService) -> None:
+        """An assertion naming a credential nobody registered is refused."""
+        enrol_passkey(passkeys)
+        stranger = SoftAuthenticator()
+        challenge = passkeys.begin_step_up(USER_ID)
+        assertion = stranger.assertion(_challenge_of(challenge.options))
+        with pytest.raises(PasskeyRejected):
+            passkeys.finish_step_up(USER_ID, challenge_id=challenge.challenge_id, credential=assertion)
+
+    def test_a_wrong_origin_is_refused(self, passkeys: PasskeyService) -> None:
+        """The origin check applies to re-authentication as it does to sign-in."""
+        authenticator, _ = enrol_passkey(passkeys)
+        authenticator.origin = "https://evil.example.com"
+        challenge_id, assertion = _step_up_ceremony(passkeys, authenticator)
+        with pytest.raises(PasskeyRejected):
+            passkeys.finish_step_up(USER_ID, challenge_id=challenge_id, credential=assertion)
+
+    def test_the_sign_count_advances(self, passkeys: PasskeyService, stores: IdentityStores) -> None:
+        """A step-up records the new counter, so a replayed assertion is a regression."""
+        authenticator, record = enrol_passkey(passkeys)
+        challenge_id, assertion = _step_up_ceremony(passkeys, authenticator)
+        passkeys.finish_step_up(USER_ID, challenge_id=challenge_id, credential=assertion)
+        stored = stores.require_passkeys().get(USER_ID, record.credential_id)
+        assert stored is not None
+        assert stored.sign_count == authenticator.sign_count
+
+
+class TestStepUpFlows:
+    """`IdentityFlows.begin_passkey_step_up` and `step_up_with_passkey`."""
+
+    def test_step_up_keeps_the_session_and_mints_no_refresh_token(
+        self, flows: IdentityFlows, passkeys: PasskeyService, hooks: FakeHooks, stores: IdentityStores
+    ) -> None:
+        """The same contract as the code path: a fresher token, the same session, no cookie."""
+        seed_account(hooks, stores)
+        authenticator, _ = enrol_passkey(passkeys)
+        challenge = flows.begin_passkey_step_up(user_id=USER_ID)
+        assertion = authenticator.assertion(_challenge_of(challenge.options))
+        result = flows.step_up_with_passkey(
+            user_id=USER_ID,
+            session_id="session-1",
+            challenge_id=challenge.challenge_id,
+            credential=assertion,
+        )
+        claims = _claims_of(result.access_token)
+        assert result.refresh_token == ""
+        assert result.family_id == "session-1"
+        assert claims["sid"] == "session-1"
+        assert abs(int(claims["auth_time"]) - int(time.time())) < 5
+
+    def test_the_token_claims_password_and_passkey(
+        self, flows: IdentityFlows, passkeys: PasskeyService, hooks: FakeHooks, stores: IdentityStores
+    ) -> None:
+        """`amr` is the password plus the passkey method the login path already uses."""
+        seed_account(hooks, stores)
+        authenticator, _ = enrol_passkey(passkeys)
+        challenge = flows.begin_passkey_step_up(user_id=USER_ID)
+        result = flows.step_up_with_passkey(
+            user_id=USER_ID,
+            session_id="session-1",
+            challenge_id=challenge.challenge_id,
+            credential=authenticator.assertion(_challenge_of(challenge.options)),
+        )
+        amr = _claims_of(result.access_token)["amr"]
+        assert amr[:2] == [AMR_PASSWORD, AMR_PASSKEY]
+
+    def test_it_logs_the_step_up_event_with_the_passkey_method(
+        self,
+        flows: IdentityFlows,
+        passkeys: PasskeyService,
+        hooks: FakeHooks,
+        stores: IdentityStores,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """The audit line is `mfa.step_up`, with `method` naming the passkey factor."""
+        seed_account(hooks, stores)
+        authenticator, _ = enrol_passkey(passkeys)
+        challenge = flows.begin_passkey_step_up(user_id=USER_ID)
+        assertion = authenticator.assertion(_challenge_of(challenge.options))
+        with caplog.at_level("INFO", logger="webbpulse.identity.flows"):
+            flows.step_up_with_passkey(
+                user_id=USER_ID,
+                session_id="session-1",
+                challenge_id=challenge.challenge_id,
+                credential=assertion,
+            )
+        events = [
+            (record.__dict__.get("event"), record.__dict__.get("method"))
+            for record in caplog.records
+            if record.__dict__.get("event") == "mfa.step_up"
+        ]
+        assert events == [("mfa.step_up", AMR_PASSKEY)]
+
+    def test_options_do_not_depend_on_passwordless(
+        self, hooks: FakeHooks, stores: IdentityStores, kms: FakeKms
+    ) -> None:
+        """Re-authentication is not sign-in, so `passkeys_passwordless` does not gate it."""
+        settings = make_settings(passkeys_passwordless=False)
+        flows = IdentityFlows(settings, hooks, stores, TokenService(settings, kms), kms_client=kms)
+        seed_account(hooks, stores)
+        service = flows.passkeys
+        assert service is not None
+        authenticator, _ = enrol_passkey(service)
+        challenge = flows.begin_passkey_step_up(user_id=USER_ID)
+        result = flows.step_up_with_passkey(
+            user_id=USER_ID,
+            session_id="session-1",
+            challenge_id=challenge.challenge_id,
+            credential=authenticator.assertion(_challenge_of(challenge.options)),
+        )
+        assert result.access_token
+
+    def test_passkeys_disabled_refuses_both_legs(self, hooks: FakeHooks, kms: FakeKms) -> None:
+        """A deployment with no passkey stores answers the existing disabled envelope."""
+        settings = make_settings()
+        bare = IdentityStores(
+            credentials=InMemoryCredentialStore(),
+            refresh_tokens=InMemoryRefreshTokenStore(),
+        )
+        flows = IdentityFlows(settings, hooks, bare, TokenService(settings, kms), kms_client=kms)
+        with pytest.raises(LoginRejected) as caught:
+            flows.begin_passkey_step_up(user_id=USER_ID)
+        assert caught.value.error_code == "PASSKEYS_DISABLED"
+        assert caught.value.status_code == 501
+        with pytest.raises(LoginRejected):
+            flows.step_up_with_passkey(
+                user_id=USER_ID,
+                session_id="session-1",
+                challenge_id="whatever",
+                credential={"id": "x"},
+            )
+
+    def test_a_disabled_account_cannot_step_up(
+        self, flows: IdentityFlows, passkeys: PasskeyService, hooks: FakeHooks, stores: IdentityStores
+    ) -> None:
+        """`may_authenticate` is consulted, so a suspended account cannot re-authenticate."""
+        seed_account(hooks, stores)
+        authenticator, _ = enrol_passkey(passkeys)
+        challenge = flows.begin_passkey_step_up(user_id=USER_ID)
+        assertion = authenticator.assertion(_challenge_of(challenge.options))
+        hooks.refuse = "This account is closed."
+        with pytest.raises(AuthenticationRefused):
+            flows.step_up_with_passkey(
+                user_id=USER_ID,
+                session_id="session-1",
+                challenge_id=challenge.challenge_id,
+                credential=assertion,
+            )
+
+    def test_an_unknown_subject_is_refused(self, flows: IdentityFlows) -> None:
+        """No account behind the token means the shared passkey refusal, not a crash."""
+        with pytest.raises(LoginRejected):
+            flows.begin_passkey_step_up(user_id="user-9999")
+        with pytest.raises(PasskeyRejected):
+            flows.step_up_with_passkey(
+                user_id="user-9999",
+                session_id="session-1",
+                challenge_id="whatever",
+                credential={"id": "x"},
+            )
+
+    def test_the_code_path_still_takes_its_positional_contract(
+        self, flows: IdentityFlows, hooks: FakeHooks, stores: IdentityStores
+    ) -> None:
+        """`step_up(user_id=..., session_id=..., code=...)` is unchanged and still refuses a bad code."""
+        seed_account(hooks, stores)
+        with pytest.raises(MfaRejected):
+            flows.step_up(user_id=USER_ID, session_id="session-1", code="000000")
+
+
+class TestStepUpRoutes:
+    """The two HTTP surfaces: the options route and the widened `POST /step-up`."""
+
+    def test_the_options_route_is_mounted(self, client: TestClient) -> None:
+        """The route exists on a deployment that mounts passkeys."""
+        response = client.post(f"{prefix()}{STEP_UP_PASSKEY_OPTIONS_PATH}")
+        assert response.status_code != 404
+
+    def test_options_require_a_token(self, client: TestClient) -> None:
+        """Without a bearer token the options route is a 401 NOT_AUTHENTICATED."""
+        response = client.post(f"{prefix()}{STEP_UP_PASSKEY_OPTIONS_PATH}", json={})
+        assert response.status_code == 401
+        assert response.json()["error_code"] == "NOT_AUTHENTICATED"
+
+    def test_options_for_a_subject_with_no_passkey(
+        self, client: TestClient, hooks: FakeHooks, stores: IdentityStores
+    ) -> None:
+        """A signed-in caller with no passkey gets the modelled 404."""
+        seed_account(hooks, stores)
+        token = _password_login(client)
+        response = client.post(
+            f"{prefix()}{STEP_UP_PASSKEY_OPTIONS_PATH}",
+            headers={"Authorization": f"Bearer {token}"},
+            json={},
+        )
+        assert response.status_code == 404
+        assert response.json()["error_code"] == "PASSKEY_NONE_REGISTERED"
+
+    def test_the_full_step_up_over_http(self, client: TestClient, hooks: FakeHooks, stores: IdentityStores) -> None:
+        """Sign in, enrol, step up with the passkey, and get a fresher token and no cookie."""
+        seed_account(hooks, stores)
+        token = _password_login(client)
+        auth = {"Authorization": f"Bearer {token}"}
+        authenticator = _enrol_authenticator_over_http(client, token)
+
+        options = client.post(f"{prefix()}{STEP_UP_PASSKEY_OPTIONS_PATH}", headers=auth, json={})
+        assert options.status_code == 200
+        body = options.json()
+        assert body["publicKey"]["userVerification"] == "required"
+        assert body["challenge_id"]
+
+        stepped = client.post(
+            f"{prefix()}{STEP_UP_PATH}",
+            headers=auth,
+            json={
+                "challenge_id": body["challenge_id"],
+                "credential": authenticator.assertion(body["publicKey"]["challenge"]),
+            },
+        )
+        assert stepped.status_code == 200
+        assert "set-cookie" not in {name.lower() for name in stepped.headers}
+        claims = _claims_of(stepped.json()["access_token"])
+        assert AMR_PASSKEY in claims["amr"]
+        assert claims["sid"] == _claims_of(token)["sid"]
+
+    def test_a_body_with_neither_field_is_a_422(
+        self, client: TestClient, hooks: FakeHooks, stores: IdentityStores
+    ) -> None:
+        """An empty body is the existing missing-code validation error."""
+        seed_account(hooks, stores)
+        token = _password_login(client)
+        response = client.post(
+            f"{prefix()}{STEP_UP_PATH}",
+            headers={"Authorization": f"Bearer {token}"},
+            json={},
+        )
+        assert response.status_code == 422
+
+    def test_a_body_with_both_fields_is_a_422(
+        self, client: TestClient, hooks: FakeHooks, stores: IdentityStores
+    ) -> None:
+        """Sending a code and a credential together is refused rather than silently resolved."""
+        seed_account(hooks, stores)
+        token = _password_login(client)
+        response = client.post(
+            f"{prefix()}{STEP_UP_PATH}",
+            headers={"Authorization": f"Bearer {token}"},
+            json={"code": "123456", "challenge_id": "x", "credential": {"id": "y"}},
+        )
+        assert response.status_code == 422
+
+    def test_a_bad_challenge_is_the_passkey_envelope(
+        self, client: TestClient, hooks: FakeHooks, stores: IdentityStores
+    ) -> None:
+        """A step-up refusal renders as the passkey login verify route's refusal does."""
+        seed_account(hooks, stores)
+        token = _password_login(client)
+        authenticator = _enrol_authenticator_over_http(client, token)
+        response = client.post(
+            f"{prefix()}{STEP_UP_PATH}",
+            headers={"Authorization": f"Bearer {token}"},
+            json={
+                "challenge_id": "never-issued",
+                "credential": authenticator.assertion(b64url_encode(os.urandom(32))),
+            },
+        )
+        assert response.status_code == 401
+        assert response.json()["error_code"] == "PASSKEY_CHALLENGE_INVALID"
+
+    def test_another_subjects_credential_over_http_is_refused(
+        self, client: TestClient, hooks: FakeHooks, stores: IdentityStores
+    ) -> None:
+        """A credential belonging to somebody else is refused, never silently accepted."""
+        seed_account(hooks, stores)
+        token = _password_login(client)
+        authenticator = _enrol_authenticator_over_http(client, token)
+        stranger = SoftAuthenticator()
+        options = client.post(
+            f"{prefix()}{STEP_UP_PASSKEY_OPTIONS_PATH}",
+            headers={"Authorization": f"Bearer {token}"},
+            json={},
+        )
+        response = client.post(
+            f"{prefix()}{STEP_UP_PATH}",
+            headers={"Authorization": f"Bearer {token}"},
+            json={
+                "challenge_id": options.json()["challenge_id"],
+                "credential": stranger.assertion(options.json()["publicKey"]["challenge"]),
+            },
+        )
+        assert response.status_code == 401
+        assert authenticator.sign_count == 1
+
+    def test_the_code_path_is_unchanged_over_http(
+        self, client: TestClient, hooks: FakeHooks, stores: IdentityStores
+    ) -> None:
+        """`{"code": ...}` still reaches the MFA path and its refusal envelope."""
+        seed_account(hooks, stores)
+        token = _password_login(client)
+        response = client.post(
+            f"{prefix()}{STEP_UP_PATH}",
+            headers={"Authorization": f"Bearer {token}"},
+            json={"code": "000000"},
+        )
+        assert response.status_code == 401
+        assert response.json()["error_code"] != "PASSKEY_CHALLENGE_INVALID"
+
+    def test_the_options_route_is_absent_without_the_stores(self, hooks: FakeHooks, kms: FakeKms) -> None:
+        """A deployment with no passkey tables never declares the route."""
+        from fastapi.routing import APIRoute
+
+        bare = IdentityStores(
+            credentials=InMemoryCredentialStore(),
+            refresh_tokens=InMemoryRefreshTokenStore(),
+        )
+        built = build_identity_router(make_settings(), hooks, bare, kms_client=kms, limiter_enabled=False)
+        paths = {route.path for route in built.routes if isinstance(route, APIRoute)}
+        assert f"{prefix()}{STEP_UP_PASSKEY_OPTIONS_PATH}" not in paths
+
+    def test_the_options_route_declares_its_statuses(
+        self, hooks: FakeHooks, stores: IdentityStores, kms: FakeKms
+    ) -> None:
+        """The new route's declared statuses are the ones its own code returns."""
+        from fastapi.routing import APIRoute
+
+        built = build_identity_router(make_settings(), hooks, stores, kms_client=kms, limiter_enabled=False)
+        declared = {
+            status
+            for route in built.routes
+            if isinstance(route, APIRoute) and route.path == f"{prefix()}{STEP_UP_PASSKEY_OPTIONS_PATH}"
+            for status in route.responses
+        }
+        assert {401, 404, 429, 501} <= declared
+
+    def test_the_step_up_route_declares_the_disabled_status(
+        self, hooks: FakeHooks, stores: IdentityStores, kms: FakeKms
+    ) -> None:
+        """`POST /step-up` says it can answer 501 to a passkey body on a deployment with passkeys off."""
+        from fastapi.routing import APIRoute
+
+        built = build_identity_router(make_settings(), hooks, stores, kms_client=kms, limiter_enabled=False)
+        declared = {
+            status
+            for route in built.routes
+            if isinstance(route, APIRoute) and route.path == f"{prefix()}{STEP_UP_PATH}"
+            for status in route.responses
+        }
+        assert {401, 429, 501} <= declared
+
+
+def _enrol_authenticator_over_http(client: TestClient, token: str) -> SoftAuthenticator:
+    """Register a fresh authenticator through the HTTP routes and return it."""
+    auth = {"Authorization": f"Bearer {token}"}
+    options = client.post(f"{prefix()}{PASSKEY_REGISTER_OPTIONS_PATH}", headers=auth)
+    assert options.status_code == 200, options.text
+    authenticator = SoftAuthenticator()
+    registered = client.post(
+        f"{prefix()}{PASSKEY_REGISTER_VERIFY_PATH}",
+        headers=auth,
+        json={
+            "challenge_id": options.json()["challenge_id"],
+            "credential": authenticator.register(options.json()["publicKey"]["challenge"]),
+            "name": "Laptop",
+        },
+    )
+    assert registered.status_code == 201, registered.text
+    return authenticator

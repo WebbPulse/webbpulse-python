@@ -99,6 +99,7 @@ Paths are relative to the issuer prefix (normally `/api/auth`).
 | `POST /password` | bearer |
 | `POST /totp/enrol`, `/totp/activate`, `/totp/disable` | bearer |
 | `POST /recovery-codes`, `POST /step-up` | bearer |
+| `POST /step-up/passkey/options` | bearer |
 | `POST /passkeys/register/options`, `/passkeys/register/verify` | bearer |
 | `GET /passkeys`, `DELETE /passkeys/{credential_id}` | bearer |
 | `POST /oauth/{provider}/link`, `GET /oauth/links` | bearer |

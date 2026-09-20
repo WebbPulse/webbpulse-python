@@ -403,6 +403,139 @@ class PasskeyService:
             amr=amr,
         )
 
+    def begin_step_up(self, user_id: str) -> RegistrationChallenge:
+        """Mint a re-authentication challenge bound to one subject's own passkeys.
+
+        Unlike `begin_login` the challenge carries the subject and `allow_credentials` is
+        never empty: a step-up proves that this session's owner is still present, so a
+        discoverable credential belonging to somebody else must not be able to answer it.
+        User verification is required rather than preferred, because the point of the
+        ceremony is a fresh human gesture.
+
+        Raises `PasskeyRejected` with `PASSKEY_NONE_REGISTERED` when the subject has no
+        passkey, which is an honest 404: the caller is asking about their own account.
+        """
+        from webauthn import generate_authentication_options, options_to_json
+        from webauthn.helpers.structs import (
+            PublicKeyCredentialDescriptor,
+            UserVerificationRequirement,
+        )
+
+        existing = self._stores.require_passkeys().list_for_user(user_id)
+        if not existing:
+            raise PasskeyRejected(
+                "No passkey is registered on this account.",
+                error_code="PASSKEY_NONE_REGISTERED",
+                status_code=404,
+            )
+
+        challenge = secrets.token_bytes(CHALLENGE_BYTES)
+        allow = [PublicKeyCredentialDescriptor(id=b64url_decode(record.credential_id)) for record in existing]
+        options = generate_authentication_options(
+            rp_id=self.rp_id,
+            challenge=challenge,
+            allow_credentials=allow,
+            user_verification=UserVerificationRequirement.REQUIRED,
+        )
+
+        record = self._new_challenge("step_up", challenge, user_id=user_id)
+        self._stores.require_webauthn_challenges().put(record)
+        return RegistrationChallenge(
+            challenge_id=record.challenge_id,
+            options=dict(json.loads(options_to_json(options))),
+        )
+
+    def finish_step_up(
+        self,
+        user_id: str,
+        *,
+        challenge_id: str,
+        credential: Mapping[str, Any],
+    ) -> AssertionResult:
+        """Verify a re-authentication assertion, requiring the subject's own credential and UV.
+
+        Three checks beyond `finish_login`: the challenge must be a step-up challenge minted
+        for this subject, the credential presented must belong to this subject, and the
+        authenticator must report user verification. Each refusal is the shared one, so a
+        caller learns nothing about another account from the shape of the failure.
+        """
+        from webauthn import verify_authentication_response
+        from webauthn.helpers.exceptions import WebAuthnException
+
+        record = self._spend_challenge(challenge_id, expected_purpose="step_up")
+        if record.user_id != user_id:
+            _log.warning(
+                "passkey.step_up challenge belonged to another subject",
+                extra={"event": "passkey.step_up.mismatch", "user_id": user_id},
+            )
+            raise PasskeyRejected()
+
+        stored = self._credential_for(user_id, credential)
+
+        try:
+            verified = verify_authentication_response(
+                credential=dict(credential),
+                expected_challenge=b64url_decode(record.challenge),
+                expected_rp_id=self.rp_id,
+                expected_origin=self.origins,
+                credential_public_key=b64url_decode(stored.public_key),
+                credential_current_sign_count=0,
+                require_user_verification=True,
+            )
+        except (WebAuthnException, ValueError, KeyError) as exc:
+            _log.info(
+                "passkey.step_up verification failed",
+                extra={"event": "passkey.step_up.failure", "user_id": user_id},
+            )
+            raise PasskeyRejected() from exc
+
+        if not verified.user_verified:
+            _log.info(
+                "passkey.step_up assertion reported no user verification",
+                extra={"event": "passkey.step_up.unverified", "user_id": user_id},
+            )
+            raise PasskeyRejected()
+
+        self._check_sign_count(stored, verified.new_sign_count)
+        self._stores.require_passkeys().record_use(
+            stored.user_id,
+            stored.credential_id,
+            sign_count=verified.new_sign_count,
+            used_at=now_iso(),
+        )
+        _log.info(
+            "passkey.step_up succeeded",
+            extra={"event": "passkey.step_up.success", "user_id": user_id},
+        )
+        return AssertionResult(
+            user_id=stored.user_id,
+            credential_id=stored.credential_id,
+            user_verified=True,
+            amr=amr_for(True),
+        )
+
+    def _credential_for(self, user_id: str, credential: Mapping[str, Any]) -> PasskeyRecord:
+        """The stored passkey the assertion names, refusing one that is not this subject's.
+
+        Ownership is decided against the row rather than the assertion, so a credential
+        registered to another account is refused before any signature is checked.
+        """
+        raw_id = credential.get("id") if isinstance(credential, dict) else None
+        if not isinstance(raw_id, str) or not raw_id:
+            raise PasskeyRejected()
+        try:
+            credential_id = b64url_encode(b64url_decode(raw_id))
+        except ValueError as exc:
+            raise PasskeyRejected() from exc
+        stored = self._stores.require_passkeys().find_by_credential_id(credential_id)
+        if stored is None or stored.user_id != user_id:
+            _log.info(
+                "passkey.step_up credential is not this subject's",
+                extra={"event": "passkey.step_up.unknown", "user_id": user_id},
+            )
+            raise PasskeyRejected()
+        return stored
+
     def _check_sign_count(self, stored: PasskeyRecord, presented: int) -> None:
         """Refuse a signature counter that did not advance, logging it as a clone signal.
 
@@ -492,7 +625,8 @@ class PasskeyService:
     ) -> WebAuthnChallengeRecord:
         """Consume a challenge, refusing an unknown, expired, spent or mismatched one.
 
-        The purpose check is what keeps the registration and login ceremonies apart.
+        The purpose check is what keeps the registration, login and step-up ceremonies
+        apart, so a login challenge can never be spent as a re-authentication.
         """
         if not challenge_id:
             raise PasskeyRejected()
