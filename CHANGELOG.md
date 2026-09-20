@@ -5,6 +5,67 @@ Notable changes to the `webbpulse` package. The version here is the one in
 
 This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## Unreleased
+
+Two whole-run checks in `webbpulse.e2e`, from the Standupless test hardening build, plus the
+collection fix that build needed locally.
+
+`TestAccessLogHealth` sweeps the gateway's own access log for this run and fails on four
+shapes a per-case assertion cannot see: any 5xx, any 401 or 403 whose `integrationStatus` is
+200, any non-`OPTIONS` request that matched no route key, and any integration error message.
+The middle one is the one that matters most: a rejection the function never saw is the
+authorizer or the gate refusing, and from outside it reads exactly like a product permission
+check. The error message is read through `log_field`, so the literal `-` the gateway renders
+for an unset context variable is not reported as an error on every healthy request. The
+group is guarded by `test_the_access_log_carries_this_runs_requests`, which fails when
+nothing correlated, because an empty sweep is what a wrong log group produces and the four
+checks below would all pass on it. It skips where `E2E_ACCESS_LOG_GROUP` is unset.
+
+`TestRouteCoverage` asks the inverse of every other group: which served operations nothing
+exercised. Concrete request paths are matched back to templated routes by specificity, the
+way API Gateway matches them, so `/api/issues/7/comments` is credited to
+`/api/issues/{issue_id}/comments` rather than to `/api/issues/{issue_id}`. Products supply
+only their allowlist, through the new `pytest_e2e_uncovered_routes` hook; the matching, the
+staleness check and the empty-reason check are the package's. An entry naming a route the
+deployment no longer serves fails as stale, so an allowlist cannot outlive the gap it
+excuses. Both groups read the run through the new `suite_requests` fixture, which is the
+shared record every client already appends to, so no case has to register itself.
+
+Both whole-run groups are gathered so the measurement is genuinely whole-run in both
+scheduling modes. Session fixtures under xdist are per worker, so a group scheduled onto a
+worker sees only that worker's requests, and `--dist loadgroup` was free to put it anywhere:
+`test_every_served_route_was_exercised_or_is_allowlisted` would have failed on staging as
+soon as a product picked the release up, reporting every route the other workers exercised as
+uncovered. A serial run had no ordering guarantee either, since a product test file that
+sorts after `test_shared.py` ran after coverage was measured.
+
+Serially, the plugin now orders both groups after every other case during collection, health
+before coverage, and they stay ordinary tests. Under xdist they skip on the worker with a
+reason naming the controller, each worker writes its own requests to a JSON file at
+`pytest_sessionfinish` under a directory keyed on `E2E_RUN_ID` and the worker id, and the
+controller reads every file once the workers have finished, runs the same checks over the
+union, prints the verdicts in the terminal summary and sets the exit status to tests-failed
+on any failure, so a controller-side finding turns the job red although every individual test
+passed. The run directory is removed afterwards, and the access log half is skipped where
+`E2E_ACCESS_LOG_GROUP` is unset exactly as the fixture skips it. Both paths call the same
+check functions in the new `webbpulse.e2e.runwide`, one per check returning a failure message
+or None, so the two modes cannot drift.
+
+`RequestRecord.path` now records the path alone, through the new
+`webbpulse.e2e.client.recorded_path`. A caller that inlines a query string rather than passing
+`params=` would otherwise have its request matched against no served template and reported as
+a request to a route the deployment does not serve, rather than as coverage of the one it
+reached.
+
+A shell with no `E2E_*` set now collects and skips instead of erroring. `pytest_generate_tests`
+and `e2e_env` both went through `E2EEnvironment.from_environ()`, which raises, so any
+`pytest` or `--collect-only` over a product's whole tree died at collection naming variables
+the run never needed, and each product was working around it locally. `environment_for_collection()`
+returns None for a wholly unset shell and the suite parametrises a skipped placeholder. A
+partially configured shell still raises, because that is a wiring mistake and skipping past
+one is how a suite goes green against nothing.
+
+
 ## 0.46.0
 
 Two gaps in the `webbpulse.e2e` plugin found while adopting it in the Terraform runner.
@@ -23,6 +84,7 @@ elements, and Playwright's strict mode raises on a multiple-match `is_visible`, 
 the case against an app that was working. Nothing is weakened: one visible match is what the
 assertion always meant, and the two `count() == 0` assertions after signing out are
 unchanged, so a session the app never cleared still fails.
+
 
 ## 0.45.0
 
@@ -147,7 +209,6 @@ gains the `identity_tables` fixture and `assert_users_repository_contract(reposi
 
 Nothing here changes behaviour. The before-and-after for `package_glue.py`, `identity_hooks.py`
 and `users.py` is in [identity-data-model.md](docs/identity-data-model.md) section 4.5.
-
 ## 0.44.0
 
 Three gaps the Standupless M5 build found on 0.43.0: an HKDF the products were hand-rolling,
