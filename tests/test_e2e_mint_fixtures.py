@@ -11,12 +11,19 @@ from __future__ import annotations
 
 import base64
 import json
-from typing import Any
+from typing import Any, ClassVar
 
 import pytest
 from _pytest.outcomes import Skipped
 
-from webbpulse.e2e import E2EEnvironment, admin_mint_token, minted_subject, minted_token
+from webbpulse.e2e import (
+    E2EEnvironment,
+    admin_mint_token,
+    ephemeral_user,
+    ephemeral_user_attributes,
+    minted_subject,
+    minted_token,
+)
 from webbpulse.e2e.identity import IdentitySession
 
 DURABLE_SUBJECT = "2f6c1a7e-6b5f-4a1f-9a8e-0d2b3c4d5e6f"
@@ -245,3 +252,162 @@ class TestAdminMintToken:
         request = RecordingRequest()
         admin_mint_token.__wrapped__(environment(), request)  # type: ignore[attr-defined]
         assert "minted.token.value" not in str(request.config.warnings[0])
+
+
+def ephemeral_user_fixture(
+    env: E2EEnvironment,
+    request: RecordingRequest,
+    attributes: Any,
+    admin_token: str = "minted.admin.token",
+) -> Any:
+    """Run the `ephemeral_user` fixture function the way pytest would and hand back its value.
+
+    The fixture is a generator, so it is driven to its first yield, closed, and the yielded
+    user returned. Closing runs the teardown, which is what exercises the delete leg.
+    """
+    generator = ephemeral_user.__wrapped__(  # type: ignore[attr-defined]
+        request,
+        env,
+        FakeAnonClient(),
+        admin_token,
+        attributes,
+    )
+    user = next(generator)
+    generator.close()
+    return user
+
+
+class FakeAnonClient:
+    """An `E2EClient` stand-in recording the create call the ephemeral fixture makes."""
+
+    created: ClassVar[list[dict[str, Any]]] = []
+
+    def with_token(self, token: str | None) -> FakeAnonClient:
+        """Keep answering from the same script whatever token is set."""
+        return self
+
+    def post(self, path: str, *, json: Any = None) -> Any:
+        """Record the create body and answer as a successful create."""
+        FakeAnonClient.created.append(dict(json or {}))
+        return CreatedResponse()
+
+    def request(self, method: str, path: str, *, json: Any = None) -> Any:
+        """Answer the delete leg as a success, so teardown issues no warning."""
+        return DeletedResponse()
+
+
+class CreatedResponse:
+    """The 201 the create route answers with."""
+
+    status_code = 201
+    text = ""
+
+    def json(self) -> Any:
+        """The created user's identifiers."""
+        return {"user_id": "usr-1", "email": "e2e-run@e2e.invalid"}
+
+
+class DeletedResponse:
+    """The 200 the delete route answers with."""
+
+    status_code = 200
+    text = ""
+
+    def json(self) -> Any:
+        """An empty body, which the delete leg does not read."""
+        return {}
+
+
+class TestEphemeralUserAttributes:
+    """A product supplies the attributes its ephemeral user is created with.
+
+    A product that grants write scopes only to an admin or verified row had to override the
+    whole `ephemeral_user` fixture to pass one argument, and so reimplemented the create,
+    the worker-id suffix and the delete-failure warning alongside it.
+    """
+
+    def setup_method(self) -> None:
+        """Clear the recorded create bodies before each case."""
+        FakeAnonClient.created.clear()
+
+    def test_the_default_is_empty(self) -> None:
+        """A product that declares nothing gets exactly the previous behaviour."""
+        assert ephemeral_user_attributes.__wrapped__() == {}  # type: ignore[attr-defined]
+
+    def test_the_declared_attributes_reach_the_create_call(self) -> None:
+        """What the fixture yields is what the create route is asked for."""
+        ephemeral_user_fixture(environment(), RecordingRequest(), {"is_admin": True, "email_verified": True})
+        assert FakeAnonClient.created[0]["attributes"] == {"is_admin": True, "email_verified": True}
+
+    def test_an_empty_mapping_sends_an_empty_attributes_object(self) -> None:
+        """The default still posts the field, so the route's own shape is unchanged."""
+        ephemeral_user_fixture(environment(), RecordingRequest(), {})
+        assert FakeAnonClient.created[0]["attributes"] == {}
+
+    def test_the_mapping_is_copied_rather_than_passed_through(self) -> None:
+        """A session-scoped mapping must not be mutable through the request body."""
+        declared = {"is_admin": True}
+        ephemeral_user_fixture(environment(), RecordingRequest(), declared)
+        FakeAnonClient.created[0]["attributes"]["is_admin"] = False
+        assert declared == {"is_admin": True}
+
+    def test_a_read_only_run_creates_nobody(self) -> None:
+        """Attributes change nothing about when a user is created at all."""
+        assert ephemeral_user_fixture(environment(read_only=True), RecordingRequest(), {"is_admin": True}) is None
+        assert FakeAnonClient.created == []
+
+    def test_a_run_that_cannot_mint_creates_nobody(self) -> None:
+        """With no admin token there is no authority to create a user with, attributes or not."""
+        assert ephemeral_user_fixture(environment(), RecordingRequest(), {"is_admin": True}, admin_token="") is None
+        assert FakeAnonClient.created == []
+
+    def test_the_created_user_is_handed_back(self) -> None:
+        """The fixture's contract is unchanged: it still yields the created user."""
+        user = ephemeral_user_fixture(environment(), RecordingRequest(), {"is_admin": True})
+        assert user is not None
+        assert user.user_id == "usr-1"
+
+
+class TestEphemeralUserDeleteWarning:
+    """The delete-failure warning survives the attributes change.
+
+    A leftover account is a warning rather than a failure, because a completed run's
+    results must not be replaced by a teardown error.
+    """
+
+    def test_a_failed_delete_warns_and_names_the_sweep(self) -> None:
+        """The warning names the user and says the next run's start sweep will collect it."""
+
+        class FailingDeleteClient(FakeAnonClient):
+            """A client that creates but refuses to delete."""
+
+            def request(self, method: str, path: str, *, json: Any = None) -> Any:
+                """Answer the delete leg with a refusal."""
+                return FailedDeleteResponse()
+
+        request = RecordingRequest()
+        generator = ephemeral_user.__wrapped__(  # type: ignore[attr-defined]
+            request,
+            environment(),
+            FailingDeleteClient(),
+            "minted.admin.token",
+            {"is_admin": True},
+        )
+        next(generator)
+        generator.close()
+
+        assert len(request.config.warnings) == 1
+        message = str(request.config.warnings[0])
+        assert "usr-1" in message
+        assert "start sweep" in message
+
+
+class FailedDeleteResponse:
+    """The 500 a delete route answers when it cannot remove the user."""
+
+    status_code = 500
+    text = "internal error"
+
+    def json(self) -> Any:
+        """A body the failure description can render."""
+        return {"error_code": "INTERNAL", "message": "could not delete"}
