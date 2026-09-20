@@ -15,12 +15,14 @@ import pytest
 from webbpulse.e2e.ephemeral import (
     BODY_EXCERPT_LIMIT,
     CREATE_PATH,
+    RESERVED_EMAIL_DOMAIN,
     Credentials,
     EphemeralUser,
     create_ephemeral_user,
     delete_ephemeral_user,
     describe_delete_failure,
     describe_error_body,
+    email_validation_hint,
     ephemeral_email,
     generate_password,
     item_path,
@@ -134,6 +136,82 @@ class TestEphemeralEmail:
         """An address with no run id would collide with every other run."""
         with pytest.raises(ValueError):
             ephemeral_email("   ")
+
+
+EMAIL_VALIDATION_ENVELOPE: Any = {
+    "success": False,
+    "status": 500,
+    "error_code": "INTERNAL_ERROR",
+    "message": "value is not a valid email address: The part after the @-sign is a special-use or reserved name.",
+    "request_id": "req-email-1",
+}
+
+
+class TestEmailValidationHint:
+    """The hint that names the reserved domain as the reason a product answered 500."""
+
+    def test_a_500_on_the_reserved_domain_earns_the_hint_with_an_opaque_body(self) -> None:
+        """A production envelope hides the cause, and the domain is the only reason a record model rejects it."""
+        hint = email_validation_hint(500, "body=Internal Server Error", f"e2e-run@{RESERVED_EMAIL_DOMAIN}")
+        assert "EmailStr" in hint
+        assert RESERVED_EMAIL_DOMAIN in hint
+
+    def test_a_gateway_failure_on_the_reserved_domain_gets_no_hint(self) -> None:
+        """Every ephemeral address is on the reserved domain, so the status must carry the decision."""
+        for status in (429, 502, 503, 504):
+            assert email_validation_hint(status, "body=Bad Gateway", f"e2e-run@{RESERVED_EMAIL_DOMAIN}") == ""
+
+    def test_a_500_mentioning_email_validation_earns_the_hint(self) -> None:
+        """A product may report the validation error without echoing the address."""
+        hint = email_validation_hint(500, "message=value is not a valid email address", "someone@example.com")
+        assert "EmailStr" in hint
+
+    def test_an_unrelated_failure_gets_no_hint(self) -> None:
+        """A misleading explanation on an unrelated failure would send a reader the wrong way."""
+        assert email_validation_hint(502, "body=Bad Gateway", "someone@example.com") == ""
+
+    def test_a_non_500_email_mention_off_the_reserved_domain_gets_no_hint(self) -> None:
+        """A 422 naming the email field is the product validating input, not the domain trap."""
+        assert email_validation_hint(422, "details=[email: Field required]", "someone@example.com") == ""
+
+
+class TestCreateEphemeralUserEmailHint:
+    """What the raised message carries when the reserved domain is the likely cause."""
+
+    def test_the_message_carries_the_status_body_and_hint(self) -> None:
+        """A reader needs the status, what the route said and why the address is the suspect."""
+        client = FakeClient([FakeResponse(500, EMAIL_VALIDATION_ENVELOPE)])
+        with pytest.raises(RuntimeError) as caught:
+            create_ephemeral_user(client, run_id=RUN_ID, admin_token=ADMIN_TOKEN)
+        message = str(caught.value)
+        assert "500" in message
+        assert "req-email-1" in message
+        assert "EmailStr" in message
+        assert RESERVED_EMAIL_DOMAIN in message
+
+    def test_the_body_stays_bounded(self) -> None:
+        """A hint appended to an unbounded body would flood the CI log."""
+        client = FakeClient([FakeResponse(500, ValueError("not json"), text="x" * 5000)])
+        with pytest.raises(RuntimeError) as caught:
+            create_ephemeral_user(client, run_id=RUN_ID, admin_token=ADMIN_TOKEN)
+        message = str(caught.value)
+        assert "x" * BODY_EXCERPT_LIMIT in message
+        assert "x" * (BODY_EXCERPT_LIMIT + 1) not in message
+
+    def test_no_secret_reaches_a_message_carrying_the_hint(self) -> None:
+        """The hint must not change what the message is allowed to hold."""
+        client = FakeClient([FakeResponse(500, EMAIL_VALIDATION_ENVELOPE)])
+        with pytest.raises(RuntimeError) as caught:
+            create_ephemeral_user(client, run_id=RUN_ID, admin_token=ADMIN_TOKEN, password="the-generated-password")
+        assert "the-generated-password" not in str(caught.value)
+        assert ADMIN_TOKEN not in str(caught.value)
+
+    def test_a_successful_creation_is_untouched(self) -> None:
+        """The hint is a failure path concern and must not alter a 201."""
+        client = FakeClient([FakeResponse(201, {"user_id": "user-1", "email": f"e2e-run@{RESERVED_EMAIL_DOMAIN}"})])
+        user = create_ephemeral_user(client, run_id=RUN_ID, admin_token=ADMIN_TOKEN)
+        assert user is not None
+        assert user.user_id == "user-1"
 
 
 class TestCredentials:

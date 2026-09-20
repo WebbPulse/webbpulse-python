@@ -612,6 +612,35 @@ Delete removes only the product's users row. The identity rows are the users-tab
 purge's to remove, so every run exercises the same deletion path production uses. A product
 enabling the flag implements the `delete_user` hook.
 
+### Gotchas
+
+- **A record model must not annotate the address `EmailStr`.** The ephemeral address is on
+  `e2e.invalid`, and `email-validator`, which Pydantic's `EmailStr` uses, refuses the
+  special-use domains RFC 2606 reserves. Neither `test_environment=True` (which re-admits
+  `.test` alone) nor `globally_deliverable=False` (which does not touch the special-use
+  check) makes `.invalid` pass, so there is no setting that rescues it. A product whose
+  persisted user record model uses `EmailStr` answers 500 on `POST /api/auth/e2e/users` and
+  every ephemeral fixture then errors in a way that reads like a product bug. Keep `EmailStr`
+  on request schemas, where rejecting an undeliverable address is the point, and let record
+  models hold a plain `local@domain` string:
+
+  ```python
+  class UserCreateRequest(BaseModel):
+      """What a caller may ask for. `EmailStr` belongs here."""
+
+      email: EmailStr
+
+  class UserRecord(BaseModel):
+      """What is persisted. A plain shape, so the reserved e2e domain round trips."""
+
+      email: str = Field(pattern=r"^[^@\s]+@[^@\s]+$")
+  ```
+
+  The ephemeral domain is deliberate and is not the thing to change: `.invalid` can never be
+  delivered to, which is what keeps a product's new-account mail away from a real inbox. When
+  creation does fail, `create_ephemeral_user` raises with the status, a bounded excerpt of the
+  response body and, where the reserved domain is the likely cause, this hint in one line.
+
 ### Attributes on the created user
 
 The user is created with the attributes `ephemeral_user_attributes` yields, which is an empty

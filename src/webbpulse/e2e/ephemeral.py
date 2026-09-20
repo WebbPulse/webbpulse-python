@@ -25,6 +25,7 @@ __all__ = [
     "BODY_EXCERPT_LIMIT",
     "CREATE_PATH",
     "PASSWORD_LENGTH",
+    "RESERVED_EMAIL_DOMAIN",
     "Credentials",
     "EphemeralUser",
     "TokenClient",
@@ -32,6 +33,7 @@ __all__ = [
     "delete_ephemeral_user",
     "describe_delete_failure",
     "describe_error_body",
+    "email_validation_hint",
     "ephemeral_email",
     "generate_password",
     "item_path",
@@ -42,6 +44,8 @@ CREATE_PATH: Final = "/api/auth/e2e/users"
 PASSWORD_LENGTH: Final = 32
 
 BODY_EXCERPT_LIMIT: Final = 300
+
+RESERVED_EMAIL_DOMAIN: Final = "e2e.invalid"
 
 DETAIL_LIMIT: Final = 10
 
@@ -128,6 +132,44 @@ def describe_error_body(response: Any) -> str:
     return f"body={excerpt}"
 
 
+_EMAIL_VALIDATION_MARKERS: Final = (
+    "email",
+    "special-use",
+    "reserved name",
+    "not a valid email",
+    "emailstr",
+)
+
+_EMAIL_HINT: Final = (
+    "Hint: the ephemeral address is on the reserved "
+    f"`{RESERVED_EMAIL_DOMAIN}` domain, which RFC 2606 sets aside so no mail can ever leave. "
+    "`email-validator`, which Pydantic's `EmailStr` uses, refuses special-use domains and "
+    "offers no option that re-admits `.invalid`, so a persisted user record model annotated "
+    "`EmailStr` answers 500 here. Keep `EmailStr` on request schemas only and let record "
+    "models hold a plain `local@domain` string."
+)
+
+
+def email_validation_hint(status_code: int, body: str, email: str) -> str:
+    """The one-line `EmailStr` hint when this failure looks like the reserved-domain trap.
+
+    Offered only for a 500, which is what a record model rejecting the address produces: for
+    any address on the reserved ephemeral domain, since that domain is the only reason a
+    product's own record model would reject an address the shared identity flow already
+    accepted and a production error envelope hides the cause, and for a body that mentions
+    email validation whatever the address. The empty string for every other status, so a
+    gateway or throttling failure on the same address is not given a misleading explanation.
+    """
+    if status_code != 500:
+        return ""
+    on_reserved_domain = email.rsplit("@", 1)[-1].lower() == RESERVED_EMAIL_DOMAIN
+    lowered = body.lower()
+    mentions_email = any(marker in lowered for marker in _EMAIL_VALIDATION_MARKERS)
+    if not on_reserved_domain and not mentions_email:
+        return ""
+    return _EMAIL_HINT
+
+
 def item_path(user_id: str, *, create_path: str = CREATE_PATH) -> str:
     """The delete path for one ephemeral user, derived from the create path."""
     return f"{create_path.rstrip('/')}/{user_id}"
@@ -148,7 +190,7 @@ def generate_password(length: int = PASSWORD_LENGTH) -> str:
     return f"{upper}{lower}{digit}{body}-"
 
 
-def ephemeral_email(run_id: str, *, domain: str = "e2e.invalid") -> str:
+def ephemeral_email(run_id: str, *, domain: str = RESERVED_EMAIL_DOMAIN) -> str:
     """The address for this run's user, carrying the run id so a leak is traceable.
 
     `.invalid` is reserved by RFC 2606 and can never be delivered to, so a product that
@@ -210,11 +252,14 @@ def create_ephemeral_user(
     if response.status_code in (403, 404, 405):
         return None
     if response.status_code != 201:
-        raise RuntimeError(
+        body = describe_error_body(response)
+        hint = email_validation_hint(response.status_code, body, email)
+        message = (
             f"POST {create_path} answered {response.status_code} rather than creating this "
             "run's ephemeral e2e user. The route is mounted, so this is a real failure "
-            f"rather than a deployment that does not offer it. It said: {describe_error_body(response)}"
+            f"rather than a deployment that does not offer it. It said: {body}"
         )
+        raise RuntimeError(f"{message} {hint}" if hint else message)
     try:
         payload = response.json()
     except ValueError as error:
