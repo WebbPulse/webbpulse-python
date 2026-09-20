@@ -1214,9 +1214,9 @@ class TestAccessLogHealth:
     ) -> None:
         """At least one of this run's requests was correlated, so the sweep proves something.
 
-        Without this the three cases below pass vacuously on an empty sweep, which is exactly
-        what a wrong log group name or a broken correlation produces, and a green group would
-        then mean the sweep never ran rather than that it found nothing wrong.
+        Without this the cases below pass vacuously on an empty sweep, which is exactly what
+        a wrong log group name or a broken correlation produces, and a green group would then
+        mean the sweep never ran rather than that it found nothing wrong.
         """
         if not any(record.request_id for record in suite_requests):
             pytest.skip("this run recorded no request ids, so there is nothing to correlate")
@@ -1232,17 +1232,6 @@ class TestAccessLogHealth:
         failure = runwide.no_request_was_answered_with_a_server_error(access_log_health)
         assert failure is None, failure
 
-    def test_no_rejection_came_from_a_healthy_integration(self, access_log_health: Sequence[AccessLogEntry]) -> None:
-        """No 401 or 403 was logged against an integration that answered 200.
-
-        The gateway records its own status and the integration's separately. A 401 whose
-        integration answered 200 was not the function refusing: the authorizer rejected the
-        request, and the function never saw it. That is the shape of a gate or authorizer
-        misconfiguration, and it reads exactly like a product permission check from outside.
-        """
-        failure = runwide.no_rejection_came_from_a_healthy_integration(access_log_health)
-        assert failure is None, failure
-
     def test_every_request_matched_a_declared_route(self, access_log_health: Sequence[AccessLogEntry]) -> None:
         """No request fell through without matching a declared route key.
 
@@ -1256,9 +1245,10 @@ class TestAccessLogHealth:
     def test_no_integration_reported_an_error(self, access_log_health: Sequence[AccessLogEntry]) -> None:
         """No entry carries an integration error message.
 
-        Read through `log_field`, because the gateway renders an unset context variable as a
-        literal `-` rather than omitting it, and a plain truthiness check reads that as an
-        error on every healthy request.
+        Only `integrationErrorMessage`, read through `log_field` so the literal `-` the
+        gateway renders for an unset context variable is not an error. `$context.error.message`
+        is not read: it is populated on every gateway-side refusal, including the ones this
+        suite's own unauthenticated probes provoke.
         """
         failure = runwide.no_integration_reported_an_error(access_log_health)
         assert failure is None, failure

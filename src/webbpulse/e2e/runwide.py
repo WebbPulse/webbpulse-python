@@ -28,7 +28,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Final, Protocol
 
-from .access_log import AccessLogEntry, log_field
+from .access_log import AccessLogEntry
 from .coverage import RouteCoverage, measure_coverage
 
 __all__ = [
@@ -41,7 +41,6 @@ __all__ = [
     "every_request_matched_a_declared_route",
     "every_served_route_was_exercised_or_is_allowlisted",
     "no_integration_reported_an_error",
-    "no_rejection_came_from_a_healthy_integration",
     "no_request_was_answered_with_a_server_error",
     "read_worker_records",
     "remove_run_directory",
@@ -215,19 +214,6 @@ def no_request_was_answered_with_a_server_error(entries: Sequence[AccessLogEntry
     return "requests answered 5xx:\n" + describe_entries(failures)
 
 
-def no_rejection_came_from_a_healthy_integration(entries: Sequence[AccessLogEntry]) -> str | None:
-    """Whether any 401 or 403 was logged against an integration that answered 200."""
-    rejected = [entry for entry in entries if entry.status in (401, 403) and entry.integration_status == 200]
-    if not rejected:
-        return None
-    return (
-        "requests the authorizer rejected although the integration answered 200:\n"
-        + describe_entries(rejected)
-        + "\nThe function never saw these. This is the authorizer or the gate refusing, "
-        "not the product."
-    )
-
-
 def every_request_matched_a_declared_route(entries: Sequence[AccessLogEntry]) -> str | None:
     """Whether any request fell through without matching a declared route key."""
     unmatched = [entry for entry in entries if not entry.matched_a_route and entry.method.upper() != "OPTIONS"]
@@ -241,12 +227,16 @@ def every_request_matched_a_declared_route(entries: Sequence[AccessLogEntry]) ->
 
 
 def no_integration_reported_an_error(entries: Sequence[AccessLogEntry]) -> str | None:
-    """Whether any entry carries an integration error message."""
-    errored = [
-        (entry, message)
-        for entry in entries
-        if (message := log_field(entry.raw, "errorMessage", "integrationErrorMessage"))
-    ]
+    """Whether any entry carries an integration error message.
+
+    Only `$context.integrationErrorMessage`, which is the integration itself reporting a
+    failure. `$context.error.message` is deliberately excluded: it is an API Gateway error
+    message, populated on every gateway-side refusal including the authorizer refusing an
+    unauthenticated probe, and the suite provokes those on purpose, so reading it would fail
+    every real run on the suite's own negative cases. `$context.authorizer.error` is excluded
+    for the same reason.
+    """
+    errored = [(entry, entry.integration_error) for entry in entries if entry.integration_error]
     if not errored:
         return None
     return "requests whose integration reported an error:\n" + "\n".join(
@@ -302,12 +292,25 @@ def the_allowlist_carries_reasons(allowlist: Mapping[tuple[str, str], str]) -> s
 
 def describe_entries(entries: Sequence[AccessLogEntry]) -> str:
     """One indented line per entry, naming what the gateway logged about it."""
-    return "\n".join(
+    return "\n".join(_describe_entry(entry) for entry in entries)
+
+
+def _describe_entry(entry: AccessLogEntry) -> str:
+    """One entry's diagnostic line, naming whether the integration ran and why it did not.
+
+    `integrationStatus` is not printed, because for a Lambda proxy integration it is 200 for
+    every invocation whatever the function answered and `-` otherwise, so the only thing it
+    tells a reader is whether the function ran.
+    """
+    invoked = "yes" if entry.integration_invoked else "no"
+    line = (
         f"  {entry.method} {entry.path} status={entry.status} "
-        f"integration={entry.integration_status} route_key={entry.route_key or '(none)'} "
+        f"invoked={invoked} route_key={entry.route_key or '(none)'} "
         f"({entry.request_id})"
-        for entry in entries
     )
+    if entry.authorizer_error:
+        line += f" authorizer_error={entry.authorizer_error}"
+    return line
 
 
 @dataclass(frozen=True)
@@ -358,7 +361,6 @@ def controller_verdicts(
             notes.append("this run recorded no request ids, so there was nothing to correlate")
         for check in (
             no_request_was_answered_with_a_server_error,
-            no_rejection_came_from_a_healthy_integration,
             every_request_matched_a_declared_route,
             no_integration_reported_an_error,
         ):

@@ -331,6 +331,8 @@ def entry_for(route_key: str, *, integration_error: str = "") -> AccessLogEntry:
         status=200,
         integration_status=200,
         integration_error=integration_error,
+        authorizer_error="",
+        error_type="",
         raw={},
     )
 

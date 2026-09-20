@@ -46,9 +46,19 @@ SCAN_PAGE_LIMIT = 10_000
 class AccessLogEntry:
     """One parsed access log line.
 
-    `integration` is the integration error or target the gateway recorded, which is empty
-    on a clean request; `status` is the gateway's own status, which differs from the
-    integration's when the gate or the authorizer answered.
+    `status` is the gateway's own status, which is what the caller saw.
+
+    `integration_status` is `$context.integrationStatus`, the status AWS Lambda returned for
+    the invocation and not the status the function's own handler returned. For a Lambda proxy
+    integration it is 200 whenever the function ran at all, whichever status the function
+    answered with, so a product 401, 403, 404 or 422 all log it as 200. A gateway-side refusal
+    never invokes the function and logs a literal `-`, which parses here as 0. The function's
+    own status is `$context.integration.status`, which the platform-modules `http-api` default
+    access log format does not emit, so this entry cannot see it.
+
+    `integration_error` is `$context.integrationErrorMessage` alone, empty on a clean request.
+    `authorizer_error` and `error_type` are the gateway's own refusal fields, kept for a
+    failure message rather than for a verdict.
     """
 
     request_id: str
@@ -58,12 +68,24 @@ class AccessLogEntry:
     status: int
     integration_status: int
     integration_error: str
+    authorizer_error: str
+    error_type: str
     raw: Mapping[str, Any]
 
     @property
     def matched_a_route(self) -> bool:
         """Whether the gateway matched a declared route rather than answering itself."""
         return bool(self.route_key) and self.route_key != "$default"
+
+    @property
+    def integration_invoked(self) -> bool:
+        """Whether the integration ran at all, rather than the gateway answering by itself.
+
+        True when `integrationStatus` parsed to a non-zero value or an integration latency was
+        recorded. Either one means AWS Lambda was called; both are `-` on a refusal the
+        authorizer or the gateway made before any invocation.
+        """
+        return bool(self.integration_status) or bool(log_field(self.raw, "integrationLatency"))
 
 
 def log_field(payload: Mapping[str, Any], *keys: str) -> str:
@@ -113,6 +135,8 @@ def parse_entry(message: str) -> AccessLogEntry | None:
         status=_int("status"),
         integration_status=_int("integrationStatus"),
         integration_error=log_field(payload, "integrationErrorMessage"),
+        authorizer_error=log_field(payload, "authorizerError"),
+        error_type=log_field(payload, "errorType"),
         raw=payload,
     )
 

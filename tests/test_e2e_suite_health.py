@@ -8,13 +8,14 @@ produces and a green group would then mean the sweep never ran.
 
 from __future__ import annotations
 
+import json
 from collections.abc import Mapping, Sequence
 from typing import Any
 
 import pytest
 
 from webbpulse.e2e import environment_for_collection, suite
-from webbpulse.e2e.access_log import AccessLogEntry
+from webbpulse.e2e.access_log import AccessLogEntry, parse_entry
 from webbpulse.e2e.client import RequestRecord
 from webbpulse.e2e.coverage import measure_coverage
 
@@ -39,6 +40,9 @@ def entry(
     integration_status: int = 200,
     route_key: str = "GET /api/issues",
     method: str = "GET",
+    integration_error: str = "",
+    authorizer_error: str = "",
+    error_type: str = "",
     raw: Mapping[str, Any] | None = None,
 ) -> AccessLogEntry:
     """One access log entry, healthy unless a test says otherwise."""
@@ -49,9 +53,65 @@ def entry(
         method=method,
         status=status,
         integration_status=integration_status,
-        integration_error="",
+        integration_error=integration_error,
+        authorizer_error=authorizer_error,
+        error_type=error_type,
         raw={"integrationErrorMessage": "-"} if raw is None else raw,
     )
+
+
+def authorizer_refusal() -> AccessLogEntry:
+    """A real gateway-side refusal, parsed from a CarModPicker staging entry.
+
+    The integration never ran, so `integrationStatus` is `-`, and the gateway filled in its
+    own `errorMessage`, `errorType` and `authorizerError`. Nothing here is a product failure.
+    """
+    entry = parse_entry(
+        json.dumps(
+            {
+                "requestId": "req-refused",
+                "routeKey": "GET /api/issues",
+                "path": "/api/issues",
+                "httpMethod": "GET",
+                "status": "403",
+                "integrationStatus": "-",
+                "integrationLatency": "-",
+                "authorizerError": "Forbidden",
+                "errorMessage": "Forbidden",
+                "errorType": "ACCESS_DENIED",
+                "integrationErrorMessage": "-",
+            }
+        )
+    )
+    assert entry is not None
+    return entry
+
+
+def product_rejection() -> AccessLogEntry:
+    """A real product 401, parsed from a CarModPicker staging entry.
+
+    The function ran and answered 401 itself, which AWS Lambda reports to the gateway as a
+    successful invocation, so `integrationStatus` is 200 and no error field is set.
+    """
+    entry = parse_entry(
+        json.dumps(
+            {
+                "requestId": "req-401",
+                "routeKey": "GET /api/issues",
+                "path": "/api/issues",
+                "httpMethod": "GET",
+                "status": "401",
+                "integrationStatus": "200",
+                "integrationLatency": "14",
+                "integrationErrorMessage": "-",
+                "authorizerError": "-",
+                "errorMessage": "-",
+                "errorType": "-",
+            }
+        )
+    )
+    assert entry is not None
+    return entry
 
 
 def record(request_id: str = "req-1") -> RequestRecord:
@@ -77,22 +137,34 @@ class TestTheSweepCannotPassVacuously:
         Health().test_the_access_log_carries_this_runs_requests([record()], [entry()])
 
 
-class TestTheFourFailingShapes:
-    """Each shape the sweep looks for fails, and a healthy run passes all four."""
+class TestTheFailingShapes:
+    """Each shape the sweep looks for fails, and a healthy run passes all of them."""
 
     def test_a_server_error_fails(self) -> None:
         """A 5xx anywhere in the run is reported."""
         with pytest.raises(AssertionError, match="answered 5xx"):
             Health().test_no_request_was_answered_with_a_server_error([entry(status=502)])
 
-    def test_a_rejection_from_a_healthy_integration_fails(self) -> None:
-        """A 401 whose integration answered 200 is the authorizer, not the product."""
-        with pytest.raises(AssertionError, match="although the integration answered 200"):
-            Health().test_no_rejection_came_from_a_healthy_integration([entry(status=401)])
+    def test_a_real_authorizer_refusal_fails_nothing(self) -> None:
+        """A gateway-side 403 is a refusal the suite provokes on purpose, not a failure.
 
-    def test_a_genuine_product_rejection_passes(self) -> None:
-        """A 401 the function itself returned is the product refusing, and is not flagged."""
-        Health().test_no_rejection_came_from_a_healthy_integration([entry(status=401, integration_status=401)])
+        It carries `errorMessage`, `errorType` and `authorizerError`, and none of them is a
+        verdict: the run cannot know which refusals were expected, and every negative auth
+        case is one.
+        """
+        entries = [authorizer_refusal()]
+        health = Health()
+        health.test_no_request_was_answered_with_a_server_error(entries)
+        health.test_every_request_matched_a_declared_route(entries)
+        health.test_no_integration_reported_an_error(entries)
+
+    def test_a_real_product_rejection_fails_nothing(self) -> None:
+        """A product 401 logs `integrationStatus` 200 because the function ran and answered."""
+        entries = [product_rejection()]
+        health = Health()
+        health.test_no_request_was_answered_with_a_server_error(entries)
+        health.test_every_request_matched_a_declared_route(entries)
+        health.test_no_integration_reported_an_error(entries)
 
     def test_an_unmatched_route_fails(self) -> None:
         """An empty route key means the gateway answered instead of a function."""
@@ -106,7 +178,9 @@ class TestTheFourFailingShapes:
     def test_an_integration_error_message_fails(self) -> None:
         """A real error message is reported."""
         with pytest.raises(AssertionError, match="reported an error"):
-            Health().test_no_integration_reported_an_error([entry(raw={"integrationErrorMessage": "Lambda timed out"})])
+            Health().test_no_integration_reported_an_error(
+                [entry(integration_error="Lambda timed out", raw={"integrationErrorMessage": "Lambda timed out"})]
+            )
 
     def test_the_unset_placeholder_is_not_an_error(self) -> None:
         """The gateway renders an unset variable as `-`, which is not an error message."""
@@ -114,12 +188,17 @@ class TestTheFourFailingShapes:
             [entry(raw={"integrationErrorMessage": "-", "errorMessage": "-"})]
         )
 
+    def test_a_gateway_error_message_is_not_an_integration_error(self) -> None:
+        """`$context.error.message` is the gateway refusing, which the suite provokes itself."""
+        Health().test_no_integration_reported_an_error(
+            [entry(status=403, raw={"integrationErrorMessage": "-", "errorMessage": "Forbidden"})]
+        )
+
     def test_a_healthy_run_passes_every_shape(self) -> None:
-        """Nothing in a clean run trips any of the four."""
+        """Nothing in a clean run trips any of them."""
         entries = [entry()]
         health = Health()
         health.test_no_request_was_answered_with_a_server_error(entries)
-        health.test_no_rejection_came_from_a_healthy_integration(entries)
         health.test_every_request_matched_a_declared_route(entries)
         health.test_no_integration_reported_an_error(entries)
 

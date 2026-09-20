@@ -99,6 +99,46 @@ class TestParseEntry:
         assert entry is not None
         assert entry.route_key == "ANY /api/{proxy+}"
 
+    def test_an_invoked_integration_is_reported_as_invoked(self) -> None:
+        """A parsed `integrationStatus` means AWS Lambda was called, whatever the function answered."""
+        entry = parse_entry(line(status="401", integrationStatus="200", integrationLatency="14"))
+        assert entry is not None
+        assert entry.integration_invoked
+
+    def test_a_gateway_refusal_never_invoked_the_integration(self) -> None:
+        """A real authorizer refusal logs `-` for both integration fields and fills in its own."""
+        entry = parse_entry(
+            line(
+                status="403",
+                integrationStatus="-",
+                integrationLatency="-",
+                authorizerError="Forbidden",
+                errorMessage="Forbidden",
+                errorType="ACCESS_DENIED",
+                integrationErrorMessage="-",
+            )
+        )
+        assert entry is not None
+        assert entry.integration_status == 0
+        assert not entry.integration_invoked
+        assert entry.authorizer_error == "Forbidden"
+        assert entry.error_type == "ACCESS_DENIED"
+        assert entry.integration_error == ""
+
+    def test_an_integration_latency_alone_counts_as_invoked(self) -> None:
+        """A format that omits `integrationStatus` still proves the invocation by its latency."""
+        entry = parse_entry(line(integrationStatus="-", integrationLatency="12"))
+        assert entry is not None
+        assert entry.integration_invoked
+
+    def test_the_unset_placeholders_read_as_empty(self) -> None:
+        """A clean request carries `-` in every optional field, which is not a value."""
+        entry = parse_entry(line(authorizerError="-", errorType="-", integrationErrorMessage="-"))
+        assert entry is not None
+        assert entry.authorizer_error == ""
+        assert entry.error_type == ""
+        assert entry.integration_error == ""
+
     def test_an_integration_error_is_kept(self) -> None:
         """The integration error is what distinguishes a 500 from the gateway's own refusal."""
         entry = parse_entry(line(status="500", integrationErrorMessage="Internal server error"))
