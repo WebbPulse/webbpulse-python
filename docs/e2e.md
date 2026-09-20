@@ -277,6 +277,7 @@ and deployment concerns and they stay in the post deploy run, which is the requi
 | `gate_headers` | The `x-origin-verify` header, or an empty mapping in production and on a local stack |
 | `anon` | A client carrying the gate header and no identity, paced everywhere but staging. It serves `get`, `post`, `put`, `patch`, `delete` and `options`, each through the same `request` path, so pacing, the 429 retry and the request record apply to every verb |
 | `ephemeral_user` | This run's own login user, created at session start and deleted at the end, or None where the route is not offered |
+| `ephemeral_user_attributes` | The attributes `ephemeral_user` creates that user with, empty by default. Override it where the product grants write scopes only to an admin or verified row |
 | `credentials` | The email and password the suite signs in with: this run's ephemeral user where there is one, the durable user otherwise. The password is kept out of the repr |
 | `user_session` | The run's user signed in through the real login route. Skips in read-only mode |
 | `api` | The authenticated client, sharing the anonymous client's pacer |
@@ -525,3 +526,23 @@ KMS-minted token the e2e workflow alone can produce.
 Delete removes only the product's users row. The identity rows are the users-table stream
 purge's to remove, so every run exercises the same deletion path production uses. A product
 enabling the flag implements the `delete_user` hook.
+
+### Attributes on the created user
+
+The user is created with the attributes `ephemeral_user_attributes` yields, which is an empty
+mapping by default. A product that grants write scopes only to an admin or a verified row
+overrides that one fixture rather than the whole of `ephemeral_user`:
+
+```python
+@pytest.fixture(scope="session")
+def ephemeral_user_attributes() -> dict[str, object]:
+    """This product grants write scopes only to an admin, verified row."""
+    return {"is_admin": True, "email_verified": True}
+```
+
+The mapping reaches `create_ephemeral_user` as `attributes=` and nothing else reads it, so it
+may carry whatever the product's own create route accepts. A user created with no attributes
+holds read scopes alone wherever that is how the product authorises, and every write case
+would be refused, which is the reason this exists. Overriding the whole fixture to pass one
+argument meant reimplementing the create, the worker-id suffix and the delete-failure warning
+alongside it.

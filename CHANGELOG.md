@@ -5,6 +5,25 @@ Notable changes to the `webbpulse` package. The version here is the one in
 
 This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## Unreleased
+
+Two gaps in the `webbpulse.e2e` plugin found while adopting it in the Terraform runner.
+
+`ephemeral_user_attributes` is a new session-scoped fixture yielding the attributes
+`ephemeral_user` creates this run's login user with, an empty mapping by default. A product
+that grants write scopes only to an admin or a verified row previously had to override the
+whole `ephemeral_user` fixture to pass one argument, and so reimplemented the create call,
+the worker-id suffix and the delete-failure warning alongside it. Overriding the new fixture
+alone is now enough, and the mapping is copied into the request body, so a session-scoped
+mapping cannot be mutated through it. The default is empty, so no existing caller changes.
+
+The shared browser sign-in case reads the signed-in marker through `.first`. A SPA header
+carrying both a brand link and a nav link to the same route resolves the marker to two
+elements, and Playwright's strict mode raises on a multiple-match `is_visible`, which failed
+the case against an app that was working. Nothing is weakened: one visible match is what the
+assertion always meant, and the two `count() == 0` assertions after signing out are
+unchanged, so a session the app never cleared still fails.
+
 ## 0.45.0
 
 Two generic helpers the Standupless and Terraform-runner builds were each keeping a local

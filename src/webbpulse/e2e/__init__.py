@@ -507,11 +507,32 @@ def admin_mint_token(e2e_env: E2EEnvironment, request: pytest.FixtureRequest) ->
 
 
 @pytest.fixture(scope="session")
+def ephemeral_user_attributes() -> Mapping[str, Any]:
+    """The attributes this run's ephemeral user is created with, empty by default.
+
+    Override it in a product's `e2e/conftest.py` to have `ephemeral_user` create a user
+    whose row already carries what the product's authorisation reads, rather than
+    reimplementing the whole fixture to pass one argument:
+
+        @pytest.fixture(scope="session")
+        def ephemeral_user_attributes() -> dict[str, object]:
+            return {"is_admin": True, "email_verified": True}
+
+    A product that grants write scopes only to an admin or a verified row needs this, since
+    a user created with no attributes holds read scopes alone and every write case would be
+    refused. The mapping reaches `create_ephemeral_user` as `attributes=` and nothing else
+    reads it, so a product may put anything its own create route accepts in it.
+    """
+    return {}
+
+
+@pytest.fixture(scope="session")
 def ephemeral_user(
     request: pytest.FixtureRequest,
     e2e_env: E2EEnvironment,
     anon: E2EClient,
     admin_mint_token: str,
+    ephemeral_user_attributes: Mapping[str, Any],
 ) -> Iterator[EphemeralUser | None]:
     """This run's own login user, created at session start and deleted at session end.
 
@@ -527,12 +548,20 @@ def ephemeral_user(
 
     Deletion failures are warnings rather than failures. The account carries the sweepable
     `e2e-` prefix, so the next run's start sweep collects anything left behind.
+
+    The user is created with whatever `ephemeral_user_attributes` yields, so a product that
+    needs an admin or verified row overrides that one fixture rather than this whole one.
     """
     if e2e_env.read_only or not admin_mint_token:
         yield None
         return
     run_id = f"{e2e_env.run_id}-{worker_id(request.config)}"
-    user = create_ephemeral_user(anon, run_id=run_id, admin_token=admin_mint_token)
+    user = create_ephemeral_user(
+        anon,
+        run_id=run_id,
+        admin_token=admin_mint_token,
+        attributes=dict(ephemeral_user_attributes),
+    )
     try:
         yield user
     finally:

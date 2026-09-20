@@ -15,10 +15,11 @@ import pytest
 from _pytest.outcomes import Skipped
 
 from webbpulse.e2e.access_log import AccessLogEntry
-from webbpulse.e2e.browser import BrowserFailure
+from webbpulse.e2e.browser import BrowserFailure, ConsoleErrors
 from webbpulse.e2e.client import E2EClient, RateLimitExhausted
+from webbpulse.e2e.ephemeral import Credentials
 from webbpulse.e2e.gateway import ABSENT_ID, Operation, Route
-from webbpulse.e2e.journeys import ExpectText
+from webbpulse.e2e.journeys import ExpectText, LoginForm
 from webbpulse.e2e.suite import (
     SETTLE_POLL_MS,
     SETTLE_TIMEOUT_MS,
@@ -34,6 +35,7 @@ from webbpulse.e2e.suite import (
     probe_every_route,
     route_probes,
 )
+from webbpulse.e2e.suite import TestBrowser as BrowserGroup
 from webbpulse.e2e.suite import TestIdentity as IdentityGroup
 from webbpulse.e2e.suite import TestRouteCut as RouteCutGroup
 from webbpulse.http import ROUTE_KEY_HEADER
@@ -756,3 +758,128 @@ class TestServedRouteKey:
     def test_an_empty_header_reads_as_empty(self) -> None:
         """The middleware never sets an empty one, and an empty one proves nothing."""
         assert _served_route_key(httpx.Response(200, headers={ROUTE_KEY_HEADER: ""}, json={})) == ""
+
+
+class _BrowserEnv:
+    """The few environment fields the sign-in and sign-out helpers read."""
+
+    user_email = "e2e@example.invalid"
+    user_password = "a-very-secret-password"
+    browser_timeout_ms = 15000
+
+
+class _StrictLocator:
+    """One `page.locator(...)` result that enforces Playwright's strict mode.
+
+    `is_visible` on a locator resolving to more than one element raises the way Playwright
+    does, so a header carrying both a brand link and a nav link to the same route fails a
+    test that reads the marker without narrowing it. `.first` narrows to one element and
+    never raises, which is what the real API does.
+    """
+
+    def __init__(self, matches: int, visible: bool = True, narrowed: bool = False) -> None:
+        """Hold how many elements match, whether they are visible and whether this is `.first`."""
+        self._matches = matches
+        self._visible = visible
+        self._narrowed = narrowed
+
+    @property
+    def first(self) -> _StrictLocator:
+        """The first match, which is exempt from the strict-mode check."""
+        return _StrictLocator(self._matches, self._visible, narrowed=True)
+
+    def is_visible(self) -> bool:
+        """Whether the element is visible, raising on a multiple match that was not narrowed."""
+        if self._matches > 1 and not self._narrowed:
+            raise RuntimeError('strict mode violation: locator resolved to 2 elements. Use ".first" to narrow it.')
+        return self._visible
+
+    def count(self) -> int:
+        """How many elements match."""
+        return self._matches
+
+
+class _MarkerPage:
+    """A page whose signed-in marker matches a set number of elements before and after signing out."""
+
+    def __init__(self, matches: int) -> None:
+        """Hold the match count the signed-in marker resolves to while signed in."""
+        self._matches = matches
+        self.signed_in = False
+
+    def goto(self, path: str, **_: object) -> None:
+        """Record nothing; navigation is not what these cases assert."""
+
+    def fill(self, selector: str, value: str) -> None:
+        """Accept a fill without holding the value, so no password is kept."""
+
+    def click(self, selector: str) -> None:
+        """Sign in on the submit button and out on the sign-out button."""
+        self.signed_in = "Sign out" not in selector and "sign-out" not in selector
+
+    def reload(self, **_: object) -> None:
+        """A reload keeps whatever state the page is in."""
+
+    def wait_for_selector(self, selector: str, state: str = "visible", **_: object) -> None:
+        """Every scripted wait is satisfied immediately."""
+
+    def locator(self, selector: str) -> _StrictLocator:
+        """The signed-in marker's locator, matching only while signed in."""
+        matches = self._matches if self.signed_in else 0
+        return _StrictLocator(matches, visible=matches > 0)
+
+
+class TestSignedInMarkerIsStrictModeSafe:
+    """The shared sign-in case reads the signed-in marker without tripping strict mode.
+
+    A SPA header that links to the same route twice, once as the brand and once as a nav
+    item, resolves the marker to two elements. Playwright's strict mode raises on
+    `is_visible` there, which failed the shared case against an app that was working.
+    """
+
+    def case(self, matches: int) -> None:
+        """Run the shared sign-in and out case against a page matching the marker `matches` times."""
+        form = LoginForm(path="/sign-in", signed_in_marker="header a[href='/workspaces']")
+        page = _MarkerPage(matches)
+        BrowserGroup().test_sign_in_and_out_through_the_ui(
+            page,
+            form,
+            _BrowserEnv(),
+            Credentials(email="e2e@e2e.invalid", password="unused"),
+            ConsoleErrors(),
+        )
+
+    def test_a_single_match_still_passes(self) -> None:
+        """The ordinary header, with one link to the route, is unaffected."""
+        self.case(1)
+
+    def test_a_header_linking_twice_no_longer_trips_strict_mode(self) -> None:
+        """Two matches is a working app, and the case must not raise a strict mode violation."""
+        self.case(2)
+
+    def test_a_marker_that_never_appears_still_fails(self) -> None:
+        """Narrowing to the first match must not weaken what the assertion checks."""
+        form = LoginForm(path="/sign-in", signed_in_marker="header a[href='/workspaces']")
+        page = _MarkerPage(0)
+        with pytest.raises(AssertionError, match="is not visible after signing in"):
+            BrowserGroup().test_sign_in_and_out_through_the_ui(
+                page,
+                form,
+                _BrowserEnv(),
+                Credentials(email="e2e@e2e.invalid", password="unused"),
+                ConsoleErrors(),
+            )
+
+    def test_a_marker_left_behind_after_signing_out_still_fails(self) -> None:
+        """The count assertions are unchanged, so a session that was never cleared still fails."""
+        form = LoginForm(path="/sign-in", signed_in_marker="header a[href='/workspaces']")
+        page = _MarkerPage(2)
+        page.click = lambda selector: setattr(page, "signed_in", True)  # type: ignore[method-assign]
+        with pytest.raises(AssertionError, match="the session was never cleared"):
+            BrowserGroup().test_sign_in_and_out_through_the_ui(
+                page,
+                form,
+                _BrowserEnv(),
+                Credentials(email="e2e@e2e.invalid", password="unused"),
+                ConsoleErrors(),
+            )

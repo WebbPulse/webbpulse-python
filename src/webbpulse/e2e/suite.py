@@ -1195,9 +1195,15 @@ class TestBrowser:
         Sign-out is judged by what the page shows, never by the URL. An app that renders its
         login form in place leaves the path untouched, so requiring a change would fail every
         run against a correct app.
+
+        The visibility read takes `.first`, because a header that carries both a brand link
+        and a nav link to the same route matches the marker twice and Playwright's strict
+        mode raises on a multiple-match `is_visible`. Nothing is weakened by it: one visible
+        match is what the assertion always meant, and the two counts below still require
+        every match to be gone after signing out.
         """
         sign_in(page, login_form, e2e_env, credentials)
-        assert page.locator(login_form.signed_in_marker).is_visible(), (
+        assert page.locator(login_form.signed_in_marker).first.is_visible(), (
             f"{login_form.signed_in_marker} is not visible after signing in as the e2e user"
         )
 
