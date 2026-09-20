@@ -67,6 +67,22 @@ prefix, because the router itself declares its full paths: an identity router ca
 grants. A domain reaching a table it does not own must never gain write on it just by
 needing a lookup.
 
+`extra` is `create_app` keyword arguments and nothing else. Every key is forwarded verbatim,
+and anything `create_app` does not name reaches `FastAPI`, which accepts unknown keywords
+without complaint: a product fact put here is swallowed in silence rather than refused.
+Product metadata goes in `metadata`, a mapping `build_domain_app` ignores entirely, such as
+a `seeds` flag deciding which root wires a lifespan hook, an owning team, or a Terraform
+memory size.
+
+```python
+Domain(
+    name="vehicles",
+    load_routers=_vehicles_routers,
+    extra={"error_envelope": "detailed"},
+    metadata={"seeds": True},
+)
+```
+
 `DomainRegistry` is an ordered, immutable `Mapping`. `entrypoint_module` translates a
 domain name to its package name, since `build-lists` is a legal domain name and an illegal
 Python identifier, and a Dockerfile's `DOMAIN` build argument does the same translation.
@@ -136,6 +152,29 @@ into a middleware stack that has not been built yet.
 so importing an entrypoint module reads no environment. `serve` defaults to
 `webbpulse.lambda_entry.run_uvicorn`; a test passes its own to assert what `main` would
 have served without binding a port.
+
+`configure_logging` is the logging seam. It takes this domain's service name and defaults to
+the package's own `configure_logging` bound to the resolved settings, which is the JSON
+format. A product whose log format is not that one, a colorized TTY branch for instance,
+passes its own and keeps `settings`, so `main` still runs logging, then tracing, then the
+check, then the build:
+
+```python
+from app.common.core.logging import configure_app_logging
+
+build_app, main = domain_entrypoint(
+    DOMAIN,
+    build=build_domain_app,
+    settings=lambda: settings,
+    configure_logging=lambda service: configure_app_logging(service=service),
+)
+```
+
+The fallback, for a product that must own the whole startup sequence, is `settings=None`
+with a `check` doing all of it: with no settings resolved `main` configures neither logging
+nor tracing, so the `check` hook has to run logging, tracing and the secrets check itself,
+in that order, before the build. Passing `configure_logging` is the shorter road to the same
+place and keeps the order the package's.
 
 ## Tracing, behind the gate
 
@@ -241,7 +280,29 @@ caller can assert something further, and it raises an `AssertionError` naming ev
 that reached into another.
 
 `entrypoint_imports` is the single-domain form, for a product wanting one case per domain
-rather than one over the registry.
+rather than one over the registry. It takes the same `package_root` default of
+`"app.domains."`.
+
+`allowed_foreign` is the exception list, for a foreign module every domain legitimately
+imports. A product whose shared middleware is built from one domain's glue, an authorizer
+every domain mounts built from the identity domain's `package_glue` for instance, names that
+module here and the check still refuses everything else:
+
+```python
+assert_entrypoint_isolation(
+    DOMAINS,
+    cwd=BACKEND,
+    allowed_foreign=["app.domains.identity.package_glue"],
+)
+```
+
+A collection applies to every domain; a mapping of domain name to collection applies per
+domain, and a domain the mapping does not name allows none. A listed module covers its own
+submodules, and the packages between it and `package_root` are allowed exactly, since Python
+cannot import `app.domains.identity.package_glue` without importing `app.domains.identity`.
+Naming one module of a domain therefore never opens the rest of that domain: the glue lands
+in every image and that domain's endpoints must not follow it there. Keep the list to what
+shared wiring genuinely needs, for the same reason.
 
 ## Migration for adopters
 
@@ -270,8 +331,9 @@ def add_local_authorizer(app: FastAPI) -> bool: ...
 def scope_for(domains: Sequence[Domain]) -> RepositoryScope: ...
 
 
-def build_domain_app(domains, *, title=None, include_root_routes=True) -> FastAPI:
-    ...  # ninety lines of create_app, middleware, binding and include_router
+def build_domain_app(
+    domains, *, title=None, include_root_routes=True
+) -> FastAPI: ...  # ninety lines of create_app, middleware, binding and include_router
 ```
 
 After:
@@ -318,7 +380,37 @@ def build_domain_app(domains, **kwargs):
     )
 ```
 
-Each registry row gains `service_name_template=SERVICE_NAME_TEMPLATE`, and
+### Fields a migrating product must set explicitly
+
+`Domain`'s defaults are the ones a new product wants, not the ones a product's own descriptor
+had, and two of them will silently change behaviour if a migrating row leaves them out:
+
+- **`router_prefix`** defaults to `""`. A product whose own descriptor defaulted it to its
+  API prefix, `settings.API_STR` say, unprefixes every route of every domain by migrating
+  without setting it. Nothing raises: the application builds, the routes serve, and they
+  serve at the wrong paths. Set it on every row, or compute it once and stamp it on each.
+- **`service_name_template`** defaults to `"{domain}"`. A product whose functions log and
+  trace under `product-{domain}` loses that prefix by migrating without setting it, so the
+  logs and traces of a deployed function land under a service name its Terraform never used.
+
+Both are per-row rather than per-registry, so the shortest safe migration is one constant
+each in the product and both named on every row:
+
+```python
+API_PREFIX = settings.API_STR
+SERVICE_NAME_TEMPLATE = "carmodpicker-{domain}"
+
+Domain(
+    name="vehicles",
+    router_prefix=API_PREFIX,
+    service_name_template=SERVICE_NAME_TEMPLATE,
+    load_routers=_vehicles_routers,
+)
+```
+
+A route-cut test over the OpenAPI document catches the first of these and a service-name
+assertion catches the second. Write both before migrating the rows, not after.
+
 `check_signing_key([domain])` becomes `check_secrets([domain], settings)`.
 
 An `entrypoint.py` goes from forty-odd lines to three. Before:

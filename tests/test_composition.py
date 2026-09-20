@@ -244,6 +244,20 @@ def test_explicit_keyword_arguments_win_over_a_row_extra() -> None:
     assert app.description == "from caller"
 
 
+def test_the_metadata_mapping_is_never_read_by_the_builder() -> None:
+    """`metadata` carries product facts `create_app` knows nothing about and would reject."""
+    domain = Domain(name="d", load_routers=posts_router, metadata={"seeds": True, "team": "platform"})
+    app = build_domain_app(domain, settings=Settings())
+    assert domain.metadata == {"seeds": True, "team": "platform"}
+    assert paths_of(app) == {"/posts"}
+    assert not hasattr(app, "seeds")
+
+
+def test_metadata_defaults_to_an_empty_mapping() -> None:
+    """A row naming none carries an empty mapping rather than `None`."""
+    assert Domain(name="bare").metadata == {}
+
+
 def test_the_configure_hooks_run_before_the_routers() -> None:
     """`configure` sees an app with no domain routes and `after_routers` sees them all."""
     seen: list[tuple[str, int]] = []
@@ -504,6 +518,73 @@ def test_main_configures_logging_then_tracing_then_serves(monkeypatch: pytest.Mo
     assert order == ["logging", "tracing", "check", "build", "serve"]
 
 
+def test_a_product_logging_hook_replaces_the_package_format(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The seam a product with its own log format uses, instead of passing `settings=None`.
+
+    The package's `configure_logging` must not also run: a product passing its own is
+    replacing the format, not adding to it.
+    """
+    order: list[str] = []
+    monkeypatch.setattr("webbpulse.composition.configure_logging", lambda *a, **k: order.append("package-logging"))
+    monkeypatch.setattr("webbpulse.composition.configure_tracing", lambda *a, **k: order.append("tracing"))
+    services: list[str] = []
+
+    def product_logging(service: str) -> None:
+        """This product's own colorized format, taking the service name and nothing else."""
+        services.append(service)
+        order.append("product-logging")
+
+    def build(domain: Domain) -> FastAPI:
+        """Record that the application was built, after the process-wide wiring."""
+        order.append("build")
+        return build_domain_app(domain, settings=Settings())
+
+    _, main = domain_entrypoint(
+        POSTS,
+        build=build,
+        settings=Settings,
+        check=lambda domain, settings: order.append("check"),
+        serve=lambda app: order.append("serve"),
+        configure_logging=product_logging,
+    )
+    main()
+    assert order == ["product-logging", "tracing", "check", "build", "serve"]
+    assert services == ["product-posts"]
+
+
+def test_a_logging_hook_keeps_the_settings_and_the_default_secrets_check(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Passing a hook does not cost the settings, so `check_secrets` still runs by default."""
+    monkeypatch.setattr("webbpulse.composition.configure_tracing", lambda *a, **k: False)
+    calls: list[tuple[str, ...]] = []
+    _, main = domain_entrypoint(
+        DISCUSSION,
+        build=lambda domain: build_domain_app(domain, settings=Settings()),
+        settings=lambda: Settings(environment="production", require_secrets=lambda *n: calls.append(n)),
+        serve=lambda app: None,
+        configure_logging=lambda service: None,
+    )
+    main()
+    assert calls == [("SECRET_KEY",)]
+
+
+def test_the_package_logging_runs_when_no_hook_is_passed(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The default is unchanged: the package's own format, bound to the resolved settings."""
+    monkeypatch.setattr("webbpulse.composition.configure_tracing", lambda *a, **k: False)
+    seen: list[str | None] = []
+    monkeypatch.setattr(
+        "webbpulse.composition.configure_logging",
+        lambda settings, service=None, **k: seen.append(service),
+    )
+    _, main = domain_entrypoint(
+        POSTS,
+        build=lambda domain: build_domain_app(domain, settings=Settings()),
+        settings=Settings,
+        serve=lambda app: None,
+    )
+    main()
+    assert seen == ["product-posts"]
+
+
 def test_main_checks_the_secrets_its_own_domain_names(monkeypatch: pytest.MonkeyPatch) -> None:
     """With no `check` passed, `check_secrets` runs over this one domain."""
     monkeypatch.setattr("webbpulse.composition.configure_logging", lambda *a, **k: None)
@@ -704,3 +785,103 @@ def test_the_isolation_helper_reports_a_failing_build(product: Path) -> None:
             package_root="app.domains.",
             cwd=product,
         )
+
+
+def test_entrypoint_imports_defaults_the_package_root(product: Path) -> None:
+    """The single-domain form takes the same default as the whole-registry form."""
+    from webbpulse.testing import entrypoint_imports
+
+    result = entrypoint_imports(
+        "posts",
+        module="app.domains.posts.entrypoint",
+        package="posts",
+        cwd=product,
+    )
+    assert result
+    assert "app.domains.posts.entrypoint" in result.imported
+
+
+def test_an_allowed_foreign_import_is_not_reported(product: Path) -> None:
+    """Shared wiring built from one domain's glue is a legitimate import for every domain.
+
+    A product whose local authorizer is built from the identity domain's `package_glue`
+    cannot use the check as shipped without this, and narrowing it to the named module is
+    what keeps the rest of that domain out of every image.
+    """
+    from webbpulse.testing import assert_entrypoint_isolation
+
+    glue = product / "app" / "domains" / "comments" / "package_glue.py"
+    glue.write_text("SHARED = True\n")
+    entrypoint = product / "app" / "domains" / "posts" / "entrypoint.py"
+    original = entrypoint.read_text()
+    shared_import = "from app.domains.comments import package_glue  # noqa: F401\n\nDOMAIN = "
+    entrypoint.write_text(original.replace("DOMAIN = ", shared_import))
+    try:
+        results = assert_entrypoint_isolation(
+            DomainRegistry([Domain(name="posts")]),
+            cwd=product,
+            allowed_foreign=["app.domains.comments.package_glue"],
+        )
+        assert not results["posts"].foreign
+        assert "app.domains.comments.package_glue" in results["posts"].imported
+    finally:
+        entrypoint.write_text(original)
+        glue.unlink()
+
+
+def test_a_foreign_import_outside_the_allowance_is_still_refused(product: Path) -> None:
+    """The allowance is an exception list, not an opt-out: everything else fails as before.
+
+    Naming one module of a domain does not open the rest of it, which is the whole point:
+    the glue lands in every image and the domain's endpoints must not follow it there.
+    """
+    from webbpulse.testing import assert_entrypoint_isolation
+
+    glue = product / "app" / "domains" / "comments" / "package_glue.py"
+    glue.write_text("SHARED = True\n")
+    leaky = product / "app" / "domains" / "posts" / "leak.py"
+    leaky.write_text("from app.domains.comments import api, package_glue  # noqa: F401\n")
+    entrypoint = product / "app" / "domains" / "posts" / "entrypoint.py"
+    original = entrypoint.read_text()
+    leaking_import = "from app.domains.posts import leak  # noqa: F401\n\nDOMAIN = "
+    entrypoint.write_text(original.replace("DOMAIN = ", leaking_import))
+    try:
+        with pytest.raises(AssertionError, match=r"the posts image also imported.*comments\.api"):
+            assert_entrypoint_isolation(
+                DomainRegistry([Domain(name="posts")]),
+                cwd=product,
+                allowed_foreign=["app.domains.comments.package_glue"],
+            )
+    finally:
+        entrypoint.write_text(original)
+        leaky.unlink()
+        glue.unlink()
+
+
+def test_an_allowance_mapping_applies_per_domain(product: Path) -> None:
+    """A mapping allows a module for the domain it names and for no other."""
+    from webbpulse.testing import assert_entrypoint_isolation
+
+    glue = product / "app" / "domains" / "comments" / "package_glue.py"
+    glue.write_text("SHARED = True\n")
+    entrypoint = product / "app" / "domains" / "posts" / "entrypoint.py"
+    original = entrypoint.read_text()
+    shared_import = "from app.domains.comments import package_glue  # noqa: F401\n\nDOMAIN = "
+    entrypoint.write_text(original.replace("DOMAIN = ", shared_import))
+    registry = DomainRegistry([Domain(name="posts")])
+    try:
+        results = assert_entrypoint_isolation(
+            registry,
+            cwd=product,
+            allowed_foreign={"posts": ["app.domains.comments.package_glue"]},
+        )
+        assert not results["posts"].foreign
+        with pytest.raises(AssertionError, match="the posts image also imported"):
+            assert_entrypoint_isolation(
+                registry,
+                cwd=product,
+                allowed_foreign={"comments": ["app.domains.comments.package_glue"]},
+            )
+    finally:
+        entrypoint.write_text(original)
+        glue.unlink()

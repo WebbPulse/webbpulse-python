@@ -126,7 +126,19 @@ class Domain:
     reaching a table it does not own must never gain write on it just by needing a lookup.
     """
     extra: dict[str, Any] = field(default_factory=dict)
-    """Extra keyword arguments passed through to `create_app` for this domain."""
+    """Extra keyword arguments passed through to `create_app` for this domain.
+
+    `create_app` keyword arguments and nothing else: every key is forwarded verbatim and
+    anything `create_app` does not name reaches `FastAPI`, which accepts unknown keywords
+    without complaint. A product fact put here is therefore swallowed in silence rather
+    than refused, which is why product metadata belongs in `metadata`."""
+    metadata: Mapping[str, Any] = field(default_factory=dict)
+    """Product-specific facts about this domain that the builder never reads.
+
+    The seam for what a product wants on the row but `create_app` knows nothing about: a
+    `seeds` flag deciding which root wires a lifespan hook, an owning team, a Terraform
+    memory size. `build_domain_app` ignores it entirely, which is what makes it safe to put
+    anything here."""
 
     @property
     def service_name(self) -> str:
@@ -534,6 +546,7 @@ def domain_entrypoint(
     settings: Callable[[], Any] | Any = None,
     check: Callable[[Domain, Any], Any] | None = None,
     serve: Callable[[FastAPI], None] | None = None,
+    configure_logging: Callable[[str], Any] | None = None,
 ) -> tuple[Callable[[], FastAPI], Callable[[], None]]:
     """The `(build_app, main)` pair one domain's `entrypoint.py` binds, so it is three lines.
 
@@ -549,8 +562,15 @@ def domain_entrypoint(
     `check_secrets` over this one domain. `serve` defaults to
     `webbpulse.lambda_entry.run_uvicorn`, and a test passes its own to assert what `main`
     would have served without binding a port.
+
+    `configure_logging` is the logging seam, a callable taking this domain's service name,
+    defaulting to the package's own `configure_logging` bound to the resolved settings. A
+    product whose log format is not this package's, a colorized TTY branch for instance,
+    passes its own and keeps `settings`, rather than passing `settings=None` and redoing
+    logging, tracing and the secrets check inside `check` to preserve the order.
     """
     resolved = resolve_domains(domain, registry)[0]
+    configure_logging_hook = configure_logging
 
     def build_app() -> FastAPI:
         """This domain's routers and the root routes, and nothing else."""
@@ -559,8 +579,11 @@ def domain_entrypoint(
     def main() -> None:
         """Configure logging and tracing process-wide, then serve the application."""
         current = settings() if callable(settings) else settings
+        if configure_logging_hook is not None:
+            configure_logging_hook(resolved.service_name)
+        elif current is not None:
+            _default_logging(current, service=resolved.service_name)
         if current is not None:
-            configure_logging(current, service=resolved.service_name)
             configure_tracing(resolved, current)
         if check is not None:
             check(resolved, current)
@@ -570,6 +593,18 @@ def domain_entrypoint(
         runner(build_app())
 
     return build_app, main
+
+
+def _default_logging(settings: SettingsLike, *, service: str | None = None) -> None:
+    """Call this module's `configure_logging` through its module attribute.
+
+    An indirection rather than a direct call because `domain_entrypoint` now takes a
+    `configure_logging` parameter, which shadows the module function inside it, and because
+    a test monkeypatching `webbpulse.composition.configure_logging` must still be seen.
+    """
+    import webbpulse.composition as module
+
+    module.configure_logging(settings, service=service)
 
 
 def _run_uvicorn(app: FastAPI) -> None:
