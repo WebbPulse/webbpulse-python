@@ -67,6 +67,30 @@ address is not given a misleading cause.
 request-schema-only pattern are written up in `docs/e2e.md`, and the `users` record contract
 in `docs/identity-data-model.md` carries the same line.
 
+### `http`: exception groups no longer take down the worker
+
+`create_app` now installs `ExceptionGroupMiddleware` on every application it builds, always
+and with no flag. Starlette's `BaseHTTPMiddleware` runs the application inside an `anyio`
+task group, and a task group raises a `BaseExceptionGroup`. Starlette collapses a group
+holding one leaf, but a group with several leaves, or one nested inside another group,
+escapes. Handlers are registered against the plain exception type and a group is not a
+subclass of its leaves, so nothing matched.
+
+A group whose leaves are all `Exception` is an `ExceptionGroup`, which is an `Exception`, so
+the catch-all handler rendered a flat 500 and discarded the handler its leaf deserved. A
+group holding a cancellation beside a fault is a `BaseExceptionGroup`, which is not an
+`Exception`, so nothing matched it and it reached uvicorn. Under the Lambda Web Adapter that
+kills the worker, which takes every other in-flight request in that execution environment
+with it and makes the gateway report `INTEGRATION_FAILURE` on unrelated paths.
+
+The middleware unwraps to the leaves, reports the first that is not a cancellation, and
+routes it through the application's registered handlers, falling back to the standard 500
+envelope with the request id and the CORS headers `CORSMiddleware` would have added. A group
+of only cancellations is re-raised untouched, and a response that has already started logs
+and re-raises the leaf rather than sending a second response. `guard_exception_groups` is
+exported for an application assembled without `create_app`. Products carrying their own
+outermost `BaseExceptionGroup` guard can drop it.
+
 ## 0.48.0
 
 ### `e2e`: run-wide access log checks read the gateway fields correctly
