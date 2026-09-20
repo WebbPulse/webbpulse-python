@@ -35,7 +35,8 @@ import pytest
 
 from webbpulse.http import ROUTE_KEY_HEADER
 
-from .access_log import AccessLogEntry, AccessLogLookup, log_field
+from . import runwide
+from .access_log import AccessLogEntry, AccessLogLookup
 from .browser import (
     ROOT_SELECTORS,
     BrowserFailure,
@@ -46,7 +47,7 @@ from .browser import (
     sign_out,
 )
 from .client import E2EClient, RateLimitExhausted, RequestRecord
-from .coverage import RouteCoverage, measure_coverage
+from .coverage import RouteCoverage
 from .ephemeral import create_ephemeral_user, describe_delete_failure
 from .frontend import fetch_bundle, missing_allowed_headers, shell_looks_like_an_app
 from .gateway import (
@@ -1217,15 +1218,10 @@ class TestAccessLogHealth:
         what a wrong log group name or a broken correlation produces, and a green group would
         then mean the sweep never ran rather than that it found nothing wrong.
         """
-        attempted = [record for record in suite_requests if record.request_id]
-        if not attempted:
+        if not any(record.request_id for record in suite_requests):
             pytest.skip("this run recorded no request ids, so there is nothing to correlate")
-        assert access_log_health, (
-            f"none of this run's {len(attempted)} requests were found in the access log. "
-            "Either the log group is not the one this stage writes to, or delivery is "
-            "lagging further than the scan window. The sweep below would pass on an empty "
-            "set, so it is reported here as a failure rather than as a clean sweep."
-        )
+        failure = runwide.the_access_log_carries_this_runs_requests(suite_requests, access_log_health)
+        assert failure is None, failure
 
     def test_no_request_was_answered_with_a_server_error(self, access_log_health: Sequence[AccessLogEntry]) -> None:
         """No request this run made was answered 5xx.
@@ -1233,8 +1229,8 @@ class TestAccessLogHealth:
         A 5xx is the gateway or the function failing rather than the product refusing, and a
         case that asserts only `!= 200` passes straight through one.
         """
-        failures = [entry for entry in access_log_health if entry.status >= 500]
-        assert not failures, "requests answered 5xx:\n" + _describe(failures)
+        failure = runwide.no_request_was_answered_with_a_server_error(access_log_health)
+        assert failure is None, failure
 
     def test_no_rejection_came_from_a_healthy_integration(self, access_log_health: Sequence[AccessLogEntry]) -> None:
         """No 401 or 403 was logged against an integration that answered 200.
@@ -1244,15 +1240,8 @@ class TestAccessLogHealth:
         request, and the function never saw it. That is the shape of a gate or authorizer
         misconfiguration, and it reads exactly like a product permission check from outside.
         """
-        rejected = [
-            entry for entry in access_log_health if entry.status in (401, 403) and entry.integration_status == 200
-        ]
-        assert not rejected, (
-            "requests the authorizer rejected although the integration answered 200:\n"
-            + _describe(rejected)
-            + "\nThe function never saw these. This is the authorizer or the gate refusing, "
-            "not the product."
-        )
+        failure = runwide.no_rejection_came_from_a_healthy_integration(access_log_health)
+        assert failure is None, failure
 
     def test_every_request_matched_a_declared_route(self, access_log_health: Sequence[AccessLogEntry]) -> None:
         """No request fell through without matching a declared route key.
@@ -1261,14 +1250,8 @@ class TestAccessLogHealth:
         is what a path that no prefix covers looks like from the edge. `OPTIONS` is excluded
         because a preflight is answered by the CORS configuration rather than by a route.
         """
-        unmatched = [
-            entry for entry in access_log_health if not entry.matched_a_route and entry.method.upper() != "OPTIONS"
-        ]
-        assert not unmatched, (
-            "requests that matched no declared route key:\n"
-            + _describe(unmatched)
-            + "\nThe gateway answered these itself, so the path reaches no function at all."
-        )
+        failure = runwide.every_request_matched_a_declared_route(access_log_health)
+        assert failure is None, failure
 
     def test_no_integration_reported_an_error(self, access_log_health: Sequence[AccessLogEntry]) -> None:
         """No entry carries an integration error message.
@@ -1277,14 +1260,8 @@ class TestAccessLogHealth:
         literal `-` rather than omitting it, and a plain truthiness check reads that as an
         error on every healthy request.
         """
-        errored = [
-            (entry, message)
-            for entry in access_log_health
-            if (message := log_field(entry.raw, "errorMessage", "integrationErrorMessage"))
-        ]
-        assert not errored, "requests whose integration reported an error:\n" + "\n".join(
-            f"  {entry.method} {entry.path} ({entry.request_id}): {message}" for entry, message in errored
-        )
+        failure = runwide.no_integration_reported_an_error(access_log_health)
+        assert failure is None, failure
 
 
 class TestRouteCoverage:
@@ -1304,20 +1281,13 @@ class TestRouteCoverage:
         A run that recorded nothing would report every route as uncovered, which is a broken
         suite rather than a coverage gap and should not read as one.
         """
-        assert suite_requests, (
-            "this run recorded no requests at all, so coverage cannot be measured. Every "
-            "route would report as uncovered, which would be a broken suite rather than a "
-            "real gap."
-        )
+        failure = runwide.the_run_recorded_requests_to_correlate(suite_requests)
+        assert failure is None, failure
 
     def test_every_served_route_was_exercised_or_is_allowlisted(self, route_coverage: RouteCoverage) -> None:
         """Every operation the deployment serves was either reached or knowingly excused."""
-        assert not route_coverage.uncovered, (
-            f"{len(route_coverage.uncovered)} served routes were never exercised by this run:\n"
-            + "\n".join(f"  {method} {path}" for method, path in route_coverage.uncovered)
-            + "\nAdd a case that reaches each, or name it in pytest_e2e_uncovered_routes with "
-            "the reason it is not worth covering."
-        )
+        failure = runwide.every_served_route_was_exercised_or_is_allowlisted(route_coverage)
+        assert failure is None, failure
 
     def test_the_coverage_allowlist_is_not_stale(self, route_coverage: RouteCoverage) -> None:
         """No allowlist entry names a route the deployment no longer serves.
@@ -1325,30 +1295,13 @@ class TestRouteCoverage:
         An allowlist that outlives its route quietly excuses nothing while looking like it
         excuses something, and the next real gap inherits its reason.
         """
-        assert not route_coverage.stale, (
-            "pytest_e2e_uncovered_routes names routes this deployment does not serve:\n"
-            + "\n".join(f"  {method} {path}" for method, path in route_coverage.stale)
-            + "\nRemove them: the gap they excused is gone."
-        )
+        failure = runwide.the_allowlist_is_not_stale(route_coverage)
+        assert failure is None, failure
 
     def test_every_allowlist_entry_carries_a_reason(self, uncovered_routes: Mapping[tuple[str, str], str]) -> None:
         """Every allowlisted route says why, so the exception can be reviewed later."""
-        unexplained = sorted(pair for pair, reason in uncovered_routes.items() if not str(reason).strip())
-        assert not unexplained, (
-            "these allowlist entries carry no reason:\n"
-            + "\n".join(f"  {method} {path}" for method, path in unexplained)
-            + "\nAn exception with no reason cannot be reviewed or retired."
-        )
-
-
-def _describe(entries: Sequence[AccessLogEntry]) -> str:
-    """One indented line per entry, naming what the gateway logged about it."""
-    return "\n".join(
-        f"  {entry.method} {entry.path} status={entry.status} "
-        f"integration={entry.integration_status} route_key={entry.route_key or '(none)'} "
-        f"({entry.request_id})"
-        for entry in entries
-    )
+        failure = runwide.the_allowlist_carries_reasons(uncovered_routes)
+        assert failure is None, failure
 
 
 @pytest.fixture(scope="session")
@@ -1358,9 +1311,7 @@ def uncovered_routes(request: pytest.FixtureRequest, e2e_env: Any) -> Mapping[tu
     Normalised to uppercase methods here so a product may spell them either way.
     """
     declared = request.config.hook.pytest_e2e_uncovered_routes(env=e2e_env)
-    if not declared:
-        return {}
-    return {(str(method).upper(), str(path)): str(reason) for (method, path), reason in dict(declared).items()}
+    return runwide.normalise_allowlist(declared)
 
 
 @pytest.fixture(scope="session")
@@ -1376,8 +1327,7 @@ def route_coverage(
     nothing about which operations sit behind them.
     """
     served = [(operation.method, operation.path) for operation in openapi_operations]
-    requests = [(record.method, record.path) for record in suite_requests]
-    return measure_coverage(served, requests, uncovered_routes)
+    return runwide.coverage_for(served, suite_requests, uncovered_routes)
 
 
 class TestBrowser:

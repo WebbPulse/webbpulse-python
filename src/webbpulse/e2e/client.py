@@ -29,6 +29,7 @@ __all__ = [
     "Pacer",
     "RateLimitExhausted",
     "RequestRecord",
+    "recorded_path",
     "retry_delay",
 ]
 
@@ -179,13 +180,31 @@ class Pacer:
 
 @dataclass
 class RequestRecord:
-    """One request the suite made, kept so a failure can be traced to an access log entry."""
+    """One request the suite made, kept so a failure can be traced to an access log entry.
+
+    `path` is the path alone. The coverage check matches it back against the templated
+    routes the deployment serves, and a template never carries a query, so a recorded
+    `?limit=10` would match nothing and be reported as a request to a route that is not
+    served rather than as coverage of the one it reached.
+    """
 
     method: str
     path: str
     status: int
     request_id: str
     throttled: int = 0
+
+
+def recorded_path(path: str) -> str:
+    """One request path with any query string and fragment removed.
+
+    Callers normally pass `params=` and httpx builds the query, which never reaches the
+    path, but a caller may also inline one. Stripping here rather than at each reader means
+    every record carries the same shape whichever way the request was spelled.
+    """
+    for separator in ("?", "#"):
+        path = path.split(separator, 1)[0]
+    return path
 
 
 @dataclass
@@ -312,7 +331,7 @@ class E2EClient:
         self.records.append(
             RequestRecord(
                 method=method,
-                path=path,
+                path=recorded_path(path),
                 status=response.status_code,
                 request_id=request_id_of(response),
                 throttled=throttled,

@@ -27,6 +27,7 @@ import pytest
 
 from webbpulse.config import rate_limits_apply
 
+from . import runwide
 from .access_log import AccessLogEntry, AccessLogLookup
 from .client import DEFAULT_PER_MINUTE, E2EClient, RequestRecord
 from .ephemeral import (
@@ -71,7 +72,9 @@ __all__ = [
     "LOCAL_GATEWAY_REASON",
     "NO_ENVIRONMENT_REASON",
     "READ_ONLY_REASON",
+    "RUN_WIDE_GROUPS",
     "SHARED_STATE_GROUP",
+    "SUITE_REQUESTS_KEY",
     "WRITES_MARKER",
     "Click",
     "Credentials",
@@ -131,6 +134,10 @@ _WEB_GATE = (
 
 BROWSER_NAMES = ("chromium", "firefox", "webkit")
 DEFAULT_BROWSER_TIMEOUT_MS = 15000
+
+RUN_WIDE_GROUPS: tuple[str, ...] = ("TestAccessLogHealth", "TestRouteCoverage")
+
+SUITE_REQUESTS_KEY: pytest.StashKey[list[RequestRecord]] = pytest.StashKey()
 
 GATE_HEADER = "x-origin-verify"
 E2E_PREFIX = "e2e-"
@@ -373,6 +380,7 @@ def pytest_collection_modifyitems(config: pytest.Config, items: list[pytest.Item
     collection happens before any fixture runs.
     """
     apply_groups(items)
+    _arrange_run_wide_groups(config, items)
     if _local_from_environ():
         _skip_gateway_only_cases(items)
     if not _read_only_from_environ():
@@ -381,6 +389,33 @@ def pytest_collection_modifyitems(config: pytest.Config, items: list[pytest.Item
     for item in items:
         if item.get_closest_marker(WRITES_MARKER) is not None:
             item.add_marker(skip)
+
+
+def _arrange_run_wide_groups(config: pytest.Config, items: list[pytest.Item]) -> None:
+    """Order the whole-run groups last in a serial run, or skip them on an xdist worker.
+
+    `TestAccessLogHealth` and `TestRouteCoverage` measure the run rather than one request,
+    so they are only meaningful once everything that sends requests has finished. A serial
+    run can give them that by ordering: they are moved to the end of the collection, health
+    before coverage, and they stay tests so the report reads as it always has. Product test
+    files that sort after the shared one would otherwise run after coverage was measured.
+
+    A distributed run cannot, because the other workers are still sending requests while
+    this one runs. There both groups are skipped on the worker and the controller reaches
+    the same verdicts from every worker's records once the session finishes.
+    """
+    if runwide.xdist_worker(config):
+        skip = pytest.mark.skip(reason=runwide.WORKER_SKIP_REASON)
+        for item in items:
+            if _owning_group(item) in RUN_WIDE_GROUPS:
+                item.add_marker(skip)
+        return
+    if runwide.xdist_is_active(config):
+        return
+    ordered = [item for item in items if _owning_group(item) not in RUN_WIDE_GROUPS]
+    for group in RUN_WIDE_GROUPS:
+        ordered.extend(item for item in items if _owning_group(item) == group)
+    items[:] = ordered
 
 
 def _skip_gateway_only_cases(items: Sequence[pytest.Item]) -> None:
@@ -488,13 +523,25 @@ def gate_headers(e2e_env: E2EEnvironment, request: pytest.FixtureRequest) -> Map
 
 
 @pytest.fixture(scope="session")
-def anon(e2e_env: E2EEnvironment, gate_headers: Mapping[str, str]) -> Iterator[E2EClient]:
-    """A client carrying the gate header and no identity."""
+def anon(
+    e2e_env: E2EEnvironment,
+    gate_headers: Mapping[str, str],
+    request: pytest.FixtureRequest,
+) -> Iterator[E2EClient]:
+    """A client carrying the gate header and no identity.
+
+    Its `records` list is the whole session's, because `with_token` hands every clone the
+    same list, so a reference to it is stashed on the config here. That is what
+    `pytest_sessionfinish` reads: session finish runs after every fixture has been torn
+    down, so it cannot ask for one, and under xdist the worker has to write its own records
+    out for the controller to aggregate.
+    """
     client = E2EClient(
         base_url=e2e_env.api_base_url,
         gate_headers=gate_headers,
         per_minute=e2e_env.rate_limit_per_minute if e2e_env.rate_limited else 0,
     )
+    request.config.stash[SUITE_REQUESTS_KEY] = client.records
     try:
         yield client
     finally:
@@ -946,3 +993,122 @@ def _warn_on_leftovers(request: pytest.FixtureRequest, results: Sequence[Any], p
             UserWarning(f"pytest_e2e_cleanup reported leftovers at the {phase} of the session: {result}"),
             stacklevel=2,
         )
+
+
+CONTROLLER_VERDICTS_KEY: pytest.StashKey[runwide.RunWideVerdicts] = pytest.StashKey()
+
+RUN_WIDE_HEADER = "webbpulse e2e run-wide checks"
+
+
+def pytest_sessionfinish(session: pytest.Session, exitstatus: int) -> None:
+    """Write this worker's requests out, or reach the run-wide verdicts on the controller.
+
+    Only ever does one of the two. On an xdist worker it writes the records the `anon`
+    fixture stashed to the run's shared directory and stops; the worker cannot judge the run
+    because it holds only part of it. On the controller of a distributed run it reads every
+    worker's file and reaches the verdicts the skipped groups would have reached, then sets
+    the exit status when any of them failed, because a controller-side failure is invisible
+    to pytest's own count of failed tests. A serial run does neither: the groups ran as
+    tests and already reported themselves.
+    """
+    config = session.config
+    worker = runwide.xdist_worker(config)
+    run_id = runwide.run_id_from_environ()
+    if not run_id:
+        return
+    directory = runwide.run_directory(run_id)
+    if worker:
+        records = config.stash.get(SUITE_REQUESTS_KEY, None) or []
+        runwide.write_worker_records(directory, worker, records)
+        return
+    if not runwide.xdist_is_active(config):
+        return
+    verdicts = _controller_verdicts(config, directory)
+    if verdicts is None:
+        return
+    config.stash[CONTROLLER_VERDICTS_KEY] = verdicts
+    if verdicts.failed:
+        session.exitstatus = int(pytest.ExitCode.TESTS_FAILED)
+
+
+def _controller_verdicts(config: pytest.Config, directory: Any) -> runwide.RunWideVerdicts | None:
+    """Every run-wide verdict for a distributed run, or None when it cannot be reached.
+
+    Builds what the fixtures would have built, from the environment rather than from a
+    fixture, because session finish runs after every fixture has been torn down. The OpenAPI
+    document comes through the same module level `e2e_openapi_document()` in the product's
+    conftest that collection already uses, so the controller and the workers describe the
+    same commit.
+
+    Returns None when the run had no environment to test against, which is the unconfigured
+    shell the collection hook already skips the whole suite on.
+    """
+    from .suite import _product_openapi_document
+
+    env = environment_for_collection()
+    if env is None:
+        return None
+    requests = runwide.read_worker_records(directory)
+    try:
+        allowlist = runwide.normalise_allowlist(config.hook.pytest_e2e_uncovered_routes(env=env))
+        operations = operations_from_openapi(_product_openapi_document(config))
+        entries, note = _controller_access_log(env, requests)
+    except Exception as error:
+        return runwide.RunWideVerdicts(
+            failures=(f"the run-wide checks could not be made on the controller: {type(error).__name__}: {error}",),
+            notes=(),
+        )
+    finally:
+        runwide.remove_run_directory(directory)
+    served = [(operation.method, operation.path) for operation in operations]
+    coverage = runwide.coverage_for(served, requests, allowlist)
+    return runwide.controller_verdicts(requests, entries, coverage, allowlist, access_log_note=note)
+
+
+def _controller_access_log(
+    env: E2EEnvironment,
+    requests: Sequence[runwide.RecordedRequest],
+) -> tuple[tuple[AccessLogEntry, ...] | None, str]:
+    """This run's access log entries, or None and the reason the sweep was not made.
+
+    Built the way the `access_log_health` fixture builds it, from one forced window scan
+    correlated by request id, and skipped on exactly the same condition: an unset
+    `E2E_ACCESS_LOG_GROUP`, which is a local stack and anything else with no log to read.
+    """
+    if not env.access_log_group:
+        return None, (
+            "E2E_ACCESS_LOG_GROUP is unset, so the access log sweep was not made. Route "
+            "coverage below was still measured."
+        )
+    import boto3
+
+    session = boto3.session.Session(region_name=env.aws_region)
+    lookup = AccessLogLookup(session.client("logs"), env.access_log_group)
+    lookup.scan_window(force=True)
+    entries = []
+    for request in requests:
+        if not request.request_id:
+            continue
+        entry = lookup.read_one(request.request_id)
+        if entry is not None:
+            entries.append(entry)
+    return tuple(entries), ""
+
+
+def pytest_terminal_summary(terminalreporter: Any) -> None:
+    """Print the controller's run-wide verdicts, in the same words the tests use.
+
+    Only a distributed run prints anything here: a serial run ran the groups as tests and
+    the report already carries them. The messages are the ones the shared check functions
+    return, so a failure reads the same whichever mode found it.
+    """
+    verdicts = terminalreporter.config.stash.get(CONTROLLER_VERDICTS_KEY, None)
+    if verdicts is None:
+        return
+    terminalreporter.write_sep("=", RUN_WIDE_HEADER)
+    for note in verdicts.notes:
+        terminalreporter.write_line(f"SKIPPED {note}")
+    for failure in verdicts.failures:
+        terminalreporter.write_line(f"FAILED {failure}")
+    if not verdicts.failed:
+        terminalreporter.write_line("PASSED the access log sweep and the route coverage measured across every worker")

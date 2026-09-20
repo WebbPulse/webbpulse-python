@@ -26,8 +26,8 @@ journey is one junit case:
 | `TestFrontend` | The web origin serves the app shell, an unknown path renders it too, the bundle references this environment's API and no legacy route name, and the CORS preflight allows the headers the shared client sends. It goes through the staging gate on signed cookies, not the origin header |
 | `TestBrowser` | A real browser signs in and out through the UI, every protected route bounces an anonymous visitor, every guest-only route bounces a signed-in one, every declared route paints with no console error and no failed API call, and every declared journey runs. An anonymous visit's own 401 or 403 is exempt in both collectors, because the browser reports one such response twice, and the auth client's cold-load session probe is exempt whoever is visiting |
 | `TestHygiene` | Names carry the run prefix, the cleanup hook is registered, and created resources are tracked |
-| `TestAccessLogHealth` | The gateway's own log of this run carries no 5xx, no 401 or 403 whose integration answered 200, no request that matched no route key, and no integration error message. Guarded so an empty sweep fails rather than passing vacuously. Skipped where no access log group is configured |
-| `TestRouteCoverage` | Every operation the deployment serves was exercised by this run, or is named in `pytest_e2e_uncovered_routes` with the reason it is not. An allowlist entry for a route that is no longer served fails as stale |
+| `TestAccessLogHealth` | The gateway's own log of this run carries no 5xx, no 401 or 403 whose integration answered 200, no request that matched no route key, and no integration error message. Guarded so an empty sweep fails rather than passing vacuously. Skipped where no access log group is configured. Run-wide: it runs last in a serial run and is reported by the controller under xdist, see [Running it in parallel](#running-it-in-parallel) |
+| `TestRouteCoverage` | Every operation the deployment serves was exercised by this run, or is named in `pytest_e2e_uncovered_routes` with the reason it is not. An allowlist entry for a route that is no longer served fails as stale. Run-wide: it runs last in a serial run and is reported by the controller under xdist, see [Running it in parallel](#running-it-in-parallel) |
 
 Two of those deserve their reasons stated, because both have shipped as green before.
 
@@ -513,11 +513,38 @@ case joins the group by carrying the `e2e_writes` marker, so it needs to name no
 
 The marker is applied whether or not xdist is installed, since it is inert in a serial run.
 
-Session fixtures under xdist run per worker rather than per run. That is safe here by
-construction rather than by locking: each worker creates its own ephemeral user keyed on its
-own worker id and deletes that one, and each opens its own access log window. The window scan
-is unfiltered, so two workers reading overlapping windows cost one extra CloudWatch read
-rather than a wrong answer. Nothing is created once per run, so there is no lock file.
+Session fixtures under xdist run per worker rather than per run. That is safe for the
+per-request groups by construction rather than by locking: each worker creates its own
+ephemeral user keyed on its own worker id and deletes that one, and each opens its own access
+log window. The window scan is unfiltered, so two workers reading overlapping windows cost one
+extra CloudWatch read rather than a wrong answer. Nothing is created once per run, so there is
+no lock file.
+
+`TestAccessLogHealth` and `TestRouteCoverage` are the exception, because they measure the run
+rather than one request. Per-worker session fixtures are exactly wrong for them: a worker
+holds only the requests it sent, so a coverage verdict reached there would report every route
+the other workers exercised as uncovered, and `--dist loadgroup` is free to schedule the
+groups onto any worker.
+
+They are therefore gathered differently in each mode, and reach the same verdicts either way:
+
+- **Serially**, the plugin orders both groups after every other case during collection,
+  health before coverage. They stay ordinary tests and the report reads as it always has.
+  The ordering is what makes the whole-run claim true: without it, a product test file that
+  sorts after `test_shared.py` runs after coverage was measured.
+- **Under xdist**, both groups skip on the worker, naming the controller in the skip reason.
+  Each worker writes the requests it recorded to a JSON file at `pytest_sessionfinish`, in a
+  directory under the system temporary directory keyed on `E2E_RUN_ID` and the worker id.
+  The controller, which is the one process that sees the whole run, reads every worker's file
+  once they have all finished, runs the same checks over the union, prints the verdicts in the
+  terminal summary under `webbpulse e2e run-wide checks`, and sets the exit status to
+  tests-failed on any failure, so a controller-side finding turns the job red even though
+  every individual test passed. It then removes the run directory.
+
+Both paths call the same check functions, one per check, each returning a failure message or
+None, so the two modes cannot drift apart. The access log half is skipped where
+`E2E_ACCESS_LOG_GROUP` is unset, on the controller exactly as in the fixture, and coverage is
+still measured.
 
 Pacing is per worker, so a rate-limited target is hit by every worker at once against one
 per-IP bucket. Against production, keep `-n` small or run serially.

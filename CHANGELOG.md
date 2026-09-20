@@ -172,6 +172,32 @@ deployment no longer serves fails as stale, so an allowlist cannot outlive the g
 excuses. Both groups read the run through the new `suite_requests` fixture, which is the
 shared record every client already appends to, so no case has to register itself.
 
+Both whole-run groups are gathered so the measurement is genuinely whole-run in both
+scheduling modes. Session fixtures under xdist are per worker, so a group scheduled onto a
+worker sees only that worker's requests, and `--dist loadgroup` was free to put it anywhere:
+`test_every_served_route_was_exercised_or_is_allowlisted` would have failed on staging as
+soon as a product picked the release up, reporting every route the other workers exercised as
+uncovered. A serial run had no ordering guarantee either, since a product test file that
+sorts after `test_shared.py` ran after coverage was measured.
+
+Serially, the plugin now orders both groups after every other case during collection, health
+before coverage, and they stay ordinary tests. Under xdist they skip on the worker with a
+reason naming the controller, each worker writes its own requests to a JSON file at
+`pytest_sessionfinish` under a directory keyed on `E2E_RUN_ID` and the worker id, and the
+controller reads every file once the workers have finished, runs the same checks over the
+union, prints the verdicts in the terminal summary and sets the exit status to tests-failed
+on any failure, so a controller-side finding turns the job red although every individual test
+passed. The run directory is removed afterwards, and the access log half is skipped where
+`E2E_ACCESS_LOG_GROUP` is unset exactly as the fixture skips it. Both paths call the same
+check functions in the new `webbpulse.e2e.runwide`, one per check returning a failure message
+or None, so the two modes cannot drift.
+
+`RequestRecord.path` now records the path alone, through the new
+`webbpulse.e2e.client.recorded_path`. A caller that inlines a query string rather than passing
+`params=` would otherwise have its request matched against no served template and reported as
+a request to a route the deployment does not serve, rather than as coverage of the one it
+reached.
+
 A shell with no `E2E_*` set now collects and skips instead of erroring. `pytest_generate_tests`
 and `e2e_env` both went through `E2EEnvironment.from_environ()`, which raises, so any
 `pytest` or `--collect-only` over a product's whole tree died at collection naming variables
