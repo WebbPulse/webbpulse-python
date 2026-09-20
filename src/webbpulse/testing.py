@@ -679,7 +679,8 @@ def entrypoint_imports(
     *,
     module: str,
     package: str,
-    package_root: str,
+    package_root: str = "app.domains.",
+    allowed_foreign: Collection[str] = (),
     cwd: str | os.PathLike[str] | None = None,
     env: Mapping[str, str] | None = None,
     timeout: float = 180.0,
@@ -692,8 +693,15 @@ def entrypoint_imports(
     fail here rather than in a cold start.
 
     `module` is the entrypoint module to import, `package` the domain's own package under
-    `package_root`, and `package_root` the prefix every domain package shares, normally
-    `"app.domains."`. Raises `AssertionError` when the child fails, with its stderr.
+    `package_root`, and `package_root` the prefix every domain package shares, defaulting to
+    `"app.domains."` as `assert_entrypoint_isolation` does.
+
+    `allowed_foreign` names module paths every domain may import although they live under
+    another domain, for the case a product's shared middleware legitimately needs one
+    domain's glue: an authorizer every domain mounts, built from the identity domain's
+    `package_glue`, is the shape this is for. A listed module and its submodules are not
+    reported as foreign; everything else still is. Raises `AssertionError` when the child
+    fails, with its stderr.
     """
     import subprocess  # nosec B404
     import sys
@@ -717,10 +725,39 @@ def entrypoint_imports(
 
     imported = frozenset(name for name in json.loads(result.stdout.strip().splitlines()[-1]) if name)
     own = f"{package_root}{package}"
+    allowed = tuple(allowed_foreign)
+    ancestors = _allowed_ancestors(allowed, package_root)
     foreign = frozenset(
-        name for name in imported if name != package_root.rstrip(".") and name != own and not name.startswith(f"{own}.")
+        name
+        for name in imported
+        if name != package_root.rstrip(".")
+        and name != own
+        and not name.startswith(f"{own}.")
+        and name not in ancestors
+        and not any(name == permitted or name.startswith(f"{permitted}.") for permitted in allowed)
     )
     return EntrypointImports(domain=domain, module=module, imported=imported, foreign=foreign)
+
+
+def _allowed_ancestors(allowed_foreign: Collection[str], package_root: str) -> frozenset[str]:
+    """The packages between each allowed module and `package_root`, exactly and no further.
+
+    Importing `app.domains.identity.package_glue` imports `app.domains.identity` as well,
+    because Python cannot reach a submodule without its parents, and reporting that parent
+    as foreign would defeat the allowance. These are matched exactly rather than by prefix,
+    so allowing one module of a domain never opens the rest of it: the glue lands in every
+    image and that domain's endpoints must not follow it there.
+    """
+    root = package_root.rstrip(".")
+    ancestors: set[str] = set()
+    for permitted in allowed_foreign:
+        parts = permitted.split(".")
+        for index in range(len(parts) - 1, 0, -1):
+            ancestor = ".".join(parts[:index])
+            if ancestor == root or not ancestor.startswith(f"{root}."):
+                break
+            ancestors.add(ancestor)
+    return frozenset(ancestors)
 
 
 _ENTRYPOINT_PROBE = (
@@ -738,6 +775,7 @@ def assert_entrypoint_isolation(
     entrypoint_module: Callable[[str], str] | None = None,
     package_root: str = "app.domains.",
     module_template: str = "{root}{package}.entrypoint",
+    allowed_foreign: Mapping[str, Collection[str]] | Collection[str] = (),
     cwd: str | os.PathLike[str] | None = None,
     env: Mapping[str, str] | None = None,
     domains: Collection[str] | None = None,
@@ -752,6 +790,12 @@ def assert_entrypoint_isolation(
 
     `entrypoint_module` maps a domain name to its package name, defaulting to the registry's
     own method when it has one and to a hyphen-to-underscore translation otherwise.
+
+    `allowed_foreign` is the exception list for a foreign module every domain legitimately
+    imports, such as the identity glue a product's shared local authorizer is built from.
+    A collection of module paths applies to every domain; a mapping of domain name to
+    collection applies per domain, and a domain the mapping does not name allows none.
+    Anything outside it is refused exactly as before.
     """
     resolve = entrypoint_module
     if resolve is None:
@@ -766,6 +810,7 @@ def assert_entrypoint_isolation(
             module=module_template.format(root=package_root, package=package),
             package=package,
             package_root=package_root,
+            allowed_foreign=_allowed_foreign_for(allowed_foreign, domain),
             cwd=cwd,
             env=env,
         )
@@ -773,3 +818,17 @@ def assert_entrypoint_isolation(
     leaked = {domain: sorted(result.foreign) for domain, result in results.items() if result.foreign}
     assert not leaked, "\n".join(f"the {domain} image also imported {modules}" for domain, modules in leaked.items())
     return results
+
+
+def _allowed_foreign_for(
+    allowed_foreign: Mapping[str, Collection[str]] | Collection[str],
+    domain: str,
+) -> Collection[str]:
+    """The foreign modules one domain may import, from either shape of the argument.
+
+    A mapping is read per domain and names nothing for a domain it omits; any other
+    collection applies to every domain alike.
+    """
+    if isinstance(allowed_foreign, Mapping):
+        return allowed_foreign.get(domain, ())
+    return allowed_foreign
