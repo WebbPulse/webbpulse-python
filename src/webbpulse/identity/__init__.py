@@ -15,6 +15,7 @@ from webbpulse.identity.api_keys import (
     API_KEY_USER_INDEX,
     API_KEYS_TABLE,
     KEY_BYTES,
+    KIND_USER,
     PREFIX_DISPLAY_LENGTH,
     TENANT_CLAIM,
     ApiKeyRecord,
@@ -31,7 +32,9 @@ from webbpulse.identity.api_keys import (
 )
 from webbpulse.identity.api_keys import mint as mint_api_key
 from webbpulse.identity.api_keys import new_key as new_api_key
+from webbpulse.identity.api_keys import new_key_id as new_api_key_id
 from webbpulse.identity.api_keys import revoke as revoke_api_key
+from webbpulse.identity.api_keys import revoke_by_id as revoke_api_key_by_id
 from webbpulse.identity.api_keys import verify as verify_api_key
 from webbpulse.identity.api_keys import verify_for_tenant as verify_api_key_for_tenant
 from webbpulse.identity.claims import (
@@ -335,12 +338,14 @@ from webbpulse.identity.share_tokens import (
     SHARE_TOKEN_PREFIX,
     SHARE_TOKEN_SUBJECT,
     SHARE_TOKEN_TABLE,
+    SHARE_TOKEN_TARGET_INDEX,
     SHARE_TOKEN_TENANT_INDEX,
     SHARE_TOKENS_TABLE,
     DynamoShareTokenStore,
     FakeShareTokenStore,
     InMemoryShareTokenStore,
     MintedShareToken,
+    ShareTarget,
     ShareTokenRecord,
     ShareTokenStore,
     claims_for_share_token,
@@ -351,6 +356,7 @@ from webbpulse.identity.share_tokens import (
     mint_share_token,
     new_share_token,
     revoke_share_token,
+    share_target_key,
     share_token_capability,
     share_token_credential,
     verify_share_token,
@@ -506,6 +512,7 @@ __all__ = [
     "JWKS_PATH",
     "JWS_ALGORITHM",
     "KEY_BYTES",
+    "KIND_USER",
     "KMS_KEY_SPEC",
     "KMS_SIGNING_ALGORITHM",
     "LOCAL_ENVIRONMENT",
@@ -780,6 +787,7 @@ __all__ = [
     "mint_test_token",
     "missing_scopes",
     "new_api_key",
+    "new_api_key_id",
     "new_attempt",
     "new_pkce_verifier",
     "new_token",
@@ -800,6 +808,7 @@ __all__ = [
     "render_verification",
     "require_scopes",
     "revoke_api_key",
+    "revoke_api_key_by_id",
     "signing_client",
     "subject_dependency",
     "users_key_attribute",
@@ -817,11 +826,13 @@ __all__ += [
     "SHARE_TOKEN_PREFIX",
     "SHARE_TOKEN_SUBJECT",
     "SHARE_TOKEN_TABLE",
+    "SHARE_TOKEN_TARGET_INDEX",
     "SHARE_TOKEN_TENANT_INDEX",
     "DynamoShareTokenStore",
     "FakeShareTokenStore",
     "InMemoryShareTokenStore",
     "MintedShareToken",
+    "ShareTarget",
     "ShareTokenRecord",
     "ShareTokenStore",
     "claims_for_share_token",
@@ -834,6 +845,7 @@ __all__ += [
     "new_share_token",
     "require_tenant",
     "revoke_share_token",
+    "share_target_key",
     "share_token_capability",
     "share_token_credential",
     "tenant_matches",
