@@ -88,8 +88,10 @@ routes it through the application's registered handlers, falling back to the sta
 envelope with the request id and the CORS headers `CORSMiddleware` would have added. A group
 of only cancellations is re-raised untouched, and a response that has already started logs
 and re-raises the leaf rather than sending a second response. `guard_exception_groups` is
-exported for an application assembled without `create_app`. Products carrying their own
-outermost `BaseExceptionGroup` guard can drop it.
+exported for an application assembled without `create_app`. The guard sits beneath
+`ServerErrorMiddleware`, leaving that layer on top so the OpenTelemetry instrumentor still
+instruments a stack guarded before `instrument_fastapi` ran, as `build_domain_app` does.
+Products carrying their own `BaseExceptionGroup` guard can drop it.
 
 ## 0.48.0
 

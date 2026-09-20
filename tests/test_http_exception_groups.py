@@ -1,4 +1,4 @@
-"""Tests for `ExceptionGroupMiddleware`, the outermost guard `create_app` always installs.
+"""Tests for `ExceptionGroupMiddleware`, the guard `create_app` always installs under server errors.
 
 The failure this guards against is a `BaseExceptionGroup` reaching uvicorn, which under the
 Lambda Web Adapter kills the worker and every other request sharing it. Starlette collapses
@@ -410,37 +410,84 @@ def test_a_nested_group_is_unwrapped_all_the_way_to_its_leaf() -> None:
     assert json.loads(sent[1]["body"]) == {"leaf": "deep"}
 
 
-def test_the_guard_is_idempotent_unless_a_rewrap_is_asked_for() -> None:
-    """A second plain call changes nothing, so an app cannot be wrapped twice by accident."""
+def test_the_guard_is_idempotent() -> None:
+    """A second call changes nothing, so an app cannot be wrapped twice by accident."""
     app = create_app()
     first = app.build_middleware_stack
     guard_exception_groups(app)
     assert app.build_middleware_stack is first, "create_app already installed the guard"
 
-    guard_exception_groups(app, rewrap=True)
-    assert app.build_middleware_stack is not first, "a rewrap must put a new layer outside"
 
-
-def test_create_app_puts_a_guard_outside_the_stack_and_under_server_errors() -> None:
-    """The backstop is outermost and the working guard sits under the innermost server errors."""
-    from starlette.middleware.errors import ServerErrorMiddleware
-
-    app = create_app()
-    stack = app.build_middleware_stack()
-    assert isinstance(stack, ExceptionGroupMiddleware), "the backstop must be outermost"
-
+def _layers(stack: Any) -> list[Any]:
+    """The built stack from the outside in, following each layer's `app`."""
     layers: list[Any] = []
     current: Any = stack
     while current is not None and len(layers) < 32:
         layers.append(current)
         current = getattr(current, "app", None)
+    return layers
+
+
+def _assert_one_guard_under_innermost_server_errors(layers: list[Any]) -> None:
+    """One guard beneath the innermost `ServerErrorMiddleware`, with only tracing layers between."""
+    from starlette.middleware.errors import ServerErrorMiddleware
 
     server_errors = [index for index, layer in enumerate(layers) if isinstance(layer, ServerErrorMiddleware)]
-    assert server_errors, "create_app must still install Starlette's own last resort"
-    innermost = server_errors[-1]
-    assert isinstance(layers[innermost + 1], ExceptionGroupMiddleware), (
-        "a group must be unwrapped before the catch-all Exception handler can flatten it"
+    assert server_errors, "Starlette's own last resort must still be installed"
+    guards = [index for index, layer in enumerate(layers) if isinstance(layer, ExceptionGroupMiddleware)]
+    assert len(guards) == 1, "exactly one guard, so a group is unwrapped and logged once"
+    innermost, guard = server_errors[-1], guards[0]
+    assert guard > innermost, "a group must be unwrapped before the catch-all Exception handler can flatten it"
+    between = [type(layer).__module__ for layer in layers[innermost + 1 : guard]]
+    assert all(module.startswith("opentelemetry") for module in between), (
+        f"only the tracing middleware may sit between server errors and the guard, found {between}"
     )
+
+
+def test_create_app_leaves_server_errors_on_top_and_the_guard_beneath() -> None:
+    """The top stays `ServerErrorMiddleware` so the OTel instrumentor still recognises the stack."""
+    from starlette.middleware.errors import ServerErrorMiddleware
+
+    app = create_app()
+    layers = _layers(app.build_middleware_stack())
+    assert isinstance(layers[0], ServerErrorMiddleware), "the top of the stack must not be the guard"
+    _assert_one_guard_under_innermost_server_errors(layers)
+
+
+@pytest.mark.parametrize("instrument_first", [True, False], ids=["instrument-then-guard", "guard-then-instrument"])
+def test_tracing_survives_either_order_against_the_guard(
+    monkeypatch: pytest.MonkeyPatch, instrument_first: bool
+) -> None:
+    """Whichever of the guard and `instrument_fastapi` is installed first, both end up on the stack.
+
+    `build_domain_app` instruments after `create_app` has already installed the guard, and the
+    OTel instrumentor skips instrumentation unless the stack it builds beneath is a
+    `ServerErrorMiddleware`, so a guard wrapped around the outside would silently cost every
+    product its request spans. Both orders must keep the span middleware and one guard.
+    """
+    pytest.importorskip("opentelemetry.instrumentation.fastapi")
+    from webbpulse.otel import OTEL_DISABLED_ENV, configure_tracing, instrument_fastapi, shutdown_tracing
+
+    monkeypatch.delenv(OTEL_DISABLED_ENV, raising=False)
+    configure_tracing("posts", endpoint="http://localhost:4318/v1/traces")
+    try:
+        if instrument_first:
+            app = FastAPI()
+            app.include_router(_boom_router())
+            instrument_fastapi(app, excluded_urls="", flush_per_request=False, flush_on_shutdown=False)
+            guard_exception_groups(app)
+        else:
+            app = create_app([_boom_router()], instrument=False)
+            instrument_fastapi(app, excluded_urls="", flush_per_request=False, flush_on_shutdown=False)
+        layers = _layers(app.build_middleware_stack())
+        assert any("OpenTelemetry" in type(layer).__name__ for layer in layers), "request spans were lost"
+        _assert_one_guard_under_innermost_server_errors(layers)
+        client = TestClient(app, raise_server_exceptions=False)
+        response = client.get("/boom")
+    finally:
+        shutdown_tracing(1)
+
+    assert response.status_code == 500
 
 
 def test_a_non_http_scope_passes_straight_through() -> None:
@@ -471,7 +518,7 @@ def _otel_stack() -> FastAPI:
     app.include_router(_boom_router())
     app.add_middleware(_FanOutMiddleware)
     instrument_fastapi(app, excluded_urls="", flush_per_request=False, flush_on_shutdown=False)
-    guard_exception_groups(app, rewrap=True)
+    guard_exception_groups(app)
     return app
 
 

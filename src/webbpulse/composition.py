@@ -519,11 +519,9 @@ def build_domain_app(
         hook(app, resolved)
 
     if instrument:
-        from webbpulse.http import guard_exception_groups
         from webbpulse.otel import instrument_fastapi
 
         instrument_fastapi(app)
-        guard_exception_groups(app, rewrap=True)
 
     return app
 

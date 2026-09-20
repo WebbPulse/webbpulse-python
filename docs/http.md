@@ -69,10 +69,16 @@ The middleware unwraps a group to its leaves, reports the first that is not a ca
 and routes that leaf through the application's own registered handlers, so a domain
 exception renders the response it would have rendered unwrapped. With no matching handler it
 renders the standard 500 envelope with the request id, and it adds the CORS headers
-`CORSMiddleware` would have added, since it sits outside that layer. A group of nothing but
+`CORSMiddleware` would have added, since it sits above that layer. A group of nothing but
 cancellations is re-raised untouched rather than turned into a 500 nobody is waiting for,
 and once the response has started it logs and re-raises the leaf instead of sending a second
-`http.response.start`. A product carrying its own outermost guard for this can drop it.
+`http.response.start`. A product carrying its own guard for this can drop it.
+
+The guard sits beneath Starlette's `ServerErrorMiddleware` and above every product
+middleware, and the top of the built stack is left as that `ServerErrorMiddleware` on
+purpose: the OpenTelemetry FastAPI instrumentor skips instrumentation unless it finds one
+there, so `instrument_fastapi` may run before or after `create_app` and both orders keep
+request spans and the guard.
 
 ### The route key header
 

@@ -479,8 +479,8 @@ def _find_cors_middleware(app: Any) -> CORSMiddleware | None:
 def _apply_cors_headers(app: Any, scope: Mapping[str, Any], response: Response) -> None:
     """Add the CORS headers the application's own `CORSMiddleware` would have added.
 
-    This middleware is outermost, so a response it renders never passes back out through
-    `CORSMiddleware` and would otherwise reach a browser with no `Access-Control-Allow-Origin`
+    This middleware sits above `CORSMiddleware`, so a response it renders never passes back
+    out through it and would otherwise reach a browser with no `Access-Control-Allow-Origin`
     header at all. The caller would then see a CORS failure in place of the 500 the server
     actually sent, which hides the real fault behind the least informative error a browser
     has. The decision mirrors Starlette's own: the wildcard origin is echoed explicitly only
@@ -508,8 +508,9 @@ def _apply_cors_headers(app: Any, scope: Mapping[str, Any], response: Response) 
 class ExceptionGroupMiddleware:
     """Keep a `BaseExceptionGroup` from ever reaching the server, rendering its leaf instead.
 
-    The outermost layer of every application `create_app` builds, and it exists because of
-    one production failure mode. Starlette's `BaseHTTPMiddleware` runs the application inside
+    Installed beneath Starlette's `ServerErrorMiddleware` and above every product middleware
+    in every application `create_app` builds, and it exists because of one production failure
+    mode. Starlette's `BaseHTTPMiddleware` runs the application inside
     an `anyio` task group, and a task group raises a `BaseExceptionGroup`. Starlette collapses
     a group holding exactly one leaf, but a group with several leaves, or one nested inside
     another group, escapes as a group. No FastAPI exception handler matches it, because
@@ -624,7 +625,7 @@ class ExceptionGroupMiddleware:
 
 
 def _guard_beneath_server_errors(stack: Any, logger: logging.Logger | None) -> Any:
-    """Slip the guard under the innermost `ServerErrorMiddleware`, or outside `stack` without one.
+    """Slip the guard under the innermost `ServerErrorMiddleware`, or around `stack` without one.
 
     Position is the whole design, and it is forced by what the two group types are. A group
     whose leaves are all `Exception` is itself an `ExceptionGroup`, which *is* an `Exception`,
@@ -635,16 +636,17 @@ def _guard_beneath_server_errors(stack: Any, logger: logging.Logger | None) -> A
     travels out to uvicorn and kills the worker. Going under `ServerErrorMiddleware` heads off
     both, and leaves it in place above as the last resort for whatever this does not convert.
 
-    The *innermost* one, because the OpenTelemetry FastAPI instrumentor inserts a second
-    `ServerErrorMiddleware` of its own further down the stack, carrying the same handler. A
+    The *innermost* one, because the OpenTelemetry FastAPI instrumentor can leave a second
+    `ServerErrorMiddleware` of its own above the application's, carrying the same handler. A
     guard placed under the outer one alone would never see a group the inner one had already
     absorbed.
 
-    A second guard goes outside the whole stack as a backstop, for a group raised by a layer
-    above the inner one, such as an instrumentation middleware's own teardown. It normally
-    sees nothing, because the inner guard has already converted anything from the application
-    itself, and it costs one `try` per request for the guarantee in the class docstring: no
-    `BaseExceptionGroup` ever reaches the server.
+    The top of the stack is returned unchanged on purpose. That instrumentor builds the stack
+    beneath it through this same hook and skips instrumentation, logging an error, unless what
+    it gets back is a `ServerErrorMiddleware`, so a guard wrapped around the outside would
+    silently cost every product its request spans whenever it was installed before tracing.
+    Only a stack with no `ServerErrorMiddleware` at all, which `create_app` never builds, gets
+    the guard around the outside, since there is nothing above to hide it behind.
     """
     from starlette.middleware.errors import ServerErrorMiddleware
 
@@ -653,6 +655,8 @@ def _guard_beneath_server_errors(stack: Any, logger: logging.Logger | None) -> A
     for _ in range(32):
         if current is None:
             break
+        if isinstance(current, ExceptionGroupMiddleware):
+            return stack
         if isinstance(current, ServerErrorMiddleware):
             innermost = current
         current = getattr(current, "app", None)
@@ -660,10 +664,10 @@ def _guard_beneath_server_errors(stack: Any, logger: logging.Logger | None) -> A
     if innermost is None:
         return ExceptionGroupMiddleware(stack, logger=logger)
     innermost.app = ExceptionGroupMiddleware(innermost.app, logger=logger)
-    return ExceptionGroupMiddleware(stack, logger=logger)
+    return stack
 
 
-def guard_exception_groups(app: FastAPI, *, logger: logging.Logger | None = None, rewrap: bool = False) -> None:
+def guard_exception_groups(app: FastAPI, *, logger: logging.Logger | None = None) -> None:
     """Install `ExceptionGroupMiddleware` beneath `ServerErrorMiddleware` on `app`.
 
     Wraps `build_middleware_stack` rather than calling `add_middleware`, for two reasons.
@@ -672,22 +676,21 @@ def guard_exception_groups(app: FastAPI, *, logger: logging.Logger | None = None
     `BaseHTTPMiddleware` that raises the group above it. And `add_middleware` raises once the
     application has started, so it cannot be applied to a built stack at all.
 
-    Order against `webbpulse.otel.instrument_fastapi` is not free to choose. The OpenTelemetry
-    FastAPI instrumentor wraps `build_middleware_stack` too, and it asserts that the stack it
-    builds underneath is a `ServerErrorMiddleware`, skipping instrumentation entirely when it
-    is not. So this must be applied after instrumentation, never before it. `create_app` calls
-    it last for that reason, and a caller that instruments an already-built application later,
-    as `build_domain_app` does, passes `rewrap=True` to put the guard back beneath the
-    `ServerErrorMiddleware` instrumentation rebuilt.
+    Order against `webbpulse.otel.instrument_fastapi` does not matter. Installed first, the
+    instrumentor still finds a `ServerErrorMiddleware` on top of the stack this builds and
+    wraps its server span middleware above the guard. Installed second, the guard slips under
+    whichever `ServerErrorMiddleware` the instrumentor left innermost. Either way the guard
+    sits above every product middleware and below the catch-all handler, which is the only
+    place it works. `build_domain_app`, which instruments after `create_app`, relies on this.
 
-    Idempotent by default: a plain call on an already-guarded application does nothing, since
-    wrapping twice would unwrap twice and log every group twice. `rewrap=True` overrides that
-    once.
+    Idempotent: a second call on an already-guarded application does nothing, and the stack
+    builder leaves a stack that already holds a guard anywhere in it alone, so a group is
+    unwrapped and logged once.
 
     `create_app` calls this for every application it builds, so it is on by default and needs
     no flag. Call it directly only on an application assembled without `create_app`.
     """
-    if getattr(app, _EXCEPTION_GROUP_WRAPPED_ATTR, False) and not rewrap:
+    if getattr(app, _EXCEPTION_GROUP_WRAPPED_ATTR, False):
         return
     setattr(app, _EXCEPTION_GROUP_WRAPPED_ATTR, True)
 
@@ -1475,8 +1478,8 @@ def create_app(
     and `GET /health`. Set `request_log=False` where the API Gateway access log is the only
     per-request record a service wants.
 
-    Every application also gets `ExceptionGroupMiddleware` as its outermost layer, always
-    and with no flag, so a `BaseExceptionGroup` raised inside a `BaseHTTPMiddleware` task
+    Every application also gets `ExceptionGroupMiddleware` beneath `ServerErrorMiddleware`,
+    always and with no flag, so a `BaseExceptionGroup` raised inside a `BaseHTTPMiddleware` task
     group renders as one of its leaves instead of killing the uvicorn worker and every other
     request sharing it. See `guard_exception_groups`.
     CORS origins come from `settings` or `cors_allow_origins`, and must be exact when
