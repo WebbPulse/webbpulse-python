@@ -23,6 +23,7 @@ if TYPE_CHECKING:  # pragma: no cover
     from webbpulse.identity.lockout import LoginAttemptStore
     from webbpulse.identity.oauth_server import ConsentRenderer, TenantResolver
     from webbpulse.identity.oauth_server_storage import OAuthServerStores
+    from webbpulse.identity.passkeys import PasskeyRejected
     from webbpulse.identity.service import TokenService
     from webbpulse.identity.settings import IdentitySettings
     from webbpulse.identity.tokens import KmsClient
@@ -969,22 +970,83 @@ def _mount_mfa(
         dependencies=limits(("mfa-verify", TOTP_VERIFY_LIMIT, "ip")),
     )
     async def step_up(request: _FastAPIRequest, payload: dict[str, Any] = Body(...)) -> JSONResponse:
-        """Re-assert the second factor, returning a stepped-up access token and no cookie."""
+        """Re-assert a factor with a code or a passkey, returning a fresher token and no cookie.
+
+        One route and two bodies: `{"code": ...}` or `{"challenge_id": ..., "credential": ...}`.
+        Neither and both are the same 422, so a client is told what it sent rather than that
+        its factor was wrong.
+        """
         try:
             subject = require_subject(request)
         except LoginRejected as exc:
             return rejected(request, exc)
+        credential = _step_up_credential(payload)
+        if credential is None:
+            code = _required_code(payload)
+            try:
+                result = await run_sync(
+                    lambda: flows.step_up(
+                        user_id=subject,
+                        session_id=_session_from_request(request, tokens),
+                        code=code,
+                    )
+                )
+            except MfaRejected as exc:
+                return mfa_refused(request, exc)
+            return JSONResponse(success_body(result))
+
+        from webbpulse.identity.passkeys import PasskeyRejected
+
         try:
             result = await run_sync(
-                lambda: flows.step_up(
+                lambda: flows.step_up_with_passkey(
                     user_id=subject,
                     session_id=_session_from_request(request, tokens),
-                    code=str(payload.get("code", "")),
+                    challenge_id=str(payload.get("challenge_id", "")),
+                    credential=credential,
                 )
             )
-        except MfaRejected as exc:
-            return mfa_refused(request, exc)
+        except PasskeyRejected as exc:
+            return _passkey_refused(request, exc)
+        except LoginRejected as exc:
+            return rejected(request, exc)
         return JSONResponse(success_body(result))
+
+
+def _step_up_credential(payload: Mapping[str, Any]) -> dict[str, Any] | None:
+    """The `credential` of a passkey step-up body, or `None` when it is the code body.
+
+    A body carrying both a code and a credential is a 422 rather than a silent preference
+    for one of them, since a client that sent both does not know which factor it proved.
+    """
+    from fastapi.exceptions import RequestValidationError
+
+    credential = payload.get("credential")
+    code = payload.get("code")
+    has_code = isinstance(code, str) and bool(code.strip())
+    if credential is None:
+        return None
+    if not isinstance(credential, dict) or has_code:
+        raise RequestValidationError(
+            [
+                {
+                    "loc": ("body", "credential"),
+                    "msg": "Send either a code or a passkey credential, not both.",
+                    "type": "value_error",
+                }
+            ]
+        )
+    return credential
+
+
+def _passkey_refused(request: Request, exc: PasskeyRejected) -> JSONResponse:
+    """Render a passkey refusal in the shared envelope, as the passkey routes do."""
+    from webbpulse.http import error_body
+
+    return JSONResponse(
+        error_body(exc.status_code, exc.message, request, error_code=exc.error_code),
+        status_code=exc.status_code,
+    )
 
 
 def _required_code(payload: Mapping[str, Any]) -> str:
@@ -1156,6 +1218,7 @@ IDENTITY_ROUTE_RESPONSES: Final[dict[tuple[str, str], dict[int, str]]] = {
     ("POST", STEP_UP_PATH): {
         401: "No bearer token was presented, or the factor was refused",
         429: "Too many attempts from this address",
+        501: "A passkey step-up was sent to a deployment with passkeys off",
     },
 }
 """The statuses the identity routes really answer, keyed by method and unprefixed path.

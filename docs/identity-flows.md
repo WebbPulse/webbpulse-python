@@ -54,6 +54,26 @@ always report zero).
 Yields `amr` including `swk`, plus `pin` on user verification. A passkey with UV satisfies MFA
 alone; without UV it counts as one factor.
 
+#### Passkey step-up
+
+`POST /step-up/passkey/options` (bearer) then `POST /step-up` with
+`{challenge_id, credential}`. This is re-authentication, not sign-in, so it is **not** gated
+on `passkeys_passwordless`: the caller already holds a session and is proving they are still
+present at it.
+
+The options differ from login's in two ways that matter. `allowCredentials` is the subject's
+own registered passkeys rather than empty, and `userVerification` is `required` rather than
+preferred. Verification then enforces three things: the challenge MUST have been minted for
+this subject, the credential presented MUST belong to this subject, and the authenticator
+MUST report user verification. A challenge or credential belonging to another user is
+refused, never silently accepted. A subject with no passkey is `PASSKEY_NONE_REGISTERED`
+as a 404.
+
+`POST /step-up` still takes `{code}` for a TOTP or recovery code. A body with neither field,
+or with both, is a 422. Either way success is the same: a fresher `auth_time`, the same
+session, no new refresh family and no cookie, with `amr` `["pwd", "swk", "mfa"]` on the
+passkey path.
+
 #### OAuth link and login
 
 1. `GET /oauth/{provider}/start`: store `{state, pkce_verifier, mode, return_to}` with a 600
