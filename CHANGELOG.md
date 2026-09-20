@@ -5,7 +5,7 @@ Notable changes to the `webbpulse` package. The version here is the one in
 
 This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## Unreleased
+## 0.46.0
 
 Two gaps in the `webbpulse.e2e` plugin found while adopting it in the Terraform runner.
 
