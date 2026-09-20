@@ -5,6 +5,43 @@ Notable changes to the `webbpulse` package. The version here is the one in
 
 This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## Unreleased
+
+### `e2e`: sessions refresh their access token
+
+`IdentitySession` logged in once and carried that access token for the whole run. The
+identity access token's TTL is ten minutes by default and a full suite runs well past it on
+one worker, so every call after the tenth minute was answered `{"message": "Forbidden"}` by
+the gateway authorizer or 401 by the app. That included the fixtures that create the
+resources a case then asserts on, so the failures read as product bugs in whichever cases
+happened to run late.
+
+The session now owns the token rather than the client. `user_session.client` asks it for a
+credential on every request, and it refreshes through `DEFAULT_REFRESH_PATH` when the current
+token is within `refresh_skew` seconds of the `exp` it declares, 60 by default. The `exp` is
+read by decoding the payload without verification, the same way `decode_claims` reads the
+rest; a token carrying no readable `exp` falls back to `access_token_ttl` measured from when
+it was issued. Refresh is lazy, so a run that finishes inside the TTL makes no extra calls.
+
+A refusal the expiry check did not predict is recovered from too. A 401, or a 403 whose body
+is the gateway's bare `{"message": "Forbidden"}` with no `error_code`, refreshes once and
+retries the request once, and the second answer is surfaced as it is. A product 403 carries
+an `error_code` in the shared error envelope and is not retried: it means authenticated and
+not permitted, and retrying it would double every permission assertion in the suite and
+report the same refusal a call later.
+
+The refresh endpoint rotates the refresh token, so the body and the cookies it answers with
+replace what the session held, mirroring what `login` stores. Keeping the spent one would
+present it again on the next refresh, which the rotation detection reads as a replay and
+answers by revoking the family. A refresh that is itself refused raises the new
+`RefreshFailed` naming the session's user, rather than surfacing a generic 401 from a route
+nobody asked about.
+
+The refresh is guarded by a lock, so concurrent callers refresh once between them and none
+loses the rotated token to another. Ephemeral and durable users share the path, both arriving
+through `login`. A `with_token` clone carries no token source, because asking for one specific
+token means that token, which is what the minted-token cases assert on.
+
 ## 0.48.0
 
 ### `e2e`: run-wide access log checks read the gateway fields correctly

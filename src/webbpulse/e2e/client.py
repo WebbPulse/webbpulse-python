@@ -19,7 +19,7 @@ from __future__ import annotations
 import time
 from collections.abc import Callable, Iterator, Mapping, MutableMapping
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, Protocol
 
 import httpx
 
@@ -29,6 +29,8 @@ __all__ = [
     "Pacer",
     "RateLimitExhausted",
     "RequestRecord",
+    "TokenSource",
+    "is_expired_credential",
     "recorded_path",
     "retry_delay",
 ]
@@ -39,6 +41,28 @@ PACING_RESERVE = 1
 RETRY_ATTEMPTS = 4
 RETRY_CAP_SECONDS = 75
 GATE_HEADER = "x-origin-verify"
+GATEWAY_FORBIDDEN_BODY = "Forbidden"
+
+
+class TokenSource(Protocol):
+    """The slice of a session a client needs to keep its bearer credential current.
+
+    Implemented by `webbpulse.e2e.identity.IdentitySession`. The client holds one of these
+    instead of a fixed string so that a token refreshed mid-session reaches every clone the
+    session handed out, rather than only the one that happened to trigger the refresh.
+    """
+
+    def bearer_token(self) -> str:
+        """The token to send now, refreshed first when it is at or near its expiry."""
+        ...
+
+    def refresh_for_retry(self, token: str) -> str:
+        """Refresh after a refusal and return the new token, or the empty string to give up.
+
+        `token` is the credential the refused request carried, so an implementation can tell
+        a genuinely stale token from one another caller has already replaced.
+        """
+        ...
 
 
 class RateLimitExhausted(RuntimeError):
@@ -219,6 +243,7 @@ class E2EClient:
     base_url: str
     gate_headers: Mapping[str, str] = field(default_factory=dict)
     token: str | None = None
+    token_source: TokenSource | None = None
     transport: httpx.BaseTransport | None = None
     timeout: float = 30.0
     per_minute: int = DEFAULT_PER_MINUTE
@@ -259,6 +284,10 @@ class E2EClient:
 
         The pacer is shared deliberately: the limiter keys on source IP, so an anonymous
         client and an authenticated one from the same runner spend the same budget.
+
+        The clone carries no token source. A caller asking for one specific token means that
+        token, so a refresh that replaced it would defeat the request: the minted-token cases
+        assert on what a particular credential is answered.
         """
         clone = E2EClient(
             base_url=self.base_url,
@@ -275,13 +304,29 @@ class E2EClient:
         clone._pacer = self._pacer
         return clone
 
-    def _headers(self, extra: Mapping[str, str] | None, send_gate_header: bool) -> dict[str, str]:
+    def _bearer(self) -> str:
+        """The bearer credential to send now, asking the token source first when there is one.
+
+        The source is consulted on every request rather than cached, because it is what
+        refreshes an access token that is at or near its expiry, and the whole point is that
+        a long run sends a live token rather than the one login returned.
+        """
+        if self.token_source is not None:
+            return self.token_source.bearer_token()
+        return self.token or ""
+
+    def _headers(
+        self,
+        extra: Mapping[str, str] | None,
+        send_gate_header: bool,
+        token: str | None = None,
+    ) -> dict[str, str]:
         """The headers for one request, gate header and bearer token included."""
         headers: dict[str, str] = {"user-agent": self.user_agent, "accept": "application/json"}
         if send_gate_header:
             headers.update({key.lower(): value for key, value in self.gate_headers.items()})
-        if self.token:
-            headers["authorization"] = f"Bearer {self.token}"
+        if token:
+            headers["authorization"] = f"Bearer {token}"
         if extra:
             headers.update({key.lower(): value for key, value in extra.items()})
         return headers
@@ -301,31 +346,28 @@ class E2EClient:
 
         Raises `RateLimitExhausted` when every attempt answered 429, since a probe that
         never got an answer must not be banked as a pass.
-        """
-        attempts = RETRY_ATTEMPTS if retry_on_429 else 1
-        throttled = 0
-        response: httpx.Response | None = None
-        for attempt in range(attempts):
-            self._pacer.before_call()
-            response = self._client.request(
-                method,
-                path,
-                json=json,
-                params=params,
-                headers=self._headers(headers, send_gate_header),
-            )
-            self._pacer.after_call(response.headers)
-            if response.status_code != 429:
-                break
-            throttled += 1
-            if attempt == attempts - 1:
-                break
-            self._pacer.wait_out_429(response.headers, attempt)
 
-        assert response is not None
+        A client holding a token source also retries once on a refusal that reads as an
+        expired credential, after refreshing. The retry re-sends `json` and `params` as they
+        were given, which is safe because every caller in this suite passes an in-memory body
+        rather than a stream or a file handle: a streamed body would already be consumed and
+        the retry would send an empty one. Pass `retry_on_429=False` to send exactly once,
+        which also disables the refresh retry.
+        """
+        token = self._bearer()
+        response, throttled = self._send(method, path, json, headers, params, send_gate_header, retry_on_429)
+
+        if retry_on_429 and self.token_source is not None and token and is_expired_credential(response):
+            refreshed = self.token_source.refresh_for_retry(token)
+            if refreshed:
+                retry, retried_throttled = self._send(
+                    method, path, json, headers, params, send_gate_header, retry_on_429, token=refreshed
+                )
+                response, throttled = retry, throttled + retried_throttled
+
         if response.status_code == 429 and retry_on_429:
             raise RateLimitExhausted(
-                f"{method} {path} answered 429 on all {attempts} attempts. Nothing can be "
+                f"{method} {path} answered 429 on all {RETRY_ATTEMPTS} attempts. Nothing can be "
                 "concluded about the route; the per-IP budget is exhausted."
             )
         self.records.append(
@@ -338,6 +380,46 @@ class E2EClient:
             )
         )
         return response
+
+    def _send(
+        self,
+        method: str,
+        path: str,
+        json: Any,
+        headers: Mapping[str, str] | None,
+        params: Mapping[str, Any] | None,
+        send_gate_header: bool,
+        retry_on_429: bool,
+        token: str | None = None,
+    ) -> tuple[httpx.Response, int]:
+        """One paced attempt with its 429 retries, returning the answer and the throttle count.
+
+        `token` is resolved once by the caller rather than here, so that the credential a
+        refusal is attributed to is the one that was actually sent.
+        """
+        bearer = token if token is not None else self._bearer()
+        attempts = RETRY_ATTEMPTS if retry_on_429 else 1
+        throttled = 0
+        response: httpx.Response | None = None
+        for attempt in range(attempts):
+            self._pacer.before_call()
+            response = self._client.request(
+                method,
+                path,
+                json=json,
+                params=params,
+                headers=self._headers(headers, send_gate_header, bearer),
+            )
+            self._pacer.after_call(response.headers)
+            if response.status_code != 429:
+                break
+            throttled += 1
+            if attempt == attempts - 1:
+                break
+            self._pacer.wait_out_429(response.headers, attempt)
+
+        assert response is not None
+        return response, throttled
 
     def get(self, path: str, **kwargs: Any) -> httpx.Response:
         """Send a GET."""
@@ -366,6 +448,33 @@ class E2EClient:
     def iter_records(self) -> Iterator[RequestRecord]:
         """Every request this client has made, oldest first."""
         return iter(self.records)
+
+
+def is_expired_credential(response: httpx.Response) -> bool:
+    """Whether this refusal is the kind a fresher access token could turn into an answer.
+
+    A 401 always qualifies: whoever answered it, the credential is the thing being refused.
+
+    A 403 qualifies only when the body is the bare `{"message": "Forbidden"}` the HTTP API
+    gateway returns when its JWT authorizer refuses a token, which is what an expired token
+    looks like from outside. The product's own 403 is the shared error envelope and carries
+    an `error_code`, and it means the caller is authenticated and not permitted. Refreshing
+    and retrying that one would send a second identical request, double every permission
+    assertion in the suite and report the same refusal a call later.
+    """
+    if response.status_code == 401:
+        return True
+    if response.status_code != 403:
+        return False
+    try:
+        payload = response.json()
+    except Exception:
+        return False
+    if not isinstance(payload, dict):
+        return False
+    if payload.get("error_code") or payload.get("errorCode"):
+        return False
+    return str(payload.get("message", "")) == GATEWAY_FORBIDDEN_BODY
 
 
 def request_id_of(response: httpx.Response) -> str:

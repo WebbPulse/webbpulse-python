@@ -153,6 +153,41 @@ function regex-matches the decoded policy. The cookies last an hour, are attache
 `http` client and every browser context, and are never printed: the policy and signature are
 kept out of the dataclass repr, so a pytest failure report cannot leak a live session.
 
+## The session keeps its own token current
+
+The identity access token's TTL is ten minutes by default, and a full suite runs well past
+that on one worker. A session that carried the login token for the whole run had every call
+after the tenth minute answered `{"message": "Forbidden"}` by the gateway authorizer, or 401
+by the app, including the fixtures that create the resources a case then asserts on, and
+those failures read exactly like product bugs.
+
+So the session, not the client, owns the access token. `user_session.client` asks the session
+for a credential on every request, and the session refreshes through `POST /api/auth/refresh`
+when the current token is within `refresh_skew` seconds of the `exp` it declares, which
+defaults to 60. A token carrying no readable `exp` falls back to `access_token_ttl` measured
+from when it was issued. Refresh is lazy, so a short run makes no extra calls at all.
+
+A refusal the expiry check did not predict is also recovered from: a 401, or a 403 whose body
+is the gateway's bare `{"message": "Forbidden"}` with no `error_code`, refreshes once and
+retries the request once, and the second answer is surfaced as it is. The product's own 403
+carries an `error_code` in the shared error envelope and is never retried, because it means
+the caller is authenticated and not permitted, and a retry would double every permission
+assertion in the suite. The retry re-sends the same in-memory body the call was given, which
+is safe for every caller here; a streamed body would already be consumed.
+
+The refresh endpoint rotates the refresh token on every call, so whatever it returns in the
+body and whatever cookies it sets replace what the session held, the same way `login` stores
+them. Presenting a spent token would be read as a replay and revoke the whole family. A
+refresh that is itself refused raises `RefreshFailed` naming the session's user rather than a
+generic HTTP failure, because at that point there is no credential left and every later case
+would fail for the same reason.
+
+The refresh is guarded by a lock, so several concurrent callers refresh once between them and
+none loses the rotated refresh token to another. This applies to the ephemeral user and the
+durable user alike, since both arrive through `login`. A client from `with_token` carries no
+token source: asking for one specific token means that token, which is what the minted-token
+cases assert on.
+
 ## Read-only mode
 
 The full suite runs against staging. After a production deploy only an anonymous read-only
@@ -290,8 +325,8 @@ and deployment concerns and they stay in the post deploy run, which is the requi
 | `ephemeral_user` | This run's own login user, created at session start and deleted at the end, or None where the route is not offered |
 | `ephemeral_user_attributes` | The attributes `ephemeral_user` creates that user with, empty by default. Override it where the product grants write scopes only to an admin or verified row |
 | `credentials` | The email and password the suite signs in with: this run's ephemeral user where there is one, the durable user otherwise. The password is kept out of the repr |
-| `user_session` | The run's user signed in through the real login route. Skips in read-only mode |
-| `api` | The authenticated client, sharing the anonymous client's pacer |
+| `user_session` | The run's user signed in through the real login route, refreshing its own access token before it expires and after a refusal that reads as an expired one. Skips in read-only mode |
+| `api` | The authenticated client, sharing the anonymous client's pacer and asking the session for a live token on every request |
 | `minted_subject` | The `sub` claim of the durable e2e user's access token, which is the subject a minted token has to name to resolve to a stored user |
 | `minted_token` | Mints a token through KMS with no login, defaulting to `minted_subject` and taking an explicit `subject=` override. Skips unless `E2E_MINT_ENABLED` is set, and in read-only mode, where there is no user to mint for |
 | `gateway_routes`, `route_keys` | The live routes, read once per run, or synthesized from the OpenAPI document on a local stack |
