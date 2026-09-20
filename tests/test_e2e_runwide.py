@@ -21,7 +21,7 @@ from typing import Any
 import pytest
 
 from webbpulse.e2e import RUN_WIDE_GROUPS, runwide
-from webbpulse.e2e.access_log import AccessLogEntry
+from webbpulse.e2e.access_log import AccessLogEntry, parse_entry
 from webbpulse.e2e.client import RequestRecord, recorded_path
 from webbpulse.e2e.coverage import measure_coverage
 
@@ -44,6 +44,9 @@ def entry(
     integration_status: int = 200,
     route_key: str = "GET /api/issues",
     method: str = "GET",
+    integration_error: str = "",
+    authorizer_error: str = "",
+    error_type: str = "",
     raw: Mapping[str, Any] | None = None,
 ) -> AccessLogEntry:
     """One access log entry, healthy unless a test says otherwise."""
@@ -54,9 +57,65 @@ def entry(
         method=method,
         status=status,
         integration_status=integration_status,
-        integration_error="",
+        integration_error=integration_error,
+        authorizer_error=authorizer_error,
+        error_type=error_type,
         raw={"integrationErrorMessage": "-"} if raw is None else raw,
     )
+
+
+def authorizer_refusal() -> AccessLogEntry:
+    """A real gateway-side refusal, parsed from a CarModPicker staging entry.
+
+    The integration never ran, so `integrationStatus` is `-`, and the gateway filled in its
+    own `errorMessage`, `errorType` and `authorizerError`. Nothing here is a product failure.
+    """
+    entry = parse_entry(
+        json.dumps(
+            {
+                "requestId": "req-refused",
+                "routeKey": "GET /api/issues",
+                "path": "/api/issues",
+                "httpMethod": "GET",
+                "status": "403",
+                "integrationStatus": "-",
+                "integrationLatency": "-",
+                "authorizerError": "Forbidden",
+                "errorMessage": "Forbidden",
+                "errorType": "ACCESS_DENIED",
+                "integrationErrorMessage": "-",
+            }
+        )
+    )
+    assert entry is not None
+    return entry
+
+
+def product_rejection() -> AccessLogEntry:
+    """A real product 401, parsed from a CarModPicker staging entry.
+
+    The function ran and answered 401 itself, which AWS Lambda reports to the gateway as a
+    successful invocation, so `integrationStatus` is 200 and no error field is set.
+    """
+    entry = parse_entry(
+        json.dumps(
+            {
+                "requestId": "req-401",
+                "routeKey": "GET /api/issues",
+                "path": "/api/issues",
+                "httpMethod": "GET",
+                "status": "401",
+                "integrationStatus": "200",
+                "integrationLatency": "14",
+                "integrationErrorMessage": "-",
+                "authorizerError": "-",
+                "errorMessage": "-",
+                "errorType": "-",
+            }
+        )
+    )
+    assert entry is not None
+    return entry
 
 
 class FakeOption:
@@ -286,20 +345,60 @@ class TestTheTwoModesCannotDrift:
         assert runwide.no_request_was_answered_with_a_server_error([entry(status=502)]) is not None
         assert runwide.no_request_was_answered_with_a_server_error([entry()]) is None
 
-    def test_a_product_rejection_is_not_the_authorizer(self) -> None:
-        """A 401 the function itself returned is the product refusing, in both modes."""
-        assert runwide.no_rejection_came_from_a_healthy_integration([entry(status=401, integration_status=401)]) is None
-        assert runwide.no_rejection_came_from_a_healthy_integration([entry(status=401)]) is not None
+    def test_no_refusal_is_a_run_wide_failure(self) -> None:
+        """Neither a gateway refusal nor a product rejection fails any run-wide check.
+
+        Both are shapes the suite provokes deliberately, and the run cannot tell an expected
+        refusal from an unexpected one, so no check may key on either.
+        """
+        for refusal in (authorizer_refusal(), product_rejection()):
+            entries = [refusal]
+            assert runwide.no_request_was_answered_with_a_server_error(entries) is None
+            assert runwide.every_request_matched_a_declared_route(entries) is None
+            assert runwide.no_integration_reported_an_error(entries) is None
+
+    def test_the_rejection_check_is_gone(self) -> None:
+        """No run-wide check keys on a refusal, which is what made the old one unsound."""
+        assert not hasattr(runwide, "no_rejection_came_from_a_healthy_integration")
+        assert "no_rejection_came_from_a_healthy_integration" not in runwide.__all__
 
     def test_a_preflight_needs_no_route_key(self) -> None:
         """`OPTIONS` is answered by the CORS configuration, in both modes."""
         assert runwide.every_request_matched_a_declared_route([entry(route_key="", method="OPTIONS")]) is None
         assert runwide.every_request_matched_a_declared_route([entry(route_key="")]) is not None
 
-    def test_the_unset_placeholder_is_not_an_error(self) -> None:
-        """The gateway's literal `-` is not an integration error, in both modes."""
+    def test_only_the_integration_error_message_is_an_error(self) -> None:
+        """`integrationErrorMessage` is the verdict, in both modes, and nothing else is.
+
+        `$context.error.message` is populated on every gateway-side refusal, so reading it
+        would fail a run on the suite's own unauthenticated probes.
+        """
         assert runwide.no_integration_reported_an_error([entry(raw={"errorMessage": "-"})]) is None
-        assert runwide.no_integration_reported_an_error([entry(raw={"errorMessage": "boom"})]) is not None
+        assert runwide.no_integration_reported_an_error([entry(raw={"errorMessage": "boom"})]) is None
+        assert (
+            runwide.no_integration_reported_an_error(
+                [entry(integration_error="boom", raw={"integrationErrorMessage": "boom"})]
+            )
+            is not None
+        )
+
+
+class TestTheDiagnosticLine:
+    """What a failing run-wide check prints about an entry."""
+
+    def test_an_invoked_entry_says_so(self) -> None:
+        """`integrationStatus` 200 means the function ran, which is what the line reports."""
+        assert "invoked=yes" in runwide.describe_entries([product_rejection()])
+
+    def test_a_gateway_refusal_says_it_was_not_invoked(self) -> None:
+        """A refusal never reached the function, and names the authorizer error it carried."""
+        line = runwide.describe_entries([authorizer_refusal()])
+        assert "invoked=no" in line
+        assert "authorizer_error=Forbidden" in line
+
+    def test_no_authorizer_error_is_left_off(self) -> None:
+        """A clean entry carries no authorizer error, so the line does not print an empty one."""
+        assert "authorizer_error" not in runwide.describe_entries([entry()])
 
     def test_the_suite_methods_call_the_shared_checks(self) -> None:
         """The test methods assert on the same functions, so a message cannot fork."""

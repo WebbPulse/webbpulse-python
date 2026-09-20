@@ -7,6 +7,35 @@ This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## Unreleased
 
+### `e2e`: run-wide access log checks read the gateway fields correctly
+
+Two of the four shapes `TestAccessLogHealth` swept for in 0.47.0 were built on a wrong
+reading of the HTTP API access log fields, and both failed every real suite.
+
+`$context.integrationStatus` is the status AWS Lambda returned for the invocation, not the
+status the function returned. For a Lambda proxy integration it is 200 whenever the function
+ran, so a product 401, 403, 404 or 422 all log it as 200, and a gateway-side refusal that
+never invoked anything logs `-`. The check that failed a 401 or 403 whose `integrationStatus`
+was 200 therefore had it exactly backwards: 200 is the proof the product answered. It is
+removed rather than inverted, and not replaced by a variant keyed on `authorizerError` or
+`errorType`, because a run-wide "the authorizer refused something" check cannot be sound:
+the suite's own route probes and every negative auth case are refused on purpose, and the
+run has no way to tell an expected refusal from an unexpected one. The function's own status
+is `$context.integration.status`, which the `platform-modules` `http-api` default access log
+format does not emit.
+
+`no_integration_reported_an_error` now reads `integrationErrorMessage` alone. It used to
+prefer `$context.error.message`, which is an API Gateway error message populated on every
+gateway-side refusal, including the authorizer refusing the unauthenticated probes the suite
+sends deliberately. On a 1232-entry CarModPicker staging run `integrationErrorMessage` was
+`-` on every entry while `errorMessage` was set on each refusal.
+
+`AccessLogEntry` gains `authorizer_error`, `error_type` and an `integration_invoked`
+property, true when `integrationStatus` parsed to a non-zero value or an integration latency
+was recorded. The diagnostic line a failing check prints now says `invoked=yes|no` and names
+the authorizer error where there is one, instead of printing an `integrationStatus` that is
+200 for every invocation whatever the function answered.
+
 Step-up re-authentication now takes a passkey as well as a TOTP or recovery code, for a
 product that wants a confirm button gated on a fresh WebAuthn gesture rather than a code
 typed out of an app.
