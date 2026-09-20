@@ -12,6 +12,7 @@ builds the same page under an API's own plural key.
 
 from __future__ import annotations
 
+import asyncio
 import base64
 import binascii
 import hashlib
@@ -59,6 +60,7 @@ __all__ = [
     "ErrorRenderer",
     "ErrorResponse",
     "ErrorSpec",
+    "ExceptionGroupMiddleware",
     "ExceptionMap",
     "InvalidCursor",
     "RequestIdMiddleware",
@@ -74,6 +76,7 @@ __all__ = [
     "encode_cursor",
     "error_body",
     "error_envelope_responses",
+    "guard_exception_groups",
     "health_router",
     "install_dynamodb_error_handlers",
     "install_dynamodb_handlers",
@@ -126,6 +129,9 @@ _STATUS_ERROR_CODES: Final[Mapping[int, str]] = {
     500: "INTERNAL_ERROR",
     503: "SERVICE_UNAVAILABLE",
 }
+
+_INTERNAL_ERROR_MESSAGE: Final = "Internal server error."
+"""The wording every 500 renders, kept in one place so the group guard cannot drift from it."""
 
 _ROUTING_DETAILS: Final[Mapping[str, str]] = {
     "Not Found": "The requested resource was not found.",
@@ -354,6 +360,349 @@ def _scope_user_id(scope: Mapping[str, Any]) -> str | None:
         if isinstance(value, str) and value and value != "-":
             return value
     return None
+
+
+_EXCEPTION_GROUP_WRAPPED_ATTR: Final = "_webbpulse_exception_group_wrapped"
+
+
+def _group_leaves(error: BaseException) -> list[BaseException]:
+    """Every non-group exception reachable inside `error`, flattened depth first.
+
+    Groups nest: a group raised by one `anyio` task group can hold another group raised by a
+    task group one layer in, so unwrapping a single level is not enough.
+    """
+    if isinstance(error, BaseExceptionGroup):
+        leaves: list[BaseException] = []
+        for nested in error.exceptions:
+            leaves.extend(_group_leaves(nested))
+        return leaves
+    return [error]
+
+
+def _is_cancellation(error: BaseException) -> bool:
+    """Whether `error` is a cancellation rather than a fault worth rendering.
+
+    Both spellings are checked because `anyio` raises the running backend's own cancellation
+    type: `asyncio.CancelledError` on asyncio, and on trio a distinct class this module
+    cannot name at import time without importing trio.
+    """
+    if isinstance(error, asyncio.CancelledError):
+        return True
+    return type(error).__name__ == "Cancelled"
+
+
+def _primary_leaf(leaves: Sequence[BaseException]) -> BaseException | None:
+    """The leaf a group should be reported as: the first that is not a cancellation.
+
+    `None` when every leaf is a cancellation, which tells the caller to re-raise the group
+    untouched rather than turn a cancelled request into a 500 nobody is waiting for.
+    """
+    for leaf in leaves:
+        if not _is_cancellation(leaf):
+            return leaf
+    return None
+
+
+def _handler_tables(scope: Mapping[str, Any]) -> list[Mapping[Any, Any]]:
+    """The exception handler tables to search, most specific first.
+
+    The request scope is preferred, because Starlette's `ExceptionMiddleware` puts the exact
+    table that request would have used there on the way in. It is not always present: a
+    middleware that fails above `ExceptionMiddleware` never reached it, and that is precisely
+    the case where a registered handler is otherwise skipped. So the application's own
+    `exception_handlers` is the fallback, read from the scope Starlette populates with the
+    application object.
+    """
+    tables: list[Mapping[Any, Any]] = []
+    entry = scope.get("starlette.exception_handlers")
+    if entry:
+        handlers = entry[0] if isinstance(entry, tuple) else entry
+        if isinstance(handlers, Mapping):
+            tables.append(handlers)
+
+    registered = getattr(scope.get("app"), "exception_handlers", None)
+    if isinstance(registered, Mapping):
+        tables.append(registered)
+    return tables
+
+
+def _scope_exception_handler(scope: Mapping[str, Any], error: BaseException) -> Any:
+    """The handler the application registered for `error`, walking its MRO, or None.
+
+    The catch-all `Exception` handler is deliberately skipped: it renders the same flat 500
+    this middleware falls back to anyway, and matching it would mask a group whose leaf has no
+    handler of its own behind a response that claims it was handled.
+    """
+    tables = _handler_tables(scope)
+    if not tables:
+        return None
+    for klass in type(error).__mro__:
+        if klass in (Exception, BaseException, object):
+            return None
+        for table in tables:
+            handler = table.get(klass)
+            if handler is not None:
+                return handler
+    return None
+
+
+async def _call_exception_handler(handler: Any, request: Request, error: BaseException) -> Response | None:
+    """Invoke one exception handler, on the loop or in the threadpool as it needs."""
+    from starlette._utils import is_async_callable
+    from starlette.concurrency import run_in_threadpool
+
+    if is_async_callable(handler):
+        result = await handler(request, error)
+    else:
+        result = await run_in_threadpool(handler, request, error)
+    return result if isinstance(result, Response) else None
+
+
+def _find_cors_middleware(app: Any) -> CORSMiddleware | None:
+    """The built `CORSMiddleware` instance inside `app`, or None when there is none.
+
+    Walks the chain of wrapped applications rather than reading `user_middleware`, because by
+    the time a request runs the stack is built and only the built instance holds the resolved
+    header values. The hop limit stops a middleware whose `app` points back at itself from
+    spinning here.
+    """
+    current: Any = app
+    for _ in range(32):
+        if current is None:
+            return None
+        if isinstance(current, CORSMiddleware):
+            return current
+        current = getattr(current, "app", None)
+    return None
+
+
+def _apply_cors_headers(app: Any, scope: Mapping[str, Any], response: Response) -> None:
+    """Add the CORS headers the application's own `CORSMiddleware` would have added.
+
+    This middleware sits above `CORSMiddleware`, so a response it renders never passes back
+    out through it and would otherwise reach a browser with no `Access-Control-Allow-Origin`
+    header at all. The caller would then see a CORS failure in place of the 500 the server
+    actually sent, which hides the real fault behind the least informative error a browser
+    has. The decision mirrors Starlette's own: the wildcard origin is echoed explicitly only
+    when credentials are allowed, and a listed origin is always mirrored back.
+    """
+    origin = ""
+    for key, value in scope.get("headers") or ():
+        if key.lower() == b"origin":
+            origin = value.decode("latin-1")
+            break
+    if not origin:
+        return
+
+    cors = _find_cors_middleware(app)
+    if cors is None:
+        return
+
+    response.headers.update(cors.simple_headers)
+    mirror_wildcard = cors.allow_all_origins and cors.allow_credentials
+    mirror_listed = not cors.allow_all_origins and cors.is_allowed_origin(origin=origin)
+    if mirror_wildcard or mirror_listed:
+        cors.allow_explicit_origin(response.headers, origin)
+
+
+class ExceptionGroupMiddleware:
+    """Keep a `BaseExceptionGroup` from ever reaching the server, rendering its leaf instead.
+
+    Installed beneath Starlette's `ServerErrorMiddleware` and above every product middleware
+    in every application `create_app` builds, and it exists because of one production failure
+    mode. Starlette's `BaseHTTPMiddleware` runs the application inside
+    an `anyio` task group, and a task group raises a `BaseExceptionGroup`. Starlette collapses
+    a group holding exactly one leaf, but a group with several leaves, or one nested inside
+    another group, escapes as a group. No FastAPI exception handler matches it, because
+    handlers are registered against the plain exception type and a group is not a subclass of
+    its leaves, so `ServerErrorMiddleware` re-raises it into the server.
+
+    Under the Lambda Web Adapter that kills the uvicorn worker, which takes every other
+    in-flight request in that execution environment down with it and makes the gateway report
+    `INTEGRATION_FAILURE` on paths that had nothing to do with the fault. The package owns
+    this rather than each product, deliberately: a product cannot know it needs the guard
+    until it has already lost a worker to it.
+
+    On a group it unwraps to the leaves, picks the first that is not a cancellation, and
+    routes that leaf through the application's own registered exception handlers, so a domain
+    exception renders exactly the response it would have rendered unwrapped. With no matching
+    handler it renders the package's standard 500 envelope with the request id, and adds the
+    CORS headers `CORSMiddleware` would have added, since this layer sits outside it. Once the
+    response has started nothing more can be sent, so it logs and re-raises the leaf: a
+    truncated body is a better failure than a second `http.response.start`.
+    """
+
+    def __init__(self, app: Any, *, logger: logging.Logger | None = None) -> None:
+        """Wrap `app`, logging unwrapped groups to `logger` or to this module's logger."""
+        self.app = app
+        self._logger = logger if logger is not None else _log
+
+    async def __call__(self, scope: Any, receive: Any, send: Any) -> None:
+        """Run the application, turning any escaping group into one rendered response."""
+        if scope.get("type") != "http":
+            await self.app(scope, receive, send)
+            return
+
+        started = False
+
+        async def send_wrapper(message: Any) -> None:
+            """Record that the response has started, then pass the message on."""
+            nonlocal started
+            if message.get("type") == "http.response.start":
+                started = True
+            await send(message)
+
+        try:
+            await self.app(scope, receive, send_wrapper)
+        except BaseExceptionGroup as group:
+            await self._handle_group(group, scope, receive, send, started=started)
+
+    async def _handle_group(
+        self,
+        group: BaseExceptionGroup[BaseException],
+        scope: Any,
+        receive: Any,
+        send: Any,
+        *,
+        started: bool,
+    ) -> None:
+        """Answer `group` as one of its leaves, or re-raise when no response can be sent."""
+        leaves = _group_leaves(group)
+        leaf = _primary_leaf(leaves)
+        if leaf is None:
+            raise group
+
+        request = Request(scope, receive)
+        rid = request_id(request)
+        if len(leaves) > 1:
+            self._logger.error(
+                "An exception group reached the server with several leaves; reporting the "
+                "first non-cancellation leaf and recording the rest here.",
+                extra={
+                    "request_id": rid,
+                    "path": request.url.path,
+                    "method": request.method,
+                    "leaf_count": len(leaves),
+                    "reported_leaf": type(leaf).__name__,
+                    "other_leaves": [f"{type(other).__name__}: {other}" for other in leaves if other is not leaf],
+                },
+            )
+
+        if started:
+            self._logger.error(
+                "An exception group reached the server after the response had already "
+                "started, so no error body can be sent.",
+                exc_info=leaf,
+                extra={"request_id": rid, "path": request.url.path, "method": request.method},
+            )
+            raise leaf from group
+
+        response = await self._render(request, leaf)
+        _apply_cors_headers(self.app, scope, response)
+        await response(scope, receive, send)
+
+    async def _render(self, request: Request, leaf: BaseException) -> Response:
+        """The response for one leaf: its registered handler's, or the standard 500."""
+        handler = _scope_exception_handler(request.scope, leaf)
+        if handler is not None:
+            try:
+                rendered = await _call_exception_handler(handler, request, leaf)
+            except Exception:
+                self._logger.exception(
+                    "The registered handler for an unwrapped group leaf itself failed.",
+                    extra={"request_id": request_id(request), "path": request.url.path},
+                )
+            else:
+                if rendered is not None:
+                    return rendered
+
+        self._logger.error(
+            "Unhandled exception group serving the request.",
+            exc_info=leaf,
+            extra={"request_id": request_id(request), "path": request.url.path, "method": request.method},
+        )
+        return JSONResponse(status_code=500, content=error_body(500, _INTERNAL_ERROR_MESSAGE, request))
+
+
+def _guard_beneath_server_errors(stack: Any, logger: logging.Logger | None) -> Any:
+    """Slip the guard under the innermost `ServerErrorMiddleware`, or around `stack` without one.
+
+    Position is the whole design, and it is forced by what the two group types are. A group
+    whose leaves are all `Exception` is itself an `ExceptionGroup`, which *is* an `Exception`,
+    so the catch-all `Exception` handler `register_error_handlers` installs on
+    `ServerErrorMiddleware` matches it and renders a flat 500, throwing away the domain
+    handler its leaf deserved. A group holding a cancellation alongside a fault is a
+    `BaseExceptionGroup`, which is *not* an `Exception`, so nothing matches it at all and it
+    travels out to uvicorn and kills the worker. Going under `ServerErrorMiddleware` heads off
+    both, and leaves it in place above as the last resort for whatever this does not convert.
+
+    The *innermost* one, because the OpenTelemetry FastAPI instrumentor can leave a second
+    `ServerErrorMiddleware` of its own above the application's, carrying the same handler. A
+    guard placed under the outer one alone would never see a group the inner one had already
+    absorbed.
+
+    The top of the stack is returned unchanged on purpose. That instrumentor builds the stack
+    beneath it through this same hook and skips instrumentation, logging an error, unless what
+    it gets back is a `ServerErrorMiddleware`, so a guard wrapped around the outside would
+    silently cost every product its request spans whenever it was installed before tracing.
+    Only a stack with no `ServerErrorMiddleware` at all, which `create_app` never builds, gets
+    the guard around the outside, since there is nothing above to hide it behind.
+    """
+    from starlette.middleware.errors import ServerErrorMiddleware
+
+    innermost: Any = None
+    current: Any = stack
+    for _ in range(32):
+        if current is None:
+            break
+        if isinstance(current, ExceptionGroupMiddleware):
+            return stack
+        if isinstance(current, ServerErrorMiddleware):
+            innermost = current
+        current = getattr(current, "app", None)
+
+    if innermost is None:
+        return ExceptionGroupMiddleware(stack, logger=logger)
+    innermost.app = ExceptionGroupMiddleware(innermost.app, logger=logger)
+    return stack
+
+
+def guard_exception_groups(app: FastAPI, *, logger: logging.Logger | None = None) -> None:
+    """Install `ExceptionGroupMiddleware` beneath `ServerErrorMiddleware` on `app`.
+
+    Wraps `build_middleware_stack` rather than calling `add_middleware`, for two reasons.
+    `add_middleware` lands the guard at the head of `user_middleware`, which a product that
+    adds its own middleware afterwards would then push the guard underneath, leaving the
+    `BaseHTTPMiddleware` that raises the group above it. And `add_middleware` raises once the
+    application has started, so it cannot be applied to a built stack at all.
+
+    Order against `webbpulse.otel.instrument_fastapi` does not matter. Installed first, the
+    instrumentor still finds a `ServerErrorMiddleware` on top of the stack this builds and
+    wraps its server span middleware above the guard. Installed second, the guard slips under
+    whichever `ServerErrorMiddleware` the instrumentor left innermost. Either way the guard
+    sits above every product middleware and below the catch-all handler, which is the only
+    place it works. `build_domain_app`, which instruments after `create_app`, relies on this.
+
+    Idempotent: a second call on an already-guarded application does nothing, and the stack
+    builder leaves a stack that already holds a guard anywhere in it alone, so a group is
+    unwrapped and logged once.
+
+    `create_app` calls this for every application it builds, so it is on by default and needs
+    no flag. Call it directly only on an application assembled without `create_app`.
+    """
+    if getattr(app, _EXCEPTION_GROUP_WRAPPED_ATTR, False):
+        return
+    setattr(app, _EXCEPTION_GROUP_WRAPPED_ATTR, True)
+
+    built = app.build_middleware_stack
+
+    def build_middleware_stack() -> Any:
+        """Build the application's own stack, then slip the guard in under server errors."""
+        return _guard_beneath_server_errors(built(), logger)
+
+    app.build_middleware_stack = build_middleware_stack  # type: ignore[method-assign]
+    if getattr(app, "middleware_stack", None) is not None:
+        app.middleware_stack = _guard_beneath_server_errors(app.middleware_stack, logger)
 
 
 def health_router(*, service: str, version: str, checks: Mapping[str, Any] | None = None) -> APIRouter:
@@ -1128,6 +1477,11 @@ def create_app(
     Adds CORS, the request id middleware, the request log, the structured error handlers
     and `GET /health`. Set `request_log=False` where the API Gateway access log is the only
     per-request record a service wants.
+
+    Every application also gets `ExceptionGroupMiddleware` beneath `ServerErrorMiddleware`,
+    always and with no flag, so a `BaseExceptionGroup` raised inside a `BaseHTTPMiddleware` task
+    group renders as one of its leaves instead of killing the uvicorn worker and every other
+    request sharing it. See `guard_exception_groups`.
     CORS origins come from `settings` or `cors_allow_origins`, and must be exact when
     credentials are allowed. `cors_allow_headers` replaces `DEFAULT_CORS_ALLOW_HEADERS`,
     which covers the request id and retry attempt headers the API clients send.
@@ -1198,6 +1552,8 @@ def create_app(
         from webbpulse.otel import instrument_fastapi
 
         instrument_fastapi(app)
+
+    guard_exception_groups(app)
     return app
 
 

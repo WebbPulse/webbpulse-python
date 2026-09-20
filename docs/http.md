@@ -48,6 +48,38 @@ can be a password or a token.
 [the warning in logging-and-metrics.md](logging-and-metrics.md#do-not-call-set_user_id-from-a-sync-def-fastapi-dependency),
 which is the shape to read before wiring authentication.
 
+### Exception groups never reach the server
+
+Every application `create_app` builds gets `ExceptionGroupMiddleware`, always and with no
+flag to turn it off. Starlette's `BaseHTTPMiddleware` runs the application inside an `anyio`
+task group, and a task group raises a `BaseExceptionGroup`. Starlette collapses a group
+holding exactly one leaf, but a group with several leaves, or one nested inside another
+group, escapes as a group. No exception handler matches it, because handlers are registered
+against the plain exception type and a group is not a subclass of its leaves.
+
+Both outcomes were wrong. A group whose leaves are all `Exception` is itself an
+`ExceptionGroup`, which is an `Exception`, so the catch-all handler rendered a flat 500 and
+threw away the handler the leaf deserved. A group holding a cancellation alongside a fault
+is a `BaseExceptionGroup`, which is not an `Exception`, so nothing matched it at all and it
+travelled out to uvicorn. Under the Lambda Web Adapter that kills the worker, taking every
+other in-flight request in that execution environment with it and making the gateway report
+`INTEGRATION_FAILURE` on paths that had nothing to do with the fault.
+
+The middleware unwraps a group to its leaves, reports the first that is not a cancellation,
+and routes that leaf through the application's own registered handlers, so a domain
+exception renders the response it would have rendered unwrapped. With no matching handler it
+renders the standard 500 envelope with the request id, and it adds the CORS headers
+`CORSMiddleware` would have added, since it sits above that layer. A group of nothing but
+cancellations is re-raised untouched rather than turned into a 500 nobody is waiting for,
+and once the response has started it logs and re-raises the leaf instead of sending a second
+`http.response.start`. A product carrying its own guard for this can drop it.
+
+The guard sits beneath Starlette's `ServerErrorMiddleware` and above every product
+middleware, and the top of the built stack is left as that `ServerErrorMiddleware` on
+purpose: the OpenTelemetry FastAPI instrumentor skips instrumentation unless it finds one
+there, so `instrument_fastapi` may run before or after `create_app` and both orders keep
+request spans and the guard.
+
 ### The route key header
 
 `RequestIdMiddleware` echoes the request id as `X-Request-ID` and the gateway's own matched
