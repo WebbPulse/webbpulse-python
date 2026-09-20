@@ -42,6 +42,30 @@ loses the rotated token to another. Ephemeral and durable users share the path, 
 through `login`. A `with_token` clone carries no token source, because asking for one specific
 token means that token, which is what the minted-token cases assert on.
 
+### `e2e`: ephemeral users on the reserved domain and EmailStr
+
+The plugin mints each run's login user on `e2e.invalid`, the domain RFC 2606 reserves so a
+product's new-account mail can never reach a real inbox. `email-validator`, which Pydantic's
+`EmailStr` uses, refuses special-use domains outright, and no option re-admits this one:
+`test_environment=True` exempts `.test` alone and `globally_deliverable=False` does not touch
+the special-use check at all. A product whose persisted user record model annotates the
+address `EmailStr` therefore answers 500 on `POST /api/auth/e2e/users`, and every ephemeral
+fixture then errors in a way that reads like a product bug rather than a model annotation.
+
+The shared path is not itself affected and is unchanged: the identity route takes a raw JSON
+body and `create_ephemeral_user` only lower cases and strips, so nothing in `webbpulse`
+validates the address against the RFCs. The reserved domain stays as it is, because being
+undeliverable is the point.
+
+What changed is the failure report. `create_ephemeral_user` already raised with the status
+and a bounded body excerpt; it now appends a one-line hint naming `EmailStr` and the reserved
+domain, offered for an address on that domain and for a 500 whose body mentions email
+validation, and withheld otherwise so an unrelated failure is not given a misleading cause.
+`email_validation_hint` and `RESERVED_EMAIL_DOMAIN` are importable from
+`webbpulse.e2e.ephemeral`. A successful creation is untouched. The gotcha and the
+request-schema-only pattern are written up in `docs/e2e.md`, and the `users` record contract
+in `docs/identity-data-model.md` carries the same line.
+
 ## 0.48.0
 
 ### `e2e`: run-wide access log checks read the gateway fields correctly

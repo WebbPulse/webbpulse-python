@@ -41,7 +41,11 @@ Attributes beyond the keys:
   `#unique#<attr>#<value>` written in the same `TransactWriteItems` as the user record. **A GSI
   MUST NOT be relied on for uniqueness**: a GSI write is asynchronous and a conditional check
   cannot span it. The record is **owned by the product's `users` domain**; identity reads
-  freely and writes only the attributes above, through the `user_repository` hook.
+  freely and writes only the attributes above, through the `user_repository` hook. **The
+  record model must not annotate the address `EmailStr`**: ephemeral e2e users are created on
+  the reserved `e2e.invalid` domain, which `email-validator` refuses with no setting that
+  re-admits it, so an `EmailStr` record model answers 500 on `POST /api/auth/e2e/users`. Keep
+  `EmailStr` on request schemas and let the record hold a plain `local@domain` string.
 - **`credentials`**: the password hash under type `password` (`PASSWORD_CREDENTIAL_TYPE`), kept
   off the user record so a route returning a user cannot serialise a hash.
 - **`passkeys`**: `credential_id`, `public_key` (COSE), `sign_count`, `transports`, `aaguid`,
