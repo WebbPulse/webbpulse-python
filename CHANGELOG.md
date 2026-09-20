@@ -5,6 +5,32 @@ Notable changes to the `webbpulse` package. The version here is the one in
 
 This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## Unreleased
+
+Five gaps `webbpulse.composition` and its isolation check hit on the first product to
+migrate onto them. All five are source-compatible: every default is the behaviour that
+shipped, so an adopter changing nothing sees no change.
+
+- `domain_entrypoint` takes a `configure_logging` callable, given this domain's service
+  name, defaulting to the package's own. A product whose log format is not the package's
+  now passes its own and keeps `settings`, instead of passing `settings=None` and redoing
+  logging, tracing and the secrets check inside `check` to keep the documented order.
+- `entrypoint_imports` defaults `package_root` to `"app.domains."`, the default
+  `assert_entrypoint_isolation` already had and the docs already implied.
+- `entrypoint_imports` and `assert_entrypoint_isolation` take `allowed_foreign`, the
+  exception list for a foreign module every domain legitimately imports, such as the
+  identity glue a product's shared local authorizer is built from. A collection applies to
+  every domain and a mapping applies per domain; anything outside it is refused as before.
+  A listed module covers its own submodules, and the packages between it and `package_root`
+  are allowed exactly, since Python cannot import a submodule without its parents. Naming
+  one module of a domain never opens the rest of it.
+- `Domain` gains `metadata`, a mapping the builder never reads, for product facts such as a
+  `seeds` flag. `extra` is documented as `create_app` keyword arguments and nothing else,
+  since it is forwarded verbatim.
+- `docs/composition.md` gains a migration section on the fields a migrating product must
+  set explicitly, `router_prefix` and `service_name_template`, whose package defaults
+  silently unprefix a product's routes and rename its logged service.
+
 ## 0.47.0
 
 Two whole-run checks in `webbpulse.e2e`, from the Standupless test hardening build, plus the
