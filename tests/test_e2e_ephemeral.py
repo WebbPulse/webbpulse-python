@@ -150,11 +150,16 @@ EMAIL_VALIDATION_ENVELOPE: Any = {
 class TestEmailValidationHint:
     """The hint that names the reserved domain as the reason a product answered 500."""
 
-    def test_a_reserved_domain_address_always_earns_the_hint(self) -> None:
-        """The ephemeral domain is the only reason a product record model rejects this address."""
+    def test_a_500_on_the_reserved_domain_earns_the_hint_with_an_opaque_body(self) -> None:
+        """A production envelope hides the cause, and the domain is the only reason a record model rejects it."""
         hint = email_validation_hint(500, "body=Internal Server Error", f"e2e-run@{RESERVED_EMAIL_DOMAIN}")
         assert "EmailStr" in hint
         assert RESERVED_EMAIL_DOMAIN in hint
+
+    def test_a_gateway_failure_on_the_reserved_domain_gets_no_hint(self) -> None:
+        """Every ephemeral address is on the reserved domain, so the status must carry the decision."""
+        for status in (429, 502, 503, 504):
+            assert email_validation_hint(status, "body=Bad Gateway", f"e2e-run@{RESERVED_EMAIL_DOMAIN}") == ""
 
     def test_a_500_mentioning_email_validation_earns_the_hint(self) -> None:
         """A product may report the validation error without echoing the address."""

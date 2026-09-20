@@ -59,8 +59,9 @@ undeliverable is the point.
 
 What changed is the failure report. `create_ephemeral_user` already raised with the status
 and a bounded body excerpt; it now appends a one-line hint naming `EmailStr` and the reserved
-domain, offered for an address on that domain and for a 500 whose body mentions email
-validation, and withheld otherwise so an unrelated failure is not given a misleading cause.
+domain, offered only on a 500, for an address on that domain or a body that mentions email
+validation, and withheld on every other status so a gateway or throttling failure on the same
+address is not given a misleading cause.
 `email_validation_hint` and `RESERVED_EMAIL_DOMAIN` are importable from
 `webbpulse.e2e.ephemeral`. A successful creation is untouched. The gotcha and the
 request-schema-only pattern are written up in `docs/e2e.md`, and the `users` record contract

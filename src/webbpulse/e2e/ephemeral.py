@@ -153,15 +153,18 @@ _EMAIL_HINT: Final = (
 def email_validation_hint(status_code: int, body: str, email: str) -> str:
     """The one-line `EmailStr` hint when this failure looks like the reserved-domain trap.
 
-    Offered for a 500 whose rendered body mentions email validation, and for any address on
-    the reserved ephemeral domain, since that domain is the only reason a product's own
-    record model would reject an address the shared identity flow already accepted. The
-    empty string whenever neither holds, so an unrelated failure is not given a misleading
-    explanation.
+    Offered only for a 500, which is what a record model rejecting the address produces: for
+    any address on the reserved ephemeral domain, since that domain is the only reason a
+    product's own record model would reject an address the shared identity flow already
+    accepted and a production error envelope hides the cause, and for a body that mentions
+    email validation whatever the address. The empty string for every other status, so a
+    gateway or throttling failure on the same address is not given a misleading explanation.
     """
+    if status_code != 500:
+        return ""
     on_reserved_domain = email.rsplit("@", 1)[-1].lower() == RESERVED_EMAIL_DOMAIN
     lowered = body.lower()
-    mentions_email = status_code == 500 and any(marker in lowered for marker in _EMAIL_VALIDATION_MARKERS)
+    mentions_email = any(marker in lowered for marker in _EMAIL_VALIDATION_MARKERS)
     if not on_reserved_domain and not mentions_email:
         return ""
     return _EMAIL_HINT
