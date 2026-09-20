@@ -48,11 +48,13 @@ __all__ = [
     "SHARE_TOKEN_PREFIX",
     "SHARE_TOKEN_SUBJECT",
     "SHARE_TOKEN_TABLE",
+    "SHARE_TOKEN_TARGET_INDEX",
     "SHARE_TOKEN_TENANT_INDEX",
     "DynamoShareTokenStore",
     "FakeShareTokenStore",
     "InMemoryShareTokenStore",
     "MintedShareToken",
+    "ShareTarget",
     "ShareTokenRecord",
     "ShareTokenStore",
     "claims_for_share_token",
@@ -63,6 +65,7 @@ __all__ = [
     "mint_share_token",
     "new_share_token",
     "revoke_share_token",
+    "share_target_key",
     "share_token_capability",
     "share_token_credential",
     "verify_share_token",
@@ -78,6 +81,18 @@ SHARE_TOKEN_TENANT_INDEX: Final = "tenant_id-created_at-index"
 
 Partitioning by the token hash is what makes resolving a presented token one point read, and
 it is also what leaves "every share in this tenant" unanswerable without this index.
+"""
+
+SHARE_TOKEN_TARGET_INDEX: Final = "tenant_id-target_key-index"
+"""The GSI listing every share token pointing at one target inside one tenant.
+
+Hash `tenant_id` and range `target_key`, which is what makes "every link onto this issue" and
+"revoke everything pointing at this view" one query each rather than a tenant-wide read
+filtered afterwards. The range key carries the type and the id together, so a caller holding
+several visible targets fans out over exact keys and never fetches a row it may not see.
+
+The name is a contract with `platform-modules/aws//modules/identity`, which provisions the
+same index under the same name.
 """
 
 SHARE_TOKEN_PREFIX: Final = "wps_"
@@ -139,6 +154,59 @@ def _now() -> datetime:
 
 
 @dataclass(frozen=True, slots=True)
+class ShareTarget:
+    """The one resource a share token opens, as a type and an id.
+
+    A first-class field rather than a convention inside `capability`, because it is the only
+    part of the payload this package has to understand: it is what `SHARE_TOKEN_TARGET_INDEX`
+    is keyed on, so "every link onto this issue" is a query rather than a filter. Everything
+    else about what the token grants stays opaque in `capability`.
+
+    The type is the product's own vocabulary, such as `issue`, `view` or `album`. Nothing here
+    validates it, for the same reason nothing here interprets `capability`.
+    """
+
+    type: str
+    id: str
+
+    @property
+    def key(self) -> str:
+        """The stored `target_key`: the type and the id joined by a `#`.
+
+        The tenant is not in it. The index hash key carries the tenant already, so repeating it
+        here would only make the range key longer without bounding anything further.
+        """
+        return share_target_key(self.type, self.id)
+
+    def __bool__(self) -> bool:
+        """Whether this names a target at all, so an unset one is falsey."""
+        return bool(self.type and self.id)
+
+
+def share_target_key(target_type: str, target_id: str) -> str:
+    """The `target_key` attribute for one target: `"<type>#<id>"`.
+
+    A module-level function as well as a property, so a caller holding two loose strings can
+    build the key without constructing a value type first.
+    """
+    return f"{target_type}#{target_id}"
+
+
+def _coerce_target(target: ShareTarget | tuple[str, str] | None) -> ShareTarget:
+    """One target from whichever spelling a caller had, or an empty one.
+
+    A pair is accepted beside the value type because a product listing several targets usually
+    has tuples in hand, and requiring a construction per element would be noise.
+    """
+    if target is None:
+        return ShareTarget(type="", id="")
+    if isinstance(target, ShareTarget):
+        return target
+    target_type, target_id = target
+    return ShareTarget(type=str(target_type), id=str(target_id))
+
+
+@dataclass(frozen=True, slots=True)
 class ShareTokenRecord:
     """One stored share token. Holds the hash and never the plaintext.
 
@@ -146,17 +214,39 @@ class ShareTokenRecord:
     small and closed: it is the whole of what the token grants, so a field this package would
     have to widen later, such as a filter applied after the fact, belongs in the row rather
     than in the request.
+
+    `target_type` and `target_id` are the exception: the one part of the payload this package
+    understands, because `SHARE_TOKEN_TARGET_INDEX` is keyed on them and revoking every link
+    onto a deleted resource has to be a query. They are stored flat, and `target` reads them
+    back as a `ShareTarget`. Both default empty, so a record minted before they existed is
+    still a valid record and simply has no target to list by.
     """
 
     token_hash: str
     tenant_id: str
     capability: Mapping[str, Any] = field(default_factory=dict)
+    target_type: str = ""
+    target_id: str = ""
     name: str = ""
     created_by: str = ""
     created_at: str = ""
     expires_at: int = 0
     last_used_at: str = ""
     revoked_at: str = ""
+
+    @property
+    def target(self) -> ShareTarget:
+        """The resource this token opens, as a value type. Empty when the row names none."""
+        return ShareTarget(type=self.target_type, id=self.target_id)
+
+    @property
+    def target_key(self) -> str:
+        """The stored `target_key`, or `""` when this row names no target.
+
+        Empty rather than `"#"` for an unset target, because the attribute is what makes a row
+        appear in the index and a row with no target must stay out of it entirely.
+        """
+        return self.target.key if self.target else ""
 
     @property
     def is_revoked(self) -> bool:
@@ -226,6 +316,50 @@ class ShareTokenStore(ABC):
     def delete_all_for_tenant(self, tenant_id: str) -> int:
         """Delete every share token of one tenant, returning how many went. The purge."""
 
+    def list_for_target(self, tenant_id: str, target: ShareTarget | tuple[str, str]) -> list[ShareTokenRecord]:
+        """Every share token of one tenant pointing at one target, oldest first.
+
+        The listing a product needs to show "this issue is shared" beside the issue, and to
+        revoke every link onto a resource it is about to delete. A tenant-wide read filtered
+        afterwards would answer the same question, but it would also fetch rows for targets the
+        caller may not see, which is exactly what a per-target query avoids.
+
+        Concrete rather than abstract so a store written before this method existed keeps
+        satisfying the protocol. The default answers empty rather than scanning, for the reason
+        `ApiKeyStore.list_for_tenant` gives: a silent scan is worse than an empty list.
+
+        Args:
+            tenant_id: The tenant to look inside. An empty one answers empty rather than
+                spanning tenants.
+            target: The resource, as a `ShareTarget` or a `(type, id)` pair.
+
+        Returns:
+            The matching records, oldest first, revoked and expired ones included.
+        """
+        del tenant_id, target
+        return []
+
+    def revoke_all_for_target(
+        self,
+        tenant_id: str,
+        target: ShareTarget | tuple[str, str],
+        *,
+        revoked_at: str | None = None,
+    ) -> int:
+        """Revoke every live share token onto one target, returning how many were revoked.
+
+        The verb for a resource being deleted or made private: its links must stop resolving at
+        once, and a link nobody remembered is exactly the one that would otherwise outlive it.
+
+        Built on `list_for_target`, so a store that cannot list a target revokes nothing and
+        says so by returning zero rather than appearing to have succeeded.
+        """
+        revoked = 0
+        for record in self.list_for_target(tenant_id, target):
+            if not record.is_revoked and self.revoke(record.token_hash, revoked_at=revoked_at) is not None:
+                revoked += 1
+        return revoked
+
     def revoke_all_for_tenant(self, tenant_id: str, *, revoked_at: str | None = None) -> int:
         """Revoke every live share token of one tenant, returning how many were revoked.
 
@@ -284,6 +418,20 @@ class InMemoryShareTokenStore(ShareTokenStore):
             del self._items[token_hash]
         return len(hashes)
 
+    def list_for_target(self, tenant_id: str, target: ShareTarget | tuple[str, str]) -> list[ShareTokenRecord]:
+        """Every token of one tenant onto one target, oldest first, matching the index order."""
+        wanted = _coerce_target(target)
+        if not tenant_id or not wanted:
+            return []
+        return sorted(
+            (
+                record
+                for record in self._items.values()
+                if record.tenant_id == tenant_id and record.target_key == wanted.key
+            ),
+            key=lambda record: record.created_at,
+        )
+
 
 FakeShareTokenStore = InMemoryShareTokenStore
 """The name a test reaches for, aliasing `InMemoryShareTokenStore`."""
@@ -294,11 +442,17 @@ def _record_to_item(record: ShareTokenRecord) -> dict[str, Any]:
 
     A map rather than a string because DynamoDB stores one natively and a product that wants
     a projection or a filter on one of its fields can then have it, which a blob forecloses.
+
+    `target_key` is written only when the row names a target. A sparse attribute keeps a
+    targetless row out of `SHARE_TOKEN_TARGET_INDEX` entirely, rather than collecting every
+    such row under one degenerate key.
     """
-    return {
+    item: dict[str, Any] = {
         "token_hash": record.token_hash,
         "tenant_id": record.tenant_id,
         "capability": dict(record.capability),
+        "target_type": record.target_type,
+        "target_id": record.target_id,
         "name": record.name,
         "created_by": record.created_by,
         "created_at": record.created_at,
@@ -306,16 +460,26 @@ def _record_to_item(record: ShareTokenRecord) -> dict[str, Any]:
         "last_used_at": record.last_used_at,
         "revoked_at": record.revoked_at,
     }
+    if record.target_key:
+        item["target_key"] = record.target_key
+    return item
 
 
 def _record_from_item(item: Mapping[str, Any]) -> ShareTokenRecord:
-    """Rebuild a record from a DynamoDB item, tolerating an absent optional attribute."""
+    """Rebuild a record from a DynamoDB item, tolerating an absent optional attribute.
+
+    `target_key` is not read back: it is derived from `target_type` and `target_id`, so the
+    stored copy exists only to key the index and a row written before it existed simply has
+    no target.
+    """
     raw_capability = item.get("capability")
     capability = dict(raw_capability) if isinstance(raw_capability, Mapping) else {}
     return ShareTokenRecord(
         token_hash=str(item["token_hash"]),
         tenant_id=str(item.get("tenant_id", "")),
         capability=capability,
+        target_type=str(item.get("target_type", "")),
+        target_id=str(item.get("target_id", "")),
         name=str(item.get("name", "")),
         created_by=str(item.get("created_by", "")),
         created_at=str(item.get("created_at", "")),
@@ -405,6 +569,29 @@ class DynamoShareTokenStore(ShareTokenStore):
             return 0
         return self._repo.delete_many(keys)
 
+    def list_for_target(self, tenant_id: str, target: ShareTarget | tuple[str, str]) -> list[ShareTokenRecord]:
+        """Every token onto one target, oldest first, from `SHARE_TOKEN_TARGET_INDEX`.
+
+        One query on the exact index key, never a tenant read with a filter: the range key is
+        the whole target, so DynamoDB returns the rows for that one resource and nothing else
+        is read or paid for. The read may be slightly stale, as any GSI read is.
+
+        Sorted here rather than by the index. The range key is the target, which is what makes
+        the query exact, and that leaves the order within one target the table's own rather
+        than creation order. One target's links are few by construction, so sorting them in
+        memory costs nothing and the ordering stays the same as every other listing's.
+        """
+        from boto3.dynamodb.conditions import Key as KeyCondition
+
+        wanted = _coerce_target(target)
+        if not tenant_id or not wanted:
+            return []
+        condition = KeyCondition("tenant_id").eq(tenant_id) & KeyCondition("target_key").eq(wanted.key)
+        records = [
+            _record_from_item(item) for item in self._repo.iter_query(condition, index_name=SHARE_TOKEN_TARGET_INDEX)
+        ]
+        return sorted(records, key=lambda record: record.created_at)
+
 
 SHARE_TOKEN_TABLE: Final = TableSpec(
     logical_name=SHARE_TOKENS_TABLE,
@@ -412,9 +599,13 @@ SHARE_TOKEN_TABLE: Final = TableSpec(
         TableAttribute("token_hash", "S"),
         TableAttribute("tenant_id", "S"),
         TableAttribute("created_at", "S"),
+        TableAttribute("target_key", "S"),
     ),
     hash_key="token_hash",
-    global_secondary_indexes=(TableIndex(name=SHARE_TOKEN_TENANT_INDEX, hash_key="tenant_id", range_key="created_at"),),
+    global_secondary_indexes=(
+        TableIndex(name=SHARE_TOKEN_TENANT_INDEX, hash_key="tenant_id", range_key="created_at"),
+        TableIndex(name=SHARE_TOKEN_TARGET_INDEX, hash_key="tenant_id", range_key="target_key"),
+    ),
     ttl_attribute=IDENTITY_TTL_ATTRIBUTE,
 )
 """The `share-tokens` table spec, in the shape the platform identity module provisions it.
@@ -428,6 +619,7 @@ def mint_share_token(
     *,
     tenant_id: str,
     capability: Mapping[str, Any] | None = None,
+    target: ShareTarget | tuple[str, str] | None = None,
     name: str = "",
     created_by: str = "",
     expires_at: datetime | int | None = None,
@@ -447,6 +639,10 @@ def mint_share_token(
         capability: The payload naming exactly what this token opens. Opaque to this package
             and read back by the product out of `record.capability`. Keep it closed: whatever
             it does not name, the token does not grant.
+        target: The one resource this token points at, as a `ShareTarget` or a `(type, id)`
+            pair. The only part of the grant this package understands, because it is what
+            `list_for_target` and `revoke_all_for_target` query on. `None` mints a token with
+            no target, which resolves exactly as before and simply cannot be listed by one.
         name: A label the owner recognises the share by in a list.
         created_by: The user who minted it, for the listing and for an audit line.
         expires_at: When the share stops resolving, as a datetime or a Unix timestamp.
@@ -466,10 +662,13 @@ def mint_share_token(
         expiry = int((_now() + expires_in).timestamp())
     else:
         expiry = 0
+    wanted = _coerce_target(target)
     record = ShareTokenRecord(
         token_hash=hash_share_token(plaintext),
         tenant_id=tenant_id,
         capability=dict(capability or {}),
+        target_type=wanted.type,
+        target_id=wanted.id,
         name=name,
         created_by=created_by,
         created_at=created_at or now_iso(),

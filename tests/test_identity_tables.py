@@ -4,11 +4,11 @@ The expected specs below are a literal transcription of the `tables` default in
 `platform-modules/aws//modules/identity`. They are written out rather than derived, so a
 change to either side has to be made in both places deliberately.
 
-Two of them are ahead of the module and are what a terraform change has to catch up with: the
-`tenant_id-created_at-index` on `api-keys`, and the whole `share-tokens` table. Until that
-lands, a deployment provisioned by the module answers `list_for_tenant` with a
-`ValidationException` on the missing index, and a product using share tokens has no table at
-all. See CHANGELOG.md for the exact key schema.
+Some of them are ahead of the module and are what a terraform change has to catch up with:
+the `tenant_id-created_at-index` on `api-keys`, and the whole `share-tokens` table with both
+of its indexes. Until that lands, a deployment provisioned by the module answers
+`list_for_tenant` with a `ValidationException` on the missing index, and a product using
+share tokens has no table at all. See CHANGELOG.md for the exact key schema.
 """
 
 from __future__ import annotations
@@ -35,6 +35,7 @@ from webbpulse.identity import (
     REFRESH_FAMILY_INDEX,
     REFRESH_TOKENS_TABLE,
     REFRESH_USER_INDEX,
+    SHARE_TOKEN_TARGET_INDEX,
     SHARE_TOKEN_TENANT_INDEX,
     SHARE_TOKENS_TABLE,
     TABLES,
@@ -127,10 +128,13 @@ MODULE_TABLES: dict[str, dict[str, Any]] = {
         "ttl_attribute": None,
     },
     "share-tokens": {
-        "attributes": [("token_hash", "S"), ("tenant_id", "S"), ("created_at", "S")],
+        "attributes": [("token_hash", "S"), ("tenant_id", "S"), ("created_at", "S"), ("target_key", "S")],
         "hash_key": "token_hash",
         "range_key": None,
-        "global_secondary_indexes": [("tenant_id-created_at-index", "tenant_id", "created_at", "ALL")],
+        "global_secondary_indexes": [
+            ("tenant_id-created_at-index", "tenant_id", "created_at", "ALL"),
+            ("tenant_id-target_key-index", "tenant_id", "target_key", "ALL"),
+        ],
         "ttl_attribute": "expires_at",
     },
 }
@@ -174,7 +178,10 @@ def test_index_names_are_the_package_constants() -> None:
         API_KEY_USER_INDEX,
         API_KEY_TENANT_INDEX,
     ]
-    assert [index.name for index in BY_NAME[SHARE_TOKENS_TABLE].global_secondary_indexes] == [SHARE_TOKEN_TENANT_INDEX]
+    assert [index.name for index in BY_NAME[SHARE_TOKENS_TABLE].global_secondary_indexes] == [
+        SHARE_TOKEN_TENANT_INDEX,
+        SHARE_TOKEN_TARGET_INDEX,
+    ]
 
 
 @pytest.mark.parametrize("logical", sorted(MODULE_TABLES))

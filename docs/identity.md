@@ -343,6 +343,73 @@ against a tenant id, answering true for claims carrying no tenant at all: a sess
 unbound, because a person's authority is their membership read fresh in whichever tenant the
 path names, and an unbound credential is not one bound somewhere else.
 
+### Key ids, kinds and the per-tenant cap
+
+A record carries four fields a product would otherwise keep in a table of its own, all of
+them optional and all of them defaulted, so nothing that mints a key today changes.
+
+`key_id` is the revoke handle. It is deliberately not the hash: a settings page that has to
+name the hash to revoke a key renders a value one hash away from the credential, whereas an
+id is a name and can go in a URL. `mint` allocates one, `revoke_api_key_by_id` spends it, and
+neither ever holds a secret:
+
+```python
+from webbpulse.identity import mint_api_key, revoke_api_key_by_id
+
+minted = mint_api_key(
+    user_id=subject,
+    tenant_id=workspace.id,
+    scopes=payload.scopes,
+    name=payload.name,
+    kind="workspace",
+    created_by=actor.id,
+    metadata={"label": payload.label},
+    store=store,
+)
+return {"key_id": minted.record.key_id, "secret": minted.plaintext}
+
+
+revoke_api_key_by_id(workspace.id, key_id, store)
+```
+
+The tenant comes first on every id-taking call, so a key id from one product's URL can never
+resolve a row in another tenant even if the id were guessed. An unknown id, a key in another
+tenant and one already revoked are all `None`, so ids cannot be walked to learn which exist.
+
+`kind` is free-form and defaults to `KIND_USER`. Nothing in the package interprets it; the
+usual second kind is a service key whose subject is the tenant rather than a person, which
+matters because it survives its minter leaving. `created_by` records who minted a key when
+that is someone other than its subject, and is `None` rather than `""` when unrecorded, so
+"not recorded" stays distinguishable from "recorded as nobody". `metadata` is a mapping the
+store round-trips untouched.
+
+A record written before any of this existed loads unchanged: the id comes back empty, the
+kind defaults, the creator is `None` and the metadata is empty. `revoke_handle` is what a
+caller reads for a handle either way, answering the `key_id` when there is one and the hash
+when there is not, and `revoke_api_key_by_id` accepts both. Nothing is backfilled, so a
+listing renders an id for a new key and a hash for an old one.
+
+`count_for_tenant` is the cap check, and it is cheap enough to run on every create:
+`DynamoApiKeyStore` answers it with a `Select="COUNT"` query on `tenant_id-created_at-index`,
+which counts index entries server side and returns no items at all. It paginates, so a tenant
+whose entries spill past 1 MB cannot be walked past its cap. Never a scan.
+
+```python
+if store.count_for_tenant(workspace.id) >= MAX_KEYS_PER_TENANT:
+    raise HTTPException(status_code=409, detail=AT_LIMIT)
+```
+
+It counts every row, revoked ones included, because "how many rows exist" is what an index
+counts cheaply and "how many are still usable" is not: revocation is an attribute rather than
+a key, so counting around it would mean reading the rows. A product capping only live keys
+subtracts them itself.
+
+`get_by_id`, `revoke_by_id` and `count_for_tenant` are concrete rather than abstract on
+`ApiKeyStore`, so a store written before they existed still satisfies the protocol; the
+defaults are built on `list_for_tenant`, which means a store with no tenant index answers
+nothing rather than scanning. `webbpulse.testing.assert_api_key_store_contract` holds a
+product's own store to all of it from one test.
+
 ## Share tokens
 
 `webbpulse.identity.share_tokens` is the third credential kind, beside a session JWT and an
@@ -382,6 +449,47 @@ because the reader is anonymous and telling those apart says whether a guessed v
 existed. `revoke_share_token` takes either the plaintext or the stored hash, and a store
 offers `list_for_tenant`, `revoke_all_for_tenant` and `delete_all_for_tenant` for the settings
 page and the tenant purge.
+
+### Sharing a named target
+
+`capability` is opaque, which leaves one question the package has to answer itself: "every
+link onto this issue". A tenant-wide listing filtered afterwards would answer it, but it
+would also fetch rows for targets the caller may not see, so the target is a first-class
+field rather than a convention inside the payload.
+
+```python
+from webbpulse.identity import ShareTarget, mint_share_token
+
+minted = mint_share_token(
+    tenant_id=workspace.id,
+    target=ShareTarget(type="issue", id=issue.id),
+    capability={"project_id": issue.project_id, "title": issue.title},
+    store=store,
+)
+
+links = store.list_for_target(workspace.id, ("issue", issue.id))
+store.revoke_all_for_target(workspace.id, ("issue", issue.id))
+```
+
+It is stored flat, as `target_type` and `target_id` plus a `target_key` of `"<type>#<id>"`,
+and `record.target` reads it back as a `ShareTarget`. A `(type, id)` pair is accepted
+anywhere the value type is, because a product listing several targets usually has tuples in
+hand. Everything else about what a token grants stays in `capability`.
+
+`list_for_target` is one query on `tenant_id-target_key-index`, hash `tenant_id` and range
+`target_key`, so the tenant bounds the read and the range key names the whole target: the
+rows for that one resource come back and nothing else is read or paid for. Never a scan, and
+never a tenant read with a filter. A caller holding several visible targets fans out over
+exact keys, which is what keeps an invisible target's links from being fetched at all.
+`revoke_all_for_target` is the verb for a resource being deleted or made private, built on
+the listing so a store that cannot list revokes nothing and returns zero rather than
+appearing to have succeeded.
+
+The target is optional and the index is sparse: a token minted without one carries no
+`target_key`, stays out of the index entirely rather than collecting under a degenerate key,
+and resolves exactly as it always did. `list_for_target` is concrete on `ShareTokenStore`, so
+a store written before it existed still satisfies the protocol, and
+`webbpulse.testing.assert_share_token_store_contract` holds a product's own store to it.
 
 `claims_or_credential` resolves all three kinds into one claims object, in the order JWT, API
 key, share token, so the weakest is consulted only where neither stronger one arrived and
@@ -430,19 +538,26 @@ matching flag; until then a product using share tokens has no table at all.
 | range key | `created_at` |
 | projection | `ALL` |
 
-`share-tokens` is a new table:
+`share-tokens` is a new table, with two indexes:
 
 | | |
 | --- | --- |
-| attributes | `token_hash` (`S`), `tenant_id` (`S`), `created_at` (`S`) |
+| attributes | `token_hash` (`S`), `tenant_id` (`S`), `created_at` (`S`), `target_key` (`S`) |
 | hash key | `token_hash` |
 | range key | none |
-| index name | `tenant_id-created_at-index` |
-| index hash key | `tenant_id` |
-| index range key | `created_at` |
-| projection | `ALL` |
+| projection | `ALL` on both indexes |
 | TTL attribute | `expires_at` |
 | billing | `PAY_PER_REQUEST` |
+
+| index name | hash key | range key |
+| --- | --- | --- |
+| `tenant_id-created_at-index` | `tenant_id` | `created_at` |
+| `tenant_id-target_key-index` | `tenant_id` | `target_key` |
+
+`tenant_id-target_key-index` is sparse: `target_key` is written only when a row names a
+target, so a token minted without one stays out of the index rather than collecting under a
+degenerate key. Those index names and keys are a contract with the module, which provisions
+the same two.
 
 Adding a GSI to a live `api-keys` table is an online operation and no data has to be
 backfilled: every row already carries `tenant_id`, because `mint` has always written it, so
@@ -453,7 +568,15 @@ rows appear in the new index as it builds.
 Standupless keeps two shims this module replaces once the tables exist. `WorkspaceApiKeyStore`
 and its `key_hash-index` go away: `ApiKeyRepository.list_for_workspace` becomes
 `store.list_for_tenant(workspace_id)`, and `_check_tenant_binding` becomes `tenant_matches`
-or `claims_or_api_key(tenant=...)`. `share_links.py` becomes `DynamoShareTokenStore`, with
-`target_type`, `target_id`, `project_id` and `title` moving into `capability` and the
-`ws_target-index` dropped. Existing `shr_` links do not migrate, since the package hashes
-`wps_` tokens; re-mint them or read the old table until they expire.
+or `claims_or_api_key(tenant=...)`. `share_links.py` becomes `DynamoShareTokenStore`: `target_type` and
+`target_id` become the record's own target, `project_id` and `title` move into `capability`,
+and `ws_target-index` becomes `tenant_id-target_key-index`. The key splits differently, the
+product's `<ws>#<type>#<id>` hash against the package's `tenant_id` hash with a `<type>#<id>`
+range, and both scope a listing to one tenant and one target, so `list_for_target` and
+`list_for_targets` map straight across. Existing `shr_` links do not migrate, since the
+package hashes `wps_` tokens; re-mint them or read the old table until they expire.
+
+On the key side, `ApiKey`'s `key_id`, `kind` and `created_by` are now on `ApiKeyRecord`,
+`new_key_id` is `new_api_key_id`, `ApiKeyRepository.revoke(workspace_id, key_id)` is
+`revoke_api_key_by_id`, and `count_for_workspace` is `count_for_tenant`, with the caveat that
+the package's count includes revoked rows.

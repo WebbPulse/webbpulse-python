@@ -31,6 +31,52 @@ shipped, so an adopter changing nothing sees no change.
   set explicitly, `router_prefix` and `service_name_template`, whose package defaults
   silently unprefix a product's routes and rename its logged service.
 
+The tenant-facing half of `webbpulse.identity.api_keys` and `webbpulse.identity.share_tokens`,
+so a multi-tenant product can list, cap and revoke its own credentials without a table beside
+the package's. Everything here is additive: every new field is optional with a default, every
+new store method is concrete on the base class, and no existing caller changes.
+
+A share token now names a target. `ShareTarget` is a type and an id, stored flat as
+`target_type`, `target_id` and a `target_key` of `"<type>#<id>"`, and `record.target` reads it
+back. `list_for_target` and `revoke_all_for_target` answer "every link onto this issue" and
+"revoke everything pointing at this view" through the new `tenant_id-target_key-index` GSI,
+hash `tenant_id` and range `target_key`, which is one query on an exact key rather than a
+tenant read filtered afterwards. That distinction is the point: a filtered listing fetches
+rows for targets the caller may not be allowed to see, and a product whose authorization rule
+is "never fetch an invisible project's links" cannot use one. The index name and keys are a
+contract with `platform-modules/aws//modules/identity`, which is adding the same index. The
+attribute is sparse, so a token minted with no target stays out of the index and resolves
+exactly as before. Never a scan.
+
+An API key record gained `key_id`, `kind`, `created_by` and `metadata`. `key_id` is a revoke
+handle that is not the hash, allocated by `mint` and spent by `revoke_api_key_by_id`, so a
+settings page revokes by a name in a URL rather than by a value one hash away from the
+credential. `kind` is free-form and defaults to `"user"`; `created_by` records who minted a
+key whose subject is not a person, and is `None` rather than `""` when unrecorded; `metadata`
+round-trips through the store untouched. `count_for_tenant` is the per-create cap check, and
+`DynamoApiKeyStore` answers it with a paginated `Select="COUNT"` query on
+`tenant_id-created_at-index` that counts index entries server side and returns no rows at all.
+
+Records written before any of this load unchanged. A row with no `key_id` comes back with an
+empty one and `revoke_handle` falls back to the hash, which `revoke_by_id` also accepts, so an
+old key stays revocable by the same call as a new one; nothing is backfilled, so a listing
+renders an id for a new key and a hash for an old one. A missing `kind` defaults, a missing
+creator is `None`, and missing metadata is an empty mapping.
+
+`webbpulse.testing` gained `assert_api_key_store_contract` and
+`assert_share_token_store_contract`, which hold a product's own store implementation to all of
+the above from one test, in the shape `assert_users_repository_contract` already had.
+
+Standupless deletes `backend/app/common/db/dynamo/share_links.py` and the
+`WorkspaceApiKeyStore` half of `api_keys.py` once it adopts. `ws_target-index` becomes
+`tenant_id-target_key-index`, `list_for_target` and `list_for_targets` map straight across,
+`project_id` and `title` move into `capability`, `new_key_id` becomes `new_api_key_id`,
+`ApiKeyRepository.revoke(workspace_id, key_id)` becomes `revoke_api_key_by_id`, and
+`count_for_workspace` becomes `count_for_tenant`. The `svc#<workspace_id>` service subject and
+the 25-key cap stay the product's own: the package stores the subject a product hands it and
+counts rows, and neither the prefix nor the number is the package's to choose. The package's
+count includes revoked rows, so a product capping only live keys subtracts them itself.
+
 ## 0.47.0
 
 Two whole-run checks in `webbpulse.e2e`, from the Standupless test hardening build, plus the
@@ -90,7 +136,6 @@ the run never needed, and each product was working around it locally. `environme
 returns None for a wholly unset shell and the suite parametrises a skipped placeholder. A
 partially configured shell still raises, because that is a wiring mistake and skipping past
 one is how a suite goes green against nothing.
-
 
 ## 0.46.0
 

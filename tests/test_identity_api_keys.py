@@ -16,6 +16,8 @@ from webbpulse.identity.api_keys import (
     ACTOR_API_KEY,
     ACTOR_CLAIM,
     API_KEY_PREFIX,
+    API_KEY_TABLE,
+    KIND_USER,
     PREFIX_DISPLAY_LENGTH,
     TENANT_CLAIM,
     ApiKeyRecord,
@@ -26,7 +28,9 @@ from webbpulse.identity.api_keys import (
     is_api_key,
     mint,
     new_key,
+    new_key_id,
     revoke,
+    revoke_by_id,
     verify,
 )
 from webbpulse.identity.claims import AuthorizerClaims
@@ -40,6 +44,7 @@ from webbpulse.identity.scopes import (
     missing_scopes,
     require_scopes,
 )
+from webbpulse.testing import assert_api_key_store_contract
 
 if TYPE_CHECKING:  # pragma: no cover
     from fastapi.testclient import TestClient
@@ -388,3 +393,124 @@ def test_a_record_reports_its_own_state() -> None:
     assert not record.is_revoked
     assert dataclasses.replace(record, revoked_at="2026-01-01T00:00:00Z").is_revoked
     assert not dataclasses.replace(record, revoked_at="2026-01-01T00:00:00Z").is_usable()
+
+
+def test_a_fresh_key_id_is_unique_and_is_not_the_secret() -> None:
+    """The revoke handle is a name, never anything derived from the credential."""
+    ids = {new_key_id() for _ in range(32)}
+
+    assert len(ids) == 32
+    assert all(not is_api_key(one) for one in ids)
+
+
+def test_a_minted_key_carries_the_product_dimensions(store: FakeApiKeyStore) -> None:
+    """`kind`, `created_by` and `metadata` reach the record and round trip through the store."""
+    minted = mint(
+        user_id="svc#t1",
+        tenant_id="t1",
+        scopes=["issues:read"],
+        store=store,
+        kind="workspace",
+        created_by="u1",
+        metadata={"label": "ci"},
+    )
+
+    assert minted.record.key_id
+    assert minted.record.kind == "workspace"
+    assert minted.record.created_by == "u1"
+    assert minted.record.metadata == {"label": "ci"}
+
+    stored = store.get(minted.record.key_hash)
+
+    assert stored is not None
+    assert stored.kind == "workspace"
+    assert stored.created_by == "u1"
+    assert stored.metadata == {"label": "ci"}
+
+
+def test_minting_without_the_new_arguments_stays_exactly_as_it_was(store: FakeApiKeyStore) -> None:
+    """Every new field is optional, so a caller written before them mints the same key."""
+    minted = mint(user_id="u1", tenant_id="t1", scopes=["issues:read"], store=store)
+
+    assert minted.record.kind == KIND_USER
+    assert minted.record.created_by is None
+    assert minted.record.metadata == {}
+    assert verify(minted.plaintext, store) is not None
+
+
+def test_a_caller_may_adopt_an_id_it_allocated(store: FakeApiKeyStore) -> None:
+    """A product writing the row in its own transaction passes the id it already chose."""
+    minted = mint(user_id="u1", tenant_id="t1", scopes=[], store=store, key_id="chosen")
+
+    assert minted.record.key_id == "chosen"
+    assert store.get_by_id("t1", "chosen") is not None
+
+
+def test_a_record_without_a_key_id_falls_back_to_its_hash() -> None:
+    """A row written before `key_id` existed is still revocable, through its hash."""
+    record = ApiKeyRecord(key_hash="abc", user_id="u1", tenant_id="t1", prefix="wpk_abc")
+
+    assert record.key_id == ""
+    assert record.revoke_handle == "abc"
+    assert dataclasses.replace(record, key_id="k1").revoke_handle == "k1"
+
+
+def test_revoking_by_id_needs_no_secret(store: FakeApiKeyStore) -> None:
+    """The settings-page verb: an id from a listing revokes, and never crosses a tenant."""
+    minted = mint(user_id="u1", tenant_id="t1", scopes=[], store=store)
+    key_id = minted.record.key_id
+
+    assert revoke_by_id("t2", key_id, store) is None, "A key id must not resolve in another tenant."
+    assert verify(minted.plaintext, store) is not None
+
+    assert revoke_by_id("t1", key_id, store) is not None
+    assert revoke_by_id("t1", key_id, store) is None
+    assert verify(minted.plaintext, store) is None
+
+
+def test_counting_a_tenant_gates_a_create(store: FakeApiKeyStore) -> None:
+    """The cap check counts every row of one tenant and nothing of another's."""
+    assert store.count_for_tenant("t1") == 0
+
+    for index in range(3):
+        mint(user_id="u1", tenant_id="t1", scopes=[], store=store, created_at=f"2026-01-0{index + 1}T00:00:00Z")
+    mint(user_id="u2", tenant_id="t2", scopes=[], store=store)
+
+    assert store.count_for_tenant("t1") == 3
+    assert store.count_for_tenant("t2") == 1
+    assert store.count_for_tenant("missing") == 0
+
+    store.revoke_all_for_tenant("t1")
+
+    assert store.count_for_tenant("t1") == 3, "A revoked row still exists, so the count still counts it."
+
+
+def test_the_in_memory_store_satisfies_the_api_key_contract(store: FakeApiKeyStore) -> None:
+    """The reusable contract an adopting product runs against its own key store."""
+    assert_api_key_store_contract(store)
+
+
+def test_the_dynamo_key_store_answers_the_new_methods(dynamodb_resource: Any) -> None:
+    """Id lookup, revoke by id and the counted query against a real DynamoDB, moto backed."""
+    from webbpulse.dynamodb import Repository
+    from webbpulse.identity.api_keys import DynamoApiKeyStore
+
+    dynamodb_resource.meta.client.create_table(**API_KEY_TABLE.create_table_request("wp-local"))
+    store = DynamoApiKeyStore(Repository(API_KEY_TABLE.logical_name, prefix="wp-local"))
+
+    assert_api_key_store_contract(store)
+
+
+def test_the_dynamo_key_store_counts_past_one_page(dynamodb_resource: Any) -> None:
+    """The counted query follows `LastEvaluatedKey`, so a cap cannot be walked past."""
+    from webbpulse.dynamodb import Repository
+    from webbpulse.identity.api_keys import DynamoApiKeyStore
+
+    dynamodb_resource.meta.client.create_table(**API_KEY_TABLE.create_table_request("wp-local"))
+    store = DynamoApiKeyStore(Repository(API_KEY_TABLE.logical_name, prefix="wp-local"))
+
+    for index in range(30):
+        mint(user_id="u1", tenant_id="t1", scopes=[], store=store, created_at=f"2026-01-01T00:00:{index:02d}Z")
+
+    assert store.count_for_tenant("t1") == 30
+    assert store.count_for_tenant("t2") == 0

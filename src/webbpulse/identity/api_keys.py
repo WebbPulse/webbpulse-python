@@ -16,9 +16,10 @@ import dataclasses
 import hashlib
 import logging
 import secrets
+import uuid
 from abc import ABC, abstractmethod
 from collections.abc import Iterable, Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Any, Final
 
@@ -43,6 +44,7 @@ __all__ = [
     "API_KEY_TENANT_INDEX",
     "API_KEY_USER_INDEX",
     "KEY_BYTES",
+    "KIND_USER",
     "PREFIX_DISPLAY_LENGTH",
     "TENANT_CLAIM",
     "ApiKeyRecord",
@@ -57,7 +59,9 @@ __all__ = [
     "is_api_key",
     "mint",
     "new_key",
+    "new_key_id",
     "revoke",
+    "revoke_by_id",
     "verify",
     "verify_for_tenant",
 ]
@@ -104,6 +108,23 @@ ACTOR_CLAIM: Final = "actor_kind"
 
 ACTOR_API_KEY: Final = "api_key"
 """The `ACTOR_CLAIM` value marking a request authenticated by an API key rather than a user."""
+
+KIND_USER: Final = "user"
+"""The default `kind`: a key that acts as the person who minted it.
+
+A free-form string rather than an enum, because what kinds exist is a product's decision. A
+second kind is usually a service key acting as the tenant rather than as a person, which
+matters because it survives its minter leaving, but nothing here depends on that meaning.
+"""
+
+
+def new_key_id() -> str:
+    """A fresh key id: a revoke handle that is not the secret and not its hash.
+
+    A uuid4 rather than a ULID, so this module does not depend on an id scheme outside it. The
+    id is not a credential and orders nothing, so its only requirement is uniqueness.
+    """
+    return uuid.uuid4().hex
 
 
 def new_key() -> str:
@@ -161,6 +182,17 @@ class ApiKeyRecord:
     `prefix` is the only clear-text fragment, and exists so a person can recognise a key in a
     list without the list being able to authenticate as one of them. `scopes` is the ceiling
     the key was minted with, not the authority it currently has: see `effective_scopes`.
+
+    `key_id` is the revoke handle. It is deliberately not the hash: a settings page that has
+    to name the hash to revoke a key is rendering a value that, for the older callers who
+    passed the plaintext through `revoke`, is one hash away from the credential itself. An id
+    is a name and nothing more, so it can be put in a URL. It defaults empty, and a record
+    loaded from a row written before this field existed has no id: `revoke_handle` is what a
+    caller reads to get a handle either way.
+
+    `kind`, `created_by` and `metadata` are the product's own dimensions, none of which this
+    package interprets. `metadata` round-trips through the store untouched, so a product does
+    not grow a second table beside this one to hold two extra fields.
     """
 
     key_hash: str
@@ -173,6 +205,21 @@ class ApiKeyRecord:
     expires_at: int = 0
     last_used_at: str = ""
     revoked_at: str = ""
+    key_id: str = ""
+    kind: str = KIND_USER
+    created_by: str | None = None
+    metadata: Mapping[str, Any] = field(default_factory=dict)
+
+    @property
+    def revoke_handle(self) -> str:
+        """The value to revoke this key by: its `key_id`, falling back to its hash.
+
+        The fallback is what keeps a row written before `key_id` existed revocable by the same
+        call as a new one. It is a fallback and not a migration: the row still has no id, so a
+        listing that renders this value renders the hash for an old key and an id for a new
+        one, and `revoke_by_id` accepts both.
+        """
+        return self.key_id or self.key_hash
 
     @property
     def is_revoked(self) -> bool:
@@ -246,6 +293,52 @@ class ApiKeyStore(ABC):
         del tenant_id
         return []
 
+    def get_by_id(self, tenant_id: str, key_id: str) -> ApiKeyRecord | None:
+        """The record one tenant's `key_id` names, or `None`.
+
+        Tenant first, so a key id from one product's URL can never resolve a row in another
+        tenant even if the id were guessed. The id is matched against `revoke_handle`, so a row
+        written before `key_id` existed is reachable by its hash through the same call.
+
+        Concrete rather than abstract so a store written before this method existed keeps
+        satisfying the protocol. The default is built on `list_for_tenant`, which means a store
+        with no tenant index answers `None` rather than scanning.
+        """
+        if not tenant_id or not key_id:
+            return None
+        for record in self.list_for_tenant(tenant_id):
+            if constant_time_equals(record.revoke_handle, key_id):
+                return record
+        return None
+
+    def revoke_by_id(self, tenant_id: str, key_id: str, *, revoked_at: str | None = None) -> ApiKeyRecord | None:
+        """Revoke one key by its id, without ever holding the secret or its hash.
+
+        The verb a settings page needs: a person revoking a key has an id from a list and no
+        credential, and requiring the hash would mean rendering it. Returns the record as it
+        was, or `None` when there was nothing live to revoke, which is also the answer for a
+        key belonging to another tenant.
+        """
+        record = self.get_by_id(tenant_id, key_id)
+        if record is None:
+            return None
+        return self.revoke(record.key_hash, revoked_at=revoked_at)
+
+    def count_for_tenant(self, tenant_id: str) -> int:
+        """How many keys one tenant holds, for a per-create cap check.
+
+        Every key, revoked ones included. A product that caps only live keys subtracts them
+        itself, because "how many rows exist" is what an index can count cheaply and "how many
+        are still usable" is not: revocation is an attribute, not a key, so counting around it
+        would mean reading the rows.
+
+        Concrete rather than abstract, and built on `list_for_tenant` by default, so a store
+        written before this method existed keeps satisfying the protocol and one with no tenant
+        index answers zero rather than scanning. `DynamoApiKeyStore` overrides it with a
+        counted query that never returns a row.
+        """
+        return len(self.list_for_tenant(tenant_id))
+
     def revoke_all_for_tenant(self, tenant_id: str, *, revoked_at: str | None = None) -> int:
         """Revoke every live key of one tenant, returning how many were revoked.
 
@@ -314,6 +407,10 @@ class InMemoryApiKeyStore(ApiKeyStore):
             key=lambda record: record.created_at,
         )
 
+    def count_for_tenant(self, tenant_id: str) -> int:
+        """How many keys one tenant holds, revoked ones included."""
+        return sum(1 for record in self._items.values() if record.tenant_id == tenant_id)
+
 
 FakeApiKeyStore = InMemoryApiKeyStore
 """The name a test reaches for, aliasing `InMemoryApiKeyStore`.
@@ -324,7 +421,12 @@ this alias exists for the `Fake*` spelling the test fixtures use.
 
 
 def _record_to_item(record: ApiKeyRecord) -> dict[str, Any]:
-    """The DynamoDB item for a record. `scopes` goes down as a list, not a joined string."""
+    """The DynamoDB item for a record. `scopes` goes down as a list, not a joined string.
+
+    `metadata` goes down as a map for the reason a share token's capability does: DynamoDB
+    stores one natively, so a product that later wants a projection or a filter on one of its
+    fields can have it, which a JSON blob forecloses.
+    """
     return {
         "key_hash": record.key_hash,
         "user_id": record.user_id,
@@ -336,11 +438,24 @@ def _record_to_item(record: ApiKeyRecord) -> dict[str, Any]:
         "expires_at": record.expires_at,
         "last_used_at": record.last_used_at,
         "revoked_at": record.revoked_at,
+        "key_id": record.key_id,
+        "kind": record.kind,
+        "created_by": record.created_by or "",
+        "metadata": dict(record.metadata),
     }
 
 
 def _record_from_item(item: Mapping[str, Any]) -> ApiKeyRecord:
-    """Rebuild a record from a DynamoDB item, tolerating an absent optional attribute."""
+    """Rebuild a record from a DynamoDB item, tolerating an absent optional attribute.
+
+    A row written before `key_id`, `kind`, `created_by` and `metadata` existed loads unchanged:
+    the id comes back empty and `revoke_handle` falls back to the hash, the kind defaults to
+    `KIND_USER`, the creator is `None` rather than an empty string so "not recorded" is
+    distinguishable from "recorded as nobody", and the metadata is an empty mapping.
+    """
+    raw_metadata = item.get("metadata")
+    metadata = dict(raw_metadata) if isinstance(raw_metadata, Mapping) else {}
+    created_by = str(item.get("created_by", "") or "")
     raw_scopes = item.get("scopes") or []
     scopes = tuple(str(scope) for scope in raw_scopes) if isinstance(raw_scopes, Sequence) else ()
     return ApiKeyRecord(
@@ -354,6 +469,10 @@ def _record_from_item(item: Mapping[str, Any]) -> ApiKeyRecord:
         expires_at=int(item.get("expires_at", 0) or 0),
         last_used_at=str(item.get("last_used_at", "")),
         revoked_at=str(item.get("revoked_at", "")),
+        key_id=str(item.get("key_id", "")),
+        kind=str(item.get("kind", "") or KIND_USER),
+        created_by=created_by or None,
+        metadata=metadata,
     )
 
 
@@ -450,6 +569,37 @@ class DynamoApiKeyStore(ApiKeyStore):
             for item in self._repo.iter_query(KeyCondition("tenant_id").eq(tenant_id), index_name=API_KEY_TENANT_INDEX)
         ]
 
+    def count_for_tenant(self, tenant_id: str) -> int:
+        """How many keys one tenant holds, as a counted query on `API_KEY_TENANT_INDEX`.
+
+        `Select="COUNT"` rather than the base class's listing, because this runs on the create
+        path of every key: DynamoDB counts the index entries server side and returns no items
+        at all, so the call costs the read capacity of the keys it counted and nothing is
+        deserialised. Never a scan.
+
+        Paginated, because `Count` is per page and a tenant whose index entries spill past 1 MB
+        would otherwise report only the first page's worth and let a cap be walked past.
+        """
+        from boto3.dynamodb.conditions import Key as KeyCondition
+
+        if not tenant_id:
+            return 0
+        total = 0
+        start_key: dict[str, Any] | None = None
+        while True:
+            kwargs: dict[str, Any] = {
+                "KeyConditionExpression": KeyCondition("tenant_id").eq(tenant_id),
+                "IndexName": API_KEY_TENANT_INDEX,
+                "Select": "COUNT",
+            }
+            if start_key is not None:
+                kwargs["ExclusiveStartKey"] = start_key
+            response = self._repo.table.query(**kwargs)
+            total += int(response.get("Count", 0))
+            start_key = response.get("LastEvaluatedKey")
+            if not start_key:
+                return total
+
 
 API_KEY_TABLE: Final = TableSpec(
     logical_name=API_KEYS_TABLE,
@@ -481,6 +631,10 @@ def mint(
     expires_at: datetime | int | None = None,
     store: ApiKeyStore | None = None,
     created_at: str | None = None,
+    kind: str = KIND_USER,
+    created_by: str | None = None,
+    metadata: Mapping[str, Any] | None = None,
+    key_id: str | None = None,
 ) -> MintedApiKey:
     """Mint a key, returning the plaintext once alongside the record that was stored.
 
@@ -500,6 +654,14 @@ def mint(
         store: Where to write the record. `None` mints without storing, for a caller that
             writes through its own transaction.
         created_at: The creation stamp, defaulting to now. A seam for tests.
+        kind: The product's own label for what sort of key this is, defaulting to `KIND_USER`.
+            Never interpreted here.
+        created_by: Who minted it, when that is someone other than `user_id`. A key that acts
+            as a service has no person as its subject, and this is where the person who created
+            it is recorded. `None` leaves it unrecorded rather than recording nobody.
+        metadata: Product fields the store round-trips untouched.
+        key_id: The revoke handle, defaulting to a fresh one. Pass one only to adopt an id a
+            caller already allocated, such as one written in the same transaction.
 
     Returns:
         The plaintext and the stored record, together, once.
@@ -515,6 +677,10 @@ def mint(
         name=name,
         created_at=created_at or now_iso(),
         expires_at=expiry,
+        key_id=key_id if key_id is not None else new_key_id(),
+        kind=kind,
+        created_by=created_by,
+        metadata=dict(metadata or {}),
     )
     if store is not None:
         store.put(record)
@@ -593,6 +759,26 @@ def revoke(plaintext_or_hash: str, store: ApiKeyStore, *, revoked_at: str | None
     """
     key_hash = hash_key(plaintext_or_hash) if is_api_key(plaintext_or_hash) else plaintext_or_hash
     return store.revoke(key_hash, revoked_at=revoked_at)
+
+
+def revoke_by_id(
+    tenant_id: str,
+    key_id: str,
+    store: ApiKeyStore,
+    *,
+    revoked_at: str | None = None,
+) -> ApiKeyRecord | None:
+    """Revoke a key by the tenant it belongs to and its id, holding no secret at all.
+
+    The counterpart to `revoke` for the human path. `revoke` takes a plaintext or a hash,
+    which is what a service rotating its own key and a page rendering the hash have; this takes
+    the id a listing shows, so a settings page never has to put a value derived from the
+    credential in a URL.
+
+    Answers `None` for an unknown id, for a key in another tenant and for one already revoked
+    alike, so a key id cannot be walked across tenants to learn which ones exist.
+    """
+    return store.revoke_by_id(tenant_id, key_id, revoked_at=revoked_at)
 
 
 def effective_scopes(key_scopes: Iterable[str], live_scopes: Iterable[str]) -> tuple[str, ...]:

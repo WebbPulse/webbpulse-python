@@ -36,8 +36,10 @@ from webbpulse.identity.share_tokens import (
     SHARE_TOKEN_PREFIX,
     SHARE_TOKEN_SUBJECT,
     SHARE_TOKEN_TABLE,
+    SHARE_TOKEN_TARGET_INDEX,
     SHARE_TOKEN_TENANT_INDEX,
     FakeShareTokenStore,
+    ShareTarget,
     ShareTokenRecord,
     claims_for_share_token,
     claims_or_credential,
@@ -47,9 +49,11 @@ from webbpulse.identity.share_tokens import (
     mint_share_token,
     new_share_token,
     revoke_share_token,
+    share_target_key,
     share_token_capability,
     verify_share_token,
 )
+from webbpulse.testing import assert_share_token_store_contract
 
 if TYPE_CHECKING:  # pragma: no cover
     from fastapi.testclient import TestClient
@@ -522,3 +526,58 @@ def test_the_dynamo_stores_round_trip(dynamodb_resource: Any) -> None:
     assert verify_share_token(minted.plaintext, share_store) is None
     assert share_store.delete_all_for_tenant("t1") == 1
     assert share_store.list_for_tenant("t1") == []
+
+
+def test_a_target_reads_as_a_value_type_and_a_flat_key() -> None:
+    """A target is one value type over two flat attributes, and an unset one is falsey."""
+    target = ShareTarget(type="issue", id="i1")
+
+    assert target.key == "issue#i1"
+    assert share_target_key("issue", "i1") == "issue#i1"
+    assert bool(target) is True
+    assert bool(ShareTarget(type="issue", id="")) is False
+    assert bool(ShareTarget(type="", id="i1")) is False
+
+    record = ShareTokenRecord(token_hash="h", tenant_id="t1", target_type="issue", target_id="i1")
+
+    assert record.target == target
+    assert record.target_key == "issue#i1"
+    assert ShareTokenRecord(token_hash="h", tenant_id="t1").target_key == ""
+
+
+def test_minting_without_a_target_stays_exactly_as_it_was(shares: FakeShareTokenStore) -> None:
+    """The target is optional, so a caller written before it existed mints the same row."""
+    minted = mint_share_token(tenant_id="t1", capability={"issue": "i1"}, store=shares)
+
+    assert minted.record.target_type == ""
+    assert minted.record.target_id == ""
+    assert minted.record.target_key == ""
+    assert verify_share_token(minted.plaintext, shares) is not None
+    assert shares.list_for_target("t1", ("issue", "i1")) == []
+
+
+def test_the_in_memory_store_satisfies_the_share_token_contract(shares: FakeShareTokenStore) -> None:
+    """The reusable contract an adopting product runs against its own share token store."""
+    assert_share_token_store_contract(shares)
+
+
+def test_the_dynamo_share_store_lists_and_revokes_by_target(dynamodb_resource: Any) -> None:
+    """The target index answers per target against a real DynamoDB, moto backed."""
+    from webbpulse.dynamodb import Repository
+    from webbpulse.identity.share_tokens import DynamoShareTokenStore
+
+    dynamodb_resource.meta.client.create_table(**SHARE_TOKEN_TABLE.create_table_request("wp-local"))
+    store = DynamoShareTokenStore(Repository(SHARE_TOKEN_TABLE.logical_name, prefix="wp-local"))
+
+    assert_share_token_store_contract(store)
+
+
+def test_the_share_token_table_carries_the_contracted_target_index() -> None:
+    """The index name and keys are a contract with the platform identity module."""
+    assert SHARE_TOKEN_TARGET_INDEX == "tenant_id-target_key-index"
+
+    index = next(one for one in SHARE_TOKEN_TABLE.global_secondary_indexes if one.name == SHARE_TOKEN_TARGET_INDEX)
+
+    assert index.hash_key == "tenant_id"
+    assert index.range_key == "target_key"
+    assert any(attribute.name == "target_key" for attribute in SHARE_TOKEN_TABLE.attributes)

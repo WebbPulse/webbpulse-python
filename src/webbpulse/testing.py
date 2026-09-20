@@ -33,7 +33,9 @@ __all__ = [
     "FakePresigner",
     "FakeQueue",
     "FakeWebhookSender",
+    "assert_api_key_store_contract",
     "assert_entrypoint_isolation",
+    "assert_share_token_store_contract",
     "assert_users_repository_contract",
     "aws_credentials",
     "create_table",
@@ -270,6 +272,169 @@ def assert_users_repository_contract(repository: Any, *, email: str = "Someone@E
     assert repository.delete("contract-1") is True
     assert repository.delete("contract-1") is False, "delete must be idempotent."
     assert repository.get("contract-1") is None
+
+
+def assert_api_key_store_contract(store: Any, *, tenant_id: str = "contract-tenant") -> None:
+    """Assert one `ApiKeyStore` satisfies the shared contract, or raise `AssertionError`.
+
+    The behaviour the identity package's verification and a settings page owe every store: a
+    minted key that round trips with its id, kind, creator and metadata intact, a tenant
+    listing, a count cheap enough to gate a create on, a revoke by id that needs no secret,
+    and a row written before `key_id` existed staying revocable through its hash.
+
+    `store` is anything with `webbpulse.identity.ApiKeyStore`'s methods, so a product's own
+    class qualifies without subclassing this package's base.
+
+    The store must be empty of `tenant_id` when this is called, because the contract asserts
+    exact counts.
+    """
+    import dataclasses
+
+    from webbpulse.identity.api_keys import ApiKeyRecord, hash_key, mint, verify
+
+    assert store.count_for_tenant(tenant_id) == 0, "A tenant with no keys must count zero."
+    assert store.list_for_tenant(tenant_id) == [], "A tenant with no keys must list empty."
+
+    minted = mint(
+        user_id="contract-user",
+        tenant_id=tenant_id,
+        scopes=["issues:read"],
+        name="Contract key",
+        store=store,
+        kind="service",
+        created_by="contract-admin",
+        metadata={"label": "ci", "nested": {"team": "platform"}},
+        created_at="2026-01-01T00:00:00Z",
+    )
+    record = minted.record
+    assert record.key_id, "mint must allocate a key_id."
+    assert record.revoke_handle == record.key_id
+
+    stored = store.get(record.key_hash)
+    assert stored is not None, "A minted key must be readable by its hash."
+    assert stored.key_id == record.key_id, "key_id must round trip."
+    assert stored.kind == "service", "kind must round trip."
+    assert stored.created_by == "contract-admin", "created_by must round trip."
+    assert stored.metadata == {"label": "ci", "nested": {"team": "platform"}}, "metadata must round trip untouched."
+
+    assert store.count_for_tenant(tenant_id) == 1
+    assert [row.key_id for row in store.list_for_tenant(tenant_id)] == [record.key_id]
+    assert store.count_for_tenant("") == 0, "An empty tenant must never count another tenant's keys."
+
+    found = store.get_by_id(tenant_id, record.key_id)
+    assert found is not None, "get_by_id must find a key by its id."
+    assert found.key_hash == record.key_hash
+    assert store.get_by_id("other-tenant", record.key_id) is None, "A key id must not resolve in another tenant."
+    assert store.get_by_id(tenant_id, "missing") is None
+    assert store.get_by_id(tenant_id, "") is None
+
+    assert verify(minted.plaintext, store) is not None, "A fresh key must verify."
+    revoked = store.revoke_by_id(tenant_id, record.key_id)
+    assert revoked is not None, "revoke_by_id must revoke a live key."
+    assert store.revoke_by_id(tenant_id, record.key_id) is None, "A second revoke must report nothing to do."
+    assert verify(minted.plaintext, store) is None, "A revoked key must stop verifying."
+
+    legacy_plaintext = "wpk_contract-legacy"
+    legacy = ApiKeyRecord(
+        key_hash=hash_key(legacy_plaintext),
+        user_id="contract-user",
+        tenant_id=tenant_id,
+        prefix="wpk_contract",
+        created_at="2026-01-02T00:00:00Z",
+    )
+    assert legacy.key_id == "", "A record built without a key_id must have none."
+    assert legacy.revoke_handle == legacy.key_hash, "revoke_handle must fall back to the hash."
+    store.put(legacy)
+
+    reloaded = store.get(legacy.key_hash)
+    assert reloaded is not None, "A row with no key_id must still load."
+    assert reloaded.key_id == ""
+    assert reloaded.kind == "user", "A row with no kind must default to the user kind."
+    assert reloaded.created_by is None, "An unrecorded creator must be None, not an empty string."
+    assert reloaded.metadata == {}
+
+    assert store.count_for_tenant(tenant_id) == 2
+    by_hash = store.get_by_id(tenant_id, legacy.key_hash)
+    assert by_hash is not None, "A row with no key_id must be reachable by its hash."
+    assert store.revoke_by_id(tenant_id, legacy.key_hash) is not None, "A legacy row must be revocable by its hash."
+    assert verify(legacy_plaintext, store) is None
+
+    adopted = dataclasses.replace(legacy, key_hash=hash_key("wpk_contract-adopted"), key_id="adopted-id")
+    assert adopted.revoke_handle == "adopted-id"
+
+
+def assert_share_token_store_contract(store: Any, *, tenant_id: str = "contract-tenant") -> None:
+    """Assert one `ShareTokenStore` satisfies the shared contract, or raise `AssertionError`.
+
+    The behaviour a product's share listing owes every store: a token that round trips with
+    its target, a per-target listing that returns that target's rows and no other's, a revoke
+    that clears every link onto one resource, and a token minted with no target staying
+    resolvable while never appearing in a target listing.
+
+    `store` is anything with `webbpulse.identity.ShareTokenStore`'s methods.
+
+    The store must be empty of `tenant_id` when this is called, because the contract asserts
+    exact listings.
+    """
+    from webbpulse.identity.share_tokens import ShareTarget, mint_share_token, verify_share_token
+
+    issue = ShareTarget(type="issue", id="i1")
+    other = ShareTarget(type="issue", id="i2")
+    view = ShareTarget(type="view", id="i1")
+
+    assert store.list_for_target(tenant_id, issue) == [], "A target with no links must list empty."
+
+    first = mint_share_token(
+        tenant_id=tenant_id,
+        capability={"project_id": "p1", "title": "One"},
+        target=issue,
+        store=store,
+        created_at="2026-01-01T00:00:00Z",
+    )
+    second = mint_share_token(
+        tenant_id=tenant_id,
+        capability={"project_id": "p1", "title": "Two"},
+        target=("issue", "i1"),
+        store=store,
+        created_at="2026-01-02T00:00:00Z",
+    )
+    mint_share_token(tenant_id=tenant_id, target=other, store=store, created_at="2026-01-03T00:00:00Z")
+    mint_share_token(tenant_id=tenant_id, target=view, store=store, created_at="2026-01-04T00:00:00Z")
+    untargeted = mint_share_token(tenant_id=tenant_id, store=store, created_at="2026-01-05T00:00:00Z")
+
+    stored = store.get(first.record.token_hash)
+    assert stored is not None
+    assert stored.target == issue, "The target must round trip."
+    assert stored.target_key == "issue#i1"
+    assert stored.capability == {"project_id": "p1", "title": "One"}, "capability must round trip beside the target."
+
+    hashes = [row.token_hash for row in store.list_for_target(tenant_id, issue)]
+    assert hashes == [first.record.token_hash, second.record.token_hash], "A target listing is oldest first."
+
+    assert [row.token_hash for row in store.list_for_target(tenant_id, other)] == [
+        row.token_hash for row in store.list_for_target(tenant_id, ("issue", "i2"))
+    ], "A pair and a ShareTarget must name the same target."
+
+    view_rows = store.list_for_target(tenant_id, view)
+    assert len(view_rows) == 1, "A type and an id must be matched together, not either alone."
+    assert view_rows[0].target_type == "view"
+
+    assert store.list_for_target("other-tenant", issue) == [], "A target must not resolve in another tenant."
+    assert store.list_for_target("", issue) == [], "An empty tenant must never span tenants."
+    assert store.list_for_target(tenant_id, ("issue", "")) == [], "An incomplete target must list empty."
+
+    assert untargeted.record.target_key == "", "A token with no target carries no target key."
+    assert verify_share_token(untargeted.plaintext, store) is not None, "A token with no target still resolves."
+    assert all(row.token_hash != untargeted.record.token_hash for row in store.list_for_target(tenant_id, issue)), (
+        "A token with no target must not appear in a target listing."
+    )
+
+    assert store.revoke_all_for_target(tenant_id, issue) == 2, "Revoking a target clears every link onto it."
+    assert store.revoke_all_for_target(tenant_id, issue) == 0, "A second revoke must report nothing to do."
+    assert verify_share_token(first.plaintext, store) is None
+    assert verify_share_token(second.plaintext, store) is None
+    assert len(store.list_for_target(tenant_id, issue)) == 2, "A revoked link stays listed."
+    assert store.revoke_all_for_target(tenant_id, other) == 1, "Another target must be untouched."
 
 
 def make_request_context_headers(
