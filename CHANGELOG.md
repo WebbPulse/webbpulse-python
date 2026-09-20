@@ -5,7 +5,7 @@ Notable changes to the `webbpulse` package. The version here is the one in
 
 This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## Unreleased
+## 0.47.0
 
 Two whole-run checks in `webbpulse.e2e`, from the Standupless test hardening build, plus the
 collection fix that build needed locally.
