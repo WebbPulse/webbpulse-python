@@ -5,7 +5,7 @@ Notable changes to the `webbpulse` package. The version here is the one in
 
 This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## Unreleased
+## 0.45.0
 
 Two generic helpers the Standupless and Terraform-runner builds were each keeping a local
 copy of.
