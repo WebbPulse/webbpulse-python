@@ -167,12 +167,23 @@ when the current token is within `refresh_skew` seconds of the `exp` it declares
 defaults to 60. A token carrying no readable `exp` falls back to `access_token_ttl` measured
 from when it was issued. Refresh is lazy, so a short run makes no extra calls at all.
 
-A refusal the expiry check did not predict is also recovered from: a 401, or a 403 whose body
-is the gateway's bare `{"message": "Forbidden"}` with no `error_code`, refreshes once and
-retries the request once, and the second answer is surfaced as it is. The product's own 403
-carries an `error_code` in the shared error envelope and is never retried, because it means
-the caller is authenticated and not permitted, and a retry would double every permission
-assertion in the suite. The retry re-sends the same in-memory body the call was given, which
+A refusal the expiry check did not predict is also recovered from, and whether it is depends
+on the body rather than the status. A 401 or a 403 carrying no `error_code` came from the
+gateway or an authorizer, which is what an expired token looks like from outside: it
+refreshes once and retries the request once, and the second answer is surfaced as it is. The
+401 arm takes any envelope-less body, an empty or unreadable one included, since an
+authorizer may answer `Unauthorized`, nothing at all or something that is not JSON. The 403
+arm additionally requires the gateway's bare `{"message": "Forbidden"}`.
+
+A refusal carrying an `error_code` in the shared error envelope is never retried, because
+only `webbpulse.http.error_body` writes that field and it runs inside the function: the
+caller was authenticated and refused anyway. For a 403 that means too few permissions, and a
+retry would double every permission assertion in the suite. For a 401 it means the wrong kind
+of principal, which is what a route that authenticates a machine token inside the function
+rather than at the gateway answers a user bearer with. Refreshing against one of those met a
+refusal from the refresh endpoint too, and that raises the terminal `RefreshFailed`, so a
+correct product answer became a suite error and the session lost its credential for every
+later case. The retry re-sends the same in-memory body the call was given, which
 is safe for every caller here; a streamed body would already be consumed. That body is a JSON
 one from `json=` or a form-encoded one from `data=`, the latter being how the identity OAuth
 token and consent endpoints are exercised, since RFC 6749 requires them to read

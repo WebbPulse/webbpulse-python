@@ -30,6 +30,7 @@ __all__ = [
     "RateLimitExhausted",
     "RequestRecord",
     "TokenSource",
+    "carries_error_envelope",
     "is_expired_credential",
     "recorded_path",
     "retry_delay",
@@ -472,29 +473,59 @@ class E2EClient:
         return iter(self.records)
 
 
-def is_expired_credential(response: httpx.Response) -> bool:
-    """Whether this refusal is the kind a fresher access token could turn into an answer.
+def carries_error_envelope(response: httpx.Response) -> bool:
+    """Whether a refusal carries the shared error envelope's `error_code`.
 
-    A 401 always qualifies: whoever answered it, the credential is the thing being refused.
+    The one question that separates the two kinds of refusal, asked the same way for a 401
+    and for a 403 so the two can never drift apart. Only `webbpulse.http.error_body` writes
+    `error_code`, and it runs inside the function, so the field's presence proves the
+    application authenticated the caller and then refused the request on its own terms. The
+    gateway and its authorizers answer before the function runs and can only produce a bare
+    `{"message": ...}` object, an empty body or something that is not JSON at all, none of
+    which carry the field.
 
-    A 403 qualifies only when the body is the bare `{"message": "Forbidden"}` the HTTP API
-    gateway returns when its JWT authorizer refuses a token, which is what an expired token
-    looks like from outside. The product's own 403 is the shared error envelope and carries
-    an `error_code`, and it means the caller is authenticated and not permitted. Refreshing
-    and retrying that one would send a second identical request, double every permission
-    assertion in the suite and report the same refusal a call later.
+    A body that cannot be read as a JSON object reads as no envelope, so an unreadable
+    refusal is never mistaken for the application answering.
     """
-    if response.status_code == 401:
-        return True
-    if response.status_code != 403:
-        return False
     try:
         payload = response.json()
     except Exception:
         return False
     if not isinstance(payload, dict):
         return False
-    if payload.get("error_code") or payload.get("errorCode"):
+    return bool(payload.get("error_code") or payload.get("errorCode"))
+
+
+def is_expired_credential(response: httpx.Response) -> bool:
+    """Whether this refusal is the kind a fresher access token could turn into an answer.
+
+    A 401 or a 403 qualifies only when it carries no shared error envelope. A refusal that
+    carries an `error_code` came from the application, which means the caller was
+    authenticated and then refused anyway: too few permissions for a 403, or the wrong kind
+    of principal entirely for a 401, as on a route that authenticates a machine token inside
+    the function rather than at the gateway. No refresh can turn either into an answer, and
+    retrying one would send a second identical request, double every authorization assertion
+    in the suite and report the same refusal a call later.
+
+    A refusal carrying no envelope came from the gateway or an authorizer, which is what an
+    expired token looks like from outside, so it is worth one refresh and one retry. The 403
+    arm additionally requires the gateway's bare `{"message": "Forbidden"}`, because a 403
+    with any other envelope-less body is not a shape the authorizer produces. The 401 arm
+    takes any envelope-less body, since an authorizer refusing a token may answer
+    `Unauthorized`, an empty body or a non-JSON one, and a genuinely expired session must
+    still recover from all of them.
+    """
+    if response.status_code not in (401, 403):
+        return False
+    if carries_error_envelope(response):
+        return False
+    if response.status_code == 401:
+        return True
+    try:
+        payload = response.json()
+    except Exception:
+        return False
+    if not isinstance(payload, dict):
         return False
     return str(payload.get("message", "")) == GATEWAY_FORBIDDEN_BODY
 
