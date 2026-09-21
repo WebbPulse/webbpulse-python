@@ -23,7 +23,7 @@ from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Any, Final
 
-from webbpulse.dynamodb import now_iso
+from webbpulse.dynamodb import ReadOnlyTable, now_iso
 from webbpulse.identity.claims import AuthorizerClaims
 from webbpulse.identity.storage import (
     TableAttribute,
@@ -525,6 +525,10 @@ class DynamoApiKeyStore(ApiKeyStore):
         Best effort by design: this runs on the authorization path, and a write that fails
         must not turn a good key into a refused request. A conditional check keeps it from
         resurrecting a row that was deleted between the read and this write.
+
+        The package's own `ReadOnlyTable` refusal is swallowed alongside the AWS error, so a
+        domain holding this table read-only behaves locally as it does in AWS, where the same
+        write comes back as an `AccessDeniedException`.
         """
         from boto3.dynamodb.conditions import Attr
         from botocore.exceptions import ClientError
@@ -536,7 +540,7 @@ class DynamoApiKeyStore(ApiKeyStore):
                 expression_values={":now": used_at or now_iso()},
                 condition=Attr("key_hash").exists(),
             )
-        except ClientError as exc:
+        except (ClientError, ReadOnlyTable) as exc:
             _log.debug("Could not stamp last_used_at on an API key: %s", exc)
 
     def delete_all_for_user(self, user_id: str) -> int:

@@ -572,6 +572,24 @@ def test_the_dynamo_share_store_lists_and_revokes_by_target(dynamodb_resource: A
     assert_share_token_store_contract(store)
 
 
+def test_the_dynamo_share_store_touches_a_read_only_table_without_raising(dynamodb_resource: Any) -> None:
+    """A read-only repository refuses the stamp the way AWS does, so `touch` stays best effort."""
+    from webbpulse.dynamodb import Repository
+    from webbpulse.identity.share_tokens import DynamoShareTokenStore
+
+    dynamodb_resource.meta.client.create_table(**SHARE_TOKEN_TABLE.create_table_request("wp-local"))
+    writable = DynamoShareTokenStore(Repository(SHARE_TOKEN_TABLE.logical_name, prefix="wp-local"))
+    minted = mint_share_token(tenant_id="t1", capability={"issue": "i1"}, store=writable)
+    reader = DynamoShareTokenStore(Repository(SHARE_TOKEN_TABLE.logical_name, prefix="wp-local", read_only=True))
+
+    reader.touch(minted.record.token_hash)
+
+    stored = writable.get(minted.record.token_hash)
+
+    assert stored is not None
+    assert stored.last_used_at == minted.record.last_used_at
+
+
 def test_the_share_token_table_carries_the_contracted_target_index() -> None:
     """The index name and keys are a contract with the platform identity module."""
     assert SHARE_TOKEN_TARGET_INDEX == "tenant_id-target_key-index"

@@ -7,6 +7,20 @@ This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## Unreleased
 
+### `identity`: touch tolerates the package's own read-only refusal
+
+`DynamoApiKeyStore.touch` and `DynamoShareTokenStore.touch` are best effort by contract: they
+stamp `last_used_at` on the authorization path and a failed write must never refuse a good
+credential. Until now they caught only `ClientError`, which made the two environments
+disagree. A domain that holds the api-keys or share-tokens table read-only, matching the IAM
+grant it actually has, got an `AccessDeniedException` in AWS and that was swallowed, but locally
+and under test the same write came back as `ReadOnlyTable`, a `PermissionError` that escaped
+and turned `verify()` into a 500.
+
+Both methods now swallow `ReadOnlyTable` alongside `ClientError`, logging at the same debug
+level, so a read-only holder behaves the same way everywhere. Nothing else changes: a write
+that is meant to land still lands, and a real failure is still only a debug line.
+
 ### `e2e`: declare routes that answer 503 until an integration is configured
 
 A 5xx fails the reachability group and the route cut probe. Some routes answer one on
