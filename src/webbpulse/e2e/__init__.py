@@ -1038,7 +1038,10 @@ def _controller_verdicts(config: pytest.Config, directory: Any) -> runwide.RunWi
     fixture, because session finish runs after every fixture has been torn down. The OpenAPI
     document comes through the same module level `e2e_openapi_document()` in the product's
     conftest that collection already uses, so the controller and the workers describe the
-    same commit.
+    same commit. The expected-unavailable declaration is resolved through the same helper
+    the `expected_unavailable` fixture uses, so the 5xx sweep excuses the same routes in
+    both modes; a declaration that does not parse is reported as a controller failure here
+    rather than as the `UsageError` the fixture raises, because no fixture is left to raise it.
 
     Returns None when the run had no environment to test against, which is the unconfigured
     shell the collection hook already skips the whole suite on.
@@ -1051,6 +1054,7 @@ def _controller_verdicts(config: pytest.Config, directory: Any) -> runwide.RunWi
     requests = runwide.read_worker_records(directory)
     try:
         allowlist = runwide.normalise_allowlist(config.hook.pytest_e2e_uncovered_routes(env=env))
+        expected_unavailable = runwide.expected_unavailable_from_config(config, env)
         operations = operations_from_openapi(_product_openapi_document(config))
         entries, note = _controller_access_log(env, requests)
     except Exception as error:
@@ -1062,7 +1066,14 @@ def _controller_verdicts(config: pytest.Config, directory: Any) -> runwide.RunWi
         runwide.remove_run_directory(directory)
     served = [(operation.method, operation.path) for operation in operations]
     coverage = runwide.coverage_for(served, requests, allowlist)
-    return runwide.controller_verdicts(requests, entries, coverage, allowlist, access_log_note=note)
+    return runwide.controller_verdicts(
+        requests,
+        entries,
+        coverage,
+        allowlist,
+        access_log_note=note,
+        expected_unavailable=expected_unavailable,
+    )
 
 
 def _controller_access_log(

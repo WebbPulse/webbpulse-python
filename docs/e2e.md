@@ -431,8 +431,11 @@ The value is `"ERROR_CODE: reason"`, where the code is the `error_code` the rout
 envelope carries. A declared route passes only while it answers a 503 with that exact code.
 Any other status, including a 200, and a 503 carrying a different code, fail as a stale entry
 naming the route to remove, so the declaration retires itself once the integration is
-configured rather than excusing a real outage forever. A route not named here behaves exactly
-as before, and any other 5xx on any route still fails. The hook is optional; declaring none
+configured rather than excusing a real outage forever. The run-wide 5xx sweep over the access
+log excuses the declared routes' 503s too, matched on the route key alone because the log
+carries no body to read the code from, so a run whose per-route cases were green does not fail
+on the same 503s. A route not named here behaves exactly as before, and any other 5xx on any
+route still fails. The hook is optional; declaring none
 is the same as declaring an empty mapping. A value that does not parse fails the run with a
 message naming the entry.
 

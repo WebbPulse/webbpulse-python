@@ -24,6 +24,7 @@ from webbpulse.e2e import RUN_WIDE_GROUPS, runwide
 from webbpulse.e2e.access_log import AccessLogEntry, parse_entry
 from webbpulse.e2e.client import RequestRecord, recorded_path
 from webbpulse.e2e.coverage import measure_coverage
+from webbpulse.e2e.unavailable import ExpectedUnavailable, normalise_expected_unavailable
 
 pytest_plugins = ["pytester"]
 
@@ -44,6 +45,7 @@ def entry(
     integration_status: int = 200,
     route_key: str = "GET /api/issues",
     method: str = "GET",
+    path: str = "/api/issues",
     integration_error: str = "",
     authorizer_error: str = "",
     error_type: str = "",
@@ -53,7 +55,7 @@ def entry(
     return AccessLogEntry(
         request_id="req-1",
         route_key=route_key,
-        path="/api/issues",
+        path=path,
         method=method,
         status=status,
         integration_status=integration_status,
@@ -337,6 +339,83 @@ class TestControllerAggregation:
         assert any("none of this run's 2 requests" in failure for failure in verdicts.failures)
 
 
+WEBHOOK_KEY = "POST /api/github/webhook"
+
+CALLBACK_KEY = "GET /api/github/callback"
+
+
+def unavailable_declaration() -> Mapping[tuple[str, str], ExpectedUnavailable]:
+    """The webhook route declared as deliberately answering 503."""
+    return normalise_expected_unavailable({("POST", "/api/github/webhook"): "NOT_CONFIGURED: the app is missing"})
+
+
+def unavailable_entry(*, route_key: str = WEBHOOK_KEY, status: int = 503, path: str = "") -> AccessLogEntry:
+    """One access log entry for a route that answers 503, keyed by its route template."""
+    method, _, template = route_key.partition(" ")
+    return entry(status=status, route_key=route_key, method=method, path=path or template)
+
+
+class TestTheSweepHonoursExpectedUnavailable:
+    """The run-wide 5xx sweep excuses exactly the 503s the per-route assertions excuse."""
+
+    def test_a_declared_routes_503_does_not_fail_the_sweep(self) -> None:
+        """The whole gap: the per-route cases passed, so the sweep must not fail the run."""
+        entries = [unavailable_entry() for _ in range(7)]
+        assert runwide.no_request_was_answered_with_a_server_error(entries, unavailable_declaration()) is None
+
+    def test_an_undeclared_routes_503_still_fails(self) -> None:
+        """A 503 nobody declared is the outage the sweep exists to catch."""
+        failure = runwide.no_request_was_answered_with_a_server_error(
+            [unavailable_entry(route_key=CALLBACK_KEY)],
+            unavailable_declaration(),
+        )
+        assert failure is not None
+        assert "requests answered 5xx" in failure
+
+    def test_a_declared_routes_502_still_fails(self) -> None:
+        """Only the declared status is excused; any other 5xx on that route is a real one."""
+        failure = runwide.no_request_was_answered_with_a_server_error(
+            [unavailable_entry(status=502)],
+            unavailable_declaration(),
+        )
+        assert failure is not None
+
+    def test_only_the_unexcused_entries_are_reported(self) -> None:
+        """A mix names the routes that failed and none of the ones that were declared."""
+        failure = runwide.no_request_was_answered_with_a_server_error(
+            [unavailable_entry(), unavailable_entry(route_key=CALLBACK_KEY), unavailable_entry()],
+            unavailable_declaration(),
+        )
+        assert failure is not None
+        assert failure.count("status=503") == 1
+        assert "/api/github/callback" in failure
+        assert "/api/github/webhook" not in failure
+
+    def test_the_method_case_in_the_declaration_does_not_matter(self) -> None:
+        """The declaration is normalised, so a product may spell its methods either way."""
+        declared = normalise_expected_unavailable({("post", "/api/github/webhook"): "NOT_CONFIGURED: missing"})
+        assert runwide.no_request_was_answered_with_a_server_error([unavailable_entry()], declared) is None
+
+    def test_the_route_key_is_the_lookup_and_not_the_request_path(self) -> None:
+        """A path parameter's value is in the path and never in the declaration's key."""
+        declared = normalise_expected_unavailable({("GET", "/api/issues/{id}"): "NOT_CONFIGURED: missing"})
+        excused = unavailable_entry(route_key="GET /api/issues/{id}", path="/api/issues/42")
+        assert runwide.no_request_was_answered_with_a_server_error([excused], declared) is None
+
+    def test_an_entry_with_no_route_key_is_never_excused(self) -> None:
+        """A request that matched no route was answered by the gateway, which nobody declared."""
+        failure = runwide.no_request_was_answered_with_a_server_error(
+            [unavailable_entry(route_key="")],
+            unavailable_declaration(),
+        )
+        assert failure is not None
+
+    def test_an_empty_declaration_leaves_the_sweep_as_it_was(self) -> None:
+        """A product that declares nothing gets the bar it had before the hook existed."""
+        assert runwide.no_request_was_answered_with_a_server_error([unavailable_entry()], {}) is not None
+        assert runwide.no_request_was_answered_with_a_server_error([unavailable_entry()]) is not None
+
+
 class TestTheTwoModesCannotDrift:
     """Every message a test method asserts is the one the controller prints."""
 
@@ -344,6 +423,46 @@ class TestTheTwoModesCannotDrift:
         """The check functions are the only place each verdict's words live."""
         assert runwide.no_request_was_answered_with_a_server_error([entry(status=502)]) is not None
         assert runwide.no_request_was_answered_with_a_server_error([entry()]) is None
+
+    def test_both_consumers_hand_the_declaration_to_the_sweep(self) -> None:
+        """The controller and the test method excuse the same 503, so neither can drift.
+
+        The controller passes it as a keyword to `controller_verdicts` and the test method
+        takes it from the `expected_unavailable` fixture; a path that stopped passing it
+        would fail the run on the 503s the other path excuses.
+        """
+        from webbpulse.e2e import suite
+
+        entries = [unavailable_entry()]
+        declared = unavailable_declaration()
+        requests = [record()]
+        suite.TestAccessLogHealth().test_no_request_was_answered_with_a_server_error(entries, declared)
+        verdicts = runwide.controller_verdicts(
+            requests,
+            entries,
+            runwide.coverage_for([("GET", "/api/issues")], requests, {}),
+            {},
+            expected_unavailable=declared,
+        )
+        assert not any("answered 5xx" in failure for failure in verdicts.failures)
+
+    def test_both_consumers_still_fail_an_undeclared_503(self) -> None:
+        """The excuse is the declaration's alone, in both modes."""
+        from webbpulse.e2e import suite
+
+        entries = [unavailable_entry(route_key=CALLBACK_KEY)]
+        declared = unavailable_declaration()
+        requests = [record()]
+        with pytest.raises(AssertionError, match="answered 5xx"):
+            suite.TestAccessLogHealth().test_no_request_was_answered_with_a_server_error(entries, declared)
+        verdicts = runwide.controller_verdicts(
+            requests,
+            entries,
+            runwide.coverage_for([("GET", "/api/issues")], requests, {}),
+            {},
+            expected_unavailable=declared,
+        )
+        assert any("answered 5xx" in failure for failure in verdicts.failures)
 
     def test_no_refusal_is_a_run_wide_failure(self) -> None:
         """Neither a gateway refusal nor a product rejection fails any run-wide check.
@@ -405,7 +524,7 @@ class TestTheDiagnosticLine:
         from webbpulse.e2e import suite
 
         with pytest.raises(AssertionError, match="answered 5xx"):
-            suite.TestAccessLogHealth().test_no_request_was_answered_with_a_server_error([entry(status=502)])
+            suite.TestAccessLogHealth().test_no_request_was_answered_with_a_server_error([entry(status=502)], {})
         with pytest.raises(AssertionError, match="POST /api/issues"):
             suite.TestRouteCoverage().test_every_served_route_was_exercised_or_is_allowlisted(
                 measure_coverage([("POST", "/api/issues")], [])

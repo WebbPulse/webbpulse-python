@@ -96,7 +96,9 @@ def pytest_e2e_expected_unavailable(env: Any) -> Any:
     carries and the reason says which integration is missing. A route named here passes the
     reachability and route cut assertions only while it answers that exact 503, so the entry
     self-heals: once the integration is configured the route answers its declared status and
-    the entry fails as stale until it is removed.
+    the entry fails as stale until it is removed. The run-wide 5xx sweep over the access log
+    excuses the same routes' 503s, on the route key alone, because the log carries no body to
+    read the error code from.
 
     For a route whose unavailability is deliberate rather than a fault, such as a webhook
     endpoint that must answer 503 so the sender retries rather than dropping the delivery.

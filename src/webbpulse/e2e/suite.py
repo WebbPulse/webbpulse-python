@@ -82,7 +82,6 @@ from .journeys import (
 )
 from .unavailable import (
     ExpectedUnavailable,
-    normalise_expected_unavailable,
     response_error_code,
     stale_expectation,
 )
@@ -1269,13 +1268,19 @@ class TestAccessLogHealth:
         failure = runwide.the_access_log_carries_this_runs_requests(suite_requests, access_log_health)
         assert failure is None, failure
 
-    def test_no_request_was_answered_with_a_server_error(self, access_log_health: Sequence[AccessLogEntry]) -> None:
-        """No request this run made was answered 5xx.
+    def test_no_request_was_answered_with_a_server_error(
+        self,
+        access_log_health: Sequence[AccessLogEntry],
+        expected_unavailable: Mapping[tuple[str, str], ExpectedUnavailable],
+    ) -> None:
+        """No request this run made was answered 5xx, bar the routes declared unavailable.
 
         A 5xx is the gateway or the function failing rather than the product refusing, and a
-        case that asserts only `!= 200` passes straight through one.
+        case that asserts only `!= 200` passes straight through one. A 503 on a route named
+        in `pytest_e2e_expected_unavailable` is excused here as it is in the per-route cases,
+        so a run whose declared routes all behaved does not fail on their logged 503s.
         """
-        failure = runwide.no_request_was_answered_with_a_server_error(access_log_health)
+        failure = runwide.no_request_was_answered_with_a_server_error(access_log_health, expected_unavailable)
         assert failure is None, failure
 
     def test_every_request_matched_a_declared_route(self, access_log_health: Sequence[AccessLogEntry]) -> None:
@@ -1357,9 +1362,8 @@ def expected_unavailable(request: pytest.FixtureRequest, e2e_env: Any) -> Mappin
     Parsed and normalised here, so a malformed declaration fails every case that consults it
     with the same message rather than being read as no declaration at all.
     """
-    declared = request.config.hook.pytest_e2e_expected_unavailable(env=e2e_env)
     try:
-        return normalise_expected_unavailable(declared)
+        return runwide.expected_unavailable_from_config(request.config, e2e_env)
     except ValueError as error:
         raise pytest.UsageError(str(error)) from error
 
