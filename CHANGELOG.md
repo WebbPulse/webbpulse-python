@@ -5,6 +5,28 @@ Notable changes to the `webbpulse` package. The version here is the one in
 
 This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## Unreleased
+
+### `e2e`: the client keeps no cookie jar
+
+`E2EClient` wrapped a default `httpx.Client`, so every cookie an answer set was stored and
+replayed on the next request that client made. The anonymous client is session scoped and it
+is the one `login` posts through, so the login response's refresh cookie sat in its jar for
+the rest of the run. The suite then probes `POST /api/auth/refresh` anonymously, for
+reachability and for the route cut, and only `/api/auth/logout` is held back from probing.
+Each of those probes therefore presented the session's refresh cookie, and the identity
+router rotates the refresh token on every call it reads one from. The session's own later
+refresh sent the cookie it had captured at login, which by then was spent, the rotation
+detection read the replay and revoked the whole family, and every remaining case in that
+xdist worker failed with `RefreshFailed`. It showed up on WebbPulse-Terraform staging as six
+of them in one worker.
+
+The client now clears the underlying jar after every attempt, the 429 retries included, so a
+`Set-Cookie` never reaches a later request. Only what a caller passes as a header goes out.
+The refresh material stays where the design already put it, on the `IdentitySession`, which
+reads it off the login response and sends it explicitly when it refreshes. Which routes are
+probed is unchanged.
+
 ## 0.50.0
 
 ### `identity`: touch tolerates the package's own read-only refusal

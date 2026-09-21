@@ -235,6 +235,13 @@ def recorded_path(path: str) -> str:
 class E2EClient:
     """An httpx wrapper that injects the gate header, paces itself and captures request ids.
 
+    Keeps no cookie jar: a `Set-Cookie` on any answer is dropped rather than replayed on the
+    next request from the same client. The refresh cookie belongs to the `IdentitySession`,
+    which sends it explicitly when it refreshes, and a jar would hand the session-scoped
+    anonymous client the login generation's cookie for every later call it makes. The
+    anonymous probe of the refresh route would then rotate the session's family, and the
+    session's own refresh would replay a spent token and have the family revoked.
+
     Never raises on a status: every assertion in the suite is about the status, so a raise
     would turn a finding into a traceback. Transport failures do raise, because a request
     that never reached the API proves nothing.
@@ -396,6 +403,10 @@ class E2EClient:
 
         `token` is resolved once by the caller rather than here, so that the credential a
         refusal is attributed to is the one that was actually sent.
+
+        The underlying client's jar is emptied after every attempt, retries included, so a
+        cookie an answer set is never sent back. Only what a caller passes as a header goes
+        out, which is how the session keeps sole ownership of its refresh material.
         """
         bearer = token if token is not None else self._bearer()
         attempts = RETRY_ATTEMPTS if retry_on_429 else 1
@@ -410,6 +421,7 @@ class E2EClient:
                 params=params,
                 headers=self._headers(headers, send_gate_header, bearer),
             )
+            self._client.cookies.clear()
             self._pacer.after_call(response.headers)
             if response.status_code != 429:
                 break

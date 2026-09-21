@@ -177,7 +177,10 @@ is safe for every caller here; a streamed body would already be consumed.
 
 The refresh endpoint rotates the refresh token on every call, so whatever it returns in the
 body and whatever cookies it sets replace what the session held, the same way `login` stores
-them. Presenting a spent token would be read as a replay and revoke the whole family. A
+them. Presenting a spent token would be read as a replay and revoke the whole family. The
+client keeps no cookie jar for that reason: it drops whatever a response sets and sends only
+what a caller passes, so the refresh cookie is the session's alone and the suite's anonymous
+probe of `POST /api/auth/refresh` cannot rotate it. A
 refresh that is itself refused raises `RefreshFailed` naming the session's user rather than a
 generic HTTP failure, because at that point there is no credential left and every later case
 would fail for the same reason.
