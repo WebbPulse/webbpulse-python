@@ -501,6 +501,24 @@ def test_the_dynamo_key_store_answers_the_new_methods(dynamodb_resource: Any) ->
     assert_api_key_store_contract(store)
 
 
+def test_the_dynamo_key_store_touches_a_read_only_table_without_raising(dynamodb_resource: Any) -> None:
+    """A read-only repository refuses the stamp the way AWS does, so `touch` stays best effort."""
+    from webbpulse.dynamodb import Repository
+    from webbpulse.identity.api_keys import DynamoApiKeyStore
+
+    dynamodb_resource.meta.client.create_table(**API_KEY_TABLE.create_table_request("wp-local"))
+    writable = DynamoApiKeyStore(Repository(API_KEY_TABLE.logical_name, prefix="wp-local"))
+    minted = mint(user_id="u1", tenant_id="t1", scopes=[], store=writable)
+    reader = DynamoApiKeyStore(Repository(API_KEY_TABLE.logical_name, prefix="wp-local", read_only=True))
+
+    reader.touch(minted.record.key_hash)
+
+    stored = writable.get(minted.record.key_hash)
+
+    assert stored is not None
+    assert stored.last_used_at == minted.record.last_used_at
+
+
 def test_the_dynamo_key_store_counts_past_one_page(dynamodb_resource: Any) -> None:
     """The counted query follows `LastEvaluatedKey`, so a cap cannot be walked past."""
     from webbpulse.dynamodb import Repository

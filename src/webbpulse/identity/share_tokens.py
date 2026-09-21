@@ -25,7 +25,7 @@ from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING, Any, Final
 
-from webbpulse.dynamodb import now_iso
+from webbpulse.dynamodb import ReadOnlyTable, now_iso
 from webbpulse.identity.claims import AuthorizerClaims
 from webbpulse.identity.storage import (
     IDENTITY_TTL_ATTRIBUTE,
@@ -539,6 +539,10 @@ class DynamoShareTokenStore(ShareTokenStore):
 
         Best effort by design: this runs on the read path of a public page, and a write that
         fails must not turn a good share link into a refused request.
+
+        The package's own `ReadOnlyTable` refusal is swallowed alongside the AWS error, so a
+        domain holding this table read-only behaves locally as it does in AWS, where the same
+        write comes back as an `AccessDeniedException`.
         """
         from boto3.dynamodb.conditions import Attr
         from botocore.exceptions import ClientError
@@ -550,7 +554,7 @@ class DynamoShareTokenStore(ShareTokenStore):
                 expression_values={":now": used_at or now_iso()},
                 condition=Attr("token_hash").exists(),
             )
-        except ClientError as exc:
+        except (ClientError, ReadOnlyTable) as exc:
             _log.debug("Could not stamp last_used_at on a share token: %s", exc)
 
     def delete_all_for_tenant(self, tenant_id: str) -> int:
