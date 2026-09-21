@@ -7,6 +7,27 @@ This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## 0.49.0
 
+### `e2e`: declare routes that answer 503 until an integration is configured
+
+A 5xx fails the reachability group and the route cut probe. Some routes answer one on
+purpose: a webhook receiver whose upstream app does not exist yet answers 503 rather than 200
+or 404, so the sender queues the delivery and retries it once the app is created. Until now
+the only way to keep such a route green was to weaken the 5xx bar for every route.
+
+The new optional `pytest_e2e_expected_unavailable(env)` hook returns a mapping keyed exactly
+like the `pytest_e2e_uncovered_routes` allowlist, of `(method, path)` to
+`"ERROR_CODE: reason"`. Both reachability cases and the route cut probe consult it. A
+declared route passes only while it answers a 503 whose error envelope carries that exact
+`error_code`; any other status, including a 200, and a 503 carrying a different code fail as
+a stale entry naming the route to remove. The declaration therefore retires itself once the
+integration is configured rather than excusing a real outage forever. A route not named there
+behaves exactly as before, and any other 5xx still fails. A value that does not parse fails
+the run with a message naming the entry, rather than reading as no declaration.
+
+`RouteProbe` now carries the `error_code` its response envelope held, because the response
+itself is not kept and the route cut probe judges a declared route on the code as well as the
+status. The new `expected_unavailable` session fixture exposes the parsed mapping.
+
 ### `e2e`: sessions refresh their access token
 
 `IdentitySession` logged in once and carried that access token for the whole run. The

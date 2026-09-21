@@ -80,6 +80,12 @@ from .journeys import (
     expand,
     url_matches,
 )
+from .unavailable import (
+    ExpectedUnavailable,
+    normalise_expected_unavailable,
+    response_error_code,
+    stale_expectation,
+)
 from .xdist import worker_id
 
 __all__ = [
@@ -93,6 +99,7 @@ __all__ = [
     "TestReachability",
     "TestRouteCoverage",
     "TestRouteCut",
+    "expected_unavailable",
     "journey_id",
     "operation_id",
     "probe_every_route",
@@ -311,6 +318,10 @@ class RouteProbe:
     specific key shadows is never probed, and carries the `skip_reason` its case skips with
     instead of a request id. A probe that raised carries the `error` its case re-raises, so
     a limiter that exhausted the budget fails that route rather than quietly skipping it.
+
+    `error_code` is what the response's error envelope carried, captured here because the
+    response itself is not kept and a route declared in `pytest_e2e_expected_unavailable` is
+    judged on that code as well as on the status.
     """
 
     route_key: str
@@ -319,6 +330,7 @@ class RouteProbe:
     request_id: str = ""
     served_route_key: str = ""
     status: int = 0
+    error_code: str = ""
     skip_reason: str = ""
     error: Exception | None = None
 
@@ -361,6 +373,7 @@ def probe_every_route(
             request_id=response.headers.get("apigw-requestid", ""),
             served_route_key=response.headers.get(ROUTE_KEY_HEADER.lower(), ""),
             status=response.status_code,
+            error_code=response_error_code(response),
         )
     return probes
 
@@ -411,6 +424,7 @@ class TestRouteCut:
         live_route: Route,
         access_log: AccessLogLookup,
         route_probes: Mapping[str, RouteProbe],
+        expected_unavailable: Mapping[tuple[str, str], ExpectedUnavailable],
     ) -> None:
         """A probe to this route is served by this route key, with no integration error.
 
@@ -436,9 +450,14 @@ class TestRouteCut:
         if probe.skip_reason:
             pytest.skip(probe.skip_reason)
         method, path = probe.method, probe.path
-        assert probe.status < 500, (
-            f"{method} {path} answered {probe.status}. A cut cannot be verified against a gateway that is erroring."
-        )
+        expected = expected_unavailable.get((live_route.method.upper(), live_route.path))
+        if expected is None:
+            assert probe.status < 500, (
+                f"{method} {path} answered {probe.status}. A cut cannot be verified against a gateway that is erroring."
+            )
+        else:
+            failure = stale_expectation(expected, probe.status, probe.error_code, f"{method} {path}")
+            assert failure is None, failure
 
         if probe.served_route_key:
             assert probe.served_route_key == live_route.route_key, (
@@ -576,12 +595,22 @@ class TestReachability:
     429s from the per-IP limiter read as proof that twenty routes were deleted.
     """
 
-    def test_anonymous_call_is_answered_by_the_api(self, operation: Operation, anon: E2EClient) -> None:
+    def test_anonymous_call_is_answered_by_the_api(
+        self,
+        operation: Operation,
+        anon: E2EClient,
+        expected_unavailable: Mapping[tuple[str, str], ExpectedUnavailable],
+    ) -> None:
         """Calling an operation anonymously reaches the API rather than the gate or a 404."""
-        self._assert_reachable(operation, anon, "anonymously")
+        self._assert_reachable(operation, anon, "anonymously", expected_unavailable)
 
     @pytest.mark.e2e_writes
-    def test_authenticated_call_is_answered_by_the_api(self, operation: Operation, api: E2EClient) -> None:
+    def test_authenticated_call_is_answered_by_the_api(
+        self,
+        operation: Operation,
+        api: E2EClient,
+        expected_unavailable: Mapping[tuple[str, str], ExpectedUnavailable],
+    ) -> None:
         """Calling an operation as the durable e2e user reaches the API.
 
         A bare mutation is skipped here: with no path parameter to fill with an absent id,
@@ -591,15 +620,32 @@ class TestReachability:
         """
         if operation.is_bare_mutation:
             pytest.skip(f"{operation.label} would execute a real state change as the durable e2e user")
-        self._assert_reachable(operation, api, "as the e2e user")
+        self._assert_reachable(operation, api, "as the e2e user", expected_unavailable)
 
-    def _assert_reachable(self, operation: Operation, client: E2EClient, who: str) -> None:
+    def _assert_reachable(
+        self,
+        operation: Operation,
+        client: E2EClient,
+        who: str,
+        expected_unavailable: Mapping[tuple[str, str], ExpectedUnavailable],
+    ) -> None:
         """One reachability probe, with the distinction between the failure modes named."""
         path = concrete_path(operation.path)
         try:
             response = client.request(operation.method, path, json={} if operation.method != "GET" else None)
         except RateLimitExhausted as error:
             pytest.fail(str(error))
+
+        expected = expected_unavailable.get((operation.method.upper(), operation.path))
+        if expected is not None:
+            failure = stale_expectation(
+                expected,
+                response.status_code,
+                response_error_code(response),
+                f"{operation.label} called {who}",
+            )
+            assert failure is None, failure
+            return
 
         assert response.status_code < 500, (
             f"{operation.label} called {who} answered {response.status_code}: {response.text[:200]}"
@@ -1302,6 +1348,20 @@ def uncovered_routes(request: pytest.FixtureRequest, e2e_env: Any) -> Mapping[tu
     """
     declared = request.config.hook.pytest_e2e_uncovered_routes(env=e2e_env)
     return runwide.normalise_allowlist(declared)
+
+
+@pytest.fixture(scope="session")
+def expected_unavailable(request: pytest.FixtureRequest, e2e_env: Any) -> Mapping[tuple[str, str], ExpectedUnavailable]:
+    """The routes this stage deliberately answers 503 on, or an empty mapping for none.
+
+    Parsed and normalised here, so a malformed declaration fails every case that consults it
+    with the same message rather than being read as no declaration at all.
+    """
+    declared = request.config.hook.pytest_e2e_expected_unavailable(env=e2e_env)
+    try:
+        return normalise_expected_unavailable(declared)
+    except ValueError as error:
+        raise pytest.UsageError(str(error)) from error
 
 
 @pytest.fixture(scope="session")

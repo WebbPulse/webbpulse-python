@@ -17,6 +17,7 @@ import pytest
 
 __all__ = [
     "pytest_e2e_cleanup",
+    "pytest_e2e_expected_unavailable",
     "pytest_e2e_journeys",
     "pytest_e2e_login_form",
     "pytest_e2e_routes",
@@ -83,4 +84,21 @@ def pytest_e2e_uncovered_routes(env: Any) -> Any:
 
     Only the allowlist is the product's: the matching, the staleness check and the empty
     reason check are the plugin's, so a product supplies the exceptions and nothing else.
+    """
+
+
+@pytest.hookspec(firstresult=True)
+def pytest_e2e_expected_unavailable(env: Any) -> Any:
+    """Return the routes that deliberately answer 503 on this stage, or None for none.
+
+    A mapping keyed exactly like `pytest_e2e_uncovered_routes`, of `(method, path)` to
+    `"ERROR_CODE: reason"`, where the code is the stable `error_code` the route's 503 body
+    carries and the reason says which integration is missing. A route named here passes the
+    reachability and route cut assertions only while it answers that exact 503, so the entry
+    self-heals: once the integration is configured the route answers its declared status and
+    the entry fails as stale until it is removed.
+
+    For a route whose unavailability is deliberate rather than a fault, such as a webhook
+    endpoint that must answer 503 so the sender retries rather than dropping the delivery.
+    Any other 5xx on any route still fails as it always did.
     """

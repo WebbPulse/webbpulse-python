@@ -337,6 +337,7 @@ and deployment concerns and they stay in the post deploy run, which is the requi
 | `suite_requests` | Every request this run made, gathered from the shared record the clients all append to, so a whole-run check sees everything without any case registering itself |
 | `access_log_health` | This run's own access log entries, correlated by request id from one forced window scan. Skips where `E2E_ACCESS_LOG_GROUP` is unset |
 | `uncovered_routes` | The product's coverage allowlist, from `pytest_e2e_uncovered_routes`, with methods normalised to uppercase |
+| `expected_unavailable` | The routes this stage deliberately answers 503 on, from `pytest_e2e_expected_unavailable`, parsed into an error code and a reason |
 | `route_coverage` | What this run covered, left uncovered, allowlisted and what is stale, measured against the deployed operations |
 | `http` | A plain client for the web origin, carrying no API gate header |
 | `cors_request_headers` | The header names the shared TypeScript client sends |
@@ -405,6 +406,32 @@ previous run that died mid-way leaves behind. At `end` it is handed everything t
 appended to `created_resources`. Return a falsy value when the sweep was clean or a short
 description of what could not be deleted; a description is surfaced as a warning and never
 fails the suite, because a leftover must not cost the result of the tests that already ran.
+
+## Routes that are meant to answer 503
+
+A 5xx fails the reachability group and the route cut probe, which is the point. Some routes
+answer one on purpose: a webhook receiver whose upstream app does not exist yet answers 503
+rather than 200 or 404, so the sender queues the delivery and retries it once the app is
+created. Declare those through `pytest_e2e_expected_unavailable`, keyed exactly like the
+coverage allowlist:
+
+```python
+def pytest_e2e_expected_unavailable(env):
+    """The routes that deliberately answer 503 until an integration is configured."""
+    return {
+        ("GET", "/api/github/callback"): "NOT_CONFIGURED: the GitHub App does not exist yet",
+        ("POST", "/api/github/webhook"): "NOT_CONFIGURED: the GitHub App does not exist yet",
+    }
+```
+
+The value is `"ERROR_CODE: reason"`, where the code is the `error_code` the route's 503
+envelope carries. A declared route passes only while it answers a 503 with that exact code.
+Any other status, including a 200, and a 503 carrying a different code, fail as a stale entry
+naming the route to remove, so the declaration retires itself once the integration is
+configured rather than excusing a real outage forever. A route not named here behaves exactly
+as before, and any other 5xx on any route still fails. The hook is optional; declaring none
+is the same as declaring an empty mapping. A value that does not parse fails the run with a
+message naming the entry.
 
 ## The browser suite
 

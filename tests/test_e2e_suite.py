@@ -8,6 +8,7 @@ that reads exactly like a broken authorizer.
 from __future__ import annotations
 
 import time
+from collections.abc import Mapping
 from typing import Any
 
 import httpx
@@ -38,6 +39,7 @@ from webbpulse.e2e.suite import (
 from webbpulse.e2e.suite import TestBrowser as BrowserGroup
 from webbpulse.e2e.suite import TestIdentity as IdentityGroup
 from webbpulse.e2e.suite import TestRouteCut as RouteCutGroup
+from webbpulse.e2e.unavailable import ExpectedUnavailable
 from webbpulse.http import ROUTE_KEY_HEADER
 
 GATE_ID = "gate123"
@@ -357,9 +359,19 @@ class TestRouteCutProofs:
         fields.update(overrides)
         return {fields["route_key"]: RouteProbe(**fields)}
 
-    def case(self, probes: dict[str, RouteProbe], lookup: FakeLookup) -> None:
+    def case(
+        self,
+        probes: dict[str, RouteProbe],
+        lookup: FakeLookup,
+        expected_unavailable: Mapping[tuple[str, str], ExpectedUnavailable] | None = None,
+    ) -> None:
         """Run the route cut case against one probe and one lookup."""
-        RouteCutGroup().test_access_log_names_this_route_key(route("GET /api/parts"), lookup, probes)  # type: ignore[arg-type]
+        RouteCutGroup().test_access_log_names_this_route_key(
+            route("GET /api/parts"),
+            lookup,  # type: ignore[arg-type]
+            probes,
+            expected_unavailable or {},
+        )
 
     def test_the_response_header_alone_proves_the_cut(self) -> None:
         """A probe that reached the function needs no access log at all."""
