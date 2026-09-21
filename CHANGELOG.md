@@ -5,7 +5,7 @@ Notable changes to the `webbpulse` package. The version here is the one in
 
 This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## 0.49.0
+## Unreleased
 
 ### `e2e`: declare routes that answer 503 until an integration is configured
 
@@ -27,6 +27,8 @@ the run with a message naming the entry, rather than reading as no declaration.
 `RouteProbe` now carries the `error_code` its response envelope held, because the response
 itself is not kept and the route cut probe judges a declared route on the code as well as the
 status. The new `expected_unavailable` session fixture exposes the parsed mapping.
+
+## 0.49.0
 
 ### `e2e`: sessions refresh their access token
 
