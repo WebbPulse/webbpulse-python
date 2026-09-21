@@ -352,3 +352,71 @@ class TestVerbs:
         client = client_for(handle, clock, gate_headers={"x-origin-verify": "secret-value"})
         getattr(client, verb)("/api/parts/abc", json={"name": "x"})
         assert seen[0]["x-origin-verify"] == "secret-value"
+
+
+class TestCookies:
+    """Tests for the client keeping no cookie jar.
+
+    A jar cost a staging run: the session-scoped anonymous client had the login response's
+    refresh cookie, so the anonymous probe of `POST /api/auth/refresh` rotated the session's
+    family and the session's own refresh then replayed a spent token, revoking the family and
+    turning every later case in that worker into a `RefreshFailed`.
+    """
+
+    def test_a_set_cookie_is_not_sent_on_the_next_request(self) -> None:
+        """The refresh cookie an answer sets belongs to the session, not to the client."""
+        seen: list[str] = []
+
+        def handle(request: httpx.Request) -> httpx.Response:
+            """Record the cookie header sent and answer setting a refresh cookie."""
+            seen.append(request.headers.get("cookie", ""))
+            return httpx.Response(200, headers={"set-cookie": "refresh_token=cookie-1; Path=/"}, json={})
+
+        clock = Clock()
+        client = client_for(handle, clock)
+        client.post("/api/auth/login", json={})
+        client.get("/api/parts")
+        assert seen == ["", ""]
+
+    def test_a_set_cookie_survives_on_the_response_it_came_on(self) -> None:
+        """Dropping the jar must not stop `login` reading what the login response set."""
+        clock = Clock()
+        client = client_for(
+            lambda request: httpx.Response(200, headers={"set-cookie": "refresh_token=cookie-1; Path=/"}, json={}),
+            clock,
+        )
+        response = client.post("/api/auth/login", json={})
+        assert dict(response.cookies) == {"refresh_token": "cookie-1"}
+
+    def test_a_cookie_set_before_a_429_retry_is_not_sent_on_the_retry(self) -> None:
+        """The retry loop sends the same request again, not that request plus a new cookie."""
+        seen: list[str] = []
+
+        def handle(request: httpx.Request) -> httpx.Response:
+            """Throttle the first attempt while setting a cookie, then answer the retry."""
+            seen.append(request.headers.get("cookie", ""))
+            status = 429 if len(seen) == 1 else 200
+            return httpx.Response(
+                status,
+                headers={"set-cookie": "refresh_token=cookie-1; Path=/", "retry-after": "5"},
+                json={},
+            )
+
+        clock = Clock()
+        client = client_for(handle, clock)
+        assert client.post("/api/auth/refresh", json={}).status_code == 200
+        assert seen == ["", ""]
+
+    def test_a_caller_supplied_cookie_header_is_still_sent(self) -> None:
+        """The session refreshes by passing its cookie explicitly, which must keep working."""
+        seen: list[str] = []
+
+        def handle(request: httpx.Request) -> httpx.Response:
+            """Record the cookie header sent and answer 200."""
+            seen.append(request.headers.get("cookie", ""))
+            return httpx.Response(200, json={})
+
+        clock = Clock()
+        client = client_for(handle, clock)
+        client.post("/api/auth/refresh", json={}, headers={"cookie": "refresh_token=cookie-1"})
+        assert seen == ["refresh_token=cookie-1"]

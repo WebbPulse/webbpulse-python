@@ -625,3 +625,57 @@ class TestLoginWiring:
 
         session.client.get(PROTECTED)
         assert recorder.refreshes == 1
+
+
+class TestRefreshCookieOwnership:
+    """Tests that the session, not the client, carries the refresh cookie after `login`.
+
+    The anonymous client is session scoped and the suite probes `POST /api/auth/refresh`
+    anonymously. With a cookie jar on the client, that probe presented the login generation's
+    refresh cookie and rotated the family, and the session's own later refresh replayed the
+    spent token, which revoked the family and failed every later case in that worker.
+    """
+
+    def test_login_leaves_no_cookie_on_the_anonymous_client(self) -> None:
+        """A later anonymous call must not carry the refresh cookie login was answered with."""
+
+        def handle(request: httpx.Request, index: int) -> httpx.Response:
+            """Answer the login setting a refresh cookie, and anything else with 200."""
+            if request.url.path == "/api/auth/login":
+                return httpx.Response(
+                    200,
+                    headers={"set-cookie": "refresh_token=cookie-1; Path=/"},
+                    json={"access_token": access_token(expires_at=time.time() + 3600), "refresh_token": ""},
+                )
+            return httpx.Response(200, json={"ok": True})
+
+        recorder = Recorder(handle)
+        anon = client_for(recorder)
+        session = login(anon, "e2e@example.invalid", "password")
+
+        anon.post(DEFAULT_REFRESH_PATH, json={})
+        assert recorder.requests[-1].headers.get("cookie", "") == ""
+        assert session.refresh_cookies == {"refresh_token": "cookie-1"}
+
+    def test_the_session_still_sends_the_cookie_when_it_refreshes(self) -> None:
+        """The session owns the refresh material, so it passes it as a header of its own."""
+
+        def handle(request: httpx.Request, index: int) -> httpx.Response:
+            """Answer the login with a spent token and a cookie, then refresh with a live one."""
+            if request.url.path == "/api/auth/login":
+                return httpx.Response(
+                    200,
+                    headers={"set-cookie": "refresh_token=cookie-1; Path=/"},
+                    json={"access_token": access_token(expires_at=time.time()), "refresh_token": ""},
+                )
+            if request.url.path == DEFAULT_REFRESH_PATH:
+                return httpx.Response(200, json=refresh_body("b", expires_at=time.time() + 3600))
+            return httpx.Response(200, json={"ok": True})
+
+        recorder = Recorder(handle)
+        session = login(client_for(recorder), "e2e@example.invalid", "password")
+
+        session.client.get(PROTECTED)
+        refresh_request = next(r for r in recorder.requests if r.url.path == DEFAULT_REFRESH_PATH)
+        assert refresh_request.headers.get("cookie", "") == "refresh_token=cookie-1"
+        assert session.refreshes == 1
