@@ -15,7 +15,7 @@ honoured it from the start: both reachability cases and the route cut probe pass
 route while it answers its declared 503. The run-wide sweep over the access log did not. It
 failed on every entry with a status at or above 500, so a run whose per-route cases were all
 green still went red with "requests answered 5xx" listing the 503s the excused routes had
-answered. It showed up on WebbPulse-Terraform staging as seven access log rows for
+answered. It showed up on Standupless staging as seven access log rows for
 `GET /api/github/callback` and `POST /api/github/webhooks`.
 
 `no_request_was_answered_with_a_server_error` now takes the declaration and skips an entry
