@@ -420,3 +420,141 @@ class TestCookies:
         client = client_for(handle, clock)
         client.post("/api/auth/refresh", json={}, headers={"cookie": "refresh_token=cookie-1"})
         assert seen == ["refresh_token=cookie-1"]
+
+
+class StubTokenSource:
+    """A token source a test drives, counting the refreshes the client asks of it."""
+
+    def __init__(self, token: str, refreshed: str) -> None:
+        """Hold the token to send now and the one a refresh hands back."""
+        self.token = token
+        self.refreshed = refreshed
+        self.refresh_calls = 0
+
+    def bearer_token(self) -> str:
+        """The token to send now, never refreshed ahead of a refusal."""
+        return self.token
+
+    def refresh_for_retry(self, token: str) -> str:
+        """Record the refusal, rotate the token and hand the new one to the retry."""
+        self.refresh_calls += 1
+        self.token = self.refreshed
+        return self.refreshed
+
+
+class TestFormBodies:
+    """Tests for `data=`, which the identity OAuth token and consent endpoints require.
+
+    RFC 6749 requires those endpoints to read `application/x-www-form-urlencoded`, so a
+    client that could only send JSON left a product keeping a plain httpx fixture beside
+    this one and losing pacing, cookie hygiene and record capture with it.
+    """
+
+    def test_a_data_mapping_is_form_encoded(self) -> None:
+        """httpx encodes the mapping and sets the content type without the caller's help."""
+        seen: list[httpx.Request] = []
+
+        def handle(request: httpx.Request) -> httpx.Response:
+            """Record the request and answer 200."""
+            seen.append(request)
+            return httpx.Response(200, json={})
+
+        clock = Clock()
+        client = client_for(handle, clock)
+        client.post("/oauth/token", data={"grant_type": "authorization_code", "code": "abc"})
+        assert seen[0].headers["content-type"] == "application/x-www-form-urlencoded"
+        assert seen[0].content == b"grant_type=authorization_code&code=abc"
+
+    def test_a_form_request_is_recorded(self) -> None:
+        """A form body must not cost the record the failure reports and coverage read."""
+        clock = Clock()
+        client = client_for(responder([200], {"apigw-requestid": "gw-1"}), clock)
+        client.post("/oauth/token", data={"grant_type": "client_credentials"})
+        record = client.records[-1]
+        assert record.method == "POST"
+        assert record.path == "/oauth/token"
+        assert record.status == 200
+        assert record.request_id == "gw-1"
+
+    def test_a_form_request_still_clears_the_cookie_jar(self) -> None:
+        """The token endpoint sets cookies on some flows, and they stay the session's alone."""
+        seen: list[str] = []
+
+        def handle(request: httpx.Request) -> httpx.Response:
+            """Record the cookie header sent and answer setting a refresh cookie."""
+            seen.append(request.headers.get("cookie", ""))
+            return httpx.Response(200, headers={"set-cookie": "refresh_token=cookie-1; Path=/"}, json={})
+
+        clock = Clock()
+        client = client_for(handle, clock)
+        client.post("/oauth/token", data={"grant_type": "authorization_code"})
+        client.post("/oauth/token", data={"grant_type": "refresh_token"})
+        assert seen == ["", ""]
+
+    def test_a_form_body_survives_a_429_retry(self) -> None:
+        """The retry sends the same form body, not an empty one."""
+        seen: list[bytes] = []
+
+        def handle(request: httpx.Request) -> httpx.Response:
+            """Throttle the first attempt, then answer the retry, recording both bodies."""
+            seen.append(request.content)
+            status = 429 if len(seen) == 1 else 200
+            return httpx.Response(status, headers={"retry-after": "5"}, json={})
+
+        clock = Clock()
+        client = client_for(handle, clock)
+        response = client.post("/oauth/token", data={"grant_type": "client_credentials"})
+        assert response.status_code == 200
+        assert seen == [b"grant_type=client_credentials", b"grant_type=client_credentials"]
+        assert clock.slept == [5.0]
+
+    def test_a_form_body_survives_the_refresh_retry(self) -> None:
+        """An expired credential refreshes and re-sends the same form body under the new token."""
+        seen: list[tuple[str, bytes]] = []
+
+        def handle(request: httpx.Request) -> httpx.Response:
+            """Refuse the first attempt as an expired credential, then answer the retry."""
+            seen.append((request.headers.get("authorization", ""), request.content))
+            status = 401 if len(seen) == 1 else 200
+            return httpx.Response(status, json={})
+
+        clock = Clock()
+        source = StubTokenSource("stale", "fresh")
+        client = client_for(handle, clock, token_source=source)
+        response = client.post("/oauth/token", data={"grant_type": "client_credentials"})
+        assert response.status_code == 200
+        assert source.refresh_calls == 1
+        assert seen == [
+            ("Bearer stale", b"grant_type=client_credentials"),
+            ("Bearer fresh", b"grant_type=client_credentials"),
+        ]
+
+    def test_json_and_data_together_are_refused(self) -> None:
+        """A request carries one body, so the contradiction is caught before anything is sent."""
+        seen: list[httpx.Request] = []
+
+        def handle(request: httpx.Request) -> httpx.Response:
+            """Record the request and answer 200."""
+            seen.append(request)
+            return httpx.Response(200, json={})
+
+        clock = Clock()
+        client = client_for(handle, clock)
+        with pytest.raises(ValueError):
+            client.post("/oauth/token", json={"grant_type": "x"}, data={"grant_type": "x"})
+        assert seen == []
+        assert client.records == []
+
+    def test_a_form_request_sends_no_json_body(self) -> None:
+        """Only the form body goes out, so the endpoint is not handed a JSON content type."""
+        seen: list[httpx.Request] = []
+
+        def handle(request: httpx.Request) -> httpx.Response:
+            """Record the request and answer 200."""
+            seen.append(request)
+            return httpx.Response(200, json={})
+
+        clock = Clock()
+        client = client_for(handle, clock)
+        client.post("/oauth/token", data={"grant_type": "client_credentials"})
+        assert "json" not in seen[0].headers["content-type"]
