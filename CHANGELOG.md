@@ -5,6 +5,25 @@ Notable changes to the `webbpulse` package. The version here is the one in
 
 This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## Unreleased
+
+### `e2e`: the client sends form-encoded bodies
+
+`E2EClient.request` took `json=` and nothing else, so every body it could send was a JSON one.
+The package's own identity OAuth server does not accept that on the endpoints that matter:
+RFC 6749 requires the token and consent endpoints to read `application/x-www-form-urlencoded`,
+and the server's request reader only looks at a form body there. A product's suite therefore
+could not exercise its own OAuth flow through the shared client and kept a plain httpx fixture
+beside it, losing the pacing, the cookie hygiene and the access log record capture that the
+shared client exists to provide.
+
+`request` now takes a keyword-only `data` mapping alongside `json`, threaded through to httpx,
+which form-encodes it and sets the content type itself. The convenience verbs forward it with
+everything else they already forward, and a form request is paced, retried on a 429, retried
+once after a refresh on an expired credential and recorded exactly as a JSON one is, with the
+same empty cookie jar. Passing both `json` and `data` is a caller error: it raises `ValueError`
+before any request goes out, since a request carries one body.
+
 ## 0.52.0
 
 ### `e2e`: the run-wide 5xx sweep honours expected-unavailable routes

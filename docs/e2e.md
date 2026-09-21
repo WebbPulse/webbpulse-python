@@ -173,7 +173,11 @@ retries the request once, and the second answer is surfaced as it is. The produc
 carries an `error_code` in the shared error envelope and is never retried, because it means
 the caller is authenticated and not permitted, and a retry would double every permission
 assertion in the suite. The retry re-sends the same in-memory body the call was given, which
-is safe for every caller here; a streamed body would already be consumed.
+is safe for every caller here; a streamed body would already be consumed. That body is a JSON
+one from `json=` or a form-encoded one from `data=`, the latter being how the identity OAuth
+token and consent endpoints are exercised, since RFC 6749 requires them to read
+`application/x-www-form-urlencoded`. Everything else is unchanged on a form request: the same
+pacing, the same empty cookie jar, the same request record and the same retries.
 
 The refresh endpoint rotates the refresh token on every call, so whatever it returns in the
 body and whatever cookies it sets replace what the session held, the same way `login` stores
@@ -324,7 +328,7 @@ and deployment concerns and they stay in the post deploy run, which is the requi
 | --- | --- |
 | `e2e_env` | The parsed `E2EEnvironment`, including `resource_prefix`, `is_production`, `is_local` and `rate_limited` |
 | `gate_headers` | The `x-origin-verify` header, or an empty mapping in production and on a local stack |
-| `anon` | A client carrying the gate header and no identity, paced everywhere but staging. It serves `get`, `post`, `put`, `patch`, `delete` and `options`, each through the same `request` path, so pacing, the 429 retry and the request record apply to every verb |
+| `anon` | A client carrying the gate header and no identity, paced everywhere but staging. It serves `get`, `post`, `put`, `patch`, `delete` and `options`, each through the same `request` path, so pacing, the 429 retry and the request record apply to every verb. A body goes out as JSON with `json=` or form-encoded with `data=`, which is what the identity OAuth token and consent endpoints require; passing both raises `ValueError` |
 | `ephemeral_user` | This run's own login user, created at session start and deleted at the end, or None where the route is not offered |
 | `ephemeral_user_attributes` | The attributes `ephemeral_user` creates that user with, empty by default. Override it where the product grants write scopes only to an admin or verified row |
 | `credentials` | The email and password the suite signs in with: this run's ephemeral user where there is one, the durable user otherwise. The password is kept out of the repr |

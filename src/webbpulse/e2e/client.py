@@ -344,6 +344,7 @@ class E2EClient:
         path: str,
         *,
         json: Any = None,
+        data: Mapping[str, Any] | None = None,
         headers: Mapping[str, str] | None = None,
         params: Mapping[str, Any] | None = None,
         send_gate_header: bool = True,
@@ -351,24 +352,31 @@ class E2EClient:
     ) -> httpx.Response:
         """Send one request, pacing under the limiter and retrying a 429 up to the cap.
 
+        `json` sends a JSON body. `data` sends a form-encoded one, which is what the identity
+        OAuth token and consent endpoints require of an RFC 6749 client, and httpx sets the
+        `application/x-www-form-urlencoded` content type itself. Passing both is a caller
+        error and raises `ValueError` before anything goes out.
+
         Raises `RateLimitExhausted` when every attempt answered 429, since a probe that
         never got an answer must not be banked as a pass.
 
         A client holding a token source also retries once on a refusal that reads as an
-        expired credential, after refreshing. The retry re-sends `json` and `params` as they
-        were given, which is safe because every caller in this suite passes an in-memory body
-        rather than a stream or a file handle: a streamed body would already be consumed and
-        the retry would send an empty one. Pass `retry_on_429=False` to send exactly once,
-        which also disables the refresh retry.
+        expired credential, after refreshing. The retry re-sends `json`, `data` and `params`
+        as they were given, which is safe because every caller in this suite passes an
+        in-memory body rather than a stream or a file handle: a streamed body would already be
+        consumed and the retry would send an empty one. Pass `retry_on_429=False` to send
+        exactly once, which also disables the refresh retry.
         """
+        if json is not None and data is not None:
+            raise ValueError("Pass either json= or data=, not both: a request carries one body.")
         token = self._bearer()
-        response, throttled = self._send(method, path, json, headers, params, send_gate_header, retry_on_429)
+        response, throttled = self._send(method, path, json, data, headers, params, send_gate_header, retry_on_429)
 
         if retry_on_429 and self.token_source is not None and token and is_expired_credential(response):
             refreshed = self.token_source.refresh_for_retry(token)
             if refreshed:
                 retry, retried_throttled = self._send(
-                    method, path, json, headers, params, send_gate_header, retry_on_429, token=refreshed
+                    method, path, json, data, headers, params, send_gate_header, retry_on_429, token=refreshed
                 )
                 response, throttled = retry, throttled + retried_throttled
 
@@ -393,6 +401,7 @@ class E2EClient:
         method: str,
         path: str,
         json: Any,
+        data: Mapping[str, Any] | None,
         headers: Mapping[str, str] | None,
         params: Mapping[str, Any] | None,
         send_gate_header: bool,
@@ -418,6 +427,7 @@ class E2EClient:
                 method,
                 path,
                 json=json,
+                data=data,
                 params=params,
                 headers=self._headers(headers, send_gate_header, bearer),
             )
