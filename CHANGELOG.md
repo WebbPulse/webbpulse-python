@@ -13,7 +13,7 @@ This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 stamp `last_used_at` on the authorization path and a failed write must never refuse a good
 credential. Until now they caught only `ClientError`, which made the two environments
 disagree. A domain that holds the api-keys or share-tokens table read-only, matching the IAM
-grant it actually has, got an `AccessDeniedException` in AWS and a swallowed one, but locally
+grant it actually has, got an `AccessDeniedException` in AWS and that was swallowed, but locally
 and under test the same write came back as `ReadOnlyTable`, a `PermissionError` that escaped
 and turned `verify()` into a 500.
 
