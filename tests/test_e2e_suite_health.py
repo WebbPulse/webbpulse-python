@@ -143,7 +143,7 @@ class TestTheFailingShapes:
     def test_a_server_error_fails(self) -> None:
         """A 5xx anywhere in the run is reported."""
         with pytest.raises(AssertionError, match="answered 5xx"):
-            Health().test_no_request_was_answered_with_a_server_error([entry(status=502)])
+            Health().test_no_request_was_answered_with_a_server_error([entry(status=502)], {})
 
     def test_a_real_authorizer_refusal_fails_nothing(self) -> None:
         """A gateway-side 403 is a refusal the suite provokes on purpose, not a failure.
@@ -154,7 +154,7 @@ class TestTheFailingShapes:
         """
         entries = [authorizer_refusal()]
         health = Health()
-        health.test_no_request_was_answered_with_a_server_error(entries)
+        health.test_no_request_was_answered_with_a_server_error(entries, {})
         health.test_every_request_matched_a_declared_route(entries)
         health.test_no_integration_reported_an_error(entries)
 
@@ -162,7 +162,7 @@ class TestTheFailingShapes:
         """A product 401 logs `integrationStatus` 200 because the function ran and answered."""
         entries = [product_rejection()]
         health = Health()
-        health.test_no_request_was_answered_with_a_server_error(entries)
+        health.test_no_request_was_answered_with_a_server_error(entries, {})
         health.test_every_request_matched_a_declared_route(entries)
         health.test_no_integration_reported_an_error(entries)
 
@@ -198,7 +198,7 @@ class TestTheFailingShapes:
         """Nothing in a clean run trips any of them."""
         entries = [entry()]
         health = Health()
-        health.test_no_request_was_answered_with_a_server_error(entries)
+        health.test_no_request_was_answered_with_a_server_error(entries, {})
         health.test_every_request_matched_a_declared_route(entries)
         health.test_no_integration_reported_an_error(entries)
 

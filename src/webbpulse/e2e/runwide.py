@@ -26,10 +26,12 @@ import tempfile
 from collections.abc import Iterable, Iterator, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
+from types import MappingProxyType
 from typing import Any, Final, Protocol
 
 from .access_log import AccessLogEntry
 from .coverage import RouteCoverage, measure_coverage
+from .unavailable import UNAVAILABLE_STATUS, ExpectedUnavailable, normalise_expected_unavailable
 
 __all__ = [
     "RUN_DIRECTORY_PREFIX",
@@ -40,6 +42,7 @@ __all__ = [
     "describe_entries",
     "every_request_matched_a_declared_route",
     "every_served_route_was_exercised_or_is_allowlisted",
+    "expected_unavailable_from_config",
     "no_integration_reported_an_error",
     "no_request_was_answered_with_a_server_error",
     "read_worker_records",
@@ -206,12 +209,45 @@ def the_access_log_carries_this_runs_requests(
     )
 
 
-def no_request_was_answered_with_a_server_error(entries: Sequence[AccessLogEntry]) -> str | None:
-    """Whether any request this run made was answered 5xx."""
-    failures = [entry for entry in entries if entry.status >= 500]
+def no_request_was_answered_with_a_server_error(
+    entries: Sequence[AccessLogEntry],
+    expected_unavailable: Mapping[tuple[str, str], ExpectedUnavailable] = MappingProxyType({}),
+) -> str | None:
+    """Whether any request this run made was answered 5xx, bar the declared 503s.
+
+    A route named in `pytest_e2e_expected_unavailable` is meant to answer 503 until its
+    integration is configured, and the per-route assertions already pass on it. The run-wide
+    sweep excuses the same entries, or a run whose per-route cases were all green would still
+    fail here on every 503 those routes answered.
+
+    Only a 503 on a declared route is excused. The access log carries no body, so the error
+    code cannot be checked here; that check stays with the per-route assertions, which see
+    the response. A 503 on an undeclared route and any other 5xx on a declared one still fail.
+    """
+    failures = [
+        entry for entry in entries if entry.status >= 500 and not _is_expected_unavailable(entry, expected_unavailable)
+    ]
     if not failures:
         return None
     return "requests answered 5xx:\n" + describe_entries(failures)
+
+
+def _is_expected_unavailable(
+    entry: AccessLogEntry,
+    expected_unavailable: Mapping[tuple[str, str], ExpectedUnavailable],
+) -> bool:
+    """Whether this entry is a declared route answering the 503 it was declared to answer.
+
+    Keyed on the entry's route key rather than on its request path, because the path carries
+    the path parameter values the request was made with while the declaration, like the
+    coverage allowlist, names the route template the gateway matched.
+    """
+    if entry.status != UNAVAILABLE_STATUS:
+        return False
+    method, separator, path = entry.route_key.partition(" ")
+    if not separator:
+        return False
+    return (method.upper(), path) in expected_unavailable
 
 
 def every_request_matched_a_declared_route(entries: Sequence[AccessLogEntry]) -> str | None:
@@ -340,12 +376,17 @@ def controller_verdicts(
     allowlist: Mapping[tuple[str, str], str],
     *,
     access_log_note: str = "",
+    expected_unavailable: Mapping[tuple[str, str], ExpectedUnavailable] = MappingProxyType({}),
 ) -> RunWideVerdicts:
     """Every run-wide verdict for the whole run, in the order the test groups make them.
 
     `entries` is None when the access log was not swept, which is what an unset
     `E2E_ACCESS_LOG_GROUP` produces, and `access_log_note` then says why. The coverage
     verdicts are reached either way, because they need only the requests.
+
+    `expected_unavailable` is the product's declaration of the routes that deliberately
+    answer 503, passed straight through to the 5xx sweep so the controller excuses exactly
+    what the `TestAccessLogHealth` method excuses.
     """
     failures: list[str] = []
     notes: list[str] = []
@@ -359,12 +400,11 @@ def controller_verdicts(
             failures.append(vacuous)
         elif not any(request.request_id for request in requests):
             notes.append("this run recorded no request ids, so there was nothing to correlate")
-        for check in (
-            no_request_was_answered_with_a_server_error,
-            every_request_matched_a_declared_route,
-            no_integration_reported_an_error,
+        for message in (
+            no_request_was_answered_with_a_server_error(entries, expected_unavailable),
+            every_request_matched_a_declared_route(entries),
+            no_integration_reported_an_error(entries),
         ):
-            message = check(entries)
             if message is not None:
                 failures.append(message)
 
@@ -398,6 +438,16 @@ def normalise_allowlist(declared: Any) -> dict[tuple[str, str], str]:
     if not declared:
         return {}
     return {(str(method).upper(), str(path)): str(reason) for (method, path), reason in dict(declared).items()}
+
+
+def expected_unavailable_from_config(config: Any, env: Any) -> dict[tuple[str, str], ExpectedUnavailable]:
+    """The product's declared expected-unavailable routes, asked for and parsed in one place.
+
+    Shared by the `expected_unavailable` fixture and the controller, so the two modes cannot
+    excuse different routes. `ValueError` from a malformed declaration is left to the caller,
+    which reports it the way its own mode reports a configuration error.
+    """
+    return normalise_expected_unavailable(config.hook.pytest_e2e_expected_unavailable(env=env))
 
 
 def xdist_worker(config: Any) -> str:

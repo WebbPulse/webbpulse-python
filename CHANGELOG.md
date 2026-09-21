@@ -5,6 +5,30 @@ Notable changes to the `webbpulse` package. The version here is the one in
 
 This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## Unreleased
+
+### `e2e`: the run-wide 5xx sweep honours expected-unavailable routes
+
+0.50.0 added `pytest_e2e_expected_unavailable`, so a product can declare the routes that
+answer 503 with a stable error code until an integration is configured. The per-route checks
+honoured it from the start: both reachability cases and the route cut probe pass on a declared
+route while it answers its declared 503. The run-wide sweep over the access log did not. It
+failed on every entry with a status at or above 500, so a run whose per-route cases were all
+green still went red with "requests answered 5xx" listing the 503s the excused routes had
+answered. It showed up on WebbPulse-Terraform staging as seven access log rows for
+`GET /api/github/callback` and `POST /api/github/webhooks`.
+
+`no_request_was_answered_with_a_server_error` now takes the declaration and skips an entry
+whose status is 503 and whose route matches it. The lookup key is the entry's route key, split
+into a method and the route template, because the request path carries the path parameter
+values the request was made with while the declaration names the template. The error code is
+not checked here: the access log carries no body, so that check stays with the per-route
+assertions, which see the response. A 503 on an undeclared route, and any other 5xx on a
+declared one, fail exactly as before with the same message. Both consumers pass the mapping
+through, the `TestAccessLogHealth` method from the existing `expected_unavailable` fixture and
+the xdist controller through one shared resolver, so the two scheduling modes cannot excuse
+different routes.
+
 ## 0.51.0
 
 ### `e2e`: the client keeps no cookie jar
