@@ -5,6 +5,36 @@ Notable changes to the `webbpulse` package. The version here is the one in
 
 This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## Unreleased
+
+### `e2e`: a 401 from the application is no longer read as a stale token
+
+`is_expired_credential` treated every 401 as a credential the session could refresh its way
+past. Its docstring said so outright: "A 401 always qualifies: whoever answered it, the
+credential is the thing being refused." That is false for a route that authenticates a
+machine token inside the function rather than at the gateway. Such a route answers a user
+bearer with a 401 meaning "you are the wrong kind of principal", which no refresh can fix.
+
+The client refreshed against it anyway, the refresh endpoint refused the refresh, and
+`_refresh_locked` raised `RefreshFailed`, which is terminal. A correct product answer became
+a suite error and the session was left with no credential for every case that followed. It
+showed up on WebbPulse-Terraform staging as three runs routes that authenticate a runner
+token in the Lambda and are declared `authorization_type = "NONE"` at the gateway:
+`POST /api/v1/runs/{run_id}/artifact-uploads`, `GET /api/v1/runs/{run_id}/bundle` and
+`POST /api/v1/runs/{run_id}/phase-result`. All three failed within 1.3 seconds on one xdist
+worker, while the neighbouring authenticated runs routes passed.
+
+The two cases are distinguishable by inspection, so no product-side declaration is needed.
+Only `webbpulse.http.error_body` writes `error_code`, and it runs inside the function, so the
+field's presence proves the application authenticated the caller and then refused on its own
+terms. The gateway and its authorizers answer before the function runs and can only produce a
+bare `{"message": ...}` object, an empty body or a non-JSON one. `is_expired_credential` now
+asks that one question for a 401 and a 403 alike, through the new shared
+`carries_error_envelope`, so the two arms cannot drift apart. A 401 carrying an `error_code`
+no longer refreshes; an envelope-less 401 refreshes exactly as before, including an empty or
+unreadable body, so genuine session expiry is untouched. The 403 arm additionally keeps
+requiring the gateway's bare `Forbidden`, which is unchanged.
+
 ## 0.53.0
 
 ### `e2e`: the client sends form-encoded bodies

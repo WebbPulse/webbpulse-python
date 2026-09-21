@@ -6,6 +6,11 @@ by the authorizer, and those refusals read exactly like product bugs, including 
 fixtures that create the resources a case then asserts on. What is under test here is that
 the session notices before the gateway does, that it also recovers from a refusal it did not
 predict, and that it never retries a refusal a fresh token would not fix.
+
+That last property is decided by the body rather than the status. A refusal carrying the
+shared error envelope's `error_code` came from the function, so the caller was authenticated
+and refused anyway and no refresh can help; one carrying no envelope came from the gateway or
+an authorizer, which is what an expired token looks like from outside.
 """
 
 from __future__ import annotations
@@ -20,7 +25,7 @@ from typing import Any
 import httpx
 import pytest
 
-from webbpulse.e2e.client import E2EClient, is_expired_credential
+from webbpulse.e2e.client import E2EClient, carries_error_envelope, is_expired_credential
 from webbpulse.e2e.identity import (
     DEFAULT_ACCESS_TOKEN_TTL,
     DEFAULT_REFRESH_PATH,
@@ -318,13 +323,100 @@ class TestRefreshOnRefusal:
         assert clone.get(PROTECTED).status_code == 401
         assert recorder.paths == [PROTECTED]
 
+    def test_a_product_401_is_not_retried(self) -> None:
+        """A 401 carrying an `error_code` is the application refusing, so it stands as it is.
+
+        The shape a route that authenticates a machine token inside the function answers a
+        user bearer with. Refreshing against it asked the refresh endpoint for a credential
+        the route would refuse just the same.
+        """
+        clock = Clock()
+        envelope = {
+            "success": False,
+            "status": 401,
+            "message": "Authentication is required.",
+            "request_id": "req-abc123",
+            "error_code": "UNAUTHORIZED",
+        }
+        recorder = Recorder(lambda request, index: httpx.Response(401, json=envelope))
+        session = session_for(recorder, clock, expires_at=clock() + 600)
+
+        response = session.client.get(PROTECTED)
+        assert response.status_code == 401
+        assert recorder.paths == [PROTECTED]
+        assert session.refreshes == 0
+
+    def test_a_product_401_leaves_the_session_usable(self) -> None:
+        """The case that answered it fails alone rather than poisoning every later one.
+
+        Refreshing against a wrong-principal 401 met a refusal from the refresh endpoint
+        too, and `RefreshFailed` is terminal: it turned a correct product answer into a
+        suite error and left the session with no credential for the cases that followed.
+        """
+        clock = Clock()
+        runner_route = "/api/v1/runs/run-1/bundle"
+        envelope = {
+            "success": False,
+            "status": 401,
+            "message": "Authentication is required.",
+            "request_id": "req-abc123",
+            "error_code": "UNAUTHORIZED",
+        }
+
+        def handle(request: httpx.Request, index: int) -> httpx.Response:
+            """Refuse the runner route, refuse any refresh, and answer everything else."""
+            if request.url.path == runner_route:
+                return httpx.Response(401, json=envelope)
+            if request.url.path == DEFAULT_REFRESH_PATH:
+                return httpx.Response(401, json={"message": "Unauthorized"})
+            return httpx.Response(200, json={"ok": True})
+
+        recorder = Recorder(handle)
+        session = session_for(recorder, clock, expires_at=clock() + 600)
+
+        assert session.client.get(runner_route).status_code == 401
+        assert session.client.get(PROTECTED).status_code == 200
+        assert recorder.paths == [runner_route, PROTECTED]
+        assert session.refreshes == 0
+
 
 class TestIsExpiredCredential:
-    """Tests for telling an expired credential from a permission refusal."""
+    """Tests for telling an expired credential from a refusal no refresh can fix."""
 
-    def test_401_always_qualifies(self) -> None:
-        """A 401 is about the credential whoever answered it."""
-        assert is_expired_credential(httpx.Response(401, json={"error_code": "UNAUTHORIZED"}))
+    def test_a_bare_401_qualifies(self) -> None:
+        """An envelope-less 401 is the authorizer refusing the token itself."""
+        assert is_expired_credential(httpx.Response(401, json={"message": "Unauthorized"}))
+
+    def test_an_empty_bodied_401_qualifies(self) -> None:
+        """An authorizer denying with its own policy can answer nothing at all."""
+        assert is_expired_credential(httpx.Response(401))
+
+    def test_a_non_json_401_qualifies(self) -> None:
+        """A parse failure must not silently suppress a refresh a real expiry needs."""
+        assert is_expired_credential(httpx.Response(401, text="<html>401</html>"))
+
+    def test_a_json_list_401_qualifies(self) -> None:
+        """Valid JSON that is not an object carries no envelope, so it is not the app."""
+        assert is_expired_credential(httpx.Response(401, json=["Unauthorized"]))
+
+    def test_a_product_401_does_not_qualify(self) -> None:
+        """An `error_code` proves the function authenticated the caller and refused anyway.
+
+        The shape a route that authenticates a machine token inside the Lambda answers a
+        user bearer with. The caller is the wrong kind of principal, which no refresh fixes.
+        """
+        envelope = {
+            "success": False,
+            "status": 401,
+            "message": "Authentication is required.",
+            "request_id": "req-abc123",
+            "error_code": "UNAUTHORIZED",
+        }
+        assert not is_expired_credential(httpx.Response(401, json=envelope))
+
+    def test_a_camel_cased_product_401_does_not_qualify(self) -> None:
+        """The camel cased spelling is read too, as it already was for a 403."""
+        assert not is_expired_credential(httpx.Response(401, json={"errorCode": "UNAUTHORIZED"}))
 
     def test_the_gateway_forbidden_shape_qualifies(self) -> None:
         """The authorizer's bare message is what an expired token looks like from outside."""
@@ -338,9 +430,41 @@ class TestIsExpiredCredential:
         """A body that is not JSON is not the gateway shape."""
         assert not is_expired_credential(httpx.Response(403, text="Forbidden"))
 
+    def test_another_bare_403_message_does_not_qualify(self) -> None:
+        """Only the gateway's own `Forbidden` is the authorizer shape at this status."""
+        assert not is_expired_credential(httpx.Response(403, json={"message": "Nope"}))
+
     def test_other_statuses_do_not_qualify(self) -> None:
         """A 404 or a 500 says nothing about the credential."""
         assert not is_expired_credential(httpx.Response(404, json={"message": "Forbidden"}))
+
+
+class TestCarriesErrorEnvelope:
+    """Tests for the one question both refusal arms ask, so the two cannot drift apart."""
+
+    def test_an_envelope_code_is_recognised(self) -> None:
+        """`error_body` writes `error_code`, and only the application runs it."""
+        assert carries_error_envelope(httpx.Response(401, json={"error_code": "UNAUTHORIZED"}))
+
+    def test_the_camel_cased_spelling_is_recognised(self) -> None:
+        """A product serialising its envelope in camel case is still the application."""
+        assert carries_error_envelope(httpx.Response(403, json={"errorCode": "FORBIDDEN"}))
+
+    def test_a_bare_gateway_message_carries_none(self) -> None:
+        """The gateway answers before the function runs, so it writes no code."""
+        assert not carries_error_envelope(httpx.Response(401, json={"message": "Unauthorized"}))
+
+    def test_a_blank_code_carries_none(self) -> None:
+        """An empty code names no failure, so it is no more the app than an absent one."""
+        assert not carries_error_envelope(httpx.Response(401, json={"error_code": ""}))
+
+    def test_a_non_json_body_carries_none(self) -> None:
+        """An unreadable refusal is never mistaken for the application answering."""
+        assert not carries_error_envelope(httpx.Response(401, text="<html>401</html>"))
+
+    def test_a_json_list_body_carries_none(self) -> None:
+        """Valid JSON that is not an object carries no envelope."""
+        assert not carries_error_envelope(httpx.Response(401, json=["UNAUTHORIZED"]))
 
 
 class TestRotation:
