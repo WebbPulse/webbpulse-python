@@ -5,6 +5,25 @@ Notable changes to the `webbpulse` package. The version here is the one in
 
 This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## Unreleased
+
+### `ops`: the `webbpulse-config` console script (minor)
+
+App configuration is moving out of terraform variables. Secrets live only in each app's
+`<prefix>/app` Secrets Manager JSON secret, and private non-secret configuration in an SSM
+String parameter `/<prefix>/config` holding a JSON object; terraform creates both with
+`ignore_changes` on the value, and operators set values with their own AWS SSO identity.
+
+`webbpulse-config` is that operator path, available through `uv run` in every product repo.
+`secret set KEY` reads the value from a hidden prompt or stdin, so it never reaches argv or
+shell history, and merges it into the secret with `put_secret_value`; `secret unset` and
+`secret keys` (names only) complete it, and nothing prints a secret value. `config set`,
+`config get` and `config unset` manage the parameter, parsing values as JSON when they
+parse. Each write re-checks the current version before writing and retries from a fresh
+read when another writer got there first, so concurrent operators cannot lose each other's
+keys. Missing resources, non-object values and concurrent changes each exit with their own
+code. The dev dependencies gain the `ssm` boto3 stubs.
+
 ## 0.54.0
 
 ### `e2e`: a 401 from the application is no longer read as a stale token
