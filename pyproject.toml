@@ -37,6 +37,7 @@ security = ["PyJWT>=2.10,<3", "bcrypt>=4.1"]
 testing = ["moto[dynamodb,secretsmanager]>=5", "pytest>=8", "httpx2>=2"]
 identity = ["PyJWT[crypto]>=2.9", "fastapi>=0.115"]
 oauth = ["httpx>=0.27"]
+github = ["httpx>=0.27", "PyJWT[crypto]>=2.9"]
 passkeys = ["webauthn>=2.7,<4"]
 e2e = ["httpx>=0.27", "boto3>=1.35", "pytest>=8", "playwright>=1.47", "cryptography>=43"]
 
@@ -49,7 +50,7 @@ Source = "https://github.com/WebbPulse/webbpulse-python"
 
 [dependency-groups]
 dev = [
-  "webbpulse[aws-otel,dynamodb,e2e,fastapi,identity,oauth,otel,passkeys,security,testing]",
+  "webbpulse[aws-otel,dynamodb,e2e,fastapi,github,identity,oauth,otel,passkeys,security,testing]",
   "boto3-stubs[dynamodb,kms,s3,secretsmanager,ssm]",
   "botocore-stubs",
   "mypy>=1.13",

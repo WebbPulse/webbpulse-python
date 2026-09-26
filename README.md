@@ -42,6 +42,7 @@ The base install carries only `pydantic` and `pydantic-settings`. Everything els
 | `security` | `PyJWT`, `bcrypt` | `webbpulse.security` |
 | `identity` | `PyJWT[crypto]`, `fastapi` | `webbpulse.identity` |
 | `oauth` | `httpx` | OAuth sign-in, on top of `identity` |
+| `github` | `httpx`, `PyJWT[crypto]` | `webbpulse.integrations.github` |
 | `passkeys` | `webauthn` | `webbpulse.identity.passkeys`, only when `passkeys_enabled` |
 | `testing` | `moto`, `pytest`, `httpx2` | `webbpulse.testing` |
 
@@ -68,6 +69,7 @@ its dev dependencies.
 | `webbpulse.security` | `hash_password`, `verify_password`, `needs_rehash`, `create_token`, `decode_token`, `bearer_claims` | [security.md](docs/security.md) |
 | `webbpulse.identity` | App-managed identity: password, session, email link, TOTP, OAuth and passkey flows, plus a KMS-backed `TokenService` and a JWKS | [identity.md](docs/identity.md), [the standard](docs/identity-standard.md) |
 | `webbpulse.identity.oauth_server` | An OAuth 2.1 authorization server for hosting a remote MCP server: discovery, PKCE code grant, dynamic registration, consent | [oauth-server.md](docs/oauth-server.md) |
+| `webbpulse.integrations.github` | `GitHubAppClient`: the App JWT, cached installation tokens, check runs, commit statuses, issue comments and installation reads; `load_github_app_settings` for the standard `GITHUB_*` keys; `convert_manifest_code` for the App manifest flow | [GitHub App client](#github-app-client) |
 | `webbpulse.lambda_entry` | `run_uvicorn`, `is_lambda`, `resolve_port`: the AWS Lambda Web Adapter entrypoint, with no Mangum and no handler | [packaging.md](docs/packaging.md) |
 | `webbpulse.testing` | Pytest fixtures: `test_client`, `create_table`, `rate_limit_table`, `make_request_context_headers`, `FakeKms`, `FakeIdempotencyStore`, `FakePresigner`, `FakeQueue`, `FakeWebhookSender`; `assert_entrypoint_isolation` for the per-domain image check | [packaging.md](docs/packaging.md) |
 | `webbpulse.e2e` | A pytest plugin and generic post-deploy suite: route cut, coverage, reachability, identity, frontend and hygiene against a real stage | [e2e.md](docs/e2e.md) |
@@ -214,6 +216,54 @@ Data goes to stdout and diagnostics to stderr. Exit codes: `0` ok, `1` AWS or SD
 usage or a refused value, `3` the secret or parameter does not exist (apply terraform
 first), `4` the stored value is not a JSON object, `5` a concurrent change outlasted the
 retries, `6` `config get` found no such key.
+
+## GitHub App client
+
+`webbpulse.integrations.github` (the `github` extra) is a small synchronous client for a
+GitHub App. It reads its configuration from the standard keys in the `<prefix>/app` secret,
+with a non-empty environment variable of the same name winning per key:
+
+| Key | Required | Holds |
+| --- | --- | --- |
+| `GITHUB_APP_ID` | yes | The App id |
+| `GITHUB_PRIVATE_KEY` | yes | The App private key as PEM, PKCS1 or PKCS8, with real newlines; a literal `\n` is not unescaped |
+| `GITHUB_APP_INSTALLATION_ID` | no | Pins one installation; without it the installation is looked up per repository and cached |
+| `GITHUB_CLIENT_ID` | no | The App's OAuth client id, for the product's own use |
+| `GITHUB_CLIENT_SECRET` | no | The App's OAuth client secret, for the product's own use |
+| `GITHUB_WEBHOOK_SECRET` | no | The webhook signing secret, for the product's own use; check it with `webbpulse.http.verify_hmac_signature` |
+
+```python
+import os
+
+from webbpulse.integrations.github import CheckRunOutput, GitHubAppClient, load_github_app_settings
+
+settings = load_github_app_settings(os.environ["APP_SECRETS_ARN"])
+with GitHubAppClient.from_settings(settings) as github:
+    github.create_check_run(
+        "WebbPulse/example",
+        name="Example",
+        head_sha=sha,
+        conclusion="success",
+        output=CheckRunOutput(title="Passed", summary="All checks passed."),
+    )
+```
+
+Installation tokens are cached per client instance until five minutes before they expire.
+Every failure is a `GitHubError` subclass chosen by status (`GitHubNotFound`,
+`GitHubRateLimited` with `retry_after`, and so on), and the private key, client secret,
+webhook secret and tokens stay out of reprs, error messages and logs. Webhook routing and
+product naming stay in the product.
+
+An App is created per environment through GitHub's manifest flow: the product posts its
+manifest to `https://github.com/settings/apps/new` (or
+`https://github.com/organizations/<org>/settings/apps/new`) with a `state`, GitHub redirects
+back with a one-time `code`, and `convert_manifest_code(code)` answers the new App with its
+credentials masked. It needs no App configuration. Write the credentials into the `app`
+secret under the keys above in one version with
+`SecretStore(client, secret_id).set_many(app.app_secret_values())` from `webbpulse.ops.config`,
+or by hand with `webbpulse-config secret set`. The writer needs `secretsmanager:PutSecretValue`
+on that secret only, and the app-secrets module needs `json_preserve_unmanaged` so an apply
+keeps the keys.
 
 ## Hooks a consuming project implements
 

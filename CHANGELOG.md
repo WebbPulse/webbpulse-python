@@ -5,6 +5,28 @@ Notable changes to the `webbpulse` package. The version here is the one in
 
 This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## Unreleased
+
+### `integrations.github`: a GitHub App client (minor)
+
+A new `github` extra (`httpx`, `PyJWT[crypto]`) and module, hoisted from Standupless's
+`github_api.py`. `GitHubAppClient` signs the App JWT (RS256, `iat` backdated 60 seconds,
+nine minute lifetime), exchanges it for installation tokens cached per installation until
+five minutes before expiry, and creates and updates check runs, creates commit statuses,
+creates and updates issue comments, reads an installation (`get_app_installation`), lists
+its repositories, and resolves the installation a repository belongs to.
+`convert_manifest_code` finishes the App manifest flow without any App configuration and
+answers the new App's credentials as `SecretStr`.
+`GitHubAppSettings` and `load_github_app_settings` read the standard `GITHUB_*` keys from
+the `app` secret and the environment, with every secret held as `SecretStr`. Failures map
+by status to `GitHubError` subclasses, and no key or token reaches a repr, message or log.
+`AppManifestConversion.app_secret_values()` maps a conversion onto those keys.
+
+### `ops.config`: `SecretStore.set_many` (minor)
+
+Merges several keys into the secret as one new version under the same concurrent change
+guard as `set`, so a manifest conversion lands its five credentials in a single write.
+
 ## 0.55.0
 
 ### `ops`: the `webbpulse-config` console script (minor)
