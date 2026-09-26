@@ -71,6 +71,7 @@ its dev dependencies.
 | `webbpulse.lambda_entry` | `run_uvicorn`, `is_lambda`, `resolve_port`: the AWS Lambda Web Adapter entrypoint, with no Mangum and no handler | [packaging.md](docs/packaging.md) |
 | `webbpulse.testing` | Pytest fixtures: `test_client`, `create_table`, `rate_limit_table`, `make_request_context_headers`, `FakeKms`, `FakeIdempotencyStore`, `FakePresigner`, `FakeQueue`, `FakeWebhookSender`; `assert_entrypoint_isolation` for the per-domain image check | [packaging.md](docs/packaging.md) |
 | `webbpulse.e2e` | A pytest plugin and generic post-deploy suite: route cut, coverage, reachability, identity, frontend and hygiene against a real stage | [e2e.md](docs/e2e.md) |
+| `webbpulse.ops.config` | The `webbpulse-config` console script: operators set keys in the `<prefix>/app` secret and the `/<prefix>/config` parameter | [Operator config CLI](#operator-config-cli) |
 
 ## Wiring a FastAPI domain Lambda
 
@@ -165,6 +166,54 @@ all have the same shape and none leaks a stack trace:
 
 The container image, the Web Adapter environment variables and the Dockerfile are in
 [packaging.md](docs/packaging.md).
+
+## Operator config CLI
+
+Every product keeps its secrets in one Secrets Manager JSON secret, `<prefix>/app`, and its
+private non-secret configuration in one SSM String parameter, `/<prefix>/config`, holding a
+JSON object. Terraform creates both and ignores their values; operators set the values with
+their own AWS SSO identity through `webbpulse-config`. Every product already depends on
+`webbpulse` with boto3 (the `dynamodb` extra), so the script is on the path in each product
+repo:
+
+```bash
+export AWS_PROFILE=CarModPicker-Staging/AgentToolkit
+
+uv run webbpulse-config --prefix carmodpicker-staging secret set OAUTH_GITHUB_CLIENT_SECRET
+openssl rand -base64 32 | uv run webbpulse-config --prefix carmodpicker-staging secret set SECRET_KEY
+uv run webbpulse-config --prefix carmodpicker-staging secret keys
+uv run webbpulse-config --prefix carmodpicker-staging secret unset OLD_KEY
+
+uv run webbpulse-config --prefix carmodpicker-staging config set ALLOWED_EMAILS '["a@b.c"]'
+uv run webbpulse-config --prefix carmodpicker-staging config get ALLOWED_EMAILS
+uv run webbpulse-config --prefix carmodpicker-staging config unset ALLOWED_EMAILS
+```
+
+| Command | Does |
+| --- | --- |
+| `secret set KEY` | Reads the value from a hidden, confirmed prompt on a terminal, otherwise from stdin with one trailing newline dropped, and merges it into the secret |
+| `secret unset KEY` | Removes one key |
+| `secret keys` | Prints key names, one per line; no command prints a secret value |
+| `config set KEY VALUE` | Stores VALUE as JSON when it parses, otherwise as a string; `--string` forces a string |
+| `config get [KEY]` | Prints one value (a string raw, anything else as JSON), or the whole object |
+| `config unset KEY` | Removes one key |
+
+Target options go before or after the subcommand. `--prefix` resolves both names;
+`--secret-id` and `--parameter-name` override either for an estate with non-standard names
+(Portfolio's secret is `webbpulse-<env>/app`). `--profile` and `--region` default to the AWS
+SDK chain, so `AWS_PROFILE` and the profile's region work unchanged.
+
+Every write re-reads the current object, changes one key, keeps every other key, and checks
+the current version again just before writing. If another writer landed in between it
+retries from a fresh read, and after three retries it gives up without writing. Setting a
+key to the value it already holds, or unsetting an absent key, writes nothing. Empty keys
+and empty secret values are refused, and a secret key that is not UPPER_SNAKE draws a
+warning.
+
+Data goes to stdout and diagnostics to stderr. Exit codes: `0` ok, `1` AWS or SDK error, `2`
+usage or a refused value, `3` the secret or parameter does not exist (apply terraform
+first), `4` the stored value is not a JSON object, `5` a concurrent change outlasted the
+retries, `6` `config get` found no such key.
 
 ## Hooks a consuming project implements
 

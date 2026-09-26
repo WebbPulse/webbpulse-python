@@ -40,6 +40,9 @@ oauth = ["httpx>=0.27"]
 passkeys = ["webauthn>=2.7,<4"]
 e2e = ["httpx>=0.27", "boto3>=1.35", "pytest>=8", "playwright>=1.47", "cryptography>=43"]
 
+[project.scripts]
+webbpulse-config = "webbpulse.ops.config:main"
+
 [project.urls]
 Homepage = "https://github.com/WebbPulse/webbpulse-python"
 Source = "https://github.com/WebbPulse/webbpulse-python"
@@ -47,7 +50,7 @@ Source = "https://github.com/WebbPulse/webbpulse-python"
 [dependency-groups]
 dev = [
   "webbpulse[aws-otel,dynamodb,e2e,fastapi,identity,oauth,otel,passkeys,security,testing]",
-  "boto3-stubs[dynamodb,kms,s3,secretsmanager]",
+  "boto3-stubs[dynamodb,kms,s3,secretsmanager,ssm]",
   "botocore-stubs",
   "mypy>=1.13",
   "pytest-cov>=6",
