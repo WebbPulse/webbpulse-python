@@ -163,7 +163,7 @@ def test_bad_private_key_raises_without_the_key() -> None:
     broken.close()
 
 
-@pytest.mark.parametrize(("app_id", "key"), [("", PRIVATE_PEM), (1, "  ")])
+@pytest.mark.parametrize(("app_id", "key"), [("", PRIVATE_PEM), (1, "  ")], ids=["no-app-id", "blank-key"])
 def test_missing_credentials_refused(app_id: int | str, key: str) -> None:
     """An empty App id or private key is refused at construction."""
     with pytest.raises(ValueError):
