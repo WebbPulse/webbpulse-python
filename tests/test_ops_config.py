@@ -25,6 +25,7 @@ from webbpulse.ops.config import (
     EXIT_USAGE,
     ConcurrentChangeError,
     SecretStore,
+    UsageError,
     main,
     parse_config_value,
     resolve_target,
@@ -288,6 +289,30 @@ def test_a_concurrent_change_is_retried_and_both_writes_survive() -> None:
     result = store.set("MINE", "ours")
     assert result.changed
     assert stored_secret() == {"SECRET_KEY": "old", "OTHER": "keep", "RACER_0": "theirs", "MINE": "ours"}
+
+
+def test_set_many_writes_every_key_in_one_version() -> None:
+    """Several keys land in a single new version and every other key survives."""
+    make_secret()
+    store = SecretStore(secrets_client(), SECRET_ID)
+    before = store.current_version()
+    result = store.set_many({"GITHUB_APP_ID": "1", "GITHUB_PRIVATE_KEY": "pem"})
+    assert result.changed
+    assert result.version != before
+    versions = secrets_client().list_secret_version_ids(SecretId=SECRET_ID)["Versions"]
+    assert len(versions) == 2
+    assert stored_secret() == {"SECRET_KEY": "old", "OTHER": "keep", "GITHUB_APP_ID": "1", "GITHUB_PRIVATE_KEY": "pem"}
+
+
+def test_set_many_refuses_empty_and_invalid_keys() -> None:
+    """An empty map or a malformed key name fails before anything is written."""
+    make_secret()
+    store = SecretStore(secrets_client(), SECRET_ID)
+    with pytest.raises(UsageError):
+        store.set_many({})
+    with pytest.raises(UsageError):
+        store.set_many({" PADDED": "x"})
+    assert stored_secret() == {"SECRET_KEY": "old", "OTHER": "keep"}
 
 
 def test_a_value_that_keeps_changing_fails_without_writing() -> None:

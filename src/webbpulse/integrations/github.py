@@ -332,6 +332,18 @@ class AppManifestConversion:
     webhook_secret: SecretStr | None
     pem: SecretStr
 
+    def app_secret_values(self) -> dict[str, str]:
+        """Return the credentials keyed by their `app` secret names, ready for `SecretStore.set_many`."""
+        values = {
+            "GITHUB_APP_ID": str(self.id),
+            "GITHUB_PRIVATE_KEY": self.pem.get_secret_value(),
+            "GITHUB_CLIENT_ID": self.client_id,
+            "GITHUB_CLIENT_SECRET": self.client_secret.get_secret_value(),
+        }
+        if self.webhook_secret is not None:
+            values["GITHUB_WEBHOOK_SECRET"] = self.webhook_secret.get_secret_value()
+        return values
+
 
 @dataclass(slots=True)
 class _CachedToken:

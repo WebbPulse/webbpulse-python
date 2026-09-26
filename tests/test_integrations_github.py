@@ -739,6 +739,19 @@ def test_convert_manifest_code_is_unauthenticated_and_typed() -> None:
     assert not http.is_closed
 
 
+def test_manifest_conversion_maps_to_app_secret_keys() -> None:
+    """The conversion hands back exactly the standard app secret keys, webhook secret included when set."""
+    http = httpx.Client(transport=httpx.MockTransport(lambda _: httpx.Response(201, json=_conversion_body())))
+    values = convert_manifest_code("abc", client=http).app_secret_values()
+    assert values == {
+        "GITHUB_APP_ID": "1001",
+        "GITHUB_PRIVATE_KEY": PRIVATE_PEM,
+        "GITHUB_CLIENT_ID": "Iv1.new",
+        "GITHUB_CLIENT_SECRET": "fresh-client-secret",
+        "GITHUB_WEBHOOK_SECRET": "fresh-webhook-secret",
+    }
+
+
 def test_convert_manifest_code_errors() -> None:
     """A spent code maps to its error, a malformed one is refused, and no App is an error."""
     spent = httpx.Client(transport=httpx.MockTransport(lambda _: httpx.Response(404, json={"message": "Not Found"})))

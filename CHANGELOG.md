@@ -20,6 +20,12 @@ answers the new App's credentials as `SecretStr`.
 `GitHubAppSettings` and `load_github_app_settings` read the standard `GITHUB_*` keys from
 the `app` secret and the environment, with every secret held as `SecretStr`. Failures map
 by status to `GitHubError` subclasses, and no key or token reaches a repr, message or log.
+`AppManifestConversion.app_secret_values()` maps a conversion onto those keys.
+
+### `ops.config`: `SecretStore.set_many` (minor)
+
+Merges several keys into the secret as one new version under the same concurrent change
+guard as `set`, so a manifest conversion lands its five credentials in a single write.
 
 ## 0.55.0
 

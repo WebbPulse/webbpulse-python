@@ -259,8 +259,11 @@ manifest to `https://github.com/settings/apps/new` (or
 `https://github.com/organizations/<org>/settings/apps/new`) with a `state`, GitHub redirects
 back with a one-time `code`, and `convert_manifest_code(code)` answers the new App with its
 credentials masked. It needs no App configuration. Write the credentials into the `app`
-secret under the keys above with `webbpulse-config secret set`, or in code with
-`webbpulse.ops.config.SecretStore(...).set(key, value)`.
+secret under the keys above in one version with
+`SecretStore(client, secret_id).set_many(app.app_secret_values())` from `webbpulse.ops.config`,
+or by hand with `webbpulse-config secret set`. The writer needs `secretsmanager:PutSecretValue`
+on that secret only, and the app-secrets module needs `json_preserve_unmanaged` so an apply
+keeps the keys.
 
 ## Hooks a consuming project implements
 

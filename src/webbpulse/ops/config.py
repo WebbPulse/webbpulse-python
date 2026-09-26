@@ -204,6 +204,16 @@ def _with_key(key: str, value: Any) -> Mutation:
     return mutate
 
 
+def _with_keys(values: dict[str, Any]) -> Mutation:
+    """Build a mutation that sets several keys in one write."""
+
+    def mutate(current: JsonObject) -> JsonObject:
+        current.update(values)
+        return current
+
+    return mutate
+
+
 def _without_key(key: str) -> Mutation:
     """Build a mutation that removes one key if present."""
 
@@ -280,6 +290,12 @@ class SecretStore:
     def set(self, key: str, value: str) -> WriteResult:
         """Merge one key into the secret, keeping every other key."""
         return self._update(_with_key(validate_key(key), value))
+
+    def set_many(self, values: dict[str, str]) -> WriteResult:
+        """Merge several keys into the secret as one new version, keeping every other key."""
+        if not values:
+            raise UsageError("set_many needs at least one key")
+        return self._update(_with_keys({validate_key(k): v for k, v in values.items()}))
 
     def unset(self, key: str) -> WriteResult:
         """Remove one key from the secret, writing nothing when it is already absent."""
