@@ -187,8 +187,8 @@ users = Repository(
     read_only_hint="Move it from read_tables to tables in terraform/lambda_domains.tf.",
 )
 
-users.get({"pk": "user#1"})       # reads pass through
-users.put({"pk": "user#1"})       # raises ReadOnlyTable
+users.get({"pk": "user#1"})  # reads pass through
+users.put({"pk": "user#1"})  # raises ReadOnlyTable
 ```
 
 The message names the table and the refused method, and appends `read_only_hint` when the
@@ -513,9 +513,19 @@ warns and does nothing rather than silently missing.
 `rate_limit_failed_open=True`, and the request is allowed. A rate limiter is a protective
 control, not an authorisation control: if DynamoDB is unavailable, refusing every request
 turns a dependency blip into a full outage, which is strictly worse than briefly not
-enforcing a limit. The WARNING is the compensating control, so alarm on it, because a
-limiter that has been failing open for a week is invisible otherwise. Anything that must
-deny on failure is authorisation and does not belong here. A failed-open response carries no
+enforcing a limit. The WARNING and a metric are the compensating control, because a limiter
+that has been failing open for a week is invisible otherwise. Anything that must deny on
+failure is authorisation and does not belong here.
+
+Each failure, a failed `check` or a failed `clear`, also emits one `RateLimitFailedOpen`
+count (value 1) through `webbpulse.metrics` into the `WebbPulse/RateLimit` namespace, with
+two dimensions: `LimitClass`, the limiter's `namespace` (a `LimitClass` name under the
+middleware), and `Operation`, `check` or `clear`. Both are chosen in code, never taken from
+the identity, so the metric count stays bounded. It is a log and a metric with no alarm by
+default. `metrics_namespace=` moves it, and `metrics_enabled=` overrides the default gate,
+which is `metrics_enabled_from_env()` read at emit time, so it is silent under `TESTING` and
+outside staging and production. A failure to emit is logged and swallowed, never raised into
+the request. A failed-open response carries no
 RateLimit headers, so a quota is never advertised from a limiter that is not enforcing one.
 
 ### Refusals and headers

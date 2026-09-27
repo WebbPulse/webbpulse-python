@@ -359,7 +359,8 @@ within `LOCKOUT_LOOKBACK` (24 hours), a delay doubles from `LOCKOUT_BASE_DELAY` 
 the attacker a denial-of-service tool. **Passkey and OAuth logins MUST NOT be blocked by
 password lockout.**
 
-The limiter **fails open** by design, logging `rate_limit_failed_open=True` at WARNING.
+The limiter **fails open** by design, logging `rate_limit_failed_open=True` at WARNING and
+emitting a `RateLimitFailedOpen` count metric.
 Identity SHOULD alarm on that line: a limiter failing open unnoticed is the state in which
 credential stuffing is invisible.
 

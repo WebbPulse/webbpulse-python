@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import logging
 from collections.abc import Sequence
 from typing import Any
@@ -10,8 +11,11 @@ import pytest
 from botocore.exceptions import ClientError
 from fastapi import Depends, FastAPI, Request
 
+from webbpulse import ratelimit
 from webbpulse.messages import rate_limited
 from webbpulse.ratelimit import (
+    FAILED_OPEN_METRIC,
+    RATE_LIMIT_METRICS_NAMESPACE,
     LimitClass,
     RateLimitDecision,
     RateLimiter,
@@ -950,3 +954,154 @@ def test_middleware_serves_a_request_matching_no_class(rate_limit_table: Any, te
 
     client.get("/api/cars")
     assert client.get("/api/cars").status_code == 429, "the class that does match still counts"
+
+
+def _explode(*args: Any, **kwargs: Any) -> Any:
+    """Raise in place of a DynamoDB call."""
+    raise RuntimeError("table gone")
+
+
+def _capture_emits(monkeypatch: pytest.MonkeyPatch) -> list[dict[str, Any]]:
+    """Replace the limiter's `emit` with one recording its keyword arguments."""
+    calls: list[dict[str, Any]] = []
+
+    def record(**kwargs: Any) -> None:
+        """Record one emit call."""
+        calls.append(kwargs)
+
+    monkeypatch.setattr(ratelimit, "emit", record)
+    return calls
+
+
+def test_a_failed_open_check_emits_the_metric(rate_limit_table: Any, monkeypatch: pytest.MonkeyPatch) -> None:
+    """A failed-open check emits one `RateLimitFailedOpen` count, dimensioned by class and operation."""
+    assert rate_limit_table is not None
+    calls = _capture_emits(monkeypatch)
+    limiter = RateLimiter(namespace="auth", prefix="", region_name="us-west-2", metrics_enabled=True)
+    monkeypatch.setattr(limiter, "update", _explode)
+
+    decision = limiter.check("198.51.100.90", limit=3, window_seconds=60, now=1_000.0)
+
+    assert decision.failed_open is True
+    assert calls == [
+        {
+            "namespace": RATE_LIMIT_METRICS_NAMESPACE,
+            "metrics": {FAILED_OPEN_METRIC: 1},
+            "dimensions": {"LimitClass": "auth", "Operation": "check"},
+            "enabled": True,
+        }
+    ]
+    assert FAILED_OPEN_METRIC == "RateLimitFailedOpen"
+    assert "198.51.100.90" not in repr(calls), "the identity must never reach a dimension"
+
+
+def test_a_failed_first_request_check_emits_the_metric(rate_limit_table: Any, monkeypatch: pytest.MonkeyPatch) -> None:
+    """The first-request path emits the same metric under the `check` operation."""
+    assert rate_limit_table is not None
+    calls = _capture_emits(monkeypatch)
+    limiter = RateLimiter(
+        namespace="login", anchor="first_request", prefix="", region_name="us-west-2", metrics_enabled=True
+    )
+    monkeypatch.setattr(limiter, "update", _explode)
+
+    limiter.check("198.51.100.91", limit=3, window_seconds=60, now=1_000.0)
+
+    assert [call["dimensions"] for call in calls] == [{"LimitClass": "login", "Operation": "check"}]
+
+
+def test_a_failed_clear_emits_the_metric(limiter: RateLimiter, monkeypatch: pytest.MonkeyPatch) -> None:
+    """A failed clear emits the metric under the `clear` operation."""
+    calls = _capture_emits(monkeypatch)
+    monkeypatch.setattr(limiter, "delete", _explode)
+
+    limiter.clear("198.51.100.92", window_seconds=60, now=1_000.0)
+
+    assert len(calls) == 1
+    assert calls[0]["namespace"] == RATE_LIMIT_METRICS_NAMESPACE
+    assert calls[0]["metrics"] == {"RateLimitFailedOpen": 1}
+    assert calls[0]["dimensions"] == {"LimitClass": "default", "Operation": "clear"}
+
+
+def test_a_successful_check_emits_no_metric(limiter: RateLimiter, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Only failing open is counted; an ordinary check emits nothing."""
+    calls = _capture_emits(monkeypatch)
+
+    limiter.check("198.51.100.93", limit=3, window_seconds=60, now=1_000.0)
+
+    assert calls == []
+
+
+def test_the_failed_open_metric_is_written_as_emf(
+    rate_limit_table: Any, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Enabled, the metric reaches stdout as one EMF document with a Count unit."""
+    assert rate_limit_table is not None
+    limiter = RateLimiter(namespace="auth", prefix="", region_name="us-west-2", metrics_enabled=True)
+    monkeypatch.setattr(limiter, "update", _explode)
+
+    limiter.check("198.51.100.94", limit=3, window_seconds=60, now=1_000.0)
+
+    document = json.loads(capsys.readouterr().out.strip())
+    directive = document["_aws"]["CloudWatchMetrics"][0]
+    assert directive["Namespace"] == "WebbPulse/RateLimit"
+    assert directive["Dimensions"] == [["LimitClass", "Operation"]]
+    assert directive["Metrics"] == [{"Name": "RateLimitFailedOpen", "Unit": "Count"}]
+    assert document["RateLimitFailedOpen"] == 1.0
+    assert document["LimitClass"] == "auth"
+    assert document["Operation"] == "check"
+
+
+def test_the_metric_is_gated_on_the_environment_by_default(
+    limiter: RateLimiter, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Left unset, `metrics_enabled` defers to `metrics_enabled_from_env` at emit time."""
+    calls = _capture_emits(monkeypatch)
+    monkeypatch.setattr(limiter, "update", _explode)
+    monkeypatch.setenv("TESTING", "")
+    monkeypatch.setenv("ENVIRONMENT", "production")
+
+    limiter.check("198.51.100.95", limit=3, window_seconds=60, now=1_000.0)
+    monkeypatch.setenv("ENVIRONMENT", "local")
+    limiter.check("198.51.100.95", limit=3, window_seconds=60, now=1_000.0)
+
+    assert [call["enabled"] for call in calls] == [True, False]
+
+
+def test_a_failing_emitter_does_not_break_fail_open_on_check(
+    limiter: RateLimiter, caplog: pytest.LogCaptureFixture, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An emitter that raises is swallowed; the check still fails open and still logs."""
+
+    def broken(**kwargs: Any) -> None:
+        """Raise in place of the metric emission."""
+        raise ValueError("emitter down")
+
+    monkeypatch.setattr(ratelimit, "emit", broken)
+    monkeypatch.setattr(limiter, "update", _explode)
+
+    with caplog.at_level(logging.WARNING, logger="webbpulse.ratelimit"):
+        decision = limiter.check("198.51.100.96", limit=3, window_seconds=60, now=1_000.0)
+
+    assert decision.allowed is True
+    assert decision.failed_open is True
+    assert any(getattr(r, "rate_limit_failed_open", None) is True for r in caplog.records)
+
+
+def test_a_failing_emitter_does_not_break_a_failed_clear(
+    limiter: RateLimiter, caplog: pytest.LogCaptureFixture, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An emitter that raises during a failed clear is swallowed too, and the WARNING stays."""
+
+    def broken(**kwargs: Any) -> None:
+        """Raise in place of the metric emission."""
+        raise ValueError("emitter down")
+
+    monkeypatch.setattr(ratelimit, "emit", broken)
+    monkeypatch.setattr(limiter, "delete", _explode)
+
+    with caplog.at_level(logging.WARNING, logger="webbpulse.ratelimit"):
+        limiter.clear("198.51.100.97", window_seconds=60, now=1_000.0)
+
+    records = [r for r in caplog.records if getattr(r, "rate_limit_failed_open", None) is True]
+    assert len(records) == 1
+    assert getattr(records[0], "rate_limit_operation", None) == "clear"
