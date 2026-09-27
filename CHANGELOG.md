@@ -25,6 +25,15 @@ does not pull in `dynamodb`. `webbpulse.testing.sign_stripe_payload` signs a bod
 Stripe does, for receiver tests without the network. Keys are set with `webbpulse-config`,
 and a webhook signing secret never passes through Terraform.
 
+### `logging`: a colliding `extra` key no longer raises (patch)
+
+The standard library raises `KeyError` from `Logger.makeRecord` for an `extra` key that names a
+`LogRecord` attribute (`created`, `name`, `lineno`, `process` and the rest) or is `message` or
+`asctime`, which failed every run of a job that logged `extra={"created": n}`.
+`configure_logging` now installs a class-level `Logger.makeRecord` override, once, that keeps
+such a key as `extra_<key>` (`EXTRA_COLLISION_PREFIX`) and leaves the record's own attribute
+alone. It covers loggers created before configuration, and non-colliding keys are unchanged.
+
 ## 0.59.0
 
 ### `ratelimit`: a metric when the limiter fails open (minor)

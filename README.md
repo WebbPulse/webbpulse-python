@@ -55,7 +55,7 @@ its dev dependencies.
 | Module | What it provides | Reference |
 | --- | --- | --- |
 | `webbpulse.config` | `BaseServiceSettings`, the pydantic-settings base; `load_json_secret` for one Secrets Manager JSON secret | [configuration.md](docs/configuration.md) |
-| `webbpulse.logging` | `configure_logging`, `get_logger`, `JsonFormatter`: one JSON object per line with `level` and an RFC 3339 `timestamp` | [logging-and-metrics.md](docs/logging-and-metrics.md) |
+| `webbpulse.logging` | `configure_logging`, `get_logger`, `JsonFormatter`: one JSON object per line with `level` and an RFC 3339 `timestamp`; an `extra` key that collides with a `LogRecord` attribute is emitted as `extra_<key>` | [logging-and-metrics.md](docs/logging-and-metrics.md) |
 | `webbpulse.log_context` | `set_request_id`, `set_user_id`, `task_context`, `bind_context`, `LogContextFilter`: request and correlation context on ContextVars | [logging-and-metrics.md](docs/logging-and-metrics.md) |
 | `webbpulse.metrics` | `emit`, `timed`, `MetricsEmitter`, `metrics_enabled_from_env`: CloudWatch Embedded Metric Format on stdout | [logging-and-metrics.md](docs/logging-and-metrics.md) |
 | `webbpulse.otel` | `configure_tracing`, `instrument_fastapi`, `TailSamplingSpanProcessor`: tracing with errors always sampled | [tracing.md](docs/tracing.md), [tracing-sampling.md](docs/tracing-sampling.md) |

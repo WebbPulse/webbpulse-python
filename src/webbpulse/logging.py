@@ -10,11 +10,12 @@ from __future__ import annotations
 import json
 import logging
 import sys
-from collections.abc import Iterable
+from collections.abc import Callable, Iterable
 from datetime import UTC, datetime
 from typing import Any, Final, Literal, TextIO
 
 __all__ = [
+    "EXTRA_COLLISION_PREFIX",
     "MIN_REDACTABLE_LENGTH",
     "REDACTED",
     "TEXT_LOG_FORMAT",
@@ -27,6 +28,7 @@ __all__ = [
 ]
 
 REDACTED: Final = "[redacted]"
+EXTRA_COLLISION_PREFIX: Final = "extra_"
 MIN_REDACTABLE_LENGTH: Final = 4
 
 
@@ -97,6 +99,58 @@ _RESERVED: Final[frozenset[str]] = frozenset(
 )
 
 _CONFIGURED = False
+
+_MAKE_RECORD: Final = "makeRecord"
+
+_delegate_make_record: Callable[..., logging.LogRecord] | None = None
+
+
+def _safe_extra_key(key: str, record: logging.LogRecord) -> str:
+    """Return `key`, or `key` behind `EXTRA_COLLISION_PREFIX` when the record already owns it."""
+    if key in _RESERVED or key in record.__dict__:
+        return f"{EXTRA_COLLISION_PREFIX}{key}"
+    return key
+
+
+def _safe_make_record(
+    self: logging.Logger,
+    name: str,
+    level: int,
+    fn: str,
+    lno: int,
+    msg: object,
+    args: Any,
+    exc_info: Any,
+    func: str | None = None,
+    extra: Any = None,
+    sinfo: str | None = None,
+) -> logging.LogRecord:
+    """Build the record through the delegate, then attach `extra` without collisions."""
+    delegate = _delegate_make_record
+    if delegate is None:
+        raise RuntimeError("the safe makeRecord override ran before it was installed")
+    record = delegate(self, name, level, fn, lno, msg, args, exc_info, func, None, sinfo)
+    if extra is not None:
+        for key in extra:
+            record.__dict__[_safe_extra_key(key, record)] = extra[key]
+    return record
+
+
+def _install_safe_extra() -> None:
+    """Make `Logger.makeRecord` rename a colliding `extra` key instead of raising `KeyError`.
+
+    The standard library refuses an `extra` key that names a `LogRecord` attribute, or
+    `message` or `asctime`, before any record factory runs. The override sits on the class,
+    so loggers created before `configure_logging` are covered too. It calls the previous
+    `makeRecord` without `extra`, then sets each key as given or, when it collides, as
+    `extra_<key>`. A second call is a no-op.
+    """
+    global _delegate_make_record
+    current = getattr(logging.Logger, _MAKE_RECORD)
+    if current is _safe_make_record:
+        return
+    _delegate_make_record = current
+    setattr(logging.Logger, _MAKE_RECORD, _safe_make_record)
 
 
 def _trace_context() -> dict[str, str]:
@@ -230,10 +284,12 @@ def configure_logging(
     """Install a formatter on the root logger, writing to stdout by default.
 
     Idempotent unless `force` is set, and it replaces existing handlers so Lambda's own
-    handler cannot emit every record a second time. Raises `ValueError` for a bad
-    `formatter`.
+    handler cannot emit every record a second time. An `extra` key that collides with a
+    `LogRecord` attribute is kept as `extra_<key>` rather than raising. Raises `ValueError`
+    for a bad `formatter`.
     """
     global _CONFIGURED
+    _install_safe_extra()
     if _CONFIGURED and not force:
         return
 
