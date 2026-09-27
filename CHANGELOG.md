@@ -5,6 +5,26 @@ Notable changes to the `webbpulse` package. The version here is the one in
 
 This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## Unreleased
+
+### `integrations.stripe`: Stripe settings, client and webhook receiver (minor)
+
+A new `stripe` extra (`stripe~=15.6`) and `webbpulse.integrations.stripe`, shaped like
+`integrations.github`. `StripeSettings` reads `STRIPE_API_KEY` (a restricted `rk_` or secret
+`sk_` key, required), `STRIPE_WEBHOOK_SECRET` (`whsec_`, optional) and `STRIPE_API_VERSION`
+(optional) as `SETTINGS_KEYS` spells them. `load_stripe_settings` reads the `app` secret
+through `app_secrets` and lets a non-empty environment variable win per key, raising
+`StripeNotConfigured` naming missing or invalid keys, never their values. `stripe_client`
+builds a `stripe.StripeClient` from the settings with an injectable `http_client`.
+`verify_webhook_event` checks the `Stripe-Signature` header against the raw body bytes and
+answers the `stripe.Event`, raising `StripeSignatureError` for a missing, wrong, malformed or
+stale signature and `StripeNotConfigured` without a signing secret; both are
+`StripeIntegrationError`. `claim_webhook_event` claims `stripe:event:<id>` through any
+`EventClaimStore`, which `IdempotencyStore` and `FakeIdempotencyStore` satisfy, so the extra
+does not pull in `dynamodb`. `webbpulse.testing.sign_stripe_payload` signs a body the way
+Stripe does, for receiver tests without the network. Keys are set with `webbpulse-config`,
+and a webhook signing secret never passes through Terraform.
+
 ## 0.59.0
 
 ### `ratelimit`: a metric when the limiter fails open (minor)

@@ -2556,6 +2556,19 @@ wheels = [
 ]
 
 [[package]]
+name = "stripe"
+version = "15.6.1"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "requests" },
+    { name = "typing-extensions" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/1e/a6/02ea2b4e1b57913ae2e68801bf2168120bec97206782a781599339abfd64/stripe-15.6.1.tar.gz", hash = "sha256:9f3986aa960419041aba9c76191746bdf2c342c95892acfbf6edb500ab006d31", size = 1569005, upload-time = "2026-09-01T18:44:41.751Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/a9/4b/cd2d7ad83a3f49300cb3cc69ae102de68de792035bf31b0383e1c6563ec3/stripe-15.6.1-py3-none-any.whl", hash = "sha256:b33e1ea76462d7289e5fe755a1132b82099151bfb31e961021655471e6d216bf", size = 2218765, upload-time = "2026-09-01T18:44:39.706Z" },
+]
+
+[[package]]
 name = "truststore"
 version = "0.10.4"
 source = { registry = "https://pypi.org/simple" }
@@ -2686,6 +2699,9 @@ security = [
     { name = "bcrypt" },
     { name = "pyjwt" },
 ]
+stripe = [
+    { name = "stripe" },
+]
 testing = [
     { name = "httpx2" },
     { name = "moto", extra = ["dynamodb"] },
@@ -2700,7 +2716,7 @@ dev = [
     { name = "pytest-cov" },
     { name = "pytest-xdist" },
     { name = "ruff" },
-    { name = "webbpulse", extra = ["aws-otel", "dynamodb", "e2e", "fastapi", "github", "identity", "oauth", "otel", "passkeys", "security", "testing"] },
+    { name = "webbpulse", extra = ["aws-otel", "dynamodb", "e2e", "fastapi", "github", "identity", "oauth", "otel", "passkeys", "security", "stripe", "testing"] },
 ]
 
 [package.metadata]
@@ -2733,10 +2749,11 @@ requires-dist = [
     { name = "pytest", marker = "extra == 'e2e'", specifier = ">=8" },
     { name = "pytest", marker = "extra == 'testing'", specifier = ">=8" },
     { name = "starlette", marker = "extra == 'fastapi'", specifier = ">=0.40" },
+    { name = "stripe", marker = "extra == 'stripe'", specifier = "~=15.6" },
     { name = "uvicorn", marker = "extra == 'fastapi'", specifier = ">=0.32" },
     { name = "webauthn", marker = "extra == 'passkeys'", specifier = ">=2.7,<4" },
 ]
-provides-extras = ["aws-otel", "dynamodb", "e2e", "fastapi", "github", "identity", "oauth", "otel", "passkeys", "security", "testing"]
+provides-extras = ["aws-otel", "dynamodb", "e2e", "fastapi", "github", "identity", "oauth", "otel", "passkeys", "security", "stripe", "testing"]
 
 [package.metadata.requires-dev]
 dev = [
@@ -2746,7 +2763,7 @@ dev = [
     { name = "pytest-cov", specifier = ">=6" },
     { name = "pytest-xdist", specifier = ">=3" },
     { name = "ruff", specifier = ">=0.8" },
-    { name = "webbpulse", extras = ["aws-otel", "dynamodb", "e2e", "fastapi", "github", "identity", "oauth", "otel", "passkeys", "security", "testing"] },
+    { name = "webbpulse", extras = ["aws-otel", "dynamodb", "e2e", "fastapi", "github", "identity", "oauth", "otel", "passkeys", "security", "stripe", "testing"] },
 ]
 
 [[package]]

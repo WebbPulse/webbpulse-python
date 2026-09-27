@@ -43,6 +43,7 @@ The base install carries only `pydantic` and `pydantic-settings`. Everything els
 | `identity` | `PyJWT[crypto]`, `fastapi` | `webbpulse.identity` |
 | `oauth` | `httpx` | OAuth sign-in, on top of `identity` |
 | `github` | `httpx`, `PyJWT[crypto]` | `webbpulse.integrations.github` |
+| `stripe` | `stripe` | `webbpulse.integrations.stripe` |
 | `passkeys` | `webauthn` | `webbpulse.identity.passkeys`, only when `passkeys_enabled` |
 | `testing` | `moto`, `pytest`, `httpx2` | `webbpulse.testing` |
 
@@ -70,8 +71,9 @@ its dev dependencies.
 | `webbpulse.identity` | App-managed identity: password, session, email link, TOTP, OAuth and passkey flows, plus a KMS-backed `TokenService` and a JWKS | [identity.md](docs/identity.md), [the standard](docs/identity-standard.md) |
 | `webbpulse.identity.oauth_server` | An OAuth 2.1 authorization server for hosting a remote MCP server: discovery, PKCE code grant, dynamic registration, consent | [oauth-server.md](docs/oauth-server.md) |
 | `webbpulse.integrations.github` | `GitHubAppClient`: the App JWT, cached installation tokens, check runs, commit statuses, issue comments and installation reads; `load_github_app_settings` for the standard `GITHUB_*` keys; `convert_manifest_code` for the App manifest flow | [GitHub App client](#github-app-client) |
+| `webbpulse.integrations.stripe` | `load_stripe_settings` for the standard `STRIPE_*` keys; `stripe_client` for a `stripe.StripeClient`; `verify_webhook_event` and `claim_webhook_event` for a verified, exactly-once webhook receiver | [Stripe](#stripe) |
 | `webbpulse.lambda_entry` | `run_uvicorn`, `is_lambda`, `resolve_port`: the AWS Lambda Web Adapter entrypoint, with no Mangum and no handler | [packaging.md](docs/packaging.md) |
-| `webbpulse.testing` | Pytest fixtures: `test_client`, `create_table`, `rate_limit_table`, `make_request_context_headers`, `FakeKms`, `FakeIdempotencyStore`, `FakePresigner`, `FakeQueue`, `FakeWebhookSender`; `assert_entrypoint_isolation` for the per-domain image check; `primary_keys_only` (or `enforce_primary_keys`) makes moto refuse a key that is not exactly the table's primary key, as DynamoDB does | [packaging.md](docs/packaging.md) |
+| `webbpulse.testing` | Pytest fixtures: `test_client`, `create_table`, `rate_limit_table`, `make_request_context_headers`, `FakeKms`, `FakeIdempotencyStore`, `FakePresigner`, `FakeQueue`, `FakeWebhookSender`, `sign_stripe_payload`; `assert_entrypoint_isolation` for the per-domain image check; `primary_keys_only` (or `enforce_primary_keys`) makes moto refuse a key that is not exactly the table's primary key, as DynamoDB does | [packaging.md](docs/packaging.md) |
 | `webbpulse.e2e` | A pytest plugin and generic post-deploy suite: route cut, coverage, reachability, identity, frontend and hygiene against a real stage | [e2e.md](docs/e2e.md) |
 | `webbpulse.ops.config` | The `webbpulse-config` console script: operators set keys in the `<prefix>/app` secret and the `/<prefix>/config` parameter | [Operator config CLI](#operator-config-cli) |
 
@@ -266,6 +268,63 @@ secret under the keys above in one version with
 or by hand with `webbpulse-config secret set`. The writer needs `secretsmanager:PutSecretValue`
 on that secret only, and the app-secrets module needs `json_preserve_unmanaged` so an apply
 keeps the keys.
+
+## Stripe
+
+`webbpulse.integrations.stripe` (the `stripe` extra) configures the official `stripe`
+package from the standard keys in the `<prefix>/app` secret, with a non-empty environment
+variable of the same name winning per key. Each product has its own Stripe account, so each
+product and environment holds its own keys:
+
+| Key | Required | Holds |
+| --- | --- | --- |
+| `STRIPE_API_KEY` | yes | A restricted key (`rk_`), preferred, or the secret key (`sk_`); a publishable key is refused |
+| `STRIPE_WEBHOOK_SECRET` | no | The webhook endpoint's signing secret (`whsec_`); needed only to receive webhooks |
+| `STRIPE_API_VERSION` | no | Pins the API version the client sends; left unset, the SDK's own version, which its types describe |
+
+The keys are set by an operator with the `webbpulse-config` CLI, never through Terraform. A
+webhook signing secret in particular must never pass through a Terraform variable, resource
+or data source, since plan and state hold it in plaintext; the app-secrets module needs
+`json_preserve_unmanaged` so an apply keeps the keys.
+
+```bash
+uv run webbpulse-config --prefix carmodpicker-staging secret set STRIPE_API_KEY
+uv run webbpulse-config --prefix carmodpicker-staging secret set STRIPE_WEBHOOK_SECRET
+```
+
+```python
+from webbpulse.integrations.stripe import (
+    StripeSignatureError,
+    claim_webhook_event,
+    load_stripe_settings,
+    stripe_client,
+    verify_webhook_event,
+)
+
+settings = load_stripe_settings()
+client = stripe_client(settings)
+session = client.v1.checkout.sessions.create(params={"mode": "subscription", ...})
+
+@router.post("/stripe/webhooks")
+async def stripe_webhook(request: Request) -> Response:
+    try:
+        event = verify_webhook_event(await request.body(), request.headers.get("stripe-signature"), settings, client=client)
+    except StripeSignatureError:
+        return Response(status_code=400)
+    if not claim_webhook_event(event, idempotency_store):
+        return Response(status_code=200)
+    handle(event)
+    return Response(status_code=200)
+```
+
+`verify_webhook_event` takes the raw body bytes only, never a parsed and re-serialised
+copy, and refuses a delivery signed more than five minutes ago. A missing signing secret
+raises `StripeNotConfigured`; a missing, wrong, malformed or stale signature raises
+`StripeSignatureError`; both are `StripeIntegrationError`. `claim_webhook_event` claims
+`stripe:event:<id>` for seven days through any store with an `IdempotencyStore`-shaped
+`claim`, and answers False for a redelivery; release `event_claim_key(event.id)` when the
+work fails so Stripe's retry can win. In tests, `webbpulse.testing.sign_stripe_payload`
+signs a body the way Stripe does, and `FakeIdempotencyStore` stands in for the table.
 
 ## Hooks a consuming project implements
 
