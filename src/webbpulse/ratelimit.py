@@ -1,8 +1,8 @@
 """Per-identity fixed-window rate limiting on one DynamoDB table.
 
 One `UpdateItem` per request against `<prefix>-rate-limits`, with the window start in the
-key and a TTL to reclaim it. Every boto3 error fails open and logs at WARNING with
-`rate_limit_failed_open=True`, which is the signal to alarm on.
+key and a TTL to reclaim it. Every boto3 error fails open, logs at WARNING with
+`rate_limit_failed_open=True`, and emits a `RateLimitFailedOpen` count metric.
 
 Three bindings share that counter: `rate_limit` as a per-route FastAPI dependency,
 `rate_limit_middleware` as whole-app ASGI middleware that classifies each request with
@@ -22,12 +22,15 @@ from typing import TYPE_CHECKING, Any, Final, Literal, TypeAlias
 
 from webbpulse.dynamodb import Repository
 from webbpulse.messages import rate_limited
+from webbpulse.metrics import emit, metrics_enabled_from_env
 
 if TYPE_CHECKING:  # pragma: no cover
     from fastapi import Request
     from starlette.responses import Response
 
 __all__ = [
+    "FAILED_OPEN_METRIC",
+    "RATE_LIMIT_METRICS_NAMESPACE",
     "RATE_LIMIT_TABLE",
     "TTL_ATTRIBUTE",
     "Anchor",
@@ -50,7 +53,13 @@ TTL_ATTRIBUTE: Final = "expires_at"
 
 _TTL_GRACE_SECONDS: Final = 60
 
+RATE_LIMIT_METRICS_NAMESPACE: Final = "WebbPulse/RateLimit"
+
+FAILED_OPEN_METRIC: Final = "RateLimitFailedOpen"
+
 type Anchor = Literal["clock", "first_request"]
+
+type FailOpenOperation = Literal["check", "clear"]
 
 
 class RateLimitDecision:
@@ -213,18 +222,23 @@ class RateLimiter(Repository):
         namespace: str = "default",
         anchor: Anchor = "clock",
         count_attribute: str = "count",
+        metrics_namespace: str = RATE_LIMIT_METRICS_NAMESPACE,
+        metrics_enabled: bool | None = None,
         **kwargs: Any,
     ) -> None:
         """Build a limiter whose `namespace` separates limits sharing the table.
 
         A login limit and a search limit on the same IP are independent counters.
         `count_attribute` names the counter attribute, for a table already holding rows
-        written under another name.
+        written under another name. `metrics_namespace` is where the fail-open metric goes,
+        and `metrics_enabled=None` gates it on `metrics_enabled_from_env()` at emit time.
         """
         super().__init__(**kwargs)
         self.namespace = namespace
         self.anchor: Anchor = anchor
         self.count_attribute = count_attribute
+        self.metrics_namespace = metrics_namespace
+        self.metrics_enabled = metrics_enabled
 
     def _key(self, identity: str, window_start: int | None = None) -> str:
         """The partition key for one identity in this namespace.
@@ -236,16 +250,36 @@ class RateLimiter(Repository):
             return f"{self.namespace}#{identity}"
         return f"{self.namespace}#{identity}#{window_start}"
 
+    def _emit_failed_open(self, operation: FailOpenOperation) -> None:
+        """Emit one `RateLimitFailedOpen` count, dimensioned by limit class and operation.
+
+        The limit class is this limiter's `namespace`, which code chooses, so the dimension
+        stays bounded. Any failure is logged and swallowed, never raised into the request.
+        """
+        try:
+            enabled = metrics_enabled_from_env() if self.metrics_enabled is None else self.metrics_enabled
+            emit(
+                namespace=self.metrics_namespace,
+                metrics={FAILED_OPEN_METRIC: 1},
+                dimensions={"LimitClass": self.namespace, "Operation": operation},
+                enabled=enabled,
+            )
+        except Exception as exc:
+            _log.warning(
+                "Failed to emit the rate limit fail-open metric.",
+                extra={"rate_limit_namespace": self.namespace, "error_type": type(exc).__name__},
+            )
+
     def _failed_open(
         self,
-        operation: str,
+        operation: FailOpenOperation,
         exc: BaseException,
         *,
         limit: int,
         window_seconds: int,
         reset_after: int,
     ) -> RateLimitDecision:
-        """Log one fail-open WARNING and return the decision that allows the request."""
+        """Log one fail-open WARNING, emit the metric, and return the allowing decision."""
         _log.warning(
             "Rate limit check failed; allowing the request.",
             extra={
@@ -256,6 +290,7 @@ class RateLimiter(Repository):
                 "error_message": str(exc),
             },
         )
+        self._emit_failed_open(operation)
         return RateLimitDecision(
             allowed=True,
             limit=limit,
@@ -381,7 +416,7 @@ class RateLimiter(Repository):
         A first-request limiter holds one row per identity and needs nothing else. A
         clock-anchored one needs `window_seconds` to name the row, since the window start is
         part of the key; without it the call is a no-op rather than a silent miss, and logs.
-        Failures are swallowed and logged, like every other limiter call.
+        Failures are swallowed, logged and counted, like every other limiter call.
         """
         if self.anchor == "clock" and window_seconds is None:
             _log.warning(
@@ -411,6 +446,7 @@ class RateLimiter(Repository):
                     "error_message": str(exc),
                 },
             )
+            self._emit_failed_open("clear")
 
 
 def rate_limit(

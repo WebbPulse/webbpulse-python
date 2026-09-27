@@ -5,6 +5,17 @@ Notable changes to the `webbpulse` package. The version here is the one in
 
 This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## Unreleased
+
+### `ratelimit`: a metric when the limiter fails open (minor)
+
+A failed `check` or `clear` still logs its WARNING unchanged and now also emits one
+`RateLimitFailedOpen` count through `webbpulse.metrics`, in the `WebbPulse/RateLimit`
+namespace, dimensioned by `LimitClass` (the limiter's `namespace`) and `Operation` (`check`
+or `clear`). `RateLimiter` takes `metrics_namespace=` and `metrics_enabled=`; left unset,
+emission is gated on `metrics_enabled_from_env()`. A failing emitter is swallowed, so fail
+open never raises into the request. No alarm is added.
+
 ## 0.58.0
 
 ### `testing`: a guard that rejects non-primary keys the way DynamoDB does (minor)

@@ -329,9 +329,10 @@ app.include_router(build_identity_router(settings, hooks, stores, tokens=tokens)
   from `create_app` is that route. A health check that queries DynamoDB runs on every cold
   start.
 - **The rate limiter fails open.** Every boto3 error is caught, logged at WARNING with
-  `rate_limit_failed_open=True`, and the request is allowed. Alarm on that WARNING, because a
-  limiter that has been failing open for a week is otherwise invisible. Anything that must
-  deny on failure is authorisation and does not belong there.
+  `rate_limit_failed_open=True`, counted as `RateLimitFailedOpen` in the `WebbPulse/RateLimit`
+  namespace, and the request is allowed. Watch that metric, because a limiter that has been
+  failing open for a week is otherwise invisible. Anything that must deny on failure is
+  authorisation and does not belong there.
 - **CORS cannot allow credentials with a wildcard origin.** `create_app` raises `ValueError`
   when it is asked to, rather than letting the browser reject the response and make a server
   misconfiguration look like a client bug.
