@@ -304,6 +304,22 @@ class SessionService:
             revoked=revoked,
         )
 
+    def revoke_device(self, user_id: str, device: str) -> int:
+        """Revoke every family of one user started under one `device` label.
+
+        What revoking an authorized OAuth client calls. A store that cannot enumerate a
+        user's families reports nothing revoked rather than failing the call, exactly as
+        `revoke_all_for_user` does.
+        """
+        try:
+            return self._store.revoke_all_for_device(user_id, device)
+        except NotImplementedError:
+            _log.warning(
+                "This store cannot enumerate a user's families, so no family was revoked by device.",
+                extra={"event": "session.revoke_device_unsupported", "user_id": user_id, "device": device},
+            )
+            return 0
+
     def family_of(self, presented: str) -> str:
         """The family id a presented refresh token belongs to, or `""` for an unknown one.
 

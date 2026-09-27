@@ -9,6 +9,7 @@ and `coerce_claims` handle them unchanged.
 
 from __future__ import annotations
 
+import dataclasses
 import hashlib
 import logging
 import secrets
@@ -53,6 +54,7 @@ __all__ = [
     "TOKEN_ENDPOINT_AUTH_METHODS",
     "TOKEN_PATH",
     "AuthorizationRequest",
+    "AuthorizationRevocation",
     "ConsentContext",
     "ConsentRenderer",
     "OAuthServerError",
@@ -170,6 +172,14 @@ class AuthorizationRequest:
     code_challenge: str
     state: str = ""
     code_challenge_method: str = "S256"
+
+
+@dataclass(frozen=True, slots=True)
+class AuthorizationRevocation:
+    """What `revoke_authorization` removed: the consents, and how many refresh records."""
+
+    consents: tuple[ConsentRecord, ...]
+    refresh_records_revoked: int = 0
 
 
 @dataclass(frozen=True, slots=True)
@@ -566,17 +576,31 @@ class OAuthServerService:
         tenant_id: str,
         now: int | None = None,
     ) -> ConsentRecord:
-        """Write the standing grant this authorization established, and return it."""
+        """Write the standing grant this authorization established, and return it.
+
+        A client re-authorizing in the same tenant for the same resource replaces its
+        earlier grant, keeping its id and first grant time, so a user sees one row per
+        grant rather than one per authorization.
+        """
         moment = int(time.time()) if now is None else now
+        existing = next(
+            (
+                consent
+                for consent in self._stores.consents.list_for_client(user_id, request.client.client_id)
+                if consent.tenant_id == tenant_id and consent.resource == request.resource
+            ),
+            None,
+        )
         record = ConsentRecord(
-            consent_id=uuid.uuid4().hex,
+            consent_id=existing.consent_id if existing is not None else uuid.uuid4().hex,
             user_id=user_id,
             client_id=request.client.client_id,
             tenant_id=tenant_id,
             resource=request.resource,
             scopes=request.scopes,
-            granted_at=_iso(moment),
+            granted_at=existing.granted_at if existing is not None and existing.granted_at else _iso(moment),
             updated_at=_iso(moment),
+            last_used_at=_iso(moment),
         )
         self._stores.consents.put(record)
         return record
@@ -660,7 +684,7 @@ class OAuthServerService:
         """Begin a refresh family for this grant, or `None` when no store is configured."""
         if self._flows is None:
             return None
-        issued = self._flows.sessions.start_family(record.user_id, device=f"mcp:{record.client_id}")
+        issued = self._flows.sessions.start_family(record.user_id, device=_refresh_device(record.client_id))
         return issued.token
 
     def refresh(self, params: Mapping[str, str], *, now: int | None = None) -> dict[str, Any]:
@@ -687,7 +711,12 @@ class OAuthServerService:
         if outcome.issued is None:
             raise OAuthServerError("invalid_grant", "The refresh token is unknown, expired, spent or revoked.")
 
-        tenant = self._tenant_for_refresh(outcome.user_id, params.get("client_id", ""))
+        consent = self._consent_for_refresh(outcome.user_id, params.get("client_id", ""))
+        if consent is None:
+            self._flows.sessions.revoke_family(outcome.family_id)
+            raise OAuthServerError("invalid_grant", "The authorization behind this refresh token has been revoked.")
+        self._stores.consents.put(dataclasses.replace(consent, last_used_at=_iso(moment)))
+        tenant = consent.tenant_id
         access = self._tokens.mint_access_token(
             outcome.user_id,
             claims={
@@ -706,16 +735,38 @@ class OAuthServerService:
             "scope": " ".join(scopes),
         }
 
-    def _tenant_for_refresh(self, user_id: str, client_id: str) -> str:
-        """The tenant a refreshed token is bound to: the one the user consented to.
+    def _consent_for_refresh(self, user_id: str, client_id: str) -> ConsentRecord | None:
+        """The standing grant a refresh continues, or `None` when it has been revoked.
 
-        Read back from the consent record rather than taken from the request, so a refresh
-        cannot quietly move a long-lived grant to a tenant the user never approved.
+        The tenant is read back from this record rather than taken from the request, so a
+        refresh cannot quietly move a long-lived grant to a tenant the user never approved,
+        and a missing record ends the grant: revoking consent is what revokes a client.
         """
-        for consent in self._stores.consents.list_for_user(user_id):
-            if consent.client_id == client_id:
-                return consent.tenant_id
-        return ""
+        if not client_id:
+            return None
+        grants = self._stores.consents.list_for_client(user_id, client_id)
+        return grants[0] if grants else None
+
+    def revoke_authorization(self, user_id: str, client_id: str, *, tenant_id: str = "") -> AuthorizationRevocation:
+        """Withdraw a user's grant to one client, so it must authorize again.
+
+        Deletes the matching consents, every tenant's or only `tenant_id`'s. When the user
+        then holds no grant to the client at all, every refresh family the server started
+        for it is revoked too, since a family is bound to the client and not to a tenant.
+        While a grant in another tenant remains, a refresh continues under that tenant.
+        Access tokens already minted run out on their own short lifetime.
+        """
+        deleted = self._stores.consents.delete_for_client(user_id, client_id, tenant_id=tenant_id)
+        families_revoked = 0
+        if self._flows is not None and not self._stores.consents.list_for_client(user_id, client_id):
+            families_revoked = self._flows.sessions.revoke_device(user_id, _refresh_device(client_id))
+        _log.info(
+            "oauth_server_authorization_revoked client_id=%s consents=%d refresh_records=%d",
+            client_id,
+            len(deleted),
+            families_revoked,
+        )
+        return AuthorizationRevocation(consents=tuple(deleted), refresh_records_revoked=families_revoked)
 
     def revoke(self, params: Mapping[str, str]) -> None:
         """Revoke a refresh token per RFC 7009, answering 200 whatever happened.
@@ -730,6 +781,11 @@ class OAuthServerService:
             self._flows.sessions.revoke_presented(token)
         except Exception:
             _log.warning("oauth_server_revoke_failed", exc_info=True)
+
+
+def _refresh_device(client_id: str) -> str:
+    """The `device` label on every refresh family started for one client."""
+    return f"mcp:{client_id}"
 
 
 def _iso(moment: int) -> str:

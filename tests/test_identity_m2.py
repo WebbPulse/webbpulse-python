@@ -1737,6 +1737,73 @@ def test_the_session_service_revokes_through_the_index_when_there_is_one(dynamo_
     assert sessions.revoke_all_for_user(USER_ID) == 2
 
 
+def _seed_device_family(store: Any, *, user_id: str, family_id: str, device: str, generations: int = 1) -> None:
+    """Write `generations` records of one family, all labelled with `device`."""
+    from webbpulse.identity.storage import RefreshTokenRecord
+
+    for generation in range(generations):
+        store.put(
+            RefreshTokenRecord(
+                token_hash=f"{family_id}-gen{generation}",
+                family_id=family_id,
+                user_id=user_id,
+                generation=generation,
+                created_at="2026-09-13T00:00:00Z",
+                expires_at=4_102_444_800,
+                device=device,
+            )
+        )
+
+
+def test_revoke_all_for_device_revokes_only_the_matching_families(dynamo_refresh_store: Any) -> None:
+    """Families under another label, or another user, stay live."""
+    _seed_device_family(dynamo_refresh_store, user_id=USER_ID, family_id="client-a", device="app:a", generations=2)
+    _seed_device_family(dynamo_refresh_store, user_id=USER_ID, family_id="browser", device="firefox")
+    _seed_device_family(dynamo_refresh_store, user_id="other-user", family_id="theirs", device="app:a")
+
+    assert dynamo_refresh_store.revoke_all_for_device(USER_ID, "app:a") == 2
+    assert dynamo_refresh_store.get("client-a-gen1").revoked
+    assert not dynamo_refresh_store.get("browser-gen0").revoked
+    assert not dynamo_refresh_store.get("theirs-gen0").revoked
+
+
+def test_revoke_all_for_device_raises_without_a_user_index(dynamodb_resource: Any) -> None:
+    """A store with no user index cannot enumerate families, so it says so."""
+    from webbpulse.dynamodb import Repository
+    from webbpulse.identity.storage import DynamoRefreshTokenStore
+
+    _create_refresh_tokens_table(dynamodb_resource, "refresh-tokens", user_index=False)
+    store = DynamoRefreshTokenStore(Repository("refresh-tokens", prefix="", region_name="us-west-2"), user_index="")
+
+    with pytest.raises(NotImplementedError):
+        store.revoke_all_for_device(USER_ID, "app:a")
+
+
+def test_the_session_service_revokes_by_device(dynamo_refresh_store: Any) -> None:
+    """`revoke_device` passes through to the store when it can enumerate."""
+    _seed_device_family(dynamo_refresh_store, user_id=USER_ID, family_id="client-a", device="app:a")
+    sessions = SessionService(make_settings(), dynamo_refresh_store)
+
+    assert sessions.revoke_device(USER_ID, "app:a") == 1
+    assert sessions.revoke_device(USER_ID, "app:a") == 0
+
+
+def test_the_session_service_reports_nothing_revoked_by_device_without_an_index(
+    dynamodb_resource: Any, caplog: pytest.LogCaptureFixture
+) -> None:
+    """No index means a warning and zero, never an exception."""
+    from webbpulse.dynamodb import Repository
+    from webbpulse.identity.storage import DynamoRefreshTokenStore
+
+    _create_refresh_tokens_table(dynamodb_resource, "refresh-tokens", user_index=False)
+    store = DynamoRefreshTokenStore(Repository("refresh-tokens", prefix="", region_name="us-west-2"), user_index="")
+
+    with caplog.at_level("WARNING"):
+        assert SessionService(make_settings(), store).revoke_device(USER_ID, "app:a") == 0
+
+    assert any(record.__dict__.get("event") == "session.revoke_device_unsupported" for record in caplog.records)
+
+
 def _login_route_dependencies(router: Any) -> list[Any]:
     """The declared dependencies of the password login route, where the limits live."""
     for route in router.routes:
