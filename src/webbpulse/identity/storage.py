@@ -343,6 +343,16 @@ class RefreshTokenStore(ABC):
         revoked, so callers must pass `family_ids` to revoke anything on such a store.
         """
 
+    def revoke_all_for_device(self, user_id: str, device: str) -> int:
+        """Revoke every family of one user whose `device` label is exactly `device`.
+
+        What revoking one authorized OAuth client calls, since the authorization server
+        labels each family it starts `mcp:<client_id>`. Returns how many records changed.
+        The base raises `NotImplementedError`, as an implementation that cannot enumerate a
+        user's families does for `revoke_all_for_user`.
+        """
+        raise NotImplementedError("This store cannot enumerate a user's refresh families by device.")
+
     @abstractmethod
     def delete_all_for_user(self, user_id: str) -> int:
         """Delete every refresh row a user holds, returning how many rows went.
@@ -688,6 +698,13 @@ class InMemoryRefreshTokenStore(RefreshTokenStore):
                 self._items[token_hash] = dataclasses.replace(record, revoked=True)
                 count += 1
         return count
+
+    def revoke_all_for_device(self, user_id: str, device: str) -> int:
+        """Revoke every family of one user whose `device` label is exactly `device`."""
+        families = {
+            record.family_id for record in self._items.values() if record.user_id == user_id and record.device == device
+        }
+        return sum(self.revoke_family(family_id) for family_id in sorted(families))
 
     def delete_all_for_user(self, user_id: str) -> int:
         """Delete every refresh row a user holds, returning how many rows went."""
@@ -1056,6 +1073,33 @@ class DynamoRefreshTokenStore(RefreshTokenStore):
             for item in self._repo.iter_query(Key("user_id").eq(user_id), index_name=self._user_index)
             if item.get("family_id") != except_family_id
         )
+
+    def revoke_all_for_device(self, user_id: str, device: str) -> int:
+        """Revoke every family of one user whose `device` label is exactly `device`.
+
+        The user index projects `KEYS_ONLY`, so the label is not on the index row. One
+        consistent read per family, of the first row the index returned for it, reads the
+        label, which every generation of a family carries unchanged. Raises
+        `NotImplementedError` when the store was built with no index.
+        """
+        from boto3.dynamodb.conditions import Key
+
+        if not self._user_index:
+            raise NotImplementedError(
+                "revoke_all_for_device needs a user index on `refresh-tokens`, and this store "
+                f"was built with none. Set {REFRESH_USER_INDEX_ENV} to the index name."
+            )
+
+        first_hash_by_family: dict[str, str] = {}
+        for item in self._repo.iter_query(Key("user_id").eq(user_id), index_name=self._user_index):
+            first_hash_by_family.setdefault(str(item.get("family_id", "")), str(item["token_hash"]))
+
+        revoked = 0
+        for family_id, token_hash in first_hash_by_family.items():
+            record = self.get(token_hash)
+            if record is not None and record.device == device:
+                revoked += self.revoke_family(family_id)
+        return revoked
 
     def delete_all_for_user(self, user_id: str) -> int:
         """Delete every refresh row a user holds, returning how many rows went.

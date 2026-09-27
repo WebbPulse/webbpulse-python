@@ -43,7 +43,7 @@ class IssuedRefresh:
     """A freshly minted refresh token and the family it belongs to.
 
     `token` is the plaintext and exists only long enough to reach `set_cookie`; the stored
-    record carries only its hash.
+    record carries only its hash. `device` is the label the family was started under, which every generation carries.
     """
 
     token: str
@@ -51,6 +51,7 @@ class IssuedRefresh:
     user_id: str
     generation: int
     expires_at: int
+    device: str = ""
 
 
 @dataclass(frozen=True, slots=True)
@@ -144,6 +145,7 @@ class SessionService:
             user_id=user_id,
             generation=generation,
             expires_at=expires_at,
+            device=device,
         )
 
     def rotate(
@@ -303,6 +305,22 @@ class SessionService:
             user_id=record.user_id,
             revoked=revoked,
         )
+
+    def revoke_device(self, user_id: str, device: str) -> int:
+        """Revoke every family of one user started under one `device` label.
+
+        What revoking an authorized OAuth client calls. A store that cannot enumerate a
+        user's families reports nothing revoked rather than failing the call, exactly as
+        `revoke_all_for_user` does.
+        """
+        try:
+            return self._store.revoke_all_for_device(user_id, device)
+        except NotImplementedError:
+            _log.warning(
+                "This store cannot enumerate a user's families, so no family was revoked by device.",
+                extra={"event": "session.revoke_device_unsupported", "user_id": user_id, "device": device},
+            )
+            return 0
 
     def family_of(self, presented: str) -> str:
         """The family id a presented refresh token belongs to, or `""` for an unknown one.

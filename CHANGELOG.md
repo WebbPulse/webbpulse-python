@@ -7,6 +7,44 @@ This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## Unreleased
 
+### `identity`: revoking an authorized OAuth client (minor, behaviour change)
+
+`OAuthServerService.revoke_authorization(user_id, client_id, tenant_id="")` deletes the
+user's consents to that client (every tenant's, or one tenant's) and revokes the refresh
+families started for each tenant whose grant went, plus any pre-binding family once the
+user holds no grant to the client at all. It answers an `AuthorizationRevocation` naming the
+deleted consents and how many refresh records changed.
+
+**Behaviour change:** `refresh()` now requires a consent for the user and the presented
+`client_id`. With none, the rotated family is revoked and the refresh answers
+`invalid_grant`, so deleting a consent is what ends a client's access. Before this, a refresh
+with no matching consent minted a token with an empty tenant claim. A deployment with live
+refresh families whose consent row is missing must backfill those rows before upgrading, or
+those clients are sent back through authorization.
+
+**Behaviour change:** refresh families are now bound to the tenant they were issued for.
+New families carry the device label `mcp:<client_id>:<tenant_id>`, and a refresh continues
+only that tenant's consent: with it gone the family is revoked, rather than moving to
+another tenant's grant. Families started earlier carry `mcp:<client_id>` and keep today's
+lookup, any grant the user holds to the client, so nobody is signed out by the upgrade. A
+family whose label names another client, or no client (a browser session), is refused.
+
+The refresh stamps the consent through the new `ConsentStore.mark_used(consent_id,
+last_used_at)`, which only updates a present row and answers whether it was there, so a
+stamp racing a revocation never writes the grant back. The DynamoDB store uses an update
+conditioned on the key existing; the base default is best effort. `IssuedRefresh` gains
+`device`, the label its family was started under.
+
+`record_consent` now replaces an earlier grant for the same client, tenant and resource,
+keeping its `consent_id` and `granted_at`, rather than adding a row per authorization.
+`ConsentRecord` gains `last_used_at`, set at consent and on every refresh.
+
+`ConsentStore` gains concrete `list_for_client`, `delete_for_client` and `delete_for_tenant`,
+built on the four abstract methods, so every implementation has them. `RefreshTokenStore`
+gains `revoke_all_for_device(user_id, device)`, implemented for the in-memory and DynamoDB
+stores over the existing user index, and `SessionService.revoke_device` wraps it, reporting
+zero with a warning where the store cannot enumerate a user's families.
+
 ### `integrations.github`: a redirect is a failure (patch, behaviour change)
 
 **Behaviour change:** only a 2xx is success. The client never followed redirects, but it
@@ -484,7 +522,6 @@ elements, and Playwright's strict mode raises on a multiple-match `is_visible`, 
 the case against an app that was working. Nothing is weakened: one visible match is what the
 assertion always meant, and the two `count() == 0` assertions after signing out are
 unchanged, so a session the app never cleared still fails.
-
 
 ## 0.45.0
 

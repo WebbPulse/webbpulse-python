@@ -17,6 +17,8 @@ from webbpulse.identity import (
     REVOKE_PATH,
     TOKEN_PATH,
     BaseIdentityHooks,
+    ConsentRecord,
+    IdentityFlows,
     IdentitySettings,
     IdentityStores,
     InMemoryAuthorizationCodeStore,
@@ -702,6 +704,272 @@ class TestClientStore:
         record = store.get("first-party")
         assert record is not None
         assert record.expires_at == 0
+
+
+def _service_with_refresh(fake_kms: Any) -> tuple[OAuthServerService, OAuthServerStores, InMemoryRefreshTokenStore]:
+    """An `OAuthServerService` with flows, so a granted code also starts a refresh family."""
+    settings = build_settings()
+    tokens = TokenService(settings, fake_kms)
+    refresh_tokens = InMemoryRefreshTokenStore()
+    flows = IdentityFlows(
+        settings,
+        Hooks(),
+        IdentityStores(credentials=InMemoryCredentialStore(), refresh_tokens=refresh_tokens),
+        tokens,
+    )
+    stores = build_stores()
+    return OAuthServerService(settings, stores, tokens, flows=flows), stores, refresh_tokens
+
+
+def _grant(service: OAuthServerService, *, tenant_id: str = TENANT) -> dict[str, Any]:
+    """Consent, issue and exchange one code for `USER`, returning the token response."""
+    verifier = new_pkce_verifier()
+    request = service.parse_authorization_request(authorize_params(verifier))
+    service.record_consent(request, user_id=USER, tenant_id=tenant_id)
+    code = service.issue_code(request, user_id=USER, tenant_id=tenant_id)
+    return service.exchange_code(
+        {"code": code, "client_id": "first-party", "redirect_uri": REDIRECT, "code_verifier": verifier}
+    )
+
+
+def _refresh(service: OAuthServerService, token: str) -> dict[str, Any]:
+    """Rotate a refresh token for the first-party client."""
+    return service.refresh({"refresh_token": token, "client_id": "first-party", "scope": "mcp:read"})
+
+
+class TestAuthorizationRevocation:
+    """Withdrawing a grant ends the client's refresh, so it must authorize again."""
+
+    def test_a_refresh_stamps_the_consent_as_used(self, fake_kms: Any) -> None:
+        """A refresh continues the grant and records when it last did."""
+        service, stores, _ = _service_with_refresh(fake_kms)
+        body = _grant(service)
+        stores.consents.put(_replace_last_used(_only_consent(stores), ""))
+
+        refreshed = _refresh(service, body["refresh_token"])
+
+        assert refreshed["refresh_token"]
+        assert _only_consent(stores).last_used_at
+
+    def test_revoking_deletes_the_consent_and_ends_refresh(self, fake_kms: Any) -> None:
+        """After revocation the refresh token is refused and its family is revoked."""
+        service, stores, refresh_tokens = _service_with_refresh(fake_kms)
+        body = _grant(service)
+
+        result = service.revoke_authorization(USER, "first-party")
+
+        assert len(result.consents) == 1
+        assert result.refresh_records_revoked == 1
+        assert stores.consents.list_for_user(USER) == []
+        assert all(record.revoked for record in refresh_tokens._items.values())
+        with pytest.raises(OAuthServerError) as exc:
+            _refresh(service, body["refresh_token"])
+        assert exc.value.error == "invalid_grant"
+
+    def test_a_refresh_with_no_consent_is_refused_and_its_family_revoked(self, fake_kms: Any) -> None:
+        """A consent deleted out of band still ends the grant at the next refresh."""
+        service, stores, refresh_tokens = _service_with_refresh(fake_kms)
+        body = _grant(service)
+        stores.consents.delete(_only_consent(stores).consent_id)
+
+        with pytest.raises(OAuthServerError) as exc:
+            _refresh(service, body["refresh_token"])
+
+        assert exc.value.error == "invalid_grant"
+        assert all(record.revoked for record in refresh_tokens._items.values())
+
+    def test_a_tenant_scoped_revocation_ends_only_that_tenants_family(self, fake_kms: Any) -> None:
+        """Revoking one tenant's grant ends its family and leaves the other tenant's live."""
+        service, stores, _ = _service_with_refresh(fake_kms)
+        other = _grant(service, tenant_id="workspace-2")
+        body = _grant(service)
+
+        result = service.revoke_authorization(USER, "first-party", tenant_id=TENANT)
+
+        assert [record.tenant_id for record in result.consents] == [TENANT]
+        assert result.refresh_records_revoked == 1
+        assert [record.tenant_id for record in stores.consents.list_for_user(USER)] == ["workspace-2"]
+        with pytest.raises(OAuthServerError):
+            _refresh(service, body["refresh_token"])
+        refreshed = _refresh(service, other["refresh_token"])
+        assert _tenant_claim(fake_kms, refreshed) == "workspace-2"
+
+    def test_a_family_never_moves_to_another_tenant(self, fake_kms: Any) -> None:
+        """With its own tenant's consent gone, a family is refused even though another grant exists."""
+        service, stores, refresh_tokens = _service_with_refresh(fake_kms)
+        _grant(service, tenant_id="workspace-2")
+        body = _grant(service)
+        tenant_grant = next(record for record in stores.consents.list_for_user(USER) if record.tenant_id == TENANT)
+        stores.consents.delete(tenant_grant.consent_id)
+
+        with pytest.raises(OAuthServerError) as exc:
+            _refresh(service, body["refresh_token"])
+
+        assert exc.value.error == "invalid_grant"
+        assert all(
+            record.revoked for record in refresh_tokens._items.values() if record.device == f"mcp:first-party:{TENANT}"
+        )
+
+    def test_a_family_started_before_tenant_binding_falls_back_to_any_grant(self, fake_kms: Any) -> None:
+        """A family labelled with the client alone keeps refreshing under the grant the user holds."""
+        service, stores, _ = _service_with_refresh(fake_kms)
+        _grant(service, tenant_id="workspace-2")
+        legacy = _legacy_family(service)
+
+        refreshed = _refresh(service, legacy)
+
+        assert _tenant_claim(fake_kms, refreshed) == "workspace-2"
+        assert _only_consent(stores).last_used_at
+
+    def test_revoking_every_tenant_ends_tenant_bound_and_legacy_families(self, fake_kms: Any) -> None:
+        """An unscoped revocation reaches each tenant's family and the pre-binding one."""
+        service, _, refresh_tokens = _service_with_refresh(fake_kms)
+        first = _grant(service)
+        second = _grant(service, tenant_id="workspace-2")
+        legacy = _legacy_family(service)
+
+        result = service.revoke_authorization(USER, "first-party")
+
+        assert result.refresh_records_revoked == 3
+        assert all(record.revoked for record in refresh_tokens._items.values())
+        for token in (first["refresh_token"], second["refresh_token"], legacy):
+            with pytest.raises(OAuthServerError):
+                _refresh(service, token)
+
+    def test_a_family_started_for_another_client_is_refused(self, fake_kms: Any) -> None:
+        """A refresh token from a browser session or another client continues no grant."""
+        service, _, _ = _service_with_refresh(fake_kms)
+        _grant(service)
+        assert service._flows is not None
+        stray = service._flows.sessions.start_family(USER, device="firefox").token
+
+        with pytest.raises(OAuthServerError) as exc:
+            _refresh(service, stray)
+
+        assert exc.value.error == "invalid_grant"
+
+    def test_a_revocation_racing_the_stamp_is_not_undone(self, fake_kms: Any) -> None:
+        """A consent deleted between the refresh's read and its stamp stays deleted."""
+        service, stores, _ = _service_with_refresh(fake_kms)
+        body = _grant(service)
+        consents = stores.consents
+        read = consents.list_for_client
+
+        def read_then_revoke(user_id: str, client_id: str) -> list[ConsentRecord]:
+            """Return the grants, then delete them before the caller stamps one."""
+            grants = read(user_id, client_id)
+            for grant in grants:
+                consents.delete(grant.consent_id)
+            return grants
+
+        consents.list_for_client = read_then_revoke  # type: ignore[method-assign]
+
+        with pytest.raises(OAuthServerError) as exc:
+            _refresh(service, body["refresh_token"])
+
+        assert exc.value.error == "invalid_grant"
+        assert consents.list_for_user(USER) == []
+
+    def test_revoking_an_unknown_client_is_a_no_op(self, fake_kms: Any) -> None:
+        """Nothing granted means nothing deleted and nothing revoked."""
+        service, _, _ = _service_with_refresh(fake_kms)
+
+        result = service.revoke_authorization(USER, "never-authorized")
+
+        assert result.consents == ()
+        assert result.refresh_records_revoked == 0
+
+    def test_re_authorizing_replaces_the_grant_rather_than_adding_one(self, fake_kms: Any) -> None:
+        """A second consent in the same tenant keeps one row and its first grant time."""
+        service, stores, _ = _service_with_refresh(fake_kms)
+        request = service.parse_authorization_request(authorize_params(new_pkce_verifier()))
+        first = service.record_consent(request, user_id=USER, tenant_id=TENANT, now=1_700_000_000)
+        second = service.record_consent(request, user_id=USER, tenant_id=TENANT, now=1_700_000_100)
+
+        assert second.consent_id == first.consent_id
+        assert second.granted_at == first.granted_at
+        assert second.updated_at != first.updated_at
+        assert len(stores.consents.list_for_user(USER)) == 1
+
+
+class TestConsentStoreHelpers:
+    """The concrete helpers every `ConsentStore` inherits from the abstract four."""
+
+    def _seed(self) -> InMemoryConsentStore:
+        """Three grants: two clients in one tenant, and one client in a second tenant."""
+        store = InMemoryConsentStore()
+        for consent_id, client_id, tenant_id in (
+            ("c1", "client-a", "t1"),
+            ("c2", "client-b", "t1"),
+            ("c3", "client-a", "t2"),
+        ):
+            store.put(
+                ConsentRecord(
+                    consent_id=consent_id,
+                    user_id=USER,
+                    client_id=client_id,
+                    tenant_id=tenant_id,
+                    resource=RESOURCE,
+                    scopes=("mcp:read",),
+                    granted_at="2026-09-26T00:00:00Z",
+                )
+            )
+        return store
+
+    def test_list_for_client(self) -> None:
+        """Grants to one client across tenants."""
+        store = self._seed()
+        assert sorted(record.consent_id for record in store.list_for_client(USER, "client-a")) == ["c1", "c3"]
+
+    def test_delete_for_client_in_one_tenant(self) -> None:
+        """A tenant filter narrows the delete to that tenant's grant."""
+        store = self._seed()
+        deleted = store.delete_for_client(USER, "client-a", tenant_id="t1")
+        assert [record.consent_id for record in deleted] == ["c1"]
+        assert store.get("c3") is not None
+
+    def test_mark_used_touches_only_a_present_row(self) -> None:
+        """A present consent is stamped, and an absent one is reported and not written back."""
+        store = self._seed()
+        assert store.mark_used("c1", "2026-09-26T01:00:00Z")
+        assert store.get("c1") is not None
+        assert store.get("c1").last_used_at == "2026-09-26T01:00:00Z"  # type: ignore[union-attr]
+        store.delete("c1")
+        assert not store.mark_used("c1", "2026-09-26T02:00:00Z")
+        assert store.get("c1") is None
+
+    def test_delete_for_tenant(self) -> None:
+        """Every client's grant in one tenant goes, and the other tenant's stays."""
+        store = self._seed()
+        deleted = store.delete_for_tenant(USER, "t1")
+        assert sorted(record.consent_id for record in deleted) == ["c1", "c2"]
+        assert [record.consent_id for record in store.list_for_user(USER)] == ["c3"]
+
+
+def _legacy_family(service: OAuthServerService) -> str:
+    """Start a family labelled the way families were before they carried their tenant."""
+    assert service._flows is not None
+    return service._flows.sessions.start_family(USER, device="mcp:first-party").token
+
+
+def _tenant_claim(fake_kms: Any, body: dict[str, Any]) -> str:
+    """The tenant claim on the access token in a token response."""
+    claims = TokenService(build_settings(), fake_kms).verify_access_token(body["access_token"], audience=RESOURCE)
+    return str(claims["tenant_id"])
+
+
+def _only_consent(stores: OAuthServerStores) -> ConsentRecord:
+    """The single consent `USER` holds."""
+    grants = stores.consents.list_for_user(USER)
+    assert len(grants) == 1
+    return grants[0]
+
+
+def _replace_last_used(record: ConsentRecord, value: str) -> ConsentRecord:
+    """A copy of `record` with `last_used_at` set to `value`."""
+    import dataclasses
+
+    return dataclasses.replace(record, last_used_at=value)
 
 
 def _form_fields(html: str) -> dict[str, str]:
