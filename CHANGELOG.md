@@ -5,6 +5,18 @@ Notable changes to the `webbpulse` package. The version here is the one in
 
 This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## Unreleased
+
+### `integrations.github`: a redirect is a failure (patch, behaviour change)
+
+**Behaviour change:** only a 2xx is success. The client never followed redirects, but it
+raised only from 400 up, so a 3xx, such as the 301 GitHub answers for a renamed
+repository's old path, came back parsed as if the call had succeeded, writes included.
+A 3xx now raises the new `GitHubRedirected` (a `GitHubError`) carrying `location`. Reads
+were not working through a redirect before either, so nothing that worked stops working.
+A caller that hands in its own `httpx.Client(follow_redirects=True)` keeps httpx following
+them, and only the final answer is judged.
+
 ## 0.56.0
 
 ### `integrations.github`: a GitHub App client (minor)

@@ -10,7 +10,8 @@ belongs to. `convert_manifest_code` finishes the App manifest flow, before any A
 configuration exists. Nothing here routes webhooks or knows any product's naming.
 
 Every failure is a `GitHubError` subclass chosen by status, so a caller can tell a missing
-repository from a rate limit without reading status codes. The App private key and every
+repository from a rate limit without reading status codes. Only a 2xx is success: redirects
+are never followed, and a 3xx raises `GitHubRedirected`. The App private key and every
 token stay out of reprs, exception messages and log lines.
 """
 
@@ -56,6 +57,7 @@ __all__ = [
     "GitHubNotConfigured",
     "GitHubNotFound",
     "GitHubRateLimited",
+    "GitHubRedirected",
     "GitHubUnauthorized",
     "GitHubUnavailable",
     "GitHubUnprocessable",
@@ -161,6 +163,24 @@ class GitHubNotFound(GitHubError):
 
 class GitHubUnprocessable(GitHubError):
     """A 422: GitHub rejected the request body."""
+
+
+class GitHubRedirected(GitHubError):
+    """A 3xx: GitHub pointed the call elsewhere, most often because the repository was renamed or moved.
+
+    The client this module builds never follows a redirect, for any method; one a caller
+    hands in keeps its own setting, and only its final answer is judged. A followed 307 or 308 would replay a write
+    with the bearer token against a URL the caller never chose, and a followed 301 on a
+    write turns into a GET whose answer looks like success, so a caller would record a post
+    that never happened. Raising keeps success meaning the call did what was asked;
+    `location` is where GitHub pointed, so a caller can refresh its stored owner and name,
+    or address the repository by id, and call again.
+    """
+
+    def __init__(self, message: str, *, location: str = "", **kwargs: Any) -> None:
+        """Record where GitHub pointed alongside the failed call."""
+        super().__init__(message, **kwargs)
+        self.location = location
 
 
 class GitHubRateLimited(GitHubError):
@@ -442,6 +462,8 @@ def _error_for(response: httpx.Response, method: str, path: str, now: float) -> 
         "github_message": _github_message(response),
     }
     message = f"{method} {path} answered {status}"
+    if 300 <= status < 400:
+        return GitHubRedirected(f"{message}, a redirect", location=response.headers.get("location", ""), **context)
     if _is_rate_limited(response):
         return GitHubRateLimited(message, retry_after=_retry_after(response, now), **context)
     if status >= 500:
@@ -805,7 +827,8 @@ def _send(
     """One GitHub call, answering the parsed body or raising the mapped `GitHubError`.
 
     `token` is sent as a bearer when given; the manifest conversion is the one call without.
-    A failure logs the method, the path and the status, and never a header.
+    Anything but a 2xx raises, a 3xx included, since redirects are never followed (see
+    `GitHubRedirected`). A failure logs the method, the path and the status, and never a header.
     """
     headers = {"Accept": ACCEPT, "X-GitHub-Api-Version": API_VERSION}
     if token is not None:
@@ -824,7 +847,7 @@ def _send(
             extra={"event": "integrations.github.unavailable", "method": method, "path": path},
         )
         raise GitHubUnavailable(f"{method} {path} did not answer", method=method, path=path) from exc
-    if response.status_code >= 400:
+    if not 200 <= response.status_code < 300:
         error = _error_for(response, method, path, now())
         _log.warning(
             "GitHub refused a call.",

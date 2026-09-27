@@ -27,6 +27,7 @@ from webbpulse.integrations.github import (
     GitHubNotConfigured,
     GitHubNotFound,
     GitHubRateLimited,
+    GitHubRedirected,
     GitHubUnauthorized,
     GitHubUnavailable,
     GitHubUnprocessable,
@@ -468,6 +469,38 @@ def test_error_mapping(
     assert caught.value.method == "POST"
     assert caught.value.path == f"/repos/{REPO}/issues/1/comments"
     assert caught.value.github_message == "nope"
+
+
+@pytest.mark.parametrize("status", [301, 302, 307, 308])
+def test_a_redirect_raises_and_is_not_followed(client: GitHubAppClient, github: GitHub, status: int) -> None:
+    """A renamed repository's redirect raises with its location, and the call is never replayed there."""
+    moved = "https://api.github.com/repositories/7/issues/1/comments"
+    github.on("POST", f"/repos/{REPO}/issues/1/comments", status, {"message": "Moved Permanently"}, location=moved)
+    github.on("POST", "/repositories/7/issues/1/comments", 201, {"id": 5, "html_url": "", "body": "b"})
+    with pytest.raises(GitHubRedirected) as caught:
+        client.create_issue_comment(REPO, 1, "b", installation_id=INSTALLATION)
+    assert caught.value.status_code == status
+    assert caught.value.location == moved
+    assert isinstance(caught.value, GitHubError)
+    assert [r.url.path for r in github.api_requests()] == [f"/repos/{REPO}/issues/1/comments"]
+
+
+def test_a_redirect_on_a_read_raises_too(client: GitHubAppClient, github: GitHub) -> None:
+    """Reads are not followed either, so every method has one rule: only a 2xx is success."""
+    github.on("GET", f"/repos/{REPO}/installation", 301, {"message": "Moved Permanently"}, location="x")
+    with pytest.raises(GitHubRedirected):
+        client.create_issue_comment(REPO, 1, "b")
+
+
+def test_a_client_that_follows_redirects_keeps_following_them(github: GitHub, clock: Clock) -> None:
+    """A caller who hands in a following client keeps that choice; only the final answer is judged."""
+    github.on(
+        "GET", f"/repos/{REPO}/installation", 301, {}, location="https://api.github.com/repositories/7/installation"
+    )
+    github.on("GET", "/repositories/7/installation", 200, {"id": INSTALLATION})
+    http = httpx.Client(transport=httpx.MockTransport(github.handler), follow_redirects=True)
+    following = GitHubAppClient(app_id=12345, private_key=PRIVATE_PEM, client=http, clock=clock)
+    assert following.repository_installation(REPO) == INSTALLATION
 
 
 @pytest.mark.parametrize(

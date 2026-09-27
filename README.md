@@ -250,7 +250,9 @@ with GitHubAppClient.from_settings(settings) as github:
 
 Installation tokens are cached per client instance until five minutes before they expire.
 Every failure is a `GitHubError` subclass chosen by status (`GitHubNotFound`,
-`GitHubRateLimited` with `retry_after`, and so on), and the private key, client secret,
+`GitHubRateLimited` with `retry_after`, and so on). Only a 2xx is success: redirects are
+never followed, and a 3xx, such as a renamed repository's 301, raises `GitHubRedirected`
+with its `location`. The private key, client secret,
 webhook secret and tokens stay out of reprs, error messages and logs. Webhook routing and
 product naming stay in the product.
 
