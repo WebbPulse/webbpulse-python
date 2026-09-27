@@ -2,7 +2,8 @@
 
 Enable them with `pytest_plugins = ["webbpulse.testing"]`. They cover a moto-backed
 DynamoDB table, a `TestClient` whose requests carry a realistic API Gateway request
-context, and a locally signing KMS stand-in. `FakeIdempotencyStore`, `FakePresigner`,
+context, and a locally signing KMS stand-in. `primary_keys_only` holds moto to DynamoDB's
+rule that a key names exactly the table's primary key. `FakeIdempotencyStore`, `FakePresigner`,
 `FakeQueue` and `FakeWebhookSender` are the doubles for the seams a handler reaches the
 outside world through, so a test needs neither moto nor a socket. `assert_entrypoint_isolation`
 is the composition-layer check: it builds every domain's entrypoint in its own interpreter
@@ -16,6 +17,7 @@ from __future__ import annotations
 import json
 import os
 from collections.abc import Callable, Collection, Iterator, Mapping
+from contextlib import contextmanager
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
@@ -27,6 +29,7 @@ if TYPE_CHECKING:  # pragma: no cover
     from mypy_boto3_dynamodb.service_resource import Table
 
 __all__ = [
+    "CheckedKey",
     "EntrypointImports",
     "FakeIdempotencyStore",
     "FakeKms",
@@ -41,10 +44,12 @@ __all__ = [
     "create_table",
     "dynamodb_reset_hooks",
     "dynamodb_resource",
+    "enforce_primary_keys",
     "entrypoint_imports",
     "fake_kms",
     "identity_tables",
     "make_request_context_headers",
+    "primary_keys_only",
     "rate_limit_table",
     "rsa_key",
     "test_client",
@@ -220,6 +225,156 @@ def identity_tables(dynamodb_resource: Any) -> Any:
     client = dynamodb_resource.meta.client
     create_identity_tables(client, "")
     return client
+
+
+@dataclass(frozen=True)
+class CheckedKey:
+    """One DynamoDB key the primary key guard checked, recorded whether it passed or not."""
+
+    operation: str
+    table: str
+    names: frozenset[str]
+
+
+_KEY_MISMATCH = "The provided key element does not match the schema"
+_GUARD_EVENT = "before-parameter-build.dynamodb"
+_GUARD_ID = "webbpulse-primary-key-guard"
+_guard_recorders: list[list[CheckedKey]] = []
+_guard_schemas: dict[tuple[str, str], frozenset[str]] = {}
+_guard_clients: dict[str, Any] = {}
+
+
+def _keys_in_request(operation: str, params: Mapping[str, Any]) -> Iterator[tuple[str, Any]]:
+    """Yield every `(table name, key)` pair a DynamoDB request addresses by primary key."""
+    if operation in {"GetItem", "UpdateItem", "DeleteItem"}:
+        yield params.get("TableName", ""), params.get("Key")
+    elif operation == "BatchGetItem":
+        for table, spec in (params.get("RequestItems") or {}).items():
+            for key in (spec or {}).get("Keys") or ():
+                yield table, key
+    elif operation == "BatchWriteItem":
+        for table, requests in (params.get("RequestItems") or {}).items():
+            for request in requests or ():
+                if "DeleteRequest" in request:
+                    yield table, request["DeleteRequest"].get("Key")
+    elif operation in {"TransactWriteItems", "TransactGetItems"}:
+        for item in params.get("TransactItems") or ():
+            for kind in ("Get", "Update", "Delete", "ConditionCheck"):
+                if kind in item:
+                    yield item[kind].get("TableName", ""), item[kind].get("Key")
+
+
+def _moto_is_mocking() -> bool:
+    """Whether a moto mock is intercepting botocore requests right now."""
+    from moto.core.models import botocore_stubber
+
+    return bool(getattr(botocore_stubber, "enabled", False))
+
+
+def _table_key_names(region: str, table: str, *, refresh: bool = False) -> frozenset[str] | None:
+    """The attribute names of `table`'s primary key, or `None` when it cannot be described."""
+    cached = (region, table)
+    if refresh or cached not in _guard_schemas:
+        import botocore.session
+        from botocore.exceptions import BotoCoreError, ClientError
+
+        client: Any = _guard_clients.get(region)
+        if client is None:
+            client = botocore.session.get_session().create_client("dynamodb", region_name=region)
+            _guard_clients[region] = client
+        try:
+            schema = client.describe_table(TableName=table)["Table"]["KeySchema"]
+        except (BotoCoreError, ClientError):
+            return None
+        _guard_schemas[cached] = frozenset(part["AttributeName"] for part in schema)
+    return _guard_schemas[cached]
+
+
+def _check_primary_keys(params: Mapping[str, Any], model: Any, context: Mapping[str, Any], **_: Any) -> None:
+    """The botocore handler that refuses a key which is not exactly its table's primary key."""
+    if not _guard_recorders or not _moto_is_mocking():
+        return
+    from botocore.exceptions import ClientError
+
+    operation = model.name
+    region = context.get("client_region") or os.environ.get("AWS_DEFAULT_REGION", "us-west-2")
+    for table, key in _keys_in_request(operation, params):
+        if not table or not isinstance(key, Mapping):
+            continue
+        names = frozenset(key)
+        for recorder in _guard_recorders:
+            recorder.append(CheckedKey(operation, table, names))
+        expected = _table_key_names(region, table)
+        if expected is None or names == expected:
+            continue
+        if names == _table_key_names(region, table, refresh=True):
+            continue
+        raise ClientError(
+            {"Error": {"Code": "ValidationException", "Message": _KEY_MISMATCH}},
+            operation,
+        )
+
+
+def _install_primary_key_guard() -> None:
+    """Register the inert guard handler on every botocore session, present and future."""
+    import boto3
+    from botocore.handlers import BUILTIN_HANDLERS
+
+    if (_GUARD_EVENT, _check_primary_keys) not in BUILTIN_HANDLERS:
+        BUILTIN_HANDLERS.append((_GUARD_EVENT, _check_primary_keys))
+    if boto3.DEFAULT_SESSION is not None:
+        boto3.DEFAULT_SESSION.events.register(_GUARD_EVENT, _check_primary_keys, unique_id=_GUARD_ID)
+
+
+_install_primary_key_guard()
+
+
+@contextmanager
+def enforce_primary_keys() -> Iterator[list[CheckedKey]]:
+    """Make moto refuse a DynamoDB key that is not exactly its table's primary key.
+
+    moto validates a key against the key attributes of the table and of its indexes, so a
+    `GetItem` naming a GSI key beside the primary one succeeds there and fails in DynamoDB
+    with `ValidationException: The provided key element does not match the schema`. Inside
+    this block a botocore handler raises that same `ClientError` first. It checks `GetItem`,
+    `UpdateItem` and `DeleteItem`, the keys of `BatchGetItem`, the deletes of
+    `BatchWriteItem`, and every keyed entry of `TransactGetItems` and `TransactWriteItems`,
+    whether the call comes from a `Repository`, a boto3 `Table` or a bare client.
+
+    The key schema is read with `DescribeTable` against the mock and cached per table for
+    the block. It acts only while a moto mock is active and leaves a table it cannot describe
+    to moto. The handler is registered, inert, when this module is imported, on boto3's
+    default session and every session made afterwards, so only a client built on another
+    session before that import is missed.
+
+    Yields:
+        The `CheckedKey` of every key checked in the block, in call order, passed or not.
+    """
+    recorder: list[CheckedKey] = []
+    _guard_schemas.clear()
+    _guard_recorders.append(recorder)
+    try:
+        yield recorder
+    finally:
+        _guard_recorders.remove(recorder)
+        _guard_schemas.clear()
+
+
+@pytest.fixture
+def primary_keys_only() -> Iterator[list[CheckedKey]]:
+    """Run the test under `enforce_primary_keys`, yielding the keys it checked.
+
+    Opt in. The recommended adoption is autouse from a product's `conftest.py`, so every
+    moto test holds keys to the real DynamoDB rule:
+
+    ```python
+    @pytest.fixture(autouse=True)
+    def _primary_keys_only(primary_keys_only: list[CheckedKey]) -> list[CheckedKey]:
+        return primary_keys_only
+    ```
+    """
+    with enforce_primary_keys() as checked:
+        yield checked
 
 
 def assert_users_repository_contract(repository: Any, *, email: str = "Someone@Example.COM") -> None:

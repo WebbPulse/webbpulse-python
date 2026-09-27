@@ -5,6 +5,21 @@ Notable changes to the `webbpulse` package. The version here is the one in
 
 This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## Unreleased
+
+### `testing`: a guard that rejects non-primary keys the way DynamoDB does (minor)
+
+moto 5 checks a `GetItem`, `UpdateItem` or `DeleteItem` key against the key attributes of
+the table and of its indexes, so a key carrying a GSI attribute beside the primary key
+passes there and fails in DynamoDB with `ValidationException: The provided key element does
+not match the schema`. `enforce_primary_keys()` is a context manager that raises that same
+`ClientError` from a botocore handler, and `primary_keys_only` is its fixture. It covers
+`GetItem`, `UpdateItem`, `DeleteItem`, `BatchGetItem`, the deletes of `BatchWriteItem`, and
+every keyed entry of `TransactGetItems` and `TransactWriteItems`, whether the call comes from
+a `Repository`, a boto3 `Table` or a bare client. Each yields the `CheckedKey` of every key
+it checked. It is opt in; the recommended adoption is an autouse fixture in a product's
+`conftest.py` that requests `primary_keys_only`. The package's own suite now runs under it.
+
 ## 0.57.0
 
 ### `identity`: revoking an authorized OAuth client (minor, behaviour change)
