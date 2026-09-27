@@ -5,7 +5,8 @@ DynamoDB table, a `TestClient` whose requests carry a realistic API Gateway requ
 context, and a locally signing KMS stand-in. `primary_keys_only` holds moto to DynamoDB's
 rule that a key names exactly the table's primary key. `FakeIdempotencyStore`, `FakePresigner`,
 `FakeQueue` and `FakeWebhookSender` are the doubles for the seams a handler reaches the
-outside world through, so a test needs neither moto nor a socket. `assert_entrypoint_isolation`
+outside world through, so a test needs neither moto nor a socket, and `sign_stripe_payload`
+signs a Stripe webhook body the way Stripe does. `assert_entrypoint_isolation`
 is the composition-layer check: it builds every domain's entrypoint in its own interpreter
 and holds that each one imports its own domain package and no other. Import only from tests;
 it needs the `testing` extra, and `FakeKms` additionally needs `cryptography`, which the
@@ -52,6 +53,7 @@ __all__ = [
     "primary_keys_only",
     "rate_limit_table",
     "rsa_key",
+    "sign_stripe_payload",
     "test_client",
 ]
 
@@ -841,6 +843,23 @@ class FakeIdempotencyStore:
     def release(self, key: str) -> None:
         """Drop a claim. Releasing a key nobody claimed is not an error."""
         self._deadlines.pop(key, None)
+
+
+def sign_stripe_payload(payload: bytes, secret: str, *, timestamp: int | None = None) -> str:
+    """A `Stripe-Signature` header value that signs `payload` with `secret`, as Stripe does.
+
+    It answers `t=<timestamp>,v1=<hex HMAC-SHA256 of "<timestamp>.<payload>">`, so a test can
+    drive a product's webhook receiver through `verify_webhook_event` without the network or
+    the `stripe` package. `timestamp` defaults to now; pass an old one to exercise the
+    tolerance check.
+    """
+    import hashlib
+    import hmac
+    import time
+
+    moment = int(time.time()) if timestamp is None else int(timestamp)
+    digest = hmac.new(secret.encode("utf-8"), f"{moment}.".encode() + bytes(payload), hashlib.sha256).hexdigest()
+    return f"t={moment},v1={digest}"
 
 
 class FakePresigner:
