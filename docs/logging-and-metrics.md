@@ -26,7 +26,10 @@ the format setting.
 
 Trace and span ids are merged in whenever a span is recording, so a log line and a trace
 join on the same value. Anything passed as `extra={...}` becomes a top-level key, which is
-what lets a CloudWatch metric filter or an Insights query select on it. `configure_logging`
+what lets a CloudWatch metric filter or an Insights query select on it. A key that would
+collide with a `LogRecord` attribute, such as `created`, `name` or `message`, is emitted as
+`extra_<key>` instead of raising `KeyError`, for every logger once `configure_logging` has
+run. `configure_logging`
 is idempotent, replaces Lambda's own root handler rather than adding to it, and reattaches
 uvicorn's loggers so access lines are JSON too.
 
