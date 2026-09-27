@@ -203,6 +203,20 @@ class ConsentStore(ABC):
     def delete(self, consent_id: str) -> None:
         """Revoke a consent. Idempotent: removing an absent one is not an error."""
 
+    def mark_used(self, consent_id: str, last_used_at: str) -> bool:
+        """Stamp a consent as used, answering whether it still existed.
+
+        Only ever updates a row that is present, so a stamp racing a revocation cannot
+        write the revoked grant back. This default is best effort: a read then a write,
+        which leaves a narrow window a store with a conditional update should close by
+        overriding it.
+        """
+        record = self.get(consent_id)
+        if record is None:
+            return False
+        self.put(dataclasses.replace(record, last_used_at=last_used_at))
+        return True
+
     def list_for_client(self, user_id: str, client_id: str) -> list[ConsentRecord]:
         """Every consent this user has granted to one client, across tenants."""
         return [record for record in self.list_for_user(user_id) if record.client_id == client_id]
@@ -316,6 +330,14 @@ class InMemoryConsentStore(ConsentStore):
     def delete(self, consent_id: str) -> None:
         """Revoke a consent. Idempotent."""
         self._items.pop(consent_id, None)
+
+    def mark_used(self, consent_id: str, last_used_at: str) -> bool:
+        """Stamp a consent as used when it is still present, answering whether it was."""
+        record = self._items.get(consent_id)
+        if record is None:
+            return False
+        self._items[consent_id] = dataclasses.replace(record, last_used_at=last_used_at)
+        return True
 
 
 class DynamoOAuthClientStore(OAuthClientStore):
@@ -452,6 +474,27 @@ class DynamoConsentStore(ConsentStore):
     def delete(self, consent_id: str) -> None:
         """Revoke a consent. Idempotent."""
         self._repo.delete({"consent_id": consent_id})
+
+    def mark_used(self, consent_id: str, last_used_at: str) -> bool:
+        """Stamp a consent as used with an update conditioned on the row existing.
+
+        A revocation that lands first makes the condition fail, which is reported as
+        `False` rather than raised, and nothing is written back.
+        """
+        from botocore.exceptions import ClientError
+
+        try:
+            self._repo.table.update_item(
+                Key={"consent_id": consent_id},
+                UpdateExpression="SET last_used_at = :used",
+                ConditionExpression="attribute_exists(consent_id)",
+                ExpressionAttributeValues={":used": last_used_at},
+            )
+        except ClientError as exc:
+            if exc.response.get("Error", {}).get("Code") != "ConditionalCheckFailedException":
+                raise
+            return False
+        return True
 
 
 def _client_from_item(item: Mapping[str, Any]) -> OAuthClientRecord:

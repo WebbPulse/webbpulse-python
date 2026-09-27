@@ -9,7 +9,6 @@ and `coerce_claims` handle them unchanged.
 
 from __future__ import annotations
 
-import dataclasses
 import hashlib
 import logging
 import secrets
@@ -684,7 +683,9 @@ class OAuthServerService:
         """Begin a refresh family for this grant, or `None` when no store is configured."""
         if self._flows is None:
             return None
-        issued = self._flows.sessions.start_family(record.user_id, device=_refresh_device(record.client_id))
+        issued = self._flows.sessions.start_family(
+            record.user_id, device=_refresh_device(record.client_id, record.tenant_id)
+        )
         return issued.token
 
     def refresh(self, params: Mapping[str, str], *, now: int | None = None) -> dict[str, Any]:
@@ -711,11 +712,10 @@ class OAuthServerService:
         if outcome.issued is None:
             raise OAuthServerError("invalid_grant", "The refresh token is unknown, expired, spent or revoked.")
 
-        consent = self._consent_for_refresh(outcome.user_id, params.get("client_id", ""))
-        if consent is None:
+        consent = self._consent_for_refresh(outcome.user_id, params.get("client_id", ""), outcome.issued.device)
+        if consent is None or not self._stores.consents.mark_used(consent.consent_id, _iso(moment)):
             self._flows.sessions.revoke_family(outcome.family_id)
             raise OAuthServerError("invalid_grant", "The authorization behind this refresh token has been revoked.")
-        self._stores.consents.put(dataclasses.replace(consent, last_used_at=_iso(moment)))
         tenant = consent.tenant_id
         access = self._tokens.mint_access_token(
             outcome.user_id,
@@ -735,31 +735,44 @@ class OAuthServerService:
             "scope": " ".join(scopes),
         }
 
-    def _consent_for_refresh(self, user_id: str, client_id: str) -> ConsentRecord | None:
+    def _consent_for_refresh(self, user_id: str, client_id: str, device: str) -> ConsentRecord | None:
         """The standing grant a refresh continues, or `None` when it has been revoked.
 
-        The tenant is read back from this record rather than taken from the request, so a
-        refresh cannot quietly move a long-lived grant to a tenant the user never approved,
-        and a missing record ends the grant: revoking consent is what revokes a client.
+        A family started for a tenant stays bound to it: the grant is that tenant's consent
+        or nothing, so revoking one tenant's grant ends the family rather than moving it to
+        another tenant. A family started before families carried their tenant falls back
+        to any grant the user holds to the client. A family started for another client, or
+        outside this server, continues nothing. The tenant is read back from the record
+        rather than taken from the request, and a missing record ends the grant.
         """
         if not client_id:
             return None
         grants = self._stores.consents.list_for_client(user_id, client_id)
-        return grants[0] if grants else None
+        if device == _refresh_device(client_id):
+            return grants[0] if grants else None
+        prefix = _refresh_device(client_id) + ":"
+        if not device.startswith(prefix):
+            return None
+        tenant_id = device.removeprefix(prefix)
+        return next((grant for grant in grants if grant.tenant_id == tenant_id), None)
 
     def revoke_authorization(self, user_id: str, client_id: str, *, tenant_id: str = "") -> AuthorizationRevocation:
         """Withdraw a user's grant to one client, so it must authorize again.
 
-        Deletes the matching consents, every tenant's or only `tenant_id`'s. When the user
-        then holds no grant to the client at all, every refresh family the server started
-        for it is revoked too, since a family is bound to the client and not to a tenant.
-        While a grant in another tenant remains, a refresh continues under that tenant.
-        Access tokens already minted run out on their own short lifetime.
+        Deletes the matching consents, every tenant's or only `tenant_id`'s, and revokes
+        the refresh families started for each tenant whose grant went. Families started
+        before families carried their tenant are revoked once the user holds no grant to
+        the client at all. Access tokens already minted run out on their own short lifetime.
         """
         deleted = self._stores.consents.delete_for_client(user_id, client_id, tenant_id=tenant_id)
         families_revoked = 0
-        if self._flows is not None and not self._stores.consents.list_for_client(user_id, client_id):
-            families_revoked = self._flows.sessions.revoke_device(user_id, _refresh_device(client_id))
+        if self._flows is not None:
+            sessions = self._flows.sessions
+            tenants = sorted({record.tenant_id for record in deleted} | ({tenant_id} if tenant_id else set()))
+            for tenant in tenants:
+                families_revoked += sessions.revoke_device(user_id, _refresh_device(client_id, tenant))
+            if not self._stores.consents.list_for_client(user_id, client_id):
+                families_revoked += sessions.revoke_device(user_id, _refresh_device(client_id))
         _log.info(
             "oauth_server_authorization_revoked client_id=%s consents=%d refresh_records=%d",
             client_id,
@@ -783,9 +796,12 @@ class OAuthServerService:
             _log.warning("oauth_server_revoke_failed", exc_info=True)
 
 
-def _refresh_device(client_id: str) -> str:
-    """The `device` label on every refresh family started for one client."""
-    return f"mcp:{client_id}"
+def _refresh_device(client_id: str, tenant_id: str = "") -> str:
+    """The `device` label on a refresh family started for one client in one tenant.
+
+    Without a tenant it is the label families carried before they were bound to one.
+    """
+    return f"mcp:{client_id}:{tenant_id}" if tenant_id else f"mcp:{client_id}"
 
 
 def _iso(moment: int) -> str:

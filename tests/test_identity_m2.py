@@ -1850,3 +1850,37 @@ class TestLimitsFollowTheEnvironmentConvention:
         )
         assert _login_route_dependencies(on)
         assert _login_route_dependencies(off) == []
+
+
+def test_the_dynamo_consent_store_stamps_only_a_present_row(dynamodb_resource: Any) -> None:
+    """The conditional update never writes a revoked consent back."""
+    from webbpulse.dynamodb import Repository
+    from webbpulse.identity.oauth_server_storage import ConsentRecord, DynamoConsentStore
+
+    dynamodb_resource.create_table(
+        TableName="oauth-consents",
+        KeySchema=[{"AttributeName": "consent_id", "KeyType": "HASH"}],
+        AttributeDefinitions=[{"AttributeName": "consent_id", "AttributeType": "S"}],
+        BillingMode="PAY_PER_REQUEST",
+    )
+    store = DynamoConsentStore(Repository("oauth-consents", prefix="", region_name="us-west-2"))
+    store.put(
+        ConsentRecord(
+            consent_id="c1",
+            user_id=USER_ID,
+            client_id="client-a",
+            tenant_id="t1",
+            resource="https://mcp.example.test",
+            scopes=("mcp:read",),
+            granted_at="2026-09-26T00:00:00Z",
+        )
+    )
+
+    assert store.mark_used("c1", "2026-09-26T01:00:00Z")
+    stamped = store.get("c1")
+    assert stamped is not None
+    assert stamped.last_used_at == "2026-09-26T01:00:00Z"
+
+    store.delete("c1")
+    assert not store.mark_used("c1", "2026-09-26T02:00:00Z")
+    assert store.get("c1") is None
