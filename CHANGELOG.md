@@ -7,6 +7,8 @@ This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## Unreleased
 
+## 0.66.0
+
 ### `tf`: `wp-tf` sends the key only to a trusted https origin (patch)
 
 The discovered API origin must be https on the login host or a subdomain of it. Anything
