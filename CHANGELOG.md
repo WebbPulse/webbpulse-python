@@ -7,6 +7,8 @@ This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## Unreleased
 
+## 0.64.1
+
 ### `identity`: a refresh never widens the consented scopes (patch)
 
 `OAuthServerService.refresh` used to answer every `mcp_scopes_supported` scope when the
