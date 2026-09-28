@@ -7,6 +7,8 @@ This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## Unreleased
 
+## 0.67.1
+
 ### Fixed
 
 - `otel`: the per-request flush middleware now holds back the final `http.response.body`
