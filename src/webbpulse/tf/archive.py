@@ -8,9 +8,13 @@ import re
 import tarfile
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
+from typing import Any
 
 SKIPPED_DIRECTORIES = frozenset({".git", ".terraform"})
-"""Directories left out at any depth when there is no `.terraformignore`, as HCP Terraform does."""
+"""Directories always left out, at any depth, whatever `.terraformignore` says."""
+
+SKIPPED_FILES = re.compile(r"^(?:.*\.tfstate|.*\.tfstate\.backup|\.terraform\.tfstate\.lock\.info)$")
+"""Local state files, always left out: a remote run has its own state, and these hold secrets."""
 
 IGNORE_FILE = ".terraformignore"
 
@@ -20,6 +24,24 @@ MAX_UPLOAD_BYTES = 250 * 1024 * 1024
 
 class ArchiveError(Exception):
     """The directory cannot be packaged for the workspace."""
+
+
+class _CappedBuffer(io.BytesIO):
+    """An in-memory buffer that refuses to grow past `MAX_UPLOAD_BYTES`."""
+
+    def __init__(self, root: Path) -> None:
+        """Remember the root to name in the refusal."""
+        super().__init__()
+        self.root = root
+
+    def write(self, data: Any, /) -> int:
+        """Write, or raise once the archive would pass the limit."""
+        if self.tell() + len(data) > MAX_UPLOAD_BYTES:
+            raise ArchiveError(
+                f"the configuration under {self.root} is over {MAX_UPLOAD_BYTES // (1024 * 1024)} MB; "
+                f"list what the plan does not need in {self.root / IGNORE_FILE}"
+            )
+        return super().write(data)
 
 
 @dataclass(frozen=True)
@@ -115,9 +137,9 @@ def upload_root(directory: Path, working_directory: str) -> Path:
 def build_tarball(directory: Path, working_directory: str = "") -> bytes:
     """A gzipped tar of the configuration, rooted where the workspace expects it.
 
-    A `.terraformignore` at the upload root filters it the way HCP Terraform does, and
-    `.git` and `.terraform` directories are always skipped. Symlinks are stored as links
-    and never followed.
+    A `.terraformignore` at the upload root filters it the way HCP Terraform does. `.git`
+    and `.terraform` directories and local `*.tfstate` files are always skipped; `.tfvars`
+    files are configuration and are uploaded. Symlinks are stored as links and never followed.
 
     Raises:
         ArchiveError: `directory` cannot be packaged, or the tarball is over the size limit.
@@ -125,7 +147,7 @@ def build_tarball(directory: Path, working_directory: str = "") -> bytes:
     root = upload_root(directory, working_directory)
     ignore_file = root / IGNORE_FILE
     rules = parse_ignore(ignore_file.read_text(encoding="utf-8")) if ignore_file.is_file() else []
-    buffer = io.BytesIO()
+    buffer = _CappedBuffer(root)
     with tarfile.open(fileobj=buffer, mode="w:gz") as archive:
         for current, dirnames, filenames in os.walk(root):
             base = Path(current)
@@ -143,23 +165,16 @@ def build_tarball(directory: Path, working_directory: str = "") -> bytes:
             for name in sorted(filenames):
                 path = base / name
                 relative = path.relative_to(root).as_posix()
-                if not _ignored(rules, relative, False):
+                if not SKIPPED_FILES.match(name) and not _ignored(rules, relative, False):
                     archive.add(path, arcname=relative, recursive=False)
-            if buffer.tell() > MAX_UPLOAD_BYTES:
-                break
-    data = buffer.getvalue()
-    if len(data) > MAX_UPLOAD_BYTES:
-        raise ArchiveError(
-            f"the configuration under {root} is over {MAX_UPLOAD_BYTES // (1024 * 1024)} MB; "
-            f"list what the plan does not need in {root / IGNORE_FILE}"
-        )
-    return data
+    return buffer.getvalue()
 
 
 __all__ = [
     "IGNORE_FILE",
     "MAX_UPLOAD_BYTES",
     "SKIPPED_DIRECTORIES",
+    "SKIPPED_FILES",
     "ArchiveError",
     "build_tarball",
     "parse_ignore",

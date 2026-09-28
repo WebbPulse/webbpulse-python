@@ -13,7 +13,7 @@ import httpx
 import pytest
 
 from webbpulse.tf import cli
-from webbpulse.tf.client import GATE_HEADER, ApiError, ControlPlane, discover_api_url
+from webbpulse.tf.client import GATE_HEADER, ApiError, ControlPlane, check_api_url, discover_api_url
 
 API = "https://api.example.test"
 WS_ID = "ws-01M3G00GJ5VPVR3QDJV8HNBQX1"
@@ -250,3 +250,81 @@ def test_discovery_reads_the_api_origin() -> None:
 
     with httpx.Client(transport=httpx.MockTransport(missing)) as client, pytest.raises(ApiError):
         discover_api_url("host.test", client)
+
+
+@pytest.mark.parametrize(
+    "service",
+    [
+        "http://api.staging.example.test/v1/modules/",
+        "https://evil.test/v1/modules/",
+        "https://staging.example.test.evil.test/v1/modules/",
+        "https://api.staging.example.test:8443/v1/modules/",
+        "https://user@api.staging.example.test/v1/modules/",
+        "//evil.test/v1/modules/",
+    ],
+)
+def test_discovery_refuses_an_untrusted_origin(service: str) -> None:
+    """A discovery document pointing the key off https or off the login host is refused."""
+
+    def discovery(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={"modules.v1": service})
+
+    with httpx.Client(transport=httpx.MockTransport(discovery)) as client, pytest.raises(ApiError) as caught:
+        discover_api_url("staging.example.test", client)
+    assert caught.value.error_code == "UNTRUSTED_API_ORIGIN"
+
+
+def test_untrusted_discovery_sends_no_token(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Through the default connect, an untrusted discovered origin exits 1 before any API call."""
+    sent: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        sent.append(request)
+        return httpx.Response(200, json={"modules.v1": "http://evil.test/v1/modules/"})
+
+    real_client = httpx.Client
+
+    def client(**kwargs: Any) -> httpx.Client:
+        return real_client(transport=httpx.MockTransport(handler), **kwargs)
+
+    monkeypatch.setattr(httpx, "Client", client)
+    err = io.StringIO()
+    code = cli.main(["workspaces"], stdout=io.StringIO(), stderr=err, environ={"WP_TF_TOKEN": TOKEN}, home=tmp_path)
+    assert code == 1
+    assert "UNTRUSTED_API_ORIGIN" in err.getvalue()
+    assert [request.url.path for request in sent] == ["/.well-known/terraform.json"]
+    assert all("authorization" not in request.headers for request in sent)
+
+
+@pytest.mark.parametrize("url", ["http://api.example.test", "ftp://api.example.test", "https://u@api.example.test"])
+def test_insecure_api_url_is_refused(url: str) -> None:
+    """An explicit API URL must be https, from the flag or the environment."""
+    err = io.StringIO()
+    assert (
+        cli.main(["--api-url", url, "workspaces"], stdout=io.StringIO(), stderr=err, environ={"WP_TF_TOKEN": TOKEN})
+        == 1
+    )
+    assert "INSECURE_API_URL" in err.getvalue()
+    err = io.StringIO()
+    env = {"WP_TF_TOKEN": TOKEN, "WP_TF_API_URL": url}
+    assert cli.main(["workspaces"], stdout=io.StringIO(), stderr=err, environ=env) == 1
+    assert "INSECURE_API_URL" in err.getvalue()
+
+
+def test_local_http_api_url_is_allowed() -> None:
+    """Plain http is accepted for a local stack only."""
+    assert check_api_url("http://localhost:8000/") == "http://localhost:8000"
+    assert check_api_url("http://127.0.0.1:8000") == "http://127.0.0.1:8000"
+    assert check_api_url("https://api.example.test/") == "https://api.example.test"
+
+
+def test_list_workspaces_follows_the_cursor() -> None:
+    """Workspaces are read across pages when the API returns a next cursor."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.params.get("cursor") == "c2":
+            return httpx.Response(200, json={"items": [{"workspace_id": "ws-b"}], "next_cursor": None})
+        return httpx.Response(200, json={"items": [{"workspace_id": "ws-a"}], "next_cursor": "c2"})
+
+    with ControlPlane(API, TOKEN, transport=httpx.MockTransport(handler)) as plane:
+        assert [item["workspace_id"] for item in plane.list_workspaces()] == ["ws-a", "ws-b"]

@@ -7,6 +7,14 @@ This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## Unreleased
 
+### `tf`: `wp-tf` sends the key only to a trusted https origin (patch)
+
+The discovered API origin must be https on the login host or a subdomain of it. Anything
+else is refused with `UNTRUSTED_API_ORIGIN` before the key is sent. An explicit `--api-url`
+or `WP_TF_API_URL` must be https, except on `localhost`. Local `*.tfstate` files are never
+uploaded. The 250 MB cap is enforced while archiving, and the workspace list follows
+`next_cursor`.
+
 ### `tf`: the `wp-tf` plan CLI (minor)
 
 New `tf` extra and `wp-tf` console script for the WebbPulse Terraform control plane. It works

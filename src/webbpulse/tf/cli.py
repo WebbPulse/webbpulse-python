@@ -9,9 +9,10 @@
 
 The key is the one `terraform login` stored for the host, or `TF_TOKEN_<host>`, or
 `WP_TF_TOKEN`. The host defaults to `terraform.webbpulse.com` and is set with `--host` or
-`WP_TF_HOST`; the API origin is read from the host's discovery document unless `--api-url`
-or `WP_TF_API_URL` names it. Staging sits behind an access gate whose value goes in
-`WP_TF_GATE`. No command confirms, applies or reads state, and no token is ever printed.
+`WP_TF_HOST`; the API origin is read from the host's discovery document, and must be https
+on the host or a subdomain, unless `--api-url` or `WP_TF_API_URL` names an https origin.
+Staging sits behind an access gate whose value goes in `WP_TF_GATE`. No command confirms,
+applies or reads state, and no token is ever printed.
 
 Log lines go to stdout, progress to stderr. Exit codes: 0 when the plan succeeded, 1 on any
 failure, 2 under `--detailed-exitcode` when the plan has changes.
@@ -205,14 +206,16 @@ def _connect(args: argparse.Namespace, environ: Mapping[str, str], home: Path | 
     """The host and an authenticated client for it."""
     import httpx
 
-    from .client import ControlPlane, discover_api_url
+    from .client import ControlPlane, check_api_url, discover_api_url
 
     host = (args.host or environ.get(HOST_ENV) or DEFAULT_HOST).strip().lower()
     if "/" in host or not host:
         raise UsageError("--host is a hostname such as terraform.webbpulse.com, with no scheme or path")
     token = resolve_token(host, environ, home)
     api_url = (args.api_url or environ.get(API_URL_ENV) or "").strip()
-    if not api_url:
+    if api_url:
+        api_url = check_api_url(api_url)
+    else:
         with httpx.Client(timeout=30.0) as client:
             api_url = discover_api_url(host, client)
     return host, ControlPlane(api_url, token, gate=environ.get(GATE_ENV, "").strip())

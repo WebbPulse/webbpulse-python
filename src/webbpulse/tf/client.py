@@ -64,14 +64,42 @@ def _error_from(response: httpx.Response) -> ApiError:
     return ApiError(response.status_code, message, code)
 
 
+LOCAL_HOSTS = frozenset({"localhost", "127.0.0.1", "::1"})
+"""Hosts a plain-http API origin is accepted for, so a local stack can be driven."""
+
+
+def trusted_origin(host: str, url: str) -> bool:
+    """Whether `url` is an https origin on `host` or a subdomain of it, where a login key may go."""
+    parts = urlsplit(url)
+    hostname = (parts.hostname or "").lower()
+    host = host.lower()
+    on_host = hostname == host or hostname.endswith(f".{host}")
+    return parts.scheme == "https" and on_host and parts.port is None and not parts.username
+
+
+def check_api_url(url: str) -> str:
+    """`url` as an API origin, refusing anything but https outside a local stack.
+
+    Raises:
+        ApiError: The origin is not https, or http on a host other than a local one.
+    """
+    parts = urlsplit(url)
+    if parts.scheme == "https" and parts.hostname and not parts.username:
+        return url.rstrip("/")
+    if parts.scheme == "http" and (parts.hostname or "") in LOCAL_HOSTS:
+        return url.rstrip("/")
+    raise ApiError(0, f"refusing API URL {url!r}: the key is only sent over https", "INSECURE_API_URL")
+
+
 def discover_api_url(host: str, client: httpx.Client) -> str:
     """The API origin for `host`, read off the service discovery document `terraform login` uses.
 
     The control plane serves its registry and API from one origin, so the `modules.v1`
-    URL's origin is the API's. A relative entry means the API is on `host` itself.
+    URL's origin is the API's. A relative entry means the API is on `host` itself. The
+    origin must be https on `host` or a subdomain of it, since the login key is sent there.
 
     Raises:
-        ApiError: The document is missing or names no service to derive the origin from.
+        ApiError: The document is missing, names no service, or points the key elsewhere.
     """
     response = client.get(f"https://{host}{DISCOVERY_PATH}")
     if response.status_code != 200:
@@ -84,9 +112,16 @@ def discover_api_url(host: str, client: httpx.Client) -> str:
     if not isinstance(service, str) or not service:
         raise ApiError(response.status_code, f"{host}{DISCOVERY_PATH} names no modules.v1 or providers.v1 service")
     parts = urlsplit(service)
-    if not parts.scheme:
+    if not parts.scheme and not parts.netloc:
         return f"https://{host}"
-    return f"{parts.scheme}://{parts.netloc}"
+    origin = f"{parts.scheme}://{parts.netloc}"
+    if not trusted_origin(host, origin):
+        raise ApiError(
+            response.status_code,
+            f"{host}{DISCOVERY_PATH} points the API at {origin}, which is not https on {host} or a subdomain",
+            "UNTRUSTED_API_ORIGIN",
+        )
+    return origin
 
 
 class ControlPlane:
@@ -140,10 +175,17 @@ class ControlPlane:
         return response.json()
 
     def list_workspaces(self) -> list[dict[str, Any]]:
-        """Every workspace the key can read."""
-        body = self._request("GET", "/workspaces")
-        items = body.get("items", []) if isinstance(body, dict) else body
-        return [dict(item) for item in items or []]
+        """Every workspace the key can read, following `next_cursor` when the API pages."""
+        workspaces: list[dict[str, Any]] = []
+        params: dict[str, str] = {}
+        while True:
+            body = self._request("GET", "/workspaces", params=params)
+            items = body.get("items", []) if isinstance(body, dict) else body
+            workspaces.extend(dict(item) for item in items or [])
+            cursor = body.get("next_cursor") if isinstance(body, dict) else None
+            if not cursor or cursor == params.get("cursor"):
+                return workspaces
+            params = {"cursor": str(cursor)}
 
     def get_workspace(self, workspace_id: str) -> dict[str, Any]:
         """One workspace by id."""
@@ -231,5 +273,7 @@ __all__ = [
     "TERMINAL_STATUSES",
     "ApiError",
     "ControlPlane",
+    "check_api_url",
     "discover_api_url",
+    "trusted_origin",
 ]

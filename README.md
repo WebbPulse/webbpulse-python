@@ -250,15 +250,16 @@ wp-tf workspaces
 - **Scopes.** That key can read and plan. It cannot confirm, apply or read raw state, and
   `wp-tf` has no command that tries.
 - **Host.** `--host` or `WP_TF_HOST` sets the host, defaulting to
-  `terraform.webbpulse.com`. The API origin comes from the host's discovery document, or from
-  `--api-url` or `WP_TF_API_URL`.
+  `terraform.webbpulse.com`. The API origin comes from the host's discovery document and must
+  be https on the host or a subdomain. `--api-url` or `WP_TF_API_URL` can name it instead; it
+  must be https, except on a local stack (`localhost`).
 - **Staging gate.** Staging sits behind the access gate. Put the gate's origin-verify value in
   `WP_TF_GATE`.
 - **Working directory.** When a workspace has a working directory, run `wp-tf` from that
   directory. The upload is rooted that many levels up, as HCP Terraform does.
 - **What the upload skips.** A `.terraformignore` at the upload root filters it with
-  gitignore rules. `.git` and `.terraform` are always skipped, and uploads over 250 MB are
-  refused.
+  gitignore rules. `.git`, `.terraform` and local `*.tfstate` files are always skipped.
+  `.tfvars` files are configuration, so they are uploaded. Uploads over 250 MB are refused.
 - **Output and exit codes.** Log lines go to stdout and progress to stderr. It exits `0` when
   the plan succeeds and `1` on any failure. It exits `2` under `--detailed-exitcode` when the
   plan has changes, and `130` after Ctrl-C, which also cancels the run. Tokens and the gate
