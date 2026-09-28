@@ -200,6 +200,12 @@ refresh that is itself refused raises `RefreshFailed` naming the session's user 
 generic HTTP failure, because at that point there is no credential left and every later case
 would fail for the same reason.
 
+The public `refresh(session)` helper stores a 200 on the session the same way and hands the
+response back for the caller to assert on, so an explicit refresh never leaves the spent token
+behind. `logout(session)` sends the session's refresh cookie, which is how the identity logout
+route knows which family to end, and the suite's logout case signs in a session of its own
+for it, so no case ends the shared `user_session`.
+
 The refresh is guarded by a lock, so several concurrent callers refresh once between them and
 none loses the rotated refresh token to another. This applies to the ephemeral user and the
 durable user alike, since both arrive through `login`. A client from `with_token` carries no
@@ -592,7 +598,13 @@ plugin marks the shared-state cases into one group during collection and leaves 
 unmarked, so the scheduler spreads the probes and holds the rest together. Grouping is by
 owning test class: `TestIdentity`, `TestBrowser` and `TestHygiene` are grouped, and
 `TestRouteCut`, `TestCoverage`, `TestReachability` and `TestFrontend` are not. A product's own
-case joins the group by carrying the `e2e_writes` marker, so it needs to name no group.
+case joins the group by carrying the `e2e_writes` marker, so it needs to name no group. The
+plugin's own probe classes stay free even where a case carries the marker, as the
+authenticated reachability probe does for the read-only skip.
+
+xdist's worker turns the markers into the `@group` node id suffix that `loadgroup` schedules
+by, in a collection hook that runs before any ordinary plugin hook. The grouping therefore
+runs as its own `tryfirst` plugin, registered in `pytest_configure`.
 
 The marker is applied whether or not xdist is installed, since it is inert in a serial run.
 

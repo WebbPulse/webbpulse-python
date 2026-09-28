@@ -754,7 +754,11 @@ class TestIdentity:
 
     @pytest.mark.e2e_writes
     def test_refresh_issues_a_new_token(self, user_session: Any) -> None:
-        """The refresh route exchanges the refresh material for a fresh access token."""
+        """The refresh route exchanges the refresh material for a fresh access token.
+
+        `refresh` stores the rotated material back on `user_session`, so the shared session
+        keeps working for every later case.
+        """
         response = refresh(user_session)
         assert response.status_code == 200, f"refresh answered {response.status_code}: {response.text[:200]}"
         payload = response.json()
@@ -966,9 +970,17 @@ class TestIdentity:
             describe_delete_failure(anon, user, admin_token=admin_mint_token)
 
     @pytest.mark.e2e_writes
-    def test_logout_ends_the_session(self, user_session: Any) -> None:
-        """The logout route answers, and runs last because it ends the session."""
-        response = logout(user_session)
+    def test_logout_ends_the_session(self, anon: E2EClient, e2e_env: Any, credentials: Any) -> None:
+        """The logout route answers for a session this case signs in for itself.
+
+        Never `user_session`: that one is shared by every later case on this worker, and
+        logging it out left each of them refused, so the suite only passed when this case
+        happened to sort last.
+        """
+        if not e2e_env.signs_in:
+            pytest.skip("this run does not sign in, so there is no session to log out")
+        session = login(anon, credentials.email, credentials.password)
+        response = logout(session)
         assert response.status_code in (200, 204), f"logout answered {response.status_code}: {response.text[:200]}"
 
 

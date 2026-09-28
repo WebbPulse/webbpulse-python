@@ -23,10 +23,14 @@ from __future__ import annotations
 from collections.abc import Sequence
 from typing import Any, Final, Protocol
 
+import pytest
+
 __all__ = [
+    "INDEPENDENT_PREFIXES",
     "SHARED_STATE_GROUP",
     "SHARED_STATE_PREFIXES",
     "GroupableItem",
+    "GroupingPlugin",
     "apply_groups",
     "group_for",
     "worker_id",
@@ -58,6 +62,13 @@ SHARED_STATE_PREFIXES: Final[tuple[str, ...]] = (
     "TestHygiene",
 )
 
+INDEPENDENT_PREFIXES: Final[tuple[str, ...]] = (
+    "TestRouteCut",
+    "TestCoverage",
+    "TestReachability",
+    "TestFrontend",
+)
+
 
 def worker_id(config: Any) -> str:
     """This worker's xdist id, or `master` when the run is not distributed.
@@ -79,10 +90,16 @@ def group_for(item: GroupableItem) -> str:
 
     A product's own cases are grouped when they carry the `e2e_writes` marker, so a case
     that mutates the session user is held with the rest without the product naming a group.
+    The plugin's own independent probe classes stay free even where a case carries the
+    marker: the authenticated reachability probe is marked only so a read-only run skips it,
+    and it neither refreshes nor ends the session, so pinning its hundreds of cases to one
+    worker would serialise the run for nothing.
     """
-    for cls in _owning_classes(item):
-        if cls.startswith(SHARED_STATE_PREFIXES):
-            return SHARED_STATE_GROUP
+    classes = _owning_classes(item)
+    if any(cls.startswith(SHARED_STATE_PREFIXES) for cls in classes):
+        return SHARED_STATE_GROUP
+    if any(cls.startswith(INDEPENDENT_PREFIXES) for cls in classes):
+        return ""
     if item.get_closest_marker("e2e_writes") is not None:
         return SHARED_STATE_GROUP
     return ""
@@ -100,13 +117,27 @@ def apply_groups(items: Sequence[GroupableItem]) -> int:
     Applied whether or not xdist is installed: the marker is inert in a serial run, so the
     suite carries one grouping rather than two code paths.
     """
-    import pytest as _pytest
-
     marked = 0
     for item in items:
         group = group_for(item)
         if not group:
             continue
-        item.add_marker(_pytest.mark.xdist_group(group))
+        item.add_marker(pytest.mark.xdist_group(group))
         marked += 1
     return marked
+
+
+class GroupingPlugin:
+    """Applies the `xdist_group` markers before xdist reads them.
+
+    xdist's worker turns each `xdist_group` marker into the `@group` suffix on the node id
+    in its own `pytest_collection_modifyitems`, and `--dist loadgroup` schedules by that
+    suffix alone. That hook is registered after every conftest and entry point plugin, so
+    pluggy calls it first; a marker added by an ordinary hook of this plugin arrived after
+    the suffix was written and grouped nothing. `tryfirst` puts this pass ahead of it.
+    """
+
+    @pytest.hookimpl(tryfirst=True)
+    def pytest_collection_modifyitems(self, items: list[pytest.Item]) -> None:
+        """Mark the shared-state cases with their group ahead of xdist's suffix pass."""
+        apply_groups(items)
