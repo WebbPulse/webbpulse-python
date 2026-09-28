@@ -24,12 +24,13 @@ if TYPE_CHECKING:  # pragma: no cover
     from webbpulse.dynamodb import Repository
     from webbpulse.identity.hooks import IdentityHooks
     from webbpulse.identity.settings import IdentitySettings
-    from webbpulse.identity.storage import CredentialStore
+    from webbpulse.identity.storage import CredentialStore, PasskeyStore
 
 __all__ = [
     "GITHUB_PROVIDER",
     "GOOGLE_PROVIDER",
     "OAUTH_LINKS_TABLE",
+    "OAUTH_LINK_BINDING_COOKIE",
     "OAUTH_LINK_USER_INDEX",
     "OAUTH_STATES_TABLE",
     "OAUTH_STATE_TTL_SECONDS",
@@ -51,6 +52,8 @@ __all__ = [
     "OAuthService",
     "OAuthStateRecord",
     "OAuthStateStore",
+    "link_binding_matches",
+    "new_link_binding",
     "provider_account_key",
 ]
 
@@ -62,6 +65,9 @@ OAUTH_LINKS_TABLE: Final = "oauth-links"
 OAUTH_LINK_USER_INDEX: Final = "user_id-index"
 
 OAUTH_STATE_TTL_SECONDS: Final = 600
+
+OAUTH_LINK_BINDING_COOKIE: Final = "wp_oauth_link"
+"""The cookie tying a `link` state to the browser that started it."""
 
 GOOGLE_PROVIDER: Final = "google"
 GITHUB_PROVIDER: Final = "github"
@@ -239,6 +245,7 @@ class OAuthStateRecord:
     return_to: str = ""
     user_id: str = ""
     redirect_uri: str = ""
+    binding: str = ""
 
 
 @dataclass(frozen=True, slots=True)
@@ -256,6 +263,7 @@ class OAuthLinkRecord:
     provider_email: str = ""
     provider_email_verified: bool = False
     last_login_at: str = ""
+    provider_login: str = ""
 
 
 @dataclass(frozen=True, slots=True)
@@ -271,6 +279,7 @@ class OAuthIdentity:
     email: str
     email_verified: bool
     name: str = ""
+    login: str = ""
 
     @property
     def account_key(self) -> str:
@@ -428,6 +437,7 @@ class DynamoOAuthStateStore(OAuthStateStore):
                 "return_to": record.return_to,
                 "user_id": record.user_id,
                 "redirect_uri": record.redirect_uri,
+                "binding": record.binding,
             }
         )
 
@@ -531,6 +541,7 @@ def _link_to_item(record: OAuthLinkRecord) -> dict[str, Any]:
         "provider_email": record.provider_email,
         "provider_email_verified": record.provider_email_verified,
         "last_login_at": record.last_login_at,
+        "provider_login": record.provider_login,
     }
 
 
@@ -548,6 +559,7 @@ def _state_from_item(item: Mapping[str, Any]) -> OAuthStateRecord:
         return_to=str(item.get("return_to", "")),
         user_id=str(item.get("user_id", "")),
         redirect_uri=str(item.get("redirect_uri", "")),
+        binding=str(item.get("binding", "")),
     )
 
 
@@ -562,7 +574,36 @@ def _link_from_item(item: Mapping[str, Any]) -> OAuthLinkRecord:
         provider_email=str(item.get("provider_email", "")),
         provider_email_verified=bool(item.get("provider_email_verified", False)),
         last_login_at=str(item.get("last_login_at", "")),
+        provider_login=str(item.get("provider_login", "")),
     )
+
+
+def new_link_binding() -> tuple[str, str]:
+    """A fresh browser secret for a `link` start and the digest the state row keeps.
+
+    The secret goes to the browser in `OAUTH_LINK_BINDING_COOKIE`; only its SHA-256 is
+    stored, so a leaked state row cannot be replayed from another browser.
+    """
+    secret = _b64url(secrets.token_bytes(32))
+    return secret, _binding_digest(secret)
+
+
+def link_binding_matches(record: OAuthStateRecord, presented: str) -> bool:
+    """Whether the callback came from the browser that started this state.
+
+    A row with no binding, such as a login or one written by an older version, always
+    matches, so the check only ever tightens a `link`.
+    """
+    if not record.binding:
+        return True
+    if not presented:
+        return False
+    return constant_time_equals(record.binding, _binding_digest(presented))
+
+
+def _binding_digest(secret: str) -> str:
+    """The SHA-256 of a binding secret, base64url without padding."""
+    return _b64url(hashlib.sha256(secret.encode("ascii")).digest())
 
 
 def _b64url(raw: bytes) -> str:
@@ -597,13 +638,18 @@ class OAuthService:
         credentials: CredentialStore | None = None,
         client_secrets: Mapping[str, str] | None = None,
         http_client: HttpClient | None = None,
+        passkeys: PasskeyStore | None = None,
     ) -> None:
-        """Hold the settings, hooks, stores, client secrets and HTTP client to use."""
+        """Hold the settings, hooks, stores, client secrets and HTTP client to use.
+
+        `passkeys` lets the unlink guard count a passwordless passkey as a way back in.
+        """
         self._settings = settings
         self._hooks = hooks
         self._states = states
         self._links = links
         self._credentials = credentials
+        self._passkeys = passkeys
         self._secrets = dict(client_secrets or {})
         self._http = http_client if http_client is not None else HttpxClient()
 
@@ -676,11 +722,13 @@ class OAuthService:
         user_id: str = "",
         return_to: str = "",
         redirect_uri: str = "",
+        binding: str = "",
     ) -> OAuthAuthorization:
         """Mint a state, write it, and build the URL the browser is redirected to.
 
         The row is written first and `redirect_uri` is checked against the allow-list here,
         so the callback can trust the stored value. A missing client secret refuses up front.
+        `binding` is the digest from `new_link_binding`, kept only on a `link` row.
         """
         config = self._provider(provider)
         self._client_secret(provider)
@@ -706,6 +754,7 @@ class OAuthService:
                 return_to=resolved_return,
                 user_id=user_id if mode == "link" else "",
                 redirect_uri=resolved_redirect,
+                binding=binding if mode == "link" else "",
             )
         )
 
@@ -963,6 +1012,7 @@ class OAuthService:
             email=email,
             email_verified=verified,
             name=str(body.get("name", "") or body.get("login", "")),
+            login=str(body.get("login", "") or ""),
         )
 
     def _github_primary_email(self, config: OAuthProviderConfig, headers: Mapping[str, str]) -> tuple[str, bool]:
@@ -1113,8 +1163,14 @@ class OAuthService:
         """Attach a provider identity to the authenticated account that asked for it.
 
         Needs no email check, since the caller proved they hold both accounts. An identity
-        already attached is refused with the same message whoever holds it.
+        already attached is refused with the same message whoever holds it, and never moved.
         """
+        if not user_id or self._hooks.load_user_by_id(user_id) is None:
+            raise OAuthRejected(
+                "That account is no longer available.",
+                error_code="OAUTH_ACCOUNT_MISSING",
+                status_code=401,
+            )
         existing = self._links.get(identity.account_key)
         if existing is not None:
             raise OAuthRejected(
@@ -1199,6 +1255,14 @@ class OAuthService:
             if password is not None and password.secret:
                 return True
 
+        if (
+            self._passkeys is not None
+            and self._settings.passkeys_enabled
+            and self._settings.passkeys_passwordless
+            and self._passkeys.list_for_user(user_id)
+        ):
+            return True
+
         return bool(self._hooks.has_other_sign_in_method(user_id))
 
     def _new_link(self, identity: OAuthIdentity, user_id: str) -> OAuthLinkRecord:
@@ -1213,6 +1277,7 @@ class OAuthService:
             provider_email=identity.email,
             provider_email_verified=identity.email_verified,
             last_login_at=moment,
+            provider_login=identity.login,
         )
 
     def _touch(self, record: OAuthLinkRecord, identity: OAuthIdentity) -> None:
@@ -1231,6 +1296,7 @@ class OAuthService:
                     provider_email=identity.email or record.provider_email,
                     provider_email_verified=identity.email_verified,
                     last_login_at=now_iso(),
+                    provider_login=identity.login or record.provider_login,
                 )
             )
         except Exception:

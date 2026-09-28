@@ -312,6 +312,14 @@ class IdentitySettings(BaseSettings):
     sibling domain. Empty means the single default, `<issuer>/oauth/callback`.
     """
 
+    oauth_link_max_auth_age: timedelta = Field(
+        default=timedelta(minutes=10),
+        description=(
+            "The oldest sign-in that may link or unlink an OAuth provider. An older "
+            "`auth_time` is a 401 `STEP_UP_REQUIRED`. Zero turns the check off."
+        ),
+    )
+
     @field_validator("issuer", "frontend_base_url", mode="before")
     @classmethod
     def _strip_trailing_slash(cls, value: object) -> object:
@@ -527,6 +535,13 @@ class IdentitySettings(BaseSettings):
                 )
         if not self.cookie_path.startswith("/"):
             raise ValueError(f"cookie_path must be absolute, got {self.cookie_path!r}.")
+        return self
+
+    @model_validator(mode="after")
+    def _check_oauth_link_window(self) -> IdentitySettings:
+        """Refuse a negative link step-up window; zero is the way to turn it off."""
+        if self.oauth_link_max_auth_age < timedelta(0):
+            raise ValueError("oauth_link_max_auth_age must be zero, which turns the check off, or positive.")
         return self
 
     @model_validator(mode="after")

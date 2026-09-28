@@ -102,7 +102,7 @@ Paths are relative to the issuer prefix (normally `/api/auth`).
 | `POST /step-up/passkey/options` | bearer |
 | `POST /passkeys/register/options`, `/passkeys/register/verify` | bearer |
 | `GET /passkeys`, `DELETE /passkeys/{credential_id}` | bearer |
-| `POST /oauth/{provider}/link`, `GET /oauth/links` | bearer |
+| `POST /oauth/{provider}/link`, `DELETE /oauth/{provider}/link`, `GET /oauth/links` | bearer |
 
 **The two discovery routes MUST be reachable without authentication and without the staging
 access gate.** The authorizer fetches them holding no cookies; if a gate authorizer covers
