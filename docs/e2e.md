@@ -102,7 +102,7 @@ wiring mistake is how a suite goes quietly green against nothing.
 
 | Variable | Meaning |
 | --- | --- |
-| `E2E_ENVIRONMENT` | `staging`, `production` or `local`. Production has no gate and mints nothing; `local` is a stack built from source and makes no AWS call. See below |
+| `E2E_ENVIRONMENT` | `staging`, `production` or `local`. Production mints no token and no gate cookie unless `E2E_PRODUCTION_GATED` is set; `local` is a stack built from source and makes no AWS call. See below |
 | `E2E_API_BASE_URL` | The API origin under test |
 | `E2E_WEB_BASE_URL` | The deployed web origin, for the shell and bundle checks |
 | `E2E_AWS_REGION` | The region holding the API, the log group and the KMS key |
@@ -120,6 +120,7 @@ wiring mistake is how a suite goes quietly green against nothing.
 | `E2E_GATE_SIGNING_KEY_SSM_PARAMETER` | The SSM SecureString holding the gate's CloudFront signing key. Set all three gate variables or none |
 | `E2E_GATE_KEY_PAIR_ID` | The CloudFront public key id the gate trusts |
 | `E2E_GATE_COOKIE_DOMAIN` | The domain the signed cookies are scoped to, such as `staging.example.com` |
+| `E2E_PRODUCTION_GATED` | Set in production when production sits behind the web gate too, so the plugin mints the gate cookies there. Requires `E2E_READ_ONLY` and the three gate variables, and is ignored outside production. See [A gated production](#a-gated-production) |
 | `E2E_BROWSER` | `chromium`, `firefox` or `webkit`. Defaults to `chromium` |
 | `E2E_HEADLESS` | Set to `0` or `false` to watch the run. Defaults to headless |
 | `E2E_BROWSER_ARTIFACTS_DIR` | Where a failure writes its trace and screenshot. Defaults to `e2e-browser-artifacts` |
@@ -152,6 +153,20 @@ and produces the same custom policy the login Lambda produces, byte for byte, si
 function regex-matches the decoded policy. The cookies last an hour, are attached to both the
 `http` client and every browser context, and are never printed: the policy and signature are
 kept out of the dataclass repr, so a pytest failure report cannot leak a live session.
+
+### A gated production
+
+By default a production run refuses to mint gate cookies, because a production with no web
+gate has no signing key that should be readable. A production behind the
+`staging-access-gate` module does have one, so set `E2E_PRODUCTION_GATED=true` on the
+production GitHub Environment together with the three `E2E_GATE_*` web gate variables.
+`e2e.yml` forwards every `E2E_*` Environment variable, so no workflow input is needed.
+
+The flag lifts the production refusal for the cookie mint only. The parse refuses it
+unless `E2E_READ_ONLY` is set, and the `gate_cookies` fixture lifts the refusal only on a
+read-only run, so the `e2e_writes` skip, the absent user, the unminted admin token and the
+missing ephemeral user all stand. The prod e2e role needs `ssm:GetParameter` on the
+signing key parameter and `kms:Decrypt` on the key encrypting it.
 
 ## The session keeps its own token current
 

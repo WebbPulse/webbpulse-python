@@ -71,6 +71,7 @@ __all__ = [
     "LOCAL_ENVIRONMENT",
     "LOCAL_GATEWAY_REASON",
     "NO_ENVIRONMENT_REASON",
+    "PRODUCTION_GATED",
     "READ_ONLY_REASON",
     "RUN_WIDE_GROUPS",
     "SHARED_STATE_GROUP",
@@ -134,6 +135,8 @@ _WEB_GATE = (
     "E2E_GATE_COOKIE_DOMAIN",
 )
 
+PRODUCTION_GATED = "E2E_PRODUCTION_GATED"
+
 BROWSER_NAMES = ("chromium", "firefox", "webkit")
 DEFAULT_BROWSER_TIMEOUT_MS = 15000
 
@@ -177,10 +180,14 @@ class E2EEnvironment:
     no durable e2e user, so `user_email` and `user_password` are empty there and every case
     that would sign in, write or mutate is skipped with one reason.
 
-    `gate_ssm_parameter` is empty in production, which has no gate. `legacy_route_names` is
+    `gate_ssm_parameter` is empty in a production with no gate. `legacy_route_names` is
     the list of strings that must not appear in the deployed bundle. The three
     `gate_signing_key_ssm_parameter`, `gate_key_pair_id` and `gate_cookie_domain` fields
-    describe the staging web gate and are all set together or all empty.
+    describe the web gate and are all set together or all empty.
+
+    `production_gated` is set from `E2E_PRODUCTION_GATED` in production only, and declares
+    that production sits behind the web gate too. The parse accepts it only alongside
+    `read_only` and the three web gate variables, so it mints gate cookies and nothing else.
 
     `rate_limit_per_minute` is only the fallback the pacer uses for answers that carry no
     `X-RateLimit-Remaining-Minute` header, and it is read from `E2E_RATE_LIMIT_PER_MINUTE`.
@@ -205,6 +212,7 @@ class E2EEnvironment:
     browser_artifacts_dir: str = ""
     browser_timeout_ms: int = DEFAULT_BROWSER_TIMEOUT_MS
     read_only: bool = False
+    production_gated: bool = False
     mint_enabled: bool = False
     kms_key_id: str = ""
     issuer: str = ""
@@ -223,7 +231,7 @@ class E2EEnvironment:
 
     @property
     def is_production(self) -> bool:
-        """Whether this is the production stage, which has no gate and refuses minting."""
+        """Whether this is the production stage, which refuses minting and is gated only on opt-in."""
         return self.environment.lower() == "production"
 
     @property
@@ -291,6 +299,8 @@ class E2EEnvironment:
                 "to the hosted UI rather than by the app."
             )
 
+        production_gated = _production_gated(source, read_only=read_only, gate_set=bool(set_names))
+
         browser_name = source.get("E2E_BROWSER", "").strip().lower() or "chromium"
         if browser_name not in BROWSER_NAMES:
             raise MissingEnvironment(
@@ -318,6 +328,7 @@ class E2EEnvironment:
             browser_artifacts_dir=source.get("E2E_BROWSER_ARTIFACTS_DIR", "").strip(),
             browser_timeout_ms=_positive_int(source.get("E2E_BROWSER_TIMEOUT_MS", ""), DEFAULT_BROWSER_TIMEOUT_MS),
             read_only=read_only,
+            production_gated=production_gated,
             mint_enabled=mint_enabled,
             kms_key_id=source.get("E2E_KMS_KEY_ID", "").strip(),
             issuer=source.get("E2E_ISSUER", "").strip().rstrip("/"),
@@ -325,6 +336,33 @@ class E2EEnvironment:
             legacy_route_names=legacy,
             rate_limit_per_minute=_positive_int(source.get("E2E_RATE_LIMIT_PER_MINUTE", ""), DEFAULT_PER_MINUTE),
         )
+
+
+def _production_gated(source: Mapping[str, str], *, read_only: bool, gate_set: bool) -> bool:
+    """Whether a production run declared its web gate, refusing any declaration it cannot honour.
+
+    The flag means nothing outside production, where the gate cookies are minted whenever the
+    web gate variables are set. In production it is accepted only for the anonymous read-only
+    smoke with all three web gate variables set, so declaring the gate unlocks the cookie
+    mint alone and never a sign in, a write or an ephemeral user.
+    """
+    if not _truthy(source.get(PRODUCTION_GATED, "")):
+        return False
+    if source.get("E2E_ENVIRONMENT", "").strip().lower() != "production":
+        return False
+    if not read_only:
+        raise MissingEnvironment(
+            f"{PRODUCTION_GATED} is set, which production accepts only for the anonymous "
+            "read-only smoke. Set E2E_READ_ONLY=true, or unset the flag: gate cookies in "
+            "production must never come with a sign in, a write or an ephemeral user."
+        )
+    if not gate_set:
+        raise MissingEnvironment(
+            f"{PRODUCTION_GATED} is set but the web gate variables are empty: "
+            f"{', '.join(_WEB_GATE)}. Without them no session is minted, so every browser "
+            "case would be answered by the gate's redirect rather than by the app."
+        )
+    return True
 
 
 WRITES_MARKER = "e2e_writes"

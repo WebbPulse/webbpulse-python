@@ -1,11 +1,12 @@
-"""Signed CloudFront session cookies for the staging web gate.
+"""Signed CloudFront session cookies for the web gate.
 
-Both staging sites sit behind a CloudFront viewer-request function that admits a non-API
-request only when `CloudFront-Policy`, `CloudFront-Signature` and `CloudFront-Key-Pair-Id`
-are present and the policy's `AWS:EpochTime` is more than thirty seconds in the future;
-without them it redirects to the Cognito hosted UI, and a request under the site's `/api/`
-prefix is answered 401. The API host's authorizer admits either the `x-origin-verify`
-header or these same cookies, which is how a browser-driven suite reaches the API.
+Both staging sites, and a production that declares `E2E_PRODUCTION_GATED`, sit behind a
+CloudFront viewer-request function that admits a non-API request only when
+`CloudFront-Policy`, `CloudFront-Signature` and `CloudFront-Key-Pair-Id` are present and
+the policy's `AWS:EpochTime` is more than thirty seconds in the future; without them it
+redirects to the Cognito hosted UI, and a request under the site's `/api/` prefix is
+answered 401. The API host's authorizer admits either the `x-origin-verify` header or these
+same cookies, which is how a browser-driven suite reaches the API.
 
 The policy this module signs must be byte identical to the one the gate's login Lambda
 issues, because the CloudFront function regex-matches the decoded policy text: no spaces
@@ -145,15 +146,18 @@ def mint_gate_cookies(
     environment: str,
     session_seconds: int = DEFAULT_SESSION_SECONDS,
     now: int | None = None,
+    production_gated: bool = False,
 ) -> GateCookies:
-    """Read the signing PEM from SSM and mint one staging session.
+    """Read the signing PEM from SSM and mint one web gate session.
 
-    Refuses production outright, the way `mint_test_token` does: production has no web
-    gate, so a signing key there would be a key that should not exist. The parameter is
-    read with decryption through the caller's own credentials and its value is never
-    returned, logged or interpolated into a message.
+    Refuses production the way `mint_test_token` does, because a production with no web
+    gate holds no signing key that should be readable. `production_gated` lifts that only
+    for a production the environment has declared gated, and the fixture passes it only on
+    the anonymous read-only smoke. The parameter is read with decryption through the
+    caller's own credentials and its value is never returned, logged or interpolated into
+    a message.
     """
-    if environment.strip().lower() == "production":
+    if environment.strip().lower() == "production" and not production_gated:
         raise RuntimeError(
             "mint_gate_cookies refuses production. Production has no web gate, so there is "
             "no session to mint and no signing key that should be readable there."
@@ -173,12 +177,13 @@ def mint_gate_cookies(
 
 @pytest.fixture(scope="session")
 def gate_cookies(e2e_env: Any, request: Any) -> Iterator[GateCookies | None]:
-    """The minted staging session cookies, or None where no web gate is configured.
+    """The minted web gate session cookies, or None where no web gate is configured.
 
     The three `E2E_GATE_*` web gate variables are all set or all empty; the environment
-    parse refuses a mix, so by here an empty parameter name means production, a local
-    stack, or a deliberately gate-less stage. `boto3_session` is requested only after that
-    check, so a run with no gate constructs no AWS client.
+    parse refuses a mix, so by here an empty parameter name means an ungated production, a
+    local stack, or a deliberately gate-less stage. `boto3_session` is requested only after
+    that check, so a run with no gate constructs no AWS client. Production mints only when
+    `E2E_PRODUCTION_GATED` is declared on a read-only run, and is refused otherwise.
     """
     if not e2e_env.gate_signing_key_ssm_parameter:
         yield None
@@ -190,4 +195,5 @@ def gate_cookies(e2e_env: Any, request: Any) -> Iterator[GateCookies | None]:
         key_pair_id=e2e_env.gate_key_pair_id,
         domain=e2e_env.gate_cookie_domain,
         environment=e2e_env.environment,
+        production_gated=e2e_env.production_gated and e2e_env.read_only,
     )

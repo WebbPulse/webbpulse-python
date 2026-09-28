@@ -7,6 +7,14 @@ This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## Unreleased
 
+### `e2e`: gate cookies for a gated production smoke (minor)
+
+New `E2E_PRODUCTION_GATED` opt-in. A production run with it set, `E2E_READ_ONLY` on and the
+three `E2E_GATE_*` web gate variables set mints the web gate cookies through the same
+signer staging uses, so the browser smoke reaches a gated SPA. It is refused without
+`E2E_READ_ONLY` or without the gate variables, and ignored outside production. Without it,
+production refuses the mint exactly as before.
+
 ## 0.66.0
 
 ### `tf`: `wp-tf` sends the key only to a trusted https origin (patch)
