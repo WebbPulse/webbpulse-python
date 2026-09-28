@@ -1,5 +1,5 @@
 [build-system]
-requires = ["hatchling>=1.25"]
+requires = ["hatchling>=1.27"]
 build-backend = "hatchling.build"
 
 [project]
@@ -7,7 +7,8 @@ name = "webbpulse"
 description = "Shared infrastructure code for WebbPulse FastAPI services on AWS Lambda."
 readme = "README.md"
 requires-python = ">=3.13"
-license = "MIT"
+license = "LicenseRef-PolyForm-Strict-1.0.0"
+license-files = ["LICENSE"]
 authors = [{ name = "Tyler Webb", email = "tylert2610@gmail.com" }]
 keywords = ["fastapi", "aws", "lambda", "dynamodb", "opentelemetry"]
 classifiers = [
