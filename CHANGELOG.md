@@ -7,6 +7,8 @@ This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## Unreleased
 
+## 0.66.0
+
 ### `tf`: the `wp-tf` plan CLI (minor)
 
 New `tf` extra and `wp-tf` console script for the WebbPulse Terraform control plane. It works
