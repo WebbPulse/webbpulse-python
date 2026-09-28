@@ -27,21 +27,25 @@ __all__ = [
     "DEFAULT_LOGOUT_PATH",
     "DEFAULT_REFRESH_PATH",
     "DEFAULT_REFRESH_SKEW",
+    "DEFAULT_STEP_UP_PATH",
     "JWKS_PATH",
     "IdentitySession",
     "LoginFailed",
     "RefreshFailed",
+    "StepUpFailed",
     "decode_claims",
     "login",
     "logout",
     "mint",
     "refresh",
+    "step_up",
     "token_expiry",
 ]
 
 DEFAULT_LOGIN_PATH = "/api/auth/login"
 DEFAULT_REFRESH_PATH = "/api/auth/refresh"
 DEFAULT_LOGOUT_PATH = "/api/auth/logout"
+DEFAULT_STEP_UP_PATH = "/api/auth/step-up"
 JWKS_PATH = "/api/auth/.well-known/jwks.json"
 
 DEFAULT_REFRESH_SKEW = 60.0
@@ -59,6 +63,10 @@ class RefreshFailed(RuntimeError):
     the refresh family is expired or revoked there is no credential left, and every
     subsequent case would fail as a 401 that says nothing about the route it called.
     """
+
+
+class StepUpFailed(RuntimeError):
+    """The session could not re-authenticate, so a route behind `require_recent_auth` stays shut."""
 
 
 def _pad(value: str) -> str:
@@ -334,6 +342,57 @@ def refresh(
         headers["cookie"] = "; ".join(f"{name}={value}" for name, value in session.refresh_cookies.items())
     anonymous = session.client.with_token(None)
     return anonymous.post(refresh_path, json=body, headers=headers)
+
+
+def _auth_time_of(claims: Mapping[str, Any]) -> int:
+    """The `auth_time` claim as epoch seconds, or 0 when the token carries none."""
+    try:
+        return int(claims.get("auth_time") or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+def step_up(
+    session: IdentitySession,
+    password: str,
+    *,
+    step_up_path: str = DEFAULT_STEP_UP_PATH,
+) -> IdentitySession:
+    """Re-authenticate the session with its password, so a step-up gated route lets it through.
+
+    Posts `{"password": ...}` to the real step-up route, then refreshes once, so the session
+    carries a token minted from the refresh family and a later lazy refresh keeps the new
+    `auth_time` rather than falling back to the login's. Raises `StepUpFailed` when the route
+    refuses or the refreshed token did not keep the fresher `auth_time`. The password never
+    reaches the message of the raised error. Returns the same session, updated in place.
+    """
+    subject = session.user_id or "<unknown>"
+    response = session.client.post(step_up_path, json={"password": password})
+    status = getattr(response, "status_code", 0)
+    if status != 200:
+        raise StepUpFailed(
+            f"POST {step_up_path} answered {status} stepping up the session for user {subject}. "
+            "Check the user has a password in this environment and is not locked out."
+        )
+    try:
+        payload = response.json()
+    except ValueError as error:
+        raise StepUpFailed(f"POST {step_up_path} answered 200 with a body that is not JSON") from error
+    access_token = _extract_token(payload, "access_token", "accessToken", "token")
+    if not access_token:
+        raise StepUpFailed(f"POST {step_up_path} answered 200 with no access token in the body")
+
+    _, stepped_claims = decode_claims(access_token)
+    stepped_at = _auth_time_of(stepped_claims)
+    with session._lock:
+        session._refresh_locked()
+        refreshed_at = _auth_time_of(session.claims)
+    if stepped_at and refreshed_at < stepped_at:
+        raise StepUpFailed(
+            f"POST {session.refresh_path} after a step-up returned auth_time {refreshed_at}, older than "
+            f"the step-up's {stepped_at}, so the refresh family did not record the re-authentication."
+        )
+    return session
 
 
 def logout(session: IdentitySession, *, logout_path: str = DEFAULT_LOGOUT_PATH) -> Any:

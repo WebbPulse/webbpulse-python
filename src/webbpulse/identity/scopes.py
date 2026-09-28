@@ -1,8 +1,9 @@
 """Scope enforcement over the authorizer's claims, and the dependency that accepts a key.
 
-Two dependencies. `claims_or_api_key` answers with an `AuthorizerClaims` whichever credential
+Two core dependencies. `claims_or_api_key` answers with an `AuthorizerClaims` whichever credential
 arrived, a JWT the gateway already verified or one of this package's API keys presented as a
-bearer token. `require_scopes` guards a route on what that claims object carries.
+bearer token. `require_scopes` guards a route on what that claims object carries, and
+`require_recent_auth` on how recently the person behind it authenticated.
 
 Both fail closed. Every path that cannot produce verified claims raises, so no route reached
 through here ever runs anonymously, and a fault in the chain reads as 401 rather than as a
@@ -13,6 +14,7 @@ from __future__ import annotations
 
 import inspect
 import logging
+import time
 from collections.abc import Awaitable, Callable, Iterable, Mapping, Sequence
 from typing import TYPE_CHECKING, Any, Final
 
@@ -35,6 +37,8 @@ if TYPE_CHECKING:  # pragma: no cover
 __all__ = [
     "FORBIDDEN_ERROR_CODE",
     "SCOPES_KEY",
+    "STEP_UP_REQUIRED_ERROR_CODE",
+    "STEP_UP_REQUIRED_MESSAGE",
     "UNAUTHENTICATED_ERROR_CODE",
     "bearer_credential",
     "claims_or_api_key",
@@ -43,8 +47,10 @@ __all__ = [
     "has_scopes",
     "is_api_key_actor",
     "missing_scopes",
+    "require_recent_auth",
     "require_scopes",
     "require_tenant",
+    "step_up_challenge",
     "tenant_matches",
 ]
 
@@ -84,6 +90,12 @@ FORBIDDEN_ERROR_CODE: Final = "INSUFFICIENT_SCOPE"
 A missing scope is its own refusal: a frontend can offer to re-authorize for it, which it
 cannot do for the blanket `FORBIDDEN` that `webbpulse.http` gives every other 403.
 """
+
+STEP_UP_REQUIRED_ERROR_CODE: Final = "STEP_UP_REQUIRED"
+"""The 401 `error_code` `require_recent_auth` gives a login that is too old or undated."""
+
+STEP_UP_REQUIRED_MESSAGE: Final = "A more recent authentication is required."
+"""The message `require_recent_auth` refuses with."""
 
 _BEARER: Final = "bearer "
 
@@ -350,3 +362,76 @@ def is_api_key_actor(claims: Mapping[str, Any]) -> bool:
     another key: a key must never be able to mint its own successor.
     """
     return str(claims.get(ACTOR_CLAIM, "")) == ACTOR_API_KEY
+
+
+def step_up_challenge(max_age: int) -> str:
+    """The `WWW-Authenticate` value asking for a fresher login, per RFC 9470."""
+    return (
+        'Bearer error="insufficient_user_authentication", '
+        'error_description="A more recent authentication is required", '
+        f"max_age={int(max_age)}"
+    )
+
+
+def _auth_time(claims: Mapping[str, Any]) -> int | None:
+    """The `auth_time` claim as epoch seconds, or `None` when absent or unreadable."""
+    value = claims.get("auth_time")
+    if isinstance(value, bool) or value is None or value == "":
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def require_recent_auth(
+    max_age_seconds: int,
+    *,
+    claims_dependency: Any | None = None,
+    clock: Callable[[], float] = time.time,
+) -> Any:
+    """Build a dependency refusing a person whose login is older than `max_age_seconds`.
+
+    Reads `auth_time` from the verified claims. A token without one, or with one more than
+    `max_age_seconds` old, is a 401 with `error_code` `STEP_UP_REQUIRED`, a `max_age` field
+    and the RFC 9470 `WWW-Authenticate` challenge, so a client can step up and retry. An API
+    key has no login to age and passes.
+
+    Args:
+        max_age_seconds: The oldest login accepted, in seconds. Must be positive.
+        claims_dependency: The dependency producing the claims, such as a `require_scopes`
+            dependency, so the gate composes with the scope check. Defaults to
+            `claims_or_api_key()` with no store.
+        clock: Returns the current epoch seconds, for tests.
+
+    Returns:
+        An `async def` dependency suitable for `Depends`, returning the claims it checked.
+    """
+    from fastapi import Depends, HTTPException
+
+    if type(max_age_seconds) is not int or max_age_seconds <= 0:
+        raise ValueError("max_age_seconds must be a positive integer.")
+    max_age = max_age_seconds
+    resolver = claims_dependency if claims_dependency is not None else claims_or_api_key()
+
+    async def dependency(claims: AuthorizerClaims = Depends(resolver)) -> AuthorizerClaims:
+        """Return the claims when the login is recent enough, or raise a 401 asking for step-up."""
+        if is_api_key_actor(claims):
+            return claims
+        auth_time = _auth_time(claims)
+        if auth_time is not None and clock() - auth_time <= max_age:
+            return claims
+        _log.info("Refusing a caller whose login is older than %s seconds.", max_age)
+        raise HTTPException(
+            status_code=401,
+            detail={
+                "message": STEP_UP_REQUIRED_MESSAGE,
+                "error_code": STEP_UP_REQUIRED_ERROR_CODE,
+                "extra": {"max_age": max_age},
+            },
+            headers={"WWW-Authenticate": step_up_challenge(max_age)},
+        )
+
+    dependency.__name__ = "require_recent_auth"
+    dependency.__doc__ = f"Requires a login no older than {max_age} seconds on this request's claims."
+    return dependency

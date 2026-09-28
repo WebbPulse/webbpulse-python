@@ -48,7 +48,7 @@ from .gateway import (
     operations_from_openapi,
     routes_from_openapi,
 )
-from .identity import IdentitySession, login, mint
+from .identity import IdentitySession, StepUpFailed, login, mint, step_up
 from .journeys import (
     Click,
     ExpectText,
@@ -91,9 +91,11 @@ __all__ = [
     "MissingEnvironment",
     "Record",
     "RouteSpec",
+    "StepUpFailed",
     "access_log_health",
     "environment_for_collection",
     "pytest_addhooks",
+    "step_up",
     "suite_requests",
 ]
 
@@ -688,6 +690,16 @@ def user_session(e2e_env: E2EEnvironment, anon: E2EClient, credentials: Credenti
     if not e2e_env.signs_in:
         pytest.skip(READ_ONLY_REASON)
     return login(anon, credentials.email, credentials.password)
+
+
+@pytest.fixture
+def stepped_up_session(user_session: IdentitySession, credentials: Credentials) -> IdentitySession:
+    """This run's login user with a fresh `auth_time`, for a route behind `require_recent_auth`.
+
+    Steps up through the password path on every use, so the login is recent whatever the
+    route's `max_age`. Updates the shared session in place: a fresher login weakens no other case.
+    """
+    return step_up(user_session, credentials.password)
 
 
 @pytest.fixture(scope="session")

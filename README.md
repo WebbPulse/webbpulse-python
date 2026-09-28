@@ -334,6 +334,49 @@ raises `StripeNotConfigured`; a missing, wrong, malformed or stale signature rai
 work fails so Stripe's retry can win. In tests, `webbpulse.testing.sign_stripe_payload`
 signs a body the way Stripe does, and `FakeIdempotencyStore` stands in for the table.
 
+## Step-up gate
+
+`require_recent_auth(max_age_seconds)` guards a sensitive route on how recently the person
+signed in, read from the `auth_time` claim. It composes with the scope check by taking it as
+its claims dependency, and API keys pass it, since a key has no login to age:
+
+```python
+from fastapi import Depends
+
+from webbpulse.identity import claims_or_api_key, require_recent_auth, require_scopes
+
+claims = claims_or_api_key(store=api_keys)
+admin = require_scopes("workspace:admin", claims_dependency=claims)
+sudo = require_recent_auth(600, claims_dependency=admin)
+
+
+@router.delete("/workspaces/{workspace_id}")
+def delete_workspace(workspace_id: str, caller=Depends(sudo)) -> None: ...
+```
+
+A login older than the window, or a token with no `auth_time`, is refused with a 401 in the
+shared envelope and an RFC 9470 challenge, so a frontend can prompt for step-up and retry:
+
+```
+HTTP/1.1 401
+WWW-Authenticate: Bearer error="insufficient_user_authentication", error_description="A more recent authentication is required", max_age=600
+
+{"success": false, "status": 401, "message": "A more recent authentication is required.",
+ "request_id": "...", "error_code": "STEP_UP_REQUIRED", "max_age": 600}
+```
+
+The client steps up on `POST <issuer path>/step-up` with a bearer token and one of
+`{"password": "..."}`, `{"code": "123456"}` or `{"challenge_id": "...", "credential": {...}}`,
+and gets `{"access_token", "token_type": "Bearer", "expires_in"}` back with no cookie change.
+The password is checked exactly as login checks it and counts toward the same lockout; it is
+enough on its own even when the user has MFA, as in GitHub sudo mode. A user with neither a
+password nor a second factor gets 503 `MFA_NOT_CONFIGURED`. Step-up records its `auth_time` on
+the refresh family, and a refresh carries the family's `auth_time` rather than bumping it, so
+refreshing never counts as signing in again. In an e2e suite, `webbpulse.e2e.step_up(session,
+password)` or the `stepped_up_session` fixture steps up the run's user and refreshes onto the
+new `auth_time`. Tokens minted by the OAuth authorization server for MCP clients carry no
+`auth_time`, so the gate refuses them by design.
+
 ## Hooks a consuming project implements
 
 Everything below is a seam the package deliberately leaves to the product. Only

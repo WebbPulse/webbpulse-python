@@ -678,6 +678,64 @@ def test_state_consumed_inside_the_grace_window_is_replayed(sessions: SessionSer
     assert sessions.rotate(winner.issued.token).outcome == "rotated"
 
 
+def test_a_family_keeps_its_auth_time_across_rotations(sessions: SessionService) -> None:
+    """Every generation carries the family's `auth_time`, not the time it was rotated."""
+    started = datetime(2026, 9, 1, tzinfo=UTC)
+    first = sessions.start_family(USER_ID, now=started)
+    assert first.auth_time == int(started.timestamp())
+
+    second = sessions.rotate(first.token, now=started + timedelta(minutes=5)).issued
+    assert second is not None
+    third = sessions.rotate(second.token, now=started + timedelta(minutes=9)).issued
+    assert third is not None
+    assert second.auth_time == third.auth_time == int(started.timestamp())
+
+
+def test_a_reauthentication_reaches_the_next_rotation_and_the_grace_replay(sessions: SessionService) -> None:
+    """A recorded step-up is carried by the rotation after it, and by a replay of the same rotation."""
+    first = sessions.start_family(USER_ID)
+    stepped_at = first.auth_time + 120
+
+    assert sessions.record_reauthentication(first.family_id, stepped_at) >= 1
+    winner = sessions.rotate(first.token)
+    loser = sessions.rotate(first.token)
+
+    assert winner.issued is not None
+    assert loser.issued is not None
+    assert winner.issued.auth_time == stepped_at
+    assert loser.issued.auth_time == stepped_at
+
+
+def test_a_reauthentication_never_moves_auth_time_backwards(sessions: SessionService) -> None:
+    """An older `auth_time` recorded late leaves the newer one in place."""
+    first = sessions.start_family(USER_ID)
+
+    assert sessions.record_reauthentication(first.family_id, first.auth_time - 60) == 0
+    rotated = sessions.rotate(first.token).issued
+    assert rotated is not None
+    assert rotated.auth_time == first.auth_time
+
+
+def test_a_store_without_family_updates_leaves_refresh_working(stores: IdentityStores) -> None:
+    """A store that cannot record a step-up is skipped, and rotation carries the login time."""
+    from webbpulse.identity.storage import InMemoryRefreshTokenStore
+
+    class Legacy(InMemoryRefreshTokenStore):
+        """A store predating `set_family_auth_time`."""
+
+        def set_family_auth_time(self, family_id: str, auth_time: int) -> int:
+            """Refuse, as the base class does."""
+            raise NotImplementedError
+
+    service = SessionService(make_settings(), Legacy())
+    first = service.start_family(USER_ID)
+
+    assert service.record_reauthentication(first.family_id, first.auth_time + 60) == 0
+    rotated = service.rotate(first.token).issued
+    assert rotated is not None
+    assert rotated.auth_time == first.auth_time
+
+
 def test_state_consumed_outside_the_grace_window_revokes_the_family(
     sessions: SessionService, stores: IdentityStores
 ) -> None:
@@ -1086,7 +1144,7 @@ def test_the_documents_alone_mount_without_hooks_or_stores(kms: FakeKms) -> None
 def test_the_flows_mount_when_hooks_and_stores_are_supplied(
     kms: FakeKms, hooks: FakeHooks, stores: IdentityStores
 ) -> None:
-    """Supplying hooks and stores mounts the six flow routes alongside the documents."""
+    """Supplying hooks and stores mounts the flow routes, step-up included, alongside the documents."""
     router = build_identity_router(make_settings(), hooks, stores, kms_client=kms)
     paths = {route.path for route in router.routes}  # type: ignore[attr-defined]
     assert paths == {
@@ -1102,6 +1160,7 @@ def test_the_flows_mount_when_hooks_and_stores_are_supplied(
         "/api/auth/refresh",
         "/api/auth/logout",
         "/api/auth/logout-all",
+        "/api/auth/step-up",
     }
 
 
@@ -1129,6 +1188,7 @@ def test_an_origin_issuer_mounts_every_route_at_the_origin(
         "/refresh",
         "/logout",
         "/logout-all",
+        "/step-up",
     }
 
 
@@ -1626,6 +1686,37 @@ def _seed_family(store: Any, *, user_id: str, family_id: str, generations: int =
         )
         hashes.append(token_hash)
     return hashes
+
+
+def test_the_dynamo_store_records_a_reauthentication_on_every_live_row(dynamo_refresh_store: Any) -> None:
+    """`set_family_auth_time` updates every row of the family through the family index, forward only."""
+    _seed_family(dynamo_refresh_store, user_id=USER_ID, family_id="fam", generations=2)
+    _seed_family(dynamo_refresh_store, user_id=USER_ID, family_id="other")
+
+    assert dynamo_refresh_store.set_family_auth_time("fam", 1_900_000_000) == 2
+    assert dynamo_refresh_store.set_family_auth_time("fam", 1_800_000_000) == 0
+    assert dynamo_refresh_store.get("fam-gen0").auth_time == 1_900_000_000
+    assert dynamo_refresh_store.get("fam-gen1").auth_time == 1_900_000_000
+    assert dynamo_refresh_store.get("other-gen0").auth_time == 0
+
+
+def test_the_dynamo_store_round_trips_auth_time(dynamo_refresh_store: Any) -> None:
+    """A row written with an `auth_time` reads back with it."""
+    from webbpulse.identity.storage import RefreshTokenRecord
+
+    dynamo_refresh_store.put(
+        RefreshTokenRecord(
+            token_hash="t",
+            family_id="fam",
+            user_id=USER_ID,
+            generation=0,
+            created_at="2026-09-13T00:00:00Z",
+            expires_at=4_102_444_800,
+            auth_time=1_790_000_000,
+        )
+    )
+
+    assert dynamo_refresh_store.get("t").auth_time == 1_790_000_000
 
 
 def test_revoke_all_for_user_revokes_every_family_through_the_user_index(dynamo_refresh_store: Any) -> None:

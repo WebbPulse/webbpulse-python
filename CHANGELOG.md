@@ -5,6 +5,40 @@ Notable changes to the `webbpulse` package. The version here is the one in
 
 This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## Unreleased
+
+### `identity`: `require_recent_auth` step-up gate and password step-up (minor)
+
+`webbpulse.identity.require_recent_auth(max_age_seconds, *, claims_dependency=None)` is a
+FastAPI dependency factory that refuses a login older than `max_age_seconds`, or a token with
+no `auth_time`, with a 401 carrying `error_code` `STEP_UP_REQUIRED`, a top-level `max_age` and
+`WWW-Authenticate: Bearer error="insufficient_user_authentication", error_description="A more
+recent authentication is required", max_age=<n>`. API keys pass. It composes with
+`require_scopes` through `claims_dependency`. `STEP_UP_REQUIRED_ERROR_CODE`,
+`STEP_UP_REQUIRED_MESSAGE` and `step_up_challenge` are exported alongside it.
+
+`POST /step-up` now accepts `{"password": "..."}` and is mounted whether or not MFA is
+configured. `IdentityFlows.step_up_with_password` runs the password check login uses, now
+shared as one helper, under the same lockout key, so a wrong password gives login's 401
+`INVALID_CREDENTIALS` and counts toward lockout, and a locked account is a 429. A password is
+enough even for a user with MFA. A user with neither a password nor a second factor gets 503
+`MFA_NOT_CONFIGURED`; with passwords off the route answers 403 `PASSWORDS_DISABLED`.
+
+`auth_time` is now persisted on the refresh family: set at login, recorded by every step-up
+(`SessionService.record_reauthentication`, `RefreshTokenStore.set_family_auth_time`) and
+carried across rotation. A refresh used to stamp `auth_time` with the refresh time, which
+made every refresh look like a fresh login; it now keeps the family's value. Rows written
+before this release fall back to the family's start time. `RefreshTokenRecord` gains
+`auth_time`, and a custom `RefreshTokenStore` that does not implement
+`set_family_auth_time` keeps working with step-ups lasting only until the next refresh.
+
+`register_error_handlers` renders an `extra` mapping inside an `HTTPException` detail as
+top-level envelope keys, never overriding a base key and never on a 5xx.
+
+`webbpulse.e2e.step_up(session, password, *, step_up_path=DEFAULT_STEP_UP_PATH)` steps an
+`IdentitySession` up through the password path and refreshes once onto the new `auth_time`,
+raising `StepUpFailed` otherwise. The plugin adds a `stepped_up_session` fixture.
+
 ## 0.61.0
 
 ### `ops.config`: `config set` creates a missing parameter (minor)
