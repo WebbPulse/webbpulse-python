@@ -17,6 +17,7 @@ from pytest import MonkeyPatch
 
 from webbpulse.ops import config as ops
 from webbpulse.ops.config import (
+    CONFIG_PARAMETER_DESCRIPTION,
     EXIT_CONFLICT,
     EXIT_KEY_ABSENT,
     EXIT_MISSING,
@@ -24,6 +25,7 @@ from webbpulse.ops.config import (
     EXIT_OK,
     EXIT_USAGE,
     ConcurrentChangeError,
+    ConfigStore,
     SecretStore,
     UsageError,
     main,
@@ -375,12 +377,68 @@ def test_config_unset_removes_one_key() -> None:
     assert stored_parameter() == {"B": 2}
 
 
-def test_config_commands_report_a_missing_parameter() -> None:
-    """A parameter that does not exist exits with the missing code and points at terraform."""
+def test_config_get_and_unset_report_a_missing_parameter() -> None:
+    """Get and unset on a parameter that does not exist exit with the missing code and create nothing."""
     code, _, err = run("config", "get")
     assert code == EXIT_MISSING
     assert "apply terraform first" in err
-    assert run("config", "set", "A", "1")[0] == EXIT_MISSING
+    code, _, err = run("config", "unset", "A")
+    assert code == EXIT_MISSING
+    assert "apply terraform first" in err
+    assert ssm_client().describe_parameters()["Parameters"] == []
+
+
+def test_config_set_creates_a_missing_parameter_the_way_operator_config_imports_it() -> None:
+    """A missing parameter is created as a Standard String holding just the key, with the module's description."""
+    code, _, err = run("config", "set", "ses_verified_recipients", '["a@b.c"]')
+    assert code == EXIT_OK
+    assert f"created parameter {PARAMETER} ({REGION}) holding ses_verified_recipients (version 1)" in err
+    assert stored_parameter() == {"ses_verified_recipients": ["a@b.c"]}
+    described = ssm_client().describe_parameters()["Parameters"]
+    assert len(described) == 1
+    assert described[0]["Name"] == PARAMETER
+    assert described[0]["Type"] == "String"
+    assert described[0]["Tier"] == "Standard"
+    assert described[0]["Description"] == CONFIG_PARAMETER_DESCRIPTION
+
+
+def test_config_set_on_an_existing_parameter_merges_without_recreating_it() -> None:
+    """An existing parameter takes the normal merge path: a new version, the other keys and its metadata kept."""
+    ssm_client().put_parameter(Name=PARAMETER, Value='{"EXISTING":"keep"}', Type="String", Description="theirs")
+    code, _, err = run("config", "set", "A", "1")
+    assert code == EXIT_OK
+    assert "created" not in err
+    assert f"set A in parameter {PARAMETER} ({REGION}) (version 2)" in err
+    assert stored_parameter() == {"EXISTING": "keep", "A": 1}
+    assert ssm_client().describe_parameters()["Parameters"][0]["Description"] == "theirs"
+
+
+class RacingCreate:
+    """An SSM client where another operator creates the parameter just before the tool's create."""
+
+    def __init__(self, inner: Any) -> None:
+        """Wrap a real client."""
+        self._inner = inner
+
+    def put_parameter(self, **kwargs: Any) -> Any:
+        """Land the other operator's create first whenever the tool creates without overwrite."""
+        if kwargs.get("Overwrite") is False:
+            self._inner.put_parameter(Name=PARAMETER, Value='{"THEIRS":"kept"}', Type="String")
+        return self._inner.put_parameter(**kwargs)
+
+    def __getattr__(self, name: str) -> Any:
+        """Pass every other call straight through."""
+        return getattr(self._inner, name)
+
+
+def test_config_set_falls_back_to_a_merge_when_a_create_races() -> None:
+    """When another writer creates the parameter first, the tool merges its key into theirs."""
+    store = ConfigStore(cast(Any, RacingCreate(ssm_client())), PARAMETER)
+    result = store.set("MINE", "ours")
+    assert result.changed
+    assert not result.created
+    assert result.version == "2"
+    assert stored_parameter() == {"THEIRS": "kept", "MINE": "ours"}
 
 
 def test_config_that_is_not_a_json_object_is_refused() -> None:

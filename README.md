@@ -198,7 +198,7 @@ uv run webbpulse-config --prefix carmodpicker-staging config unset ALLOWED_EMAIL
 | `secret set KEY` | Reads the value from a hidden, confirmed prompt on a terminal, otherwise from stdin with one trailing newline dropped, and merges it into the secret |
 | `secret unset KEY` | Removes one key |
 | `secret keys` | Prints key names, one per line; no command prints a secret value |
-| `config set KEY VALUE` | Stores VALUE as JSON when it parses, otherwise as a string; `--string` forces a string |
+| `config set KEY VALUE` | Stores VALUE as JSON when it parses, otherwise as a string; `--string` forces a string. Creates a missing parameter holding just that key |
 | `config get [KEY]` | Prints one value (a string raw, anything else as JSON), or the whole object |
 | `config unset KEY` | Removes one key |
 
@@ -213,6 +213,14 @@ retries from a fresh read, and after three retries it gives up without writing. 
 key to the value it already holds, or unsetting an absent key, writes nothing. Empty keys
 and empty secret values are refused, and a secret key that is not UPPER_SNAKE draws a
 warning.
+
+`config set` on a parameter that does not exist yet creates it as a Standard tier `String`
+holding `{"KEY": VALUE}`, with the description the platform-modules `operator-config` module
+sets, and prints that it did. That seeds a fresh environment before its first plan imports the
+parameter, with no raw `aws ssm put-parameter`. The create never overwrites: if another writer
+created the parameter first, the key is merged into theirs as usual. Tags are not set, so an
+estate whose provider has `default_tags` sees the import plan an in-place tag update. `config
+get` and `config unset` on a missing parameter still exit `3` and create nothing.
 
 Data goes to stdout and diagnostics to stderr. Exit codes: `0` ok, `1` AWS or SDK error, `2`
 usage or a refused value, `3` the secret or parameter does not exist (apply terraform
