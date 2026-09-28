@@ -7,6 +7,8 @@ This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## Unreleased
 
+## 0.63.1
+
 ### `e2e`: the shared identity cases no longer spend or end `user_session` (patch)
 
 `refresh(session)` now stores what a 200 rotated on the session it was given: the rotated
