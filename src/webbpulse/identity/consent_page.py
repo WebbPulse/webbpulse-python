@@ -52,6 +52,7 @@ _COLOR: Final = re.compile(r"^(#[0-9a-fA-F]{3,8}|(rgb|rgba|hsl|hsla|oklch)\([0-9
 _FONT_FAMILY: Final = re.compile(r"^[A-Za-z0-9 ,'\"-]{1,300}$")
 _DATA_IMAGE: Final = re.compile(r"^data:image/(png|svg\+xml|webp|jpeg|gif)(;base64)?,[A-Za-z0-9+/=%._~!$&'()*,;:@-]*$")
 _DATA_FONT: Final = re.compile(r"^data:font/(woff2|woff|ttf|otf);base64,[A-Za-z0-9+/=]*$")
+_HTTPS_URL: Final = re.compile(r"^https://[A-Za-z0-9._~:/?#\[\]@!$&*+,;=%-]+$")
 _HOST: Final = re.compile(r"^[A-Za-z0-9.\-]+(:[0-9]{1,5})?$|^\[[0-9A-Fa-f:.]+\](:[0-9]{1,5})?$")
 _SCHEME: Final = re.compile(r"^[a-z][a-z0-9+.\-]{0,31}$")
 
@@ -326,11 +327,17 @@ def _logos(theme: ConsentTheme) -> list[str]:
 
 
 def _asset_source(url: str, *, data_pattern: re.Pattern[str], what: str) -> str:
-    """The CSP source that admits `url`: `data:` for a data URI, the origin for https."""
+    """The CSP source that admits `url`: `data:` for a data URI, the origin for https.
+
+    An https URL may hold only URL-safe characters, never quotes, parentheses, backslashes,
+    angle brackets or whitespace, because a font source is written into the stylesheet.
+    """
     if url.startswith("data:"):
         if not data_pattern.match(url):
             raise ValueError(f"{what} is not a data URI of an accepted type.")
         return "data:"
+    if not _HTTPS_URL.match(url):
+        raise ValueError(f"{what} must be an absolute https URL of URL-safe characters or a data URI, got {url!r}.")
     parsed = urlsplit(url)
     if parsed.scheme != "https" or not parsed.netloc or "@" in parsed.netloc or not _HOST.match(parsed.netloc):
         raise ValueError(f"{what} must be an absolute https URL or a data URI, got {url!r}.")

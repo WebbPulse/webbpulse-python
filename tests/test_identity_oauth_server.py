@@ -1477,6 +1477,27 @@ class TestThemeValidation:
         with pytest.raises(ValueError):
             ConsentTheme(logo_url=logo)
 
+    @pytest.mark.parametrize(
+        "src",
+        [
+            'https://cdn.example.com/a")}</style><script>alert(1)</script>',
+            "https://cdn.example.com/a)b.woff2",
+            "https://cdn.example.com/a\\b.woff2",
+            "https://cdn.example.com/a b.woff2",
+            "https://cdn.example.com/a'b.woff2",
+        ],
+    )
+    def test_a_font_url_cannot_break_out_of_the_stylesheet(self, src: str) -> None:
+        """Quotes, parentheses, backslashes, angle brackets and whitespace are refused."""
+        with pytest.raises(ValueError):
+            FontFace(weight=400, src=src)
+        with pytest.raises(ValueError):
+            ConsentTheme(logo_url=src)
+
+    def test_a_plain_https_font_url_is_accepted(self) -> None:
+        """An ordinary CDN URL with a query string passes."""
+        assert FontFace(weight=400, src="https://cdn.example.com/inter/v4/Inter.woff2?v=4").weight == 400
+
     def test_a_font_family_refuses_markup(self) -> None:
         """The family string may not close the rule it sits in."""
         with pytest.raises(ValueError):
