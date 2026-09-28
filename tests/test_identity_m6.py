@@ -27,6 +27,7 @@ from webbpulse.identity import (
     InMemoryIdentityTokenStore,
     InMemoryOAuthLinkStore,
     InMemoryOAuthStateStore,
+    InMemoryPasskeyStore,
     InMemoryRecoveryCodeStore,
     InMemoryRefreshTokenStore,
     InMemoryTotpFactorStore,
@@ -34,6 +35,7 @@ from webbpulse.identity import (
     OAuthRejected,
     OAuthService,
     OAuthStateRecord,
+    PasskeyRecord,
     TokenService,
     build_identity_router,
     identity_prefix,
@@ -1802,3 +1804,379 @@ def test_discovery_appears_in_the_openapi_document_under_an_oauth_tag(kms: FakeK
     operation = schema["paths"][f"{identity_prefix(make_settings())}/oauth/providers"]["get"]
     assert operation["tags"] == ["identity", "oauth"]
     assert operation["tags"].count("identity") == 1
+
+
+def _claims_header(user_id: str, *, auth_time: int | None) -> dict[str, str]:
+    """An API Gateway authorizer context carrying `sub` and, when given, `auth_time`."""
+    import json
+
+    claims: dict[str, Any] = {"sub": user_id}
+    if auth_time is not None:
+        claims["auth_time"] = auth_time
+    return {"x-amzn-request-context": json.dumps({"authorizer": {"jwt": {"claims": claims}}})}
+
+
+@pytest.fixture
+def link_stores(stores: IdentityStores) -> IdentityStores:
+    """The in-memory stores plus a passkey store, sharing the same OAuth tables."""
+    import dataclasses
+
+    return dataclasses.replace(stores, passkeys=InMemoryPasskeyStore())
+
+
+@pytest.fixture
+def link_client(
+    hooks: FakeHooks,
+    link_stores: IdentityStores,
+    kms: FakeKms,
+    provider: FakeProvider,
+    monkeypatch: pytest.MonkeyPatch,
+) -> Any:
+    """An HTTPS `TestClient` whose OAuth service talks to the provider fake."""
+    import webbpulse.identity.oauth as oauth_module
+
+    fake_http = provider.client()
+    monkeypatch.setattr(oauth_module, "HttpxClient", lambda: fake_http)
+    app = FastAPI()
+    app.include_router(
+        build_identity_router(
+            make_settings(),
+            hooks,
+            link_stores,
+            kms_client=kms,
+            limiter_enabled=False,
+            oauth_client_secrets={GOOGLE_PROVIDER: GOOGLE_SECRET, GITHUB_PROVIDER: GITHUB_SECRET},
+        )
+    )
+    return TestClient(app, base_url="https://testserver", follow_redirects=False)
+
+
+def _state_of(url: str) -> str:
+    """The `state` query parameter of an authorization URL."""
+    from urllib.parse import parse_qs, urlsplit
+
+    return parse_qs(urlsplit(url).query)["state"][0]
+
+
+def _start_github_link(link_client: Any, user_id: str) -> Any:
+    """POST the GitHub link start as a freshly signed-in user."""
+    prefix = identity_prefix(make_settings())
+    return link_client.post(
+        f"{prefix}/oauth/github/link",
+        json={"return_to": "/security"},
+        headers=_claims_header(user_id, auth_time=int(time.time())),
+    )
+
+
+def test_a_link_start_sets_an_httponly_binding_cookie_and_stores_only_its_digest(
+    link_client: Any, hooks: FakeHooks, stores: IdentityStores
+) -> None:
+    """The browser holds the secret; the state row holds only its hash."""
+    from webbpulse.identity.oauth import OAUTH_LINK_BINDING_COOKIE
+
+    user = hooks.add(EMAIL, email_verified=True)
+    response = _start_github_link(link_client, str(user["id"]))
+    assert response.status_code == 200
+    cookie = response.headers["set-cookie"]
+    assert cookie.startswith(f"{OAUTH_LINK_BINDING_COOKIE}=")
+    assert "HttpOnly" in cookie
+    assert "Secure" in cookie
+    assert "samesite=lax" in cookie.lower()
+    secret = link_client.cookies.get(OAUTH_LINK_BINDING_COOKIE)
+    record = stores.require_oauth_states().consume(_state_of(response.json()["authorization_url"]))
+    assert record is not None
+    assert record.binding
+    assert record.binding != secret
+
+
+def test_a_login_start_sets_no_binding_cookie(link_client: Any) -> None:
+    """Only a link binds its state to a browser."""
+    response = link_client.get(f"{identity_prefix(make_settings())}/oauth/github/start")
+    assert response.status_code == 302
+    assert "set-cookie" not in response.headers
+
+
+def test_a_link_completes_in_the_browser_that_started_it(
+    link_client: Any, hooks: FakeHooks, stores: IdentityStores
+) -> None:
+    """The happy path links the account, records the GitHub login and clears the cookie."""
+    from webbpulse.identity.oauth import OAUTH_LINK_BINDING_COOKIE
+
+    user = hooks.add("someone-else@example.com", email_verified=True)
+    prefix = identity_prefix(make_settings())
+    state = _state_of(_start_github_link(link_client, str(user["id"])).json()["authorization_url"])
+
+    response = link_client.get(f"{prefix}/oauth/callback?state={state}&code=abc")
+    assert response.status_code == 303
+    assert response.headers["location"] == f"{FRONTEND}/security?oauth_linked=1"
+    assert f'{OAUTH_LINK_BINDING_COOKIE}=""' in response.headers["set-cookie"]
+
+    listed = link_client.get(
+        f"{prefix}/oauth/links", headers=_claims_header(str(user["id"]), auth_time=int(time.time()))
+    )
+    assert listed.json()["links"][0]["provider"] == GITHUB_PROVIDER
+    assert listed.json()["links"][0]["login"] == "octocat"
+    assert listed.json()["links"][0]["email"] == EMAIL
+
+
+def test_a_link_completed_in_another_browser_is_refused(
+    link_client: Any, hooks: FakeHooks, stores: IdentityStores
+) -> None:
+    """Link CSRF: an attacker's authorization URL finished by a victim links nothing."""
+    user = hooks.add(EMAIL, email_verified=True)
+    prefix = identity_prefix(make_settings())
+    state = _state_of(_start_github_link(link_client, str(user["id"])).json()["authorization_url"])
+    link_client.cookies.clear()
+
+    response = link_client.get(f"{prefix}/oauth/callback?state={state}&code=abc")
+    assert response.status_code == 303
+    assert "oauth_error=OAUTH_STATE_INVALID" in response.headers["location"]
+    assert stores.require_oauth_links().list_for_user(str(user["id"])) == []
+
+
+def test_a_link_with_a_forged_binding_cookie_is_refused(
+    link_client: Any, hooks: FakeHooks, stores: IdentityStores
+) -> None:
+    """A cookie that does not hash to the stored digest is no binding at all."""
+    from webbpulse.identity.oauth import OAUTH_LINK_BINDING_COOKIE
+
+    user = hooks.add(EMAIL, email_verified=True)
+    prefix = identity_prefix(make_settings())
+    state = _state_of(_start_github_link(link_client, str(user["id"])).json()["authorization_url"])
+    link_client.cookies.clear()
+    link_client.cookies.set(OAUTH_LINK_BINDING_COOKIE, "forged", path=prefix)
+
+    response = link_client.get(f"{prefix}/oauth/callback?state={state}&code=abc")
+    assert "oauth_error=OAUTH_STATE_INVALID" in response.headers["location"]
+    assert stores.require_oauth_links().list_for_user(str(user["id"])) == []
+
+
+def test_the_binding_is_spent_with_the_state(link_client: Any, hooks: FakeHooks) -> None:
+    """Replaying a finished link's callback is refused even in the same browser."""
+    user = hooks.add(EMAIL, email_verified=True)
+    prefix = identity_prefix(make_settings())
+    state = _state_of(_start_github_link(link_client, str(user["id"])).json()["authorization_url"])
+    link_client.get(f"{prefix}/oauth/callback?state={state}&code=abc")
+
+    replay = link_client.get(f"{prefix}/oauth/callback?state={state}&code=abc")
+    assert "oauth_error=OAUTH_STATE_INVALID" in replay.headers["location"]
+
+
+def test_a_link_to_an_identity_owned_by_another_user_is_refused_over_the_routes(
+    link_client: Any, hooks: FakeHooks, stores: IdentityStores
+) -> None:
+    """The identity stays with its owner; the second account gets OAUTH_ALREADY_LINKED."""
+    owner = hooks.add("owner@example.com", email_verified=True)
+    other = hooks.add("other@example.com", email_verified=True)
+    prefix = identity_prefix(make_settings())
+    first = _state_of(_start_github_link(link_client, str(owner["id"])).json()["authorization_url"])
+    link_client.get(f"{prefix}/oauth/callback?state={first}&code=abc")
+
+    second = _state_of(_start_github_link(link_client, str(other["id"])).json()["authorization_url"])
+    response = link_client.get(f"{prefix}/oauth/callback?state={second}&code=abc")
+    assert "oauth_error=OAUTH_ALREADY_LINKED" in response.headers["location"]
+    links = stores.require_oauth_links()
+    assert [r.user_id for r in links.list_for_user(str(owner["id"]))] == [owner["id"]]
+    assert links.list_for_user(str(other["id"])) == []
+
+
+@pytest.mark.parametrize(
+    ("method", "path"),
+    [
+        ("post", "/oauth/github/link"),
+        ("delete", "/oauth/github/link"),
+        ("get", "/oauth/github/start?mode=link"),
+    ],
+)
+@pytest.mark.parametrize("auth_time", [None, 0, -3600])
+def test_link_and_unlink_need_a_recent_sign_in(
+    link_client: Any, hooks: FakeHooks, method: str, path: str, auth_time: int | None
+) -> None:
+    """A missing or stale `auth_time` is a 401 STEP_UP_REQUIRED carrying `max_age`."""
+    user = hooks.add(EMAIL, email_verified=True)
+    stamp = None if auth_time is None else (1 if auth_time == 0 else int(time.time()) + auth_time)
+    prefix = identity_prefix(make_settings())
+    response = getattr(link_client, method)(
+        f"{prefix}{path}",
+        headers=_claims_header(str(user["id"]), auth_time=stamp),
+        **({"json": {}} if method == "post" else {}),
+    )
+    assert response.status_code == 401
+    assert response.json()["error_code"] == "STEP_UP_REQUIRED"
+    assert response.json()["max_age"] == 600
+    assert "max_age=600" in response.headers["www-authenticate"]
+    assert "set-cookie" not in response.headers
+
+
+def test_a_zero_link_window_turns_the_step_up_off(hooks: FakeHooks, stores: IdentityStores, kms: FakeKms) -> None:
+    """`oauth_link_max_auth_age=0` lets any signed-in caller start a link."""
+    from datetime import timedelta
+
+    user = hooks.add(EMAIL, email_verified=True)
+    settings = make_settings(oauth_link_max_auth_age=timedelta(0))
+    app = FastAPI()
+    app.include_router(
+        build_identity_router(
+            settings,
+            hooks,
+            stores,
+            kms_client=kms,
+            limiter_enabled=False,
+            oauth_client_secrets={GOOGLE_PROVIDER: GOOGLE_SECRET, GITHUB_PROVIDER: GITHUB_SECRET},
+        )
+    )
+    response = TestClient(app, base_url="https://testserver").post(
+        f"{identity_prefix(settings)}/oauth/github/link",
+        json={},
+        headers=_claims_header(str(user["id"]), auth_time=None),
+    )
+    assert response.status_code == 200
+
+
+def test_a_negative_link_window_is_refused() -> None:
+    """A negative window is a configuration mistake, not a way to turn the check off."""
+    from datetime import timedelta
+
+    with pytest.raises(ValueError, match="oauth_link_max_auth_age"):
+        make_settings(oauth_link_max_auth_age=timedelta(seconds=-1))
+
+
+def test_unlink_over_the_route_refuses_the_last_sign_in_method(
+    link_client: Any, hooks: FakeHooks, stores: IdentityStores
+) -> None:
+    """With no password, passkey or other link left, DELETE is a 409 and the link stays."""
+    user = hooks.add(EMAIL, email_verified=True)
+    prefix = identity_prefix(make_settings())
+    state = _state_of(_start_github_link(link_client, str(user["id"])).json()["authorization_url"])
+    link_client.get(f"{prefix}/oauth/callback?state={state}&code=abc")
+
+    response = link_client.delete(
+        f"{prefix}/oauth/github/link", headers=_claims_header(str(user["id"]), auth_time=int(time.time()))
+    )
+    assert response.status_code == 409
+    assert response.json()["error_code"] == "OAUTH_LAST_SIGN_IN_METHOD"
+    assert len(stores.require_oauth_links().list_for_user(str(user["id"]))) == 1
+
+
+def test_unlink_over_the_route_succeeds_when_a_passkey_remains(
+    link_client: Any, hooks: FakeHooks, link_stores: IdentityStores
+) -> None:
+    """A passwordless passkey is a way back in, so the link may go."""
+    user = hooks.add(EMAIL, email_verified=True)
+    prefix = identity_prefix(make_settings())
+    state = _state_of(_start_github_link(link_client, str(user["id"])).json()["authorization_url"])
+    link_client.get(f"{prefix}/oauth/callback?state={state}&code=abc")
+    assert link_stores.passkeys is not None
+    link_stores.passkeys.put(PasskeyRecord(user_id=str(user["id"]), credential_id="cred-1", public_key="pk"))
+
+    response = link_client.delete(
+        f"{prefix}/oauth/github/link", headers=_claims_header(str(user["id"]), auth_time=int(time.time()))
+    )
+    assert response.status_code == 200
+    assert link_stores.require_oauth_links().list_for_user(str(user["id"])) == []
+
+
+def _passkey_oauth(hooks: FakeHooks, stores: IdentityStores, **settings: Any) -> tuple[OAuthService, Any]:
+    """An `OAuthService` that can see a passkey store, and that store."""
+    passkeys = InMemoryPasskeyStore()
+    service = OAuthService(
+        make_settings(**settings),
+        hooks,
+        states=stores.require_oauth_states(),
+        links=stores.require_oauth_links(),
+        credentials=stores.credentials,
+        passkeys=passkeys,
+        client_secrets={GOOGLE_PROVIDER: GOOGLE_SECRET, GITHUB_PROVIDER: GITHUB_SECRET},
+    )
+    return service, passkeys
+
+
+def test_unlink_counts_a_passwordless_passkey(hooks: FakeHooks, stores: IdentityStores) -> None:
+    """A passkey the user can sign in with keeps them from being locked out."""
+    oauth, passkeys = _passkey_oauth(hooks, stores)
+    user = hooks.add(EMAIL, email_verified=True)
+    oauth.link(OAuthIdentity(GOOGLE_PROVIDER, "g", EMAIL, True), user_id=str(user["id"]))
+    passkeys.put(PasskeyRecord(user_id=str(user["id"]), credential_id="c", public_key="pk"))
+
+    oauth.unlink(user_id=str(user["id"]), provider=GOOGLE_PROVIDER)
+    assert oauth.list_links(str(user["id"])) == []
+
+
+def test_unlink_ignores_a_passkey_that_cannot_sign_in_alone(hooks: FakeHooks, stores: IdentityStores) -> None:
+    """With passwordless passkeys off, a passkey is a second factor, not a way in."""
+    oauth, passkeys = _passkey_oauth(hooks, stores, passkeys_passwordless=False)
+    user = hooks.add(EMAIL, email_verified=True)
+    oauth.link(OAuthIdentity(GOOGLE_PROVIDER, "g", EMAIL, True), user_id=str(user["id"]))
+    passkeys.put(PasskeyRecord(user_id=str(user["id"]), credential_id="c", public_key="pk"))
+
+    with pytest.raises(OAuthRejected) as excinfo:
+        oauth.unlink(user_id=str(user["id"]), provider=GOOGLE_PROVIDER)
+    assert excinfo.value.error_code == "OAUTH_LAST_SIGN_IN_METHOD"
+
+
+def test_linking_to_a_user_that_no_longer_exists_is_refused(oauth: OAuthService) -> None:
+    """A link state that outlived its account never creates an orphan link."""
+    with pytest.raises(OAuthRejected) as excinfo:
+        oauth.link(OAuthIdentity(GOOGLE_PROVIDER, "g", EMAIL, True), user_id="user-gone")
+    assert excinfo.value.error_code == "OAUTH_ACCOUNT_MISSING"
+    assert oauth.list_links("user-gone") == []
+
+
+def test_the_github_login_is_kept_on_the_link(oauth: OAuthService, provider: FakeProvider, hooks: FakeHooks) -> None:
+    """The settings page shows `@octocat`, which only the userinfo call knows."""
+    user = hooks.add(EMAIL, email_verified=True)
+    authorization = oauth.start(GITHUB_PROVIDER, mode="link", user_id=str(user["id"]))
+    record = oauth.consume_state(authorization.state)
+    identity = oauth.identity_from_callback(GITHUB_PROVIDER, code="abc", state_record=record)
+    assert identity.login == "octocat"
+    assert oauth.link(identity, user_id=str(user["id"])).provider_login == "octocat"
+
+
+def test_link_binding_matches_only_the_secret_it_was_made_from() -> None:
+    """The digest check accepts its own secret and nothing else, and unbound rows pass."""
+    from webbpulse.identity.oauth import link_binding_matches, new_link_binding
+
+    secret, digest = new_link_binding()
+    bound = OAuthStateRecord(
+        state="s", provider=GITHUB_PROVIDER, mode="link", created_at="", expires_at=0, binding=digest
+    )
+    assert link_binding_matches(bound, secret)
+    assert not link_binding_matches(bound, "")
+    assert not link_binding_matches(bound, secret + "x")
+    unbound = OAuthStateRecord(state="s", provider=GITHUB_PROVIDER, mode="link", created_at="", expires_at=0)
+    assert link_binding_matches(unbound, "")
+
+
+def test_the_dynamo_stores_round_trip_the_binding_and_the_login(oauth_tables: dict[str, Any]) -> None:
+    """Both new fields survive DynamoDB, so the callback and the settings page can read them."""
+    from webbpulse.dynamodb import Repository
+    from webbpulse.identity.oauth import OAuthLinkRecord
+
+    links = DynamoOAuthLinkStore(Repository("oauth-links", prefix="test"))
+    record = OAuthLinkRecord(
+        provider_subject=provider_account_key(GITHUB_PROVIDER, GITHUB_SUB),
+        provider=GITHUB_PROVIDER,
+        subject=GITHUB_SUB,
+        user_id="user-0001",
+        linked_at="2026-01-01T00:00:00Z",
+        provider_email=EMAIL,
+        provider_email_verified=True,
+        provider_login="octocat",
+    )
+    links.put(record)
+    assert links.get(record.provider_subject) == record
+
+    states = DynamoOAuthStateStore(Repository("oauth-states", prefix="test"))
+    state = OAuthStateRecord(
+        state="bound-state",
+        provider=GITHUB_PROVIDER,
+        mode="link",
+        created_at="2026-01-01T00:00:00Z",
+        expires_at=int(time.time()) + 600,
+        user_id="user-0001",
+        binding="digest-value",
+    )
+    states.put(state)
+    spent = states.consume("bound-state")
+    assert spent is not None
+    assert spent.binding == "digest-value"

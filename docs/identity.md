@@ -85,9 +85,9 @@ gateway builds the discovery URL as `issuer + "/.well-known/openid-configuration
 | `GET /api/auth/oauth/providers` | The providers this deployment can sign a user in with, anonymous |
 | `GET /api/auth/oauth/{provider}/start` | Mints a state and redirects the browser to the provider |
 | `GET /api/auth/oauth/callback` | Spends the state, verifies the provider's answer, issues the token pair |
-| `POST /api/auth/oauth/{provider}/link` | Starts a link for the authenticated account, returning the URL |
-| `GET /api/auth/oauth/links` | The providers attached to this account, for a settings page |
-| `DELETE /api/auth/oauth/{provider}/link` | Detaches a provider, unless it is the last way in |
+| `POST /api/auth/oauth/{provider}/link` | Starts a link for a recently signed-in account, returning the URL and setting the browser binding cookie |
+| `GET /api/auth/oauth/links` | The providers attached to this account (`provider`, `login`, `email`, `linked_at`), for a settings page |
+| `DELETE /api/auth/oauth/{provider}/link` | Detaches a provider for a recently signed-in account, unless it is the last way in |
 | `GET /api/auth/passkeys/availability` | Whether passkeys and passwordless sign-in are on, anonymous |
 | `POST /api/auth/passkeys/register/options` | WebAuthn registration options for the authenticated caller |
 | `POST /api/auth/passkeys/register/verify` | Verifies the attestation and stores the credential |

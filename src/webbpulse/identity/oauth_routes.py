@@ -128,9 +128,87 @@ def register_oauth_routes(
     from fastapi.responses import JSONResponse, RedirectResponse
 
     from webbpulse.identity.flows import LoginRejected, MfaChallengeRequired
-    from webbpulse.identity.oauth import OAuthRejected
+    from webbpulse.identity.oauth import (
+        OAUTH_LINK_BINDING_COOKIE,
+        OAUTH_STATE_TTL_SECONDS,
+        OAuthRejected,
+        link_binding_matches,
+        new_link_binding,
+    )
 
     _bind_fastapi_request()
+
+    link_max_age = int(settings.oauth_link_max_auth_age.total_seconds())
+    binding_samesite = "none" if settings.cookie_samesite == "none" else "lax"
+
+    def binding_cookie_kwargs() -> dict[str, Any]:
+        """Where the link binding cookie lives: the refresh cookie's path and domain, `Lax`.
+
+        `Lax` rather than the refresh cookie's own setting, because the callback is a
+        top-level navigation back from the provider's site and `Strict` would withhold it.
+        """
+        kwargs: dict[str, Any] = {"path": settings.cookie_path}
+        if settings.cookie_domain:
+            kwargs["domain"] = settings.cookie_domain
+        return kwargs
+
+    def set_binding_cookie(response: Any, secret: str) -> Any:
+        """Hand the browser the secret that proves it started this link."""
+        response.set_cookie(
+            OAUTH_LINK_BINDING_COOKIE,
+            secret,
+            max_age=OAUTH_STATE_TTL_SECONDS,
+            httponly=True,
+            secure=settings.cookie_secure,
+            samesite=binding_samesite,
+            **binding_cookie_kwargs(),
+        )
+        return response
+
+    def clear_binding_cookie(response: Any) -> Any:
+        """Drop the link binding cookie once its state is spent."""
+        response.delete_cookie(
+            OAUTH_LINK_BINDING_COOKIE,
+            secure=settings.cookie_secure,
+            httponly=True,
+            samesite=binding_samesite,
+            **binding_cookie_kwargs(),
+        )
+        return response
+
+    def step_up_refusal(request: Request) -> JSONResponse | None:
+        """A 401 `STEP_UP_REQUIRED` when the caller's sign-in is older than the link window.
+
+        Mirrors `require_recent_auth`, but an API key has no sign-in to age and is refused
+        like any other undated token, since linking changes how the account is entered.
+        """
+        if link_max_age <= 0:
+            return None
+        import time
+
+        from webbpulse.http import error_body
+        from webbpulse.identity.router import _claims_from_request
+        from webbpulse.identity.scopes import (
+            STEP_UP_REQUIRED_ERROR_CODE,
+            STEP_UP_REQUIRED_MESSAGE,
+            _auth_time,
+            step_up_challenge,
+        )
+
+        auth_time = _auth_time(_claims_from_request(request, tokens))
+        if auth_time is not None and time.time() - auth_time <= link_max_age:
+            return None
+        return JSONResponse(
+            error_body(
+                401,
+                STEP_UP_REQUIRED_MESSAGE,
+                request,
+                error_code=STEP_UP_REQUIRED_ERROR_CODE,
+                max_age=link_max_age,
+            ),
+            status_code=401,
+            headers={"WWW-Authenticate": step_up_challenge(link_max_age)},
+        )
 
     def oauth_refused(request: Request, exc: OAuthRejected) -> JSONResponse:
         """Render an OAuth refusal in the shared error envelope."""
@@ -173,6 +251,11 @@ def register_oauth_routes(
         mode_param = request.query_params.get("mode", "login")
         mode: Any = "link" if mode_param == "link" else "login"
         user_id = require_subject(request) if mode == "link" else ""
+        if mode == "link" and user_id:
+            refusal = step_up_refusal(request)
+            if refusal is not None:
+                return refusal
+        secret, digest = new_link_binding() if mode == "link" else ("", "")
 
         try:
             authorization = await run_sync(
@@ -182,12 +265,14 @@ def register_oauth_routes(
                     user_id=user_id,
                     return_to=request.query_params.get("return_to", ""),
                     redirect_uri=request.query_params.get("redirect_uri", ""),
+                    binding=digest,
                 )
             )
         except OAuthRejected as exc:
             return oauth_refused(request, exc)
 
-        return RedirectResponse(authorization.authorization_url, status_code=302)
+        redirect = RedirectResponse(authorization.authorization_url, status_code=302)
+        return set_binding_cookie(redirect, secret) if secret else redirect
 
     @router.get(f"{prefix}{OAUTH_CALLBACK_PATH}")
     async def oauth_callback(request: _FastAPIRequest) -> Any:
@@ -208,11 +293,25 @@ def register_oauth_routes(
         except OAuthRejected as exc:
             return error_redirect(exc)
 
+        if record.mode == "link" and not link_binding_matches(
+            record, request.cookies.get(OAUTH_LINK_BINDING_COOKIE, "")
+        ):
+            return clear_binding_cookie(
+                error_redirect(
+                    OAuthRejected(
+                        "That sign-in attempt is no longer valid. Start again.",
+                        error_code="OAUTH_STATE_INVALID",
+                    ),
+                    record.return_to,
+                )
+            )
+
         if provider_error:
-            return error_redirect(
+            cancelled = error_redirect(
                 OAuthRejected("Sign-in was cancelled.", error_code="OAUTH_CANCELLED"),
                 record.return_to,
             )
+            return clear_binding_cookie(cancelled) if record.mode == "link" else cancelled
 
         ip, user_agent = context(request)
         try:
@@ -222,9 +321,11 @@ def register_oauth_routes(
 
             if record.mode == "link":
                 await run_sync(lambda: oauth.link(identity, user_id=record.user_id))
-                return RedirectResponse(
-                    _with_flag(record.return_to or settings.frontend_base_url, "oauth_linked"),
-                    status_code=303,
+                return clear_binding_cookie(
+                    RedirectResponse(
+                        _with_flag(record.return_to or settings.frontend_base_url, "oauth_linked"),
+                        status_code=303,
+                    )
                 )
 
             user, _outcome = await run_sync(lambda: oauth.resolve_login(identity))
@@ -242,7 +343,8 @@ def register_oauth_routes(
                 status_code=303,
             )
         except OAuthRejected as exc:
-            return error_redirect(exc, record.return_to)
+            refused = error_redirect(exc, record.return_to)
+            return clear_binding_cookie(refused) if record.mode == "link" else refused
         except LoginRejected as exc:
             return error_redirect(
                 OAuthRejected(exc.message, error_code=exc.error_code, status_code=exc.status_code),
@@ -263,6 +365,7 @@ def register_oauth_routes(
         """Start a `link` for the authenticated caller, returning the URL to send them to.
 
         Answers JSON rather than a redirect because the settings page calls it over `fetch`.
+        Needs a recent sign-in, and sets the cookie binding the state to this browser.
         """
         from webbpulse.identity.router import run_sync
 
@@ -276,6 +379,10 @@ def register_oauth_routes(
                     status_code=401,
                 ),
             )
+        refusal = step_up_refusal(request)
+        if refusal is not None:
+            return refusal
+        secret, digest = new_link_binding()
         try:
             authorization = await run_sync(
                 lambda: oauth.start(
@@ -284,11 +391,14 @@ def register_oauth_routes(
                     user_id=subject,
                     return_to=str(payload.get("return_to", "")),
                     redirect_uri=str(payload.get("redirect_uri", "")),
+                    binding=digest,
                 )
             )
         except OAuthRejected as exc:
             return oauth_refused(request, exc)
-        return JSONResponse({"authorization_url": authorization.authorization_url})
+        response = JSONResponse({"authorization_url": authorization.authorization_url})
+        set_binding_cookie(response, secret)
+        return response
 
     @router.get(f"{prefix}{OAUTH_LINKS_PATH}")
     async def oauth_links(request: _FastAPIRequest) -> JSONResponse:
@@ -314,6 +424,7 @@ def register_oauth_routes(
                 "links": [
                     {
                         "provider": record.provider,
+                        "login": record.provider_login,
                         "email": record.provider_email,
                         "email_verified": record.provider_email_verified,
                         "linked_at": record.linked_at,
@@ -328,7 +439,7 @@ def register_oauth_routes(
     async def oauth_unlink(request: _FastAPIRequest, provider: str) -> JSONResponse:
         """Detach a provider, unless it is the last way into the account.
 
-        The refusal is a 409 carrying `OAUTH_LAST_SIGN_IN_METHOD`.
+        The refusal is a 409 carrying `OAUTH_LAST_SIGN_IN_METHOD`. Needs a recent sign-in.
         """
         from webbpulse.identity.router import run_sync
 
@@ -342,6 +453,9 @@ def register_oauth_routes(
                     status_code=401,
                 ),
             )
+        refusal = step_up_refusal(request)
+        if refusal is not None:
+            return refusal
         try:
             await run_sync(lambda: oauth.unlink(user_id=subject, provider=provider))
         except OAuthRejected as exc:
@@ -364,7 +478,7 @@ OAUTH_ROUTE_RESPONSES: Final[dict[tuple[str, str], dict[int, str]]] = {
     ("GET", OAUTH_START_PATH): {
         302: "The browser is redirected to the provider's authorization endpoint",
         400: "The provider is unknown or the redirect target is not allowed",
-        401: "A link start was made without a bearer token",
+        401: "A link start was made without a bearer token, or with a sign-in older than the link window",
         429: "Too many authorization starts from this address",
         503: "The provider is configured but its client secret is absent",
     },
@@ -374,12 +488,12 @@ OAUTH_ROUTE_RESPONSES: Final[dict[tuple[str, str], dict[int, str]]] = {
     },
     ("POST", OAUTH_LINK_PATH): {
         400: "The provider is unknown",
-        401: "No bearer token was presented",
+        401: "No bearer token was presented, or the sign-in is older than the link window",
         503: "The provider is configured but its client secret is absent",
     },
     ("DELETE", OAUTH_LINK_PATH): {
         400: "The provider is unknown",
-        401: "No bearer token was presented",
+        401: "No bearer token was presented, or the sign-in is older than the link window",
         409: "That provider is the last way into the account",
     },
     ("GET", OAUTH_LINKS_PATH): {401: "No bearer token was presented"},

@@ -91,7 +91,13 @@ otherwise stop with `OAUTH_EMAIL_UNVERIFIED`, since attaching on email alone is 
 cannot be replayed into the other meaning. `redirect_uri` MUST be checked against
 `oauth_redirect_uris` by **exact string equality, never a prefix**. `provider_account_key` is
 `"<provider>#<subject>"`. `OAuthService.unlink` MUST refuse to remove the last sign-in method
-(`OAUTH_LAST_SIGN_IN_METHOD`), consulting `has_other_sign_in_method`.
+(`OAUTH_LAST_SIGN_IN_METHOD`): no password, no passwordless passkey, no other link, and
+`has_other_sign_in_method` false. Link and unlink MUST need a sign-in newer than
+`oauth_link_max_auth_age` (401 `STEP_UP_REQUIRED`). A link state MUST be bound to the browser
+that started it: the start sets the HttpOnly `wp_oauth_link` cookie, the state stores its
+SHA-256, and the callback refuses a mismatch, so an attacker's link URL finished by a victim
+attaches nothing. An identity linked to another user MUST be refused
+(`OAUTH_ALREADY_LINKED`), never moved.
 
 #### Refresh rotation with reuse detection
 

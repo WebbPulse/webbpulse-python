@@ -437,6 +437,7 @@ def _mount_oauth_discovery(
             states=stores.oauth_states,
             links=stores.oauth_links,
             credentials=stores.credentials,
+            passkeys=stores.passkeys,
             client_secrets=oauth_client_secrets,
         )
 
@@ -761,6 +762,7 @@ def _mount_flows(
             states=stores.oauth_states,
             links=stores.oauth_links,
             credentials=stores.credentials,
+            passkeys=stores.passkeys,
             client_secrets=oauth_client_secrets,
         )
         if oauth_service.enabled_providers():

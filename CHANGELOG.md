@@ -7,6 +7,28 @@ This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## Unreleased
 
+### `identity`: safer linked-account management (minor)
+
+Linking and unlinking a Google or GitHub account now needs a recent sign-in. The new
+`oauth_link_max_auth_age` setting (default ten minutes, zero turns it off) gates
+`POST /oauth/{provider}/link`, `DELETE /oauth/{provider}/link` and
+`GET /oauth/{provider}/start?mode=link`, answering 401 `STEP_UP_REQUIRED` with `max_age`
+and the RFC 9470 challenge, like `require_recent_auth`.
+
+A link start also sets the `wp_oauth_link` cookie (HttpOnly, `Lax`, the refresh cookie's
+path and domain, ten minutes). The state row stores only its SHA-256, and the callback
+refuses a link finished in a browser that did not start it with `OAUTH_STATE_INVALID`.
+This closes link CSRF, where a victim who completes an attacker's authorization URL would
+attach their provider account to the attacker's user. Login states are unchanged.
+
+The unlink guard now counts a passwordless passkey as a way back in when `OAuthService`
+gets the new `passkeys` store, which `build_identity_router` passes. `GET /oauth/links`
+adds `login`, the GitHub username, stored on the new `OAuthLinkRecord.provider_login`.
+`OAuthService.link` refuses a user that no longer exists with `OAUTH_ACCOUNT_MISSING`. An
+identity already linked to another user is still refused with `OAUTH_ALREADY_LINKED` and
+never moved. Everything is additive: new fields default to empty, and a state row written
+before this release carries no binding and completes as before.
+
 ## 0.64.1
 
 ### `identity`: a refresh never widens the consented scopes (patch)
