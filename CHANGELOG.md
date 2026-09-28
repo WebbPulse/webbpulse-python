@@ -7,6 +7,8 @@ This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## Unreleased
 
+## 0.67.0
+
 ### `e2e`: gate cookies for a gated production smoke (minor)
 
 New `E2E_PRODUCTION_GATED` opt-in. A production run with it set, `E2E_READ_ONLY` on and the
