@@ -2707,6 +2707,9 @@ testing = [
     { name = "moto", extra = ["dynamodb"] },
     { name = "pytest" },
 ]
+tf = [
+    { name = "httpx" },
+]
 
 [package.dev-dependencies]
 dev = [
@@ -2716,7 +2719,7 @@ dev = [
     { name = "pytest-cov" },
     { name = "pytest-xdist" },
     { name = "ruff" },
-    { name = "webbpulse", extra = ["aws-otel", "dynamodb", "e2e", "fastapi", "github", "identity", "oauth", "otel", "passkeys", "security", "stripe", "testing"] },
+    { name = "webbpulse", extra = ["aws-otel", "dynamodb", "e2e", "fastapi", "github", "identity", "oauth", "otel", "passkeys", "security", "stripe", "testing", "tf"] },
 ]
 
 [package.metadata]
@@ -2733,6 +2736,7 @@ requires-dist = [
     { name = "httpx", marker = "extra == 'e2e'", specifier = ">=0.27" },
     { name = "httpx", marker = "extra == 'github'", specifier = ">=0.27" },
     { name = "httpx", marker = "extra == 'oauth'", specifier = ">=0.27" },
+    { name = "httpx", marker = "extra == 'tf'", specifier = ">=0.27" },
     { name = "httpx2", marker = "extra == 'testing'", specifier = ">=2" },
     { name = "moto", extras = ["dynamodb", "secretsmanager"], marker = "extra == 'testing'", specifier = ">=5" },
     { name = "opentelemetry-api", marker = "extra == 'otel'", specifier = ">=1.30" },
@@ -2753,7 +2757,7 @@ requires-dist = [
     { name = "uvicorn", marker = "extra == 'fastapi'", specifier = ">=0.32" },
     { name = "webauthn", marker = "extra == 'passkeys'", specifier = ">=2.7,<4" },
 ]
-provides-extras = ["aws-otel", "dynamodb", "e2e", "fastapi", "github", "identity", "oauth", "otel", "passkeys", "security", "stripe", "testing"]
+provides-extras = ["aws-otel", "dynamodb", "e2e", "fastapi", "github", "identity", "oauth", "otel", "passkeys", "security", "stripe", "testing", "tf"]
 
 [package.metadata.requires-dev]
 dev = [
@@ -2763,7 +2767,7 @@ dev = [
     { name = "pytest-cov", specifier = ">=6" },
     { name = "pytest-xdist", specifier = ">=3" },
     { name = "ruff", specifier = ">=0.8" },
-    { name = "webbpulse", extras = ["aws-otel", "dynamodb", "e2e", "fastapi", "github", "identity", "oauth", "otel", "passkeys", "security", "stripe", "testing"] },
+    { name = "webbpulse", extras = ["aws-otel", "dynamodb", "e2e", "fastapi", "github", "identity", "oauth", "otel", "passkeys", "security", "stripe", "testing", "tf"] },
 ]
 
 [[package]]
