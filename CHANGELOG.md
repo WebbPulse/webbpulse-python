@@ -7,6 +7,8 @@ This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## Unreleased
 
+## 0.65.0
+
 ### `identity`: safer linked-account management (minor)
 
 Behaviour change: linking and unlinking a Google or GitHub account now needs a sign-in
