@@ -19,8 +19,9 @@ approach but keeps the tail decision, which `SimpleSpanProcessor` cannot make be
 already exported a span before the trace's outcome is known. `TailSamplingSpanProcessor`
 buffers a trace in memory only until the trace is complete, and
 `_FlushTracingASGIMiddleware` then exports it synchronously, inside the invocation, before
-the response returns. The cost is the same as `SimpleSpanProcessor`'s, one blocking export
-per request rather than per span, and no span is ever owned by a thread the freeze can stop.
+the final response body is sent, since sending it ends the invocation. The cost is the same
+as `SimpleSpanProcessor`'s, one blocking export per request rather than per span, and no
+span is ever owned by a thread the freeze can stop.
 
 Two paths remain where a buffered trace would otherwise outlive the process. A trace whose
 spans are still open when the response returns stays buffered by design, and a background
@@ -1286,10 +1287,15 @@ def _running_on_lambda() -> bool:
 
 
 class _FlushTracingASGIMiddleware:
-    """A pure ASGI wrapper that flushes buffered spans once the response is complete.
+    """A pure ASGI wrapper that flushes buffered spans before the response is complete.
 
     Wraps the instrumented app from the outside, so the flush runs after the server span has
     ended and the trace is complete. Returning from the inner app is the first such moment.
+
+    The final `http.response.body` message is held back until that flush has run. Under the
+    Lambda Web Adapter that message ends the invocation, and Lambda freezes the sandbox as soon
+    as it does, so a flush still in flight at that point is frozen mid-export and later sent
+    with an expired SigV4 signature. Earlier chunks of a streaming response pass through.
     """
 
     def __init__(self, app: Any, timeout_millis: int) -> None:
@@ -1314,16 +1320,30 @@ class _FlushTracingASGIMiddleware:
         await asyncio.get_running_loop().run_in_executor(None, self._flush)
 
     async def __call__(self, scope: Any, receive: Any, send: Any) -> None:
-        """Serve the request, then flush this request's completed trace."""
+        """Serve the request, flush its completed trace, then send the final body message."""
         if scope.get("type") != "http":
             await self.app(scope, receive, send)
             return
+
+        held: list[Any] = []
+
+        async def send_holding_final_body(message: Any) -> None:
+            """Forward every message except the last body message, which is held."""
+            if message.get("type") == "http.response.body" and not message.get("more_body", False):
+                held.append(message)
+                return
+            await send(message)
+
         try:
-            await self.app(scope, receive, send)
+            await self.app(scope, receive, send_holding_final_body)
         except Exception:
             await self._flush_async()
+            for message in held:
+                await send(message)
             raise
         await self._flush_async()
+        for message in held:
+            await send(message)
 
 
 def instrument_fastapi(
