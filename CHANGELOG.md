@@ -9,7 +9,8 @@ This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### `identity`: safer linked-account management (minor)
 
-Linking and unlinking a Google or GitHub account now needs a recent sign-in. The new
+Behaviour change: linking and unlinking a Google or GitHub account now needs a sign-in
+from the last ten minutes. Set `oauth_link_max_auth_age=0` to turn the check off. The new
 `oauth_link_max_auth_age` setting (default ten minutes, zero turns it off) gates
 `POST /oauth/{provider}/link`, `DELETE /oauth/{provider}/link` and
 `GET /oauth/{provider}/start?mode=link`, answering 401 `STEP_UP_REQUIRED` with `max_age`
