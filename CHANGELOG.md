@@ -7,6 +7,14 @@ This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## Unreleased
 
+### `tf`: the `wp-tf` plan CLI (minor)
+
+New `tf` extra and `wp-tf` console script for the WebbPulse Terraform control plane. It works
+like a remote `terraform plan`: it uploads a directory, starts a plan-only run and streams the
+log. It also has `logs`, `status` and `workspaces`. It uses the key `terraform login` stored,
+or `TF_TOKEN_<host>`, or `WP_TF_TOKEN`. It honours a workspace's working directory and
+`.terraformignore`. It never confirms or applies.
+
 ## 0.65.0
 
 ### `identity`: safer linked-account management (minor)

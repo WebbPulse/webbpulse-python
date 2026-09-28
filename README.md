@@ -76,6 +76,7 @@ its dev dependencies.
 | `webbpulse.testing` | Pytest fixtures: `test_client`, `create_table`, `rate_limit_table`, `make_request_context_headers`, `FakeKms`, `FakeIdempotencyStore`, `FakePresigner`, `FakeQueue`, `FakeWebhookSender`, `sign_stripe_payload`; `assert_entrypoint_isolation` for the per-domain image check; `primary_keys_only` (or `enforce_primary_keys`) makes moto refuse a key that is not exactly the table's primary key, as DynamoDB does | [packaging.md](docs/packaging.md) |
 | `webbpulse.e2e` | A pytest plugin and generic post-deploy suite: route cut, coverage, reachability, identity, frontend and hygiene against a real stage | [e2e.md](docs/e2e.md) |
 | `webbpulse.ops.config` | The `webbpulse-config` console script: operators set keys in the `<prefix>/app` secret and the `/<prefix>/config` parameter | [Operator config CLI](#operator-config-cli) |
+| `webbpulse.tf` | The `wp-tf` console script: plan-only runs on the WebbPulse Terraform control plane from a directory, with the log streamed | [Terraform plan CLI](#terraform-plan-cli-wp-tf) |
 
 ## Wiring a FastAPI domain Lambda
 
@@ -226,6 +227,42 @@ Data goes to stdout and diagnostics to stderr. Exit codes: `0` ok, `1` AWS or SD
 usage or a refused value, `3` the secret or parameter does not exist (apply terraform
 first), `4` the stored value is not a JSON object, `5` a concurrent change outlasted the
 retries, `6` `config get` found no such key.
+
+## Terraform plan CLI (`wp-tf`)
+
+`wp-tf` replaces a remote `terraform plan` against HCP Terraform. It tars a directory, starts
+a plan-only run on a control plane workspace and streams the log. Install it with the `tf`
+extra (`uv tool install "webbpulse[tf]"` against the CodeArtifact index, or add the extra to a
+project).
+
+```bash
+terraform login terraform.webbpulse.com
+wp-tf plan -w my-workspace                  # plan the current directory
+wp-tf plan infra/prod -w ws-... --detailed-exitcode --destroy
+wp-tf plan -w my-workspace --no-follow      # print the run id and return
+wp-tf logs run-... [--phase apply] [-f]
+wp-tf status run-...
+wp-tf workspaces
+```
+
+- **Key.** It looks for `WP_TF_TOKEN`, then `TF_TOKEN_<host>`, then the key `terraform login`
+  wrote to `credentials.tfrc.json`. There is no separate login.
+- **Scopes.** That key can read and plan. It cannot confirm, apply or read raw state, and
+  `wp-tf` has no command that tries.
+- **Host.** `--host` or `WP_TF_HOST` sets the host, defaulting to
+  `terraform.webbpulse.com`. The API origin comes from the host's discovery document, or from
+  `--api-url` or `WP_TF_API_URL`.
+- **Staging gate.** Staging sits behind the access gate. Put the gate's origin-verify value in
+  `WP_TF_GATE`.
+- **Working directory.** When a workspace has a working directory, run `wp-tf` from that
+  directory. The upload is rooted that many levels up, as HCP Terraform does.
+- **What the upload skips.** A `.terraformignore` at the upload root filters it with
+  gitignore rules. `.git` and `.terraform` are always skipped, and uploads over 250 MB are
+  refused.
+- **Output and exit codes.** Log lines go to stdout and progress to stderr. It exits `0` when
+  the plan succeeds and `1` on any failure. It exits `2` under `--detailed-exitcode` when the
+  plan has changes, and `130` after Ctrl-C, which also cancels the run. Tokens and the gate
+  value are never printed.
 
 ## GitHub App client
 
