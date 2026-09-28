@@ -7,6 +7,16 @@ This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## Unreleased
 
+### `identity`: a refresh never widens the consented scopes (patch)
+
+`OAuthServerService.refresh` used to answer every `mcp_scopes_supported` scope when the
+request named none, and any supported scope when it named one, so a grant widened silently
+whenever a product added scopes. A refresh now carries the scopes the user consented to, or
+the requested subset of them (RFC 6749 section 6). Asking beyond the consent answers
+`invalid_scope` before the refresh token is spent. Consented scopes the server no longer
+supports are dropped. Clients holding an older, narrower grant must authorize again to gain
+new scopes.
+
 ## 0.64.0
 
 ### `identity`: a brandable consent screen (minor)

@@ -88,6 +88,9 @@ RESPONSE_TYPES_SUPPORTED: Final[tuple[str, ...]] = ("code",)
 browser history, `Referer` headers and server logs, and it has no client authentication
 step at all. OAuth 2.1 removes it."""
 
+_BEYOND_CONSENT: Final = "A refresh may not ask for a scope the user did not grant. Authorize again to widen it."
+"""Why a refresh asking beyond its consent is refused."""
+
 TOKEN_ENDPOINT_AUTH_METHODS: Final[tuple[str, ...]] = ("none",)
 
 REGISTER_CLIENT_IP_LIMIT: Final = (10, 3600)
@@ -720,6 +723,9 @@ class OAuthServerService:
 
         Rotation and reuse detection are the existing `SessionService`'s, so a replayed
         token revokes its whole family here exactly as it does for a browser session.
+        The new token carries the scopes the user consented to, or the narrower set the
+        client asks for (RFC 6749 section 6). A scope beyond the consent is refused with
+        `invalid_scope` before the token is spent, so a grant never widens on refresh.
         """
         moment = int(time.time()) if now is None else now
         token = params.get("refresh_token", "")
@@ -730,10 +736,14 @@ class OAuthServerService:
                 "unsupported_grant_type",
                 "This deployment mounts no refresh token store, so refresh_token is not offered.",
             )
-        scopes = self._validate_scopes(params.get("scope", "").split())
+        requested = params.get("scope", "").split()
+        if requested:
+            self._validate_scopes(requested)
         resource = params.get("resource", "") or self._settings.mcp_resource_url
         if resource.rstrip("/") != self._settings.mcp_resource_url.rstrip("/"):
             raise OAuthServerError("invalid_target", "resource does not name a resource this server protects.")
+        if requested and not self._refresh_could_cover(token, params.get("client_id", ""), tuple(requested)):
+            raise OAuthServerError("invalid_scope", _BEYOND_CONSENT)
 
         outcome = self._flows.sessions.rotate(token)
         if outcome.issued is None:
@@ -743,6 +753,7 @@ class OAuthServerService:
         if consent is None or not self._stores.consents.mark_used(consent.consent_id, _iso(moment)):
             self._flows.sessions.revoke_family(outcome.family_id)
             raise OAuthServerError("invalid_grant", "The authorization behind this refresh token has been revoked.")
+        scopes = self._refresh_scopes(consent, tuple(requested))
         tenant = consent.tenant_id
         access = self._tokens.mint_access_token(
             outcome.user_id,
@@ -761,6 +772,33 @@ class OAuthServerService:
             "refresh_token": outcome.issued.token,
             "scope": " ".join(scopes),
         }
+
+    def _refresh_could_cover(self, token: str, client_id: str, requested: tuple[str, ...]) -> bool:
+        """Whether some grant the token's user holds to this client covers `requested`.
+
+        Read without spending the token, so a client asking too much keeps its refresh
+        token. An unknown token, or one with no grant left, answers `True` and is refused
+        by the rotation and consent checks that follow, which also end its family.
+        """
+        if self._flows is None or not client_id:
+            return True
+        presented = self._flows.sessions.peek(token)
+        if presented is None:
+            return True
+        grants = self._stores.consents.list_for_client(presented.user_id, client_id)
+        return not grants or any(grant.covers(requested) for grant in grants)
+
+    def _refresh_scopes(self, consent: ConsentRecord, requested: tuple[str, ...]) -> tuple[str, ...]:
+        """The scopes a refreshed token carries: the consent's, or the requested subset of it.
+
+        Consented scopes the server no longer supports are dropped rather than minted.
+        """
+        if requested:
+            if not consent.covers(requested):
+                raise OAuthServerError("invalid_scope", _BEYOND_CONSENT)
+            return requested
+        supported = set(self._settings.mcp_scopes_supported)
+        return tuple(scope for scope in consent.scopes if scope in supported)
 
     def _consent_for_refresh(self, user_id: str, client_id: str, device: str) -> ConsentRecord | None:
         """The standing grant a refresh continues, or `None` when it has been revoked.
