@@ -7,6 +7,8 @@ This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## Unreleased
 
+## 0.64.0
+
 ### `identity`: a brandable consent screen (minor)
 
 The MCP consent screen is redesigned and themeable. `build_identity_router` and
