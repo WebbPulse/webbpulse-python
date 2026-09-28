@@ -1679,3 +1679,42 @@ def test_the_default_renderer_is_themed() -> None:
 def test_palette_is_exported() -> None:
     """The palette type is part of the public surface."""
     assert ConsentPalette is type(DARK_PALETTE)
+
+
+class TestRefreshScopes:
+    """A refresh continues the consented scopes and never widens them."""
+
+    def test_a_refresh_naming_no_scope_carries_the_consented_scopes(self, fake_kms: Any) -> None:
+        """Omitting `scope` answers what the user granted, not every supported scope."""
+        service, _, _ = _service_with_refresh(fake_kms)
+        body = _grant(service)
+
+        refreshed = service.refresh({"refresh_token": body["refresh_token"], "client_id": "first-party"})
+
+        assert refreshed["scope"] == "mcp:read"
+
+    def test_a_refresh_may_narrow_to_a_consented_subset(self, fake_kms: Any) -> None:
+        """Asking for part of the grant answers that part."""
+        service, _, _ = _service_with_refresh(fake_kms)
+        verifier = new_pkce_verifier()
+        request = service.parse_authorization_request(authorize_params(verifier, scope="mcp:read mcp:write"))
+        service.record_consent(request, user_id=USER, tenant_id=TENANT)
+        code = service.issue_code(request, user_id=USER, tenant_id=TENANT)
+        body = service.exchange_code(
+            {"code": code, "client_id": "first-party", "redirect_uri": REDIRECT, "code_verifier": verifier}
+        )
+
+        refreshed = _refresh(service, body["refresh_token"])
+
+        assert refreshed["scope"] == "mcp:read"
+
+    def test_a_refresh_asking_beyond_the_consent_is_refused_and_keeps_its_token(self, fake_kms: Any) -> None:
+        """A scope the user never granted answers `invalid_scope`, and the token still refreshes."""
+        service, _, _ = _service_with_refresh(fake_kms)
+        body = _grant(service)
+
+        with pytest.raises(OAuthServerError) as exc:
+            service.refresh({"refresh_token": body["refresh_token"], "client_id": "first-party", "scope": "mcp:write"})
+
+        assert exc.value.error == "invalid_scope"
+        assert _refresh(service, body["refresh_token"])["scope"] == "mcp:read"
