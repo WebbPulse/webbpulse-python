@@ -18,6 +18,7 @@ if TYPE_CHECKING:  # pragma: no cover
     from fastapi import APIRouter, Request
     from fastapi.responses import JSONResponse
 
+    from webbpulse.identity.consent_page import ConsentTheme
     from webbpulse.identity.email import EmailSender
     from webbpulse.identity.hooks import IdentityHooks
     from webbpulse.identity.lockout import LoginAttemptStore
@@ -157,6 +158,7 @@ def build_identity_router(
     oauth_client_secrets: Mapping[str, str] | None = None,
     oauth_server_stores: OAuthServerStores | None = None,
     consent_renderer: ConsentRenderer | None = None,
+    consent_theme: ConsentTheme | None = None,
     tenant_resolver: TenantResolver | None = None,
 ) -> APIRouter:
     """The identity router for a product, mounted with no prefix.
@@ -164,7 +166,8 @@ def build_identity_router(
     The discovery, JWKS, health, OAuth provider and passkey availability routes always
     mount; the flows mount only when their hooks and stores are supplied. `limiter_enabled`
     left as `None` follows the environment convention, so staging mounts the flows with no
-    per-route rate limits and every other environment keeps them.
+    per-route rate limits and every other environment keeps them. `consent_theme` brands
+    the built-in OAuth consent screen; `consent_renderer` replaces it.
     """
     from fastapi import APIRouter
     from fastapi.responses import JSONResponse
@@ -261,6 +264,7 @@ def build_identity_router(
             limiter_enabled=limiter_enabled,
             kms_client=kms_client,
             consent_renderer=consent_renderer,
+            consent_theme=consent_theme,
             tenant_resolver=tenant_resolver,
         )
 
@@ -282,6 +286,7 @@ def _mount_oauth_server(
     limiter_enabled: bool,
     kms_client: Any,
     consent_renderer: ConsentRenderer | None,
+    consent_theme: ConsentTheme | None,
     tenant_resolver: TenantResolver | None,
 ) -> None:
     """Mount the OAuth 2.1 authorization server, behind `mcp_oauth_enabled`.
@@ -340,10 +345,15 @@ def _mount_oauth_server(
         claims = _claims_from_request(request, tokens)
         user_id = claims.get("sub", "")
         if user_id:
+            email, name = str(claims.get("email", "") or ""), str(claims.get("name", "") or "")
+            if not email and hooks is not None:
+                email, name = _account_of(hooks.load_user_by_id(user_id))
             return AuthorizationSubject(
                 user_id=user_id,
                 auth_time=_int_claim(claims.get("auth_time", "")),
                 session_id=claims.get("sid", ""),
+                email=email,
+                name=name,
             )
         if flows is None or hooks is None:
             return None
@@ -357,10 +367,13 @@ def _mount_oauth_server(
             hooks.may_authenticate(user)
         except AuthenticationRefused:
             return None
+        email, name = _account_of(user)
         return AuthorizationSubject(
             user_id=presented.user_id,
             auth_time=presented.auth_time,
             session_id=presented.family_id,
+            email=email,
+            name=name,
         )
 
     router.include_router(
@@ -371,6 +384,7 @@ def _mount_oauth_server(
             tokens=tokens,
             prefix=prefix,
             consent_renderer=consent_renderer,
+            consent_theme=consent_theme,
             tenant_resolver=tenant_resolver,
             limits=limits,
             authorization_subject_resolver=subject_resolver,
@@ -1370,3 +1384,11 @@ def _declare_route_responses(router: APIRouter, prefix: str, table: Mapping[tupl
         for method in route.methods or ():
             for status_code, description in table.get((method, bare), {}).items():
                 route.responses.setdefault(status_code, {"description": description})
+
+
+def _account_of(user: Mapping[str, Any] | None) -> tuple[str, str]:
+    """The email and display name a user record carries, for the consent screen."""
+    if not user:
+        return "", ""
+    name = user.get("name") or user.get("display_name") or user.get("full_name") or ""
+    return str(user.get("email", "") or ""), str(name)
