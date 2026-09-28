@@ -990,3 +990,386 @@ def _code_from(location: str) -> tuple[str, str]:
 
     query = parse_qs(urlsplit(location).query)
     return query["code"][0], query.get("state", [""])[0]
+
+
+LOGIN_URL = "https://app.staging.example.com/login"
+
+
+class CookieHooks(Hooks):
+    """Hooks for the cookie path, which also consults `may_authenticate`."""
+
+    def __init__(self, refused: frozenset[str] = frozenset(), missing: frozenset[str] = frozenset()) -> None:
+        """Record which user ids are refused and which no longer exist."""
+        self.refused = refused
+        self.missing = missing
+
+    def load_user_by_id(self, user_id: str) -> dict[str, Any] | None:
+        """Every user resolves unless it is listed as missing."""
+        return None if user_id in self.missing else super().load_user_by_id(user_id)
+
+    def may_authenticate(self, user: Any) -> None:
+        """Refuse the listed users, as a product would a disabled account."""
+        from webbpulse.identity import AuthenticationRefused
+
+        if user["id"] in self.refused:
+            raise AuthenticationRefused("disabled")
+
+
+class Browser:
+    """A test client whose only credential is the refresh cookie, as a browser tab has."""
+
+    def __init__(self, fake_kms: Any, *, hooks: CookieHooks | None = None, **overrides: Any) -> None:
+        """Mount the identity router over in-memory stores built from `overrides`."""
+        from webbpulse.identity import SessionService
+
+        self.settings = build_settings(**overrides)
+        self.store = InMemoryRefreshTokenStore()
+        self.sessions = SessionService(self.settings, self.store)
+        self.oauth_stores = build_stores()
+        self.prefix = identity_prefix(self.settings)
+        app = FastAPI()
+        app.include_router(
+            build_identity_router(
+                self.settings,
+                hooks or CookieHooks(),
+                IdentityStores(credentials=InMemoryCredentialStore(), refresh_tokens=self.store),
+                tokens=TokenService(self.settings, fake_kms),
+                oauth_server_stores=self.oauth_stores,
+                tenant_resolver=tenants_for,
+                limiter_enabled=False,
+            )
+        )
+        self.client = TestClient(app, base_url="https://api.staging.example.com")
+
+    def sign_in(self, user_id: str = USER, *, auth_time: int | None = None) -> str:
+        """Start a refresh family and hold its token as the cookie; return the token."""
+        issued = self.sessions.start_family(user_id, device="browser", auth_time=auth_time)
+        self.client.cookies.set(self.settings.cookie_name, issued.token)
+        return issued.token
+
+    def snapshot(self) -> dict[str, Any]:
+        """Every stored refresh record, to prove a request wrote nothing."""
+        return dict(self.store._items)
+
+    def authorize(self, verifier: str = "", **overrides: Any) -> Any:
+        """GET `/authorize` with a valid request, without following redirects."""
+        return self.client.get(
+            f"{self.prefix}{AUTHORIZE_PATH}",
+            params=authorize_params(verifier or new_pkce_verifier(), **overrides),
+            follow_redirects=False,
+        )
+
+    def consent(self, fields: dict[str, str], headers: dict[str, str] | None = None) -> Any:
+        """POST the consent form, without following redirects."""
+        return self.client.post(
+            f"{self.prefix}{CONSENT_PATH}", data=fields, headers=headers or {}, follow_redirects=False
+        )
+
+
+class TestCookieSignIn:
+    """A browser opened by an MCP client carries only the refresh cookie, never a bearer."""
+
+    def test_the_cookie_alone_renders_consent(self, fake_kms: Any) -> None:
+        """A live refresh family is enough to show the consent screen."""
+        browser = Browser(fake_kms)
+        browser.sign_in()
+        response = browser.authorize()
+        assert response.status_code == 200
+        assert "signature" in _form_fields(response.text)
+
+    def test_the_cookie_completes_a_grant(self, fake_kms: Any) -> None:
+        """Consent posted with the cookie issues a code the client can exchange."""
+        browser = Browser(fake_kms)
+        browser.sign_in()
+        verifier = new_pkce_verifier()
+        fields = _form_fields(browser.authorize(verifier).text)
+        fields.update(decision="allow", tenant_id=TENANT)
+        response = browser.consent(fields, headers={"Sec-Fetch-Site": "same-origin"})
+        assert response.status_code == 303
+        code, state = _code_from(response.headers["location"])
+        assert state == "opaque-state"
+        token = browser.client.post(
+            f"{browser.prefix}{TOKEN_PATH}",
+            data={
+                "grant_type": "authorization_code",
+                "code": code,
+                "code_verifier": verifier,
+                "client_id": "first-party",
+                "redirect_uri": REDIRECT,
+                "resource": RESOURCE,
+            },
+        )
+        assert token.status_code == 200
+        assert token.json()["access_token"]
+
+    def test_authorize_and_consent_write_nothing_to_the_refresh_store(self, fake_kms: Any) -> None:
+        """The cookie is read, never rotated, touched or consumed."""
+        browser = Browser(fake_kms)
+        presented = browser.sign_in()
+        before = browser.snapshot()
+        fields = _form_fields(browser.authorize().text)
+        fields.update(decision="allow", tenant_id=TENANT)
+        assert browser.consent(fields).status_code == 303
+        assert browser.snapshot() == before
+        assert browser.sessions.rotate(presented).ok
+
+    def test_a_revoked_family_is_refused_and_left_alone(self, fake_kms: Any) -> None:
+        """A signed-out family cannot authorize, and reading it changes nothing."""
+        browser = Browser(fake_kms)
+        presented = browser.sign_in()
+        browser.sessions.revoke_family(browser.sessions.family_of(presented))
+        before = browser.snapshot()
+        response = browser.authorize()
+        assert response.status_code == 401
+        assert response.json()["error"] == "login_required"
+        assert browser.snapshot() == before
+
+    def test_a_rotated_out_token_is_refused_without_reuse_detection(self, fake_kms: Any) -> None:
+        """An old generation is refused, and presenting it does not revoke the family."""
+        browser = Browser(fake_kms)
+        old = browser.sign_in()
+        successor = browser.sessions.rotate(old)
+        assert successor.issued is not None
+        before = browser.snapshot()
+        assert browser.authorize().status_code == 401
+        assert browser.snapshot() == before
+        browser.client.cookies.set(browser.settings.cookie_name, successor.issued.token)
+        assert browser.authorize().status_code == 200
+
+    def test_an_unknown_cookie_is_refused(self, fake_kms: Any) -> None:
+        """A cookie that names no stored record is the same as none."""
+        browser = Browser(fake_kms)
+        browser.client.cookies.set(browser.settings.cookie_name, "not-a-real-token")
+        assert browser.authorize().status_code == 401
+
+    def test_a_refused_user_cannot_authorize_by_cookie(self, fake_kms: Any) -> None:
+        """`may_authenticate` is consulted, as a refresh would, and its refusal holds."""
+        browser = Browser(fake_kms, hooks=CookieHooks(refused=frozenset({USER})))
+        browser.sign_in()
+        assert browser.authorize().status_code == 401
+
+    def test_a_deleted_user_cannot_authorize_by_cookie(self, fake_kms: Any) -> None:
+        """A family outliving its user resolves to nobody."""
+        browser = Browser(fake_kms, hooks=CookieHooks(missing=frozenset({USER})))
+        browser.sign_in()
+        assert browser.authorize().status_code == 401
+
+    def test_the_bearer_wins_over_the_cookie(self, fake_kms: Any) -> None:
+        """A request carrying both is the bearer's user, as every other route treats it."""
+        browser = Browser(fake_kms)
+        browser.sign_in("someone-else")
+        response = browser.client.get(
+            f"{browser.prefix}{AUTHORIZE_PATH}",
+            params=authorize_params(new_pkce_verifier()),
+            headers=signed_in(browser.client, fake_kms),
+        )
+        assert response.status_code == 200
+        fields = _form_fields(response.text)
+        fields.update(decision="allow", tenant_id=TENANT)
+        assert browser.consent(fields).status_code == 400
+
+
+class TestConsentBinding:
+    """The consent form is bound to the user it was shown to, and to this origin."""
+
+    def test_a_form_signed_for_another_user_is_refused(self, fake_kms: Any) -> None:
+        """A form minted in one account's session cannot be posted into another's."""
+        browser = Browser(fake_kms)
+        browser.sign_in("attacker")
+        fields = _form_fields(browser.authorize().text)
+        fields.update(decision="allow", tenant_id=TENANT)
+        browser.sign_in(USER)
+        response = browser.consent(fields)
+        assert response.status_code == 400
+        assert response.json()["error"] == "invalid_request"
+        assert not list(browser.oauth_stores.consents.list_for_user(USER))
+
+    def test_a_cross_site_post_is_refused(self, fake_kms: Any) -> None:
+        """A browser that reports a cross-site form post is refused before anything is read."""
+        browser = Browser(fake_kms)
+        browser.sign_in()
+        fields = _form_fields(browser.authorize().text)
+        fields.update(decision="allow", tenant_id=TENANT)
+        response = browser.consent(fields, headers={"Sec-Fetch-Site": "cross-site"})
+        assert response.status_code == 403
+
+
+class TestLoginRedirect:
+    """An unauthenticated browser is sent to the product's sign-in page and back."""
+
+    def test_no_login_url_keeps_the_401(self, fake_kms: Any) -> None:
+        """Without the setting the refusal is unchanged."""
+        response = Browser(fake_kms).authorize()
+        assert response.status_code == 401
+        assert response.json()["error"] == "login_required"
+
+    def test_the_login_url_receives_the_authorize_url(self, fake_kms: Any) -> None:
+        """The return parameter carries the full authorize request on the issuer."""
+        from urllib.parse import parse_qs, urlsplit
+
+        browser = Browser(fake_kms, mcp_login_url=LOGIN_URL)
+        verifier = new_pkce_verifier()
+        response = browser.authorize(verifier)
+        assert response.status_code == 302
+        assert response.headers["cache-control"] == "no-store"
+        location = urlsplit(response.headers["location"])
+        assert f"{location.scheme}://{location.netloc}{location.path}" == LOGIN_URL
+        query = parse_qs(location.query)
+        assert "prompt" not in query
+        back = urlsplit(query["returnTo"][0])
+        assert f"{back.scheme}://{back.netloc}{back.path}" == f"{ISSUER}{AUTHORIZE_PATH}"
+        assert {key: value[0] for key, value in parse_qs(back.query).items()} == authorize_params(verifier)
+
+    def test_the_return_url_ignores_the_request_host(self, fake_kms: Any) -> None:
+        """The return URL is built from the issuer, so a spoofed Host cannot steer it."""
+        from urllib.parse import parse_qs, urlsplit
+
+        browser = Browser(fake_kms, mcp_login_url=LOGIN_URL)
+        response = browser.client.get(
+            f"{browser.prefix}{AUTHORIZE_PATH}",
+            params=authorize_params(new_pkce_verifier()),
+            headers={"Host": "evil.example.net"},
+            follow_redirects=False,
+        )
+        back = parse_qs(urlsplit(response.headers["location"]).query)["returnTo"][0]
+        assert back.startswith(f"{ISSUER}{AUTHORIZE_PATH}?")
+
+    def test_the_return_param_is_configurable(self, fake_kms: Any) -> None:
+        """A product whose login page reads another parameter names it."""
+        browser = Browser(fake_kms, mcp_login_url=LOGIN_URL, mcp_login_return_param="next")
+        assert "next=" in browser.authorize().headers["location"]
+
+    def test_an_invalid_request_is_never_redirected(self, fake_kms: Any) -> None:
+        """A request that fails validation is answered as JSON, never bounced to login."""
+        browser = Browser(fake_kms, mcp_login_url=LOGIN_URL)
+        response = browser.authorize(redirect_uri="https://evil.example.net/cb")
+        assert response.status_code in {400, 401}
+        assert "location" not in response.headers
+
+    def test_consent_without_a_session_redirects_to_login(self, fake_kms: Any) -> None:
+        """A consent post whose session lapsed goes back through sign-in, not a dead end."""
+        browser = Browser(fake_kms, mcp_login_url=LOGIN_URL)
+        browser.sign_in()
+        fields = _form_fields(browser.authorize().text)
+        browser.client.cookies.clear()
+        fields.update(decision="allow", tenant_id=TENANT)
+        response = browser.consent(fields)
+        assert response.status_code == 303
+        assert response.headers["location"].startswith(f"{LOGIN_URL}?returnTo=")
+        assert "signature" not in response.headers["location"]
+
+
+class TestRecentAuth:
+    """`mcp_consent_max_age` sends a stale session back through sign-in."""
+
+    def test_a_fresh_session_is_shown_consent(self, fake_kms: Any) -> None:
+        """A login inside the window passes straight through."""
+        browser = Browser(fake_kms, mcp_login_url=LOGIN_URL, mcp_consent_max_age="PT1H")
+        browser.sign_in()
+        assert browser.authorize().status_code == 200
+
+    def test_a_stale_session_is_sent_to_login_with_prompt(self, fake_kms: Any) -> None:
+        """An old `auth_time` redirects with `prompt=login`, so the page asks again."""
+        browser = Browser(fake_kms, mcp_login_url=LOGIN_URL, mcp_consent_max_age="PT1H")
+        browser.sign_in(auth_time=int(time.time()) - 7200)
+        response = browser.authorize()
+        assert response.status_code == 302
+        assert "prompt=login" in response.headers["location"]
+
+    def test_a_stale_consent_post_is_sent_to_login(self, fake_kms: Any) -> None:
+        """The check repeats on the post, so a form left open past the window is refused."""
+        browser = Browser(fake_kms, mcp_login_url=LOGIN_URL, mcp_consent_max_age="PT1H")
+        browser.sign_in()
+        fields = _form_fields(browser.authorize().text)
+        browser.sign_in(auth_time=int(time.time()) - 7200)
+        fields.update(decision="allow", tenant_id=TENANT)
+        response = browser.consent(fields)
+        assert response.status_code == 303
+        assert "prompt=login" in response.headers["location"]
+
+    def test_a_stale_session_without_a_login_url_is_refused(self, fake_kms: Any) -> None:
+        """With nowhere to send the user the refusal is the 401 it always was."""
+        browser = Browser(fake_kms, mcp_consent_max_age="PT1H")
+        browser.sign_in(auth_time=int(time.time()) - 7200)
+        assert browser.authorize().status_code == 401
+
+    def test_a_bearer_without_auth_time_is_stale(self, fake_kms: Any) -> None:
+        """A token that cannot say when its user authenticated is never counted as recent."""
+        browser = Browser(fake_kms, mcp_login_url=LOGIN_URL, mcp_consent_max_age="PT1H")
+        response = browser.client.get(
+            f"{browser.prefix}{AUTHORIZE_PATH}",
+            params=authorize_params(new_pkce_verifier()),
+            headers=signed_in(browser.client, fake_kms),
+            follow_redirects=False,
+        )
+        assert response.status_code == 302
+
+
+class TestPeek:
+    """`SessionService.peek` answers who holds a token without changing anything."""
+
+    def test_a_live_token_names_its_user_family_and_auth_time(self) -> None:
+        """The family's `auth_time` comes back as the login set it."""
+        from webbpulse.identity import SessionService
+
+        settings = build_settings()
+        store = InMemoryRefreshTokenStore()
+        sessions = SessionService(settings, store)
+        issued = sessions.start_family(USER, auth_time=1_700_000_000)
+        found = sessions.peek(issued.token)
+        assert found is not None
+        assert (found.user_id, found.family_id, found.auth_time) == (USER, issued.family_id, 1_700_000_000)
+
+    def test_expired_and_capped_tokens_are_refused(self) -> None:
+        """Past the token's own expiry, or the family's absolute cap, there is no session."""
+        from datetime import UTC, datetime
+
+        from webbpulse.identity import SessionService
+
+        settings = build_settings()
+        store = InMemoryRefreshTokenStore()
+        sessions = SessionService(settings, store)
+        issued = sessions.start_family(USER)
+        before = dict(store._items)
+        now = datetime.now(UTC)
+        assert sessions.peek(issued.token, now=now + settings.refresh_token_ttl + settings.refresh_token_ttl) is None
+        assert sessions.peek(issued.token, now=now + settings.refresh_absolute_ttl) is None
+        assert sessions.peek("") is None
+        assert dict(store._items) == before
+
+
+class TestLoginSettings:
+    """What the sign-in redirect settings refuse."""
+
+    def test_a_plaintext_login_url_is_refused_outside_local(self) -> None:
+        """The page collects credentials, so http is only for local and test."""
+        with pytest.raises(ValueError, match="plaintext http"):
+            build_settings(environment="production", mcp_login_url="http://app.example.com/login")
+
+    def test_a_plaintext_login_url_is_allowed_in_test(self) -> None:
+        """Local and test run over http."""
+        assert build_settings(mcp_login_url="http://localhost:5173/login").mcp_login_url
+
+    @pytest.mark.parametrize(
+        "value",
+        ["/login", "javascript:alert(1)", "https:///login", "https://app.example.com/login#frag"],
+    )
+    def test_a_malformed_login_url_is_refused(self, value: str) -> None:
+        """Only an absolute http(s) URL on a real host, with no fragment, is accepted."""
+        with pytest.raises(ValueError, match="mcp_login_url"):
+            build_settings(mcp_login_url=value)
+
+    def test_a_login_url_already_carrying_the_return_param_is_refused(self) -> None:
+        """The redirect writes that parameter itself, so a second copy would be ambiguous."""
+        with pytest.raises(ValueError, match="already carries"):
+            build_settings(mcp_login_url="https://app.example.com/login?returnTo=/")
+
+    def test_a_blank_return_param_is_refused(self) -> None:
+        """The login page must be told where to come back to."""
+        with pytest.raises(ValueError, match="mcp_login_return_param"):
+            build_settings(mcp_login_return_param=" ")
+
+    def test_a_negative_consent_max_age_is_refused(self) -> None:
+        """Zero turns the check off; below zero is a mistake."""
+        with pytest.raises(ValueError, match="mcp_consent_max_age"):
+            build_settings(mcp_consent_max_age="-PT1H")

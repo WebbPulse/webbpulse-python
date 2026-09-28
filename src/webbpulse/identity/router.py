@@ -290,7 +290,7 @@ def _mount_oauth_server(
     absent: a deployment that advertises an authorization server in its discovery document
     and then answers 404 on `/authorize` is worse than one that fails at startup.
     """
-    from webbpulse.identity.oauth_server import build_oauth_server_router
+    from webbpulse.identity.oauth_server import AuthorizationSubject, build_oauth_server_router
 
     if oauth_server_stores is None:
         raise ValueError(
@@ -327,9 +327,41 @@ def _mount_oauth_server(
             for namespace, (limit, window), _ in specs
         ]
 
-    def subject_resolver(request: Request) -> str:
-        """The signed-in user for an authorization request, by the shared claims path."""
-        return _subject_from_request(request, tokens)
+    def subject_resolver(request: Request) -> AuthorizationSubject | None:
+        """The signed-in user for an authorization request.
+
+        The shared claims path first. Without a bearer, a browser that opened `/authorize`
+        from an MCP client carries only the refresh cookie, so that is read next, strictly
+        read-only: `SessionService.peek` rotates nothing and trips no reuse detection, and
+        the user must still load and pass `may_authenticate`, as a refresh would require.
+        """
+        from webbpulse.identity.hooks import AuthenticationRefused
+
+        claims = _claims_from_request(request, tokens)
+        user_id = claims.get("sub", "")
+        if user_id:
+            return AuthorizationSubject(
+                user_id=user_id,
+                auth_time=_int_claim(claims.get("auth_time", "")),
+                session_id=claims.get("sid", ""),
+            )
+        if flows is None or hooks is None:
+            return None
+        presented = flows.sessions.peek(request.cookies.get(settings.cookie_name, ""))
+        if presented is None:
+            return None
+        user = hooks.load_user_by_id(presented.user_id)
+        if user is None:
+            return None
+        try:
+            hooks.may_authenticate(user)
+        except AuthenticationRefused:
+            return None
+        return AuthorizationSubject(
+            user_id=presented.user_id,
+            auth_time=presented.auth_time,
+            session_id=presented.family_id,
+        )
 
     router.include_router(
         build_oauth_server_router(
@@ -341,7 +373,7 @@ def _mount_oauth_server(
             consent_renderer=consent_renderer,
             tenant_resolver=tenant_resolver,
             limits=limits,
-            subject_resolver=subject_resolver,
+            authorization_subject_resolver=subject_resolver,
         )
     )
 
@@ -1208,6 +1240,14 @@ def _fetch_site_allowed(request: Request) -> bool:
     """
     value = request.headers.get("sec-fetch-site", "")
     return not value or value.lower() in ALLOWED_FETCH_SITES
+
+
+def _int_claim(value: str) -> int:
+    """An integer claim carried as a string, or 0 when absent or malformed."""
+    try:
+        return int(float(value))
+    except (TypeError, ValueError, OverflowError):
+        return 0
 
 
 def _subject_from_request(request: Request, tokens: TokenService) -> str:

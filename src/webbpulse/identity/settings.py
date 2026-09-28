@@ -9,7 +9,7 @@ from __future__ import annotations
 import base64
 from datetime import timedelta
 from typing import Any, Final, Literal
-from urllib.parse import urlparse
+from urllib.parse import parse_qsl, urlparse
 
 from pydantic import Field, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -277,6 +277,27 @@ class IdentitySettings(BaseSettings):
             "only the registrations nothing ever came back for."
         ),
     )
+    mcp_login_url: str = Field(
+        default="",
+        description=(
+            "The product's web sign-in page. When `/authorize` has no signed-in user it "
+            "redirects here with the full authorization URL in `mcp_login_return_param`, "
+            "so the person signs in and comes back. Empty keeps the 401 `login_required` "
+            "answer."
+        ),
+    )
+    mcp_login_return_param: str = Field(
+        default="returnTo",
+        description="The query parameter on `mcp_login_url` that carries the authorization URL back.",
+    )
+    mcp_consent_max_age: timedelta = Field(
+        default=timedelta(0),
+        description=(
+            "The oldest sign-in that may approve an authorization. A session whose "
+            "`auth_time` is older is sent back through `mcp_login_url` with `prompt=login`. "
+            "Zero turns the check off."
+        ),
+    )
 
     oauth_redirect_uris: list[str] = Field(
         default_factory=list,
@@ -407,6 +428,7 @@ class IdentitySettings(BaseSettings):
                 "`mint_access_token` drops rather than honours, so the tenant would silently "
                 "vanish from every token this server issues."
             )
+        self._check_mcp_login()
         if self.mcp_authorization_code_ttl <= timedelta(0):
             raise ValueError("mcp_authorization_code_ttl must be positive.")
         if self.mcp_authorization_code_ttl > MAX_AUTHORIZATION_CODE_TTL:
@@ -416,6 +438,36 @@ class IdentitySettings(BaseSettings):
                 "that already holds the verifier, so a long-lived one is only an interception window."
             )
         return self
+
+    def _check_mcp_login(self) -> None:
+        """Refuse a sign-in redirect a browser could be sent somewhere unsafe by.
+
+        The URL is where an unauthenticated `/authorize` sends the person, so it must be an
+        absolute URL on a real host, https outside the local and test environments, and it
+        must not already use the return parameter the redirect writes.
+        """
+        if self.mcp_consent_max_age < timedelta(0):
+            raise ValueError("mcp_consent_max_age must be zero, which turns the check off, or positive.")
+        if not self.mcp_login_return_param.strip():
+            raise ValueError("mcp_login_return_param must name the query parameter the sign-in page reads.")
+        if not self.mcp_login_url:
+            return
+        parsed = urlparse(self.mcp_login_url)
+        if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+            raise ValueError(f"mcp_login_url must be an absolute http(s) URL, got {self.mcp_login_url!r}.")
+        if parsed.fragment:
+            raise ValueError(f"mcp_login_url must have no fragment, got {self.mcp_login_url!r}.")
+        if parsed.scheme == "http" and self.environment.strip().lower() not in _PLAINTEXT_ISSUER_ENVIRONMENTS:
+            raise ValueError(
+                f"mcp_login_url {self.mcp_login_url!r} is plaintext http in environment "
+                f"{self.environment!r}. The sign-in page it names collects credentials."
+            )
+        existing = {key for key, _ in parse_qsl(parsed.query, keep_blank_values=True)}
+        if self.mcp_login_return_param in existing or "prompt" in existing:
+            raise ValueError(
+                f"mcp_login_url {self.mcp_login_url!r} already carries "
+                f"{self.mcp_login_return_param!r} or 'prompt', which the redirect writes itself."
+            )
 
     @field_validator("signing_key_arns")
     @classmethod

@@ -217,6 +217,7 @@ from webbpulse.identity.oauth_server import (
     TOKEN_PATH,
     AuthorizationRequest,
     AuthorizationRevocation,
+    AuthorizationSubject,
     ConsentContext,
     ConsentRenderer,
     OAuthServerError,
@@ -331,6 +332,7 @@ from webbpulse.identity.service import (
 )
 from webbpulse.identity.sessions import (
     IssuedRefresh,
+    PresentedSession,
     RotationOutcome,
     RotationResult,
     SessionService,
@@ -617,6 +619,7 @@ __all__ = [
     "AuthorizationCodeStore",
     "AuthorizationRequest",
     "AuthorizationRevocation",
+    "AuthorizationSubject",
     "AuthorizerClaims",
     "BaseIdentityHooks",
     "ClaimsUnavailable",
@@ -716,6 +719,7 @@ __all__ = [
     "PasskeyService",
     "PasskeyStore",
     "PasswordRejected",
+    "PresentedSession",
     "PurgeResult",
     "RateLimited",
     "RecordingEmailSender",

@@ -54,6 +54,9 @@ that never turns the flag on provisions nothing extra.
 | `mcp_authorization_code_ttl` | Default 60s, capped at 10 minutes |
 | `mcp_client_ttl` | How long an unused dynamic registration survives. Default 90 days |
 | `mcp_tenant_claim` | The claim the consented tenant is written to. Default `tenant_id` |
+| `mcp_login_url` | Where a browser with no session is sent from `/authorize`. Unset answers 401 |
+| `mcp_login_return_param` | The query parameter carrying the authorize URL back. Default `returnTo` |
+| `mcp_consent_max_age` | Sends an older login back through `mcp_login_url` with `prompt=login`. Default off |
 
 **`mcp_tenant_claim` may not name a registered claim.** `mint_access_token` drops
 registered claims from product claims rather than letting them be overridden, so naming one
@@ -128,15 +131,33 @@ differently would make the endpoint an oracle for guessing tokens.
 
 ## Consent
 
-`/authorize` requires a signed-in user and renders a consent screen. **Consent binds the
+`/authorize` requires a signed-in user and renders a consent screen. An MCP client opens it
+in a plain browser tab, which carries no bearer, so the user is resolved from the bearer or
+authorizer claims first and then from the refresh cookie. The cookie is only read:
+`SessionService.peek` refuses a revoked, expired, capped or rotated-out token, writes
+nothing and never trips reuse detection, and the user must still pass `may_authenticate`.
+The cookie path defaults to the issuer path, which covers both `/authorize` and
+`/authorize/consent`; a product that narrows `cookie_path` below the issuer loses this.
+
+With no user, a valid request is redirected to `mcp_login_url` with `mcp_login_return_param`
+set to the authorize URL, rebuilt from the issuer rather than the request, so the login page
+is only ever handed this server's own authorize endpoint. The login page should accept that
+absolute URL only when its origin and path are exactly the issuer's authorize endpoint. With
+`mcp_consent_max_age` set, a login older than the window, or a bearer with no `auth_time`, is
+sent the same way with `prompt=login`, and the login page must then ask again rather than
+skip a signed-in user. A request that fails validation is never redirected.
+
+ **Consent binds the
 token to exactly one tenant**, chosen by the user from what `tenant_resolver` returns, and
 the tenant is re-checked against that resolver when the form posts rather than trusted from
 the form. It is written into the code record, not accepted again at `/token`, where the
 client could change it.
 
 The form carries the authorization parameters through the user's browser, so they are
-covered by an HMAC. A scope or redirect URI edited in the browser, or a form posted from
-somewhere else, fails the check and is refused.
+covered by an HMAC that also binds the signed-in user id, which is never sent. A scope or
+redirect URI edited in the browser, a form minted in another account's session, or a form
+posted from somewhere else fails the check and is refused. A post the browser marks
+`Sec-Fetch-Site: cross-site` is refused outright, on top of the `SameSite=Lax` cookie.
 
 `consent_renderer` replaces the built-in screen wholesale, taking a `ConsentContext` and
 returning any Starlette response. A replacement must post `form_fields` back unchanged;
