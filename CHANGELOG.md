@@ -7,6 +7,8 @@ This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## Unreleased
 
+## 0.63.0
+
 ### `identity`: browser sign-in for the MCP authorization server (minor)
 
 `/authorize` and its consent post now recognise a browser signed in by its refresh cookie.
