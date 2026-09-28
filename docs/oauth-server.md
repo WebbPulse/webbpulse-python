@@ -159,11 +159,26 @@ redirect URI edited in the browser, a form minted in another account's session, 
 posted from somewhere else fails the check and is refused. A post the browser marks
 `Sec-Fetch-Site: cross-site` is refused outright, on top of the `SameSite=Lax` cookie.
 
+Most products brand the built-in screen with `consent_theme`, a `ConsentTheme` passed to
+`build_identity_router`: a light and a dark `ConsentPalette`, `color_scheme` (`light`,
+`dark` or `system`), a logo per scheme and `FontFace`s, each an https URL or a data URI,
+plus `scope_labels` and a `revoke_note`. It is passed in code, not settings, because inlined
+fonts outgrow a Lambda environment. Scopes are worded by `describe_scopes`: the product's
+`ScopeLabel` first, then the package's own, then a sentence inferred from `resource:action`,
+grouped under read and write. The screen names the signed-in account and, with
+`mcp_login_url` set, links "Switch account" to it with `prompt=login`.
+
+The page runs no script. Its CSP is `default-src 'none'` with a per-response style nonce,
+`img-src` and `font-src` limited to the theme's own sources, `form-action` limited to this
+server, the redirect URI's origin and the login page's origin (browsers apply it across the
+redirect), and `frame-ancestors 'none'`, alongside `X-Frame-Options: DENY`, `no-store` and
+`no-referrer`. Every theme value is validated on construction, so it can only ever carry a
+colour, a font name or an approved source into the page.
+
 `consent_renderer` replaces the built-in screen wholesale, taking a `ConsentContext` and
-returning any Starlette response. A replacement must post `form_fields` back unchanged;
-everything else about the page is the product's. The default screen exists so a product has
-a working authorization screen on day one, not so it ships that one. Every value on it is
-HTML-escaped, because a client name arrives from an unauthenticated endpoint.
+returning any Starlette response. A replacement must post `form_fields` back unchanged and
+takes on the headers above itself. Every value on the built-in screen is HTML-escaped,
+because a client name arrives from an unauthenticated endpoint.
 
 ## The tokens
 

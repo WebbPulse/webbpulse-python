@@ -7,6 +7,19 @@ This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## Unreleased
 
+### `identity`: a brandable consent screen (minor)
+
+The MCP consent screen is redesigned and themeable. `build_identity_router` and
+`build_oauth_server_router` take `consent_theme`, a `ConsentTheme` of light and dark
+`ConsentPalette`s, a colour scheme, logos, `FontFace`s, `scope_labels` and a `revoke_note`.
+Scopes read as plain language through the new `describe_scopes`, grouped under read and
+write. The screen names the signed-in account with a "Switch account" link to
+`mcp_login_url` with `prompt=login`, shows a workspace picker, and disables Allow when a
+tenant resolver returns nothing. The response now carries a nonce-based CSP with no script,
+`form-action` limited to the redirect and login origins, and `frame-ancestors 'none'`.
+`ConsentContext` gains `tenant_required`, `product_name`, `account_email`, `account_name`
+and `switch_account_url`; `AuthorizationSubject` gains `email` and `name`.
+
 ## 0.63.1
 
 ### `e2e`: the shared identity cases no longer spend or end `user_session` (patch)

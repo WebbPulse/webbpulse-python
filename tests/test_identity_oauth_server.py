@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import time
+from dataclasses import replace
 from typing import TYPE_CHECKING, Any
 
 import pytest
@@ -17,7 +18,10 @@ from webbpulse.identity import (
     REVOKE_PATH,
     TOKEN_PATH,
     BaseIdentityHooks,
+    ConsentPalette,
     ConsentRecord,
+    ConsentTheme,
+    FontFace,
     IdentityFlows,
     IdentitySettings,
     IdentityStores,
@@ -30,15 +34,19 @@ from webbpulse.identity import (
     OAuthServerError,
     OAuthServerService,
     OAuthServerStores,
+    ScopeLabel,
     TenantChoice,
     TokenService,
+    build_consent_renderer,
     build_identity_router,
+    describe_scopes,
     identity_prefix,
     new_pkce_verifier,
     pkce_challenge,
     validate_redirect_uri,
 )
-from webbpulse.identity.oauth_server import CONSENT_PATH
+from webbpulse.identity.consent_page import DARK_PALETTE, consent_security_policy, render_consent_page
+from webbpulse.identity.oauth_server import CONSENT_PATH, AuthorizationRequest, ConsentContext
 from webbpulse.identity.tokens import DISCOVERY_PATH
 
 if TYPE_CHECKING:
@@ -578,8 +586,6 @@ class TestConsent:
     def test_a_custom_renderer_replaces_the_screen(self, fake_kms: Any) -> None:
         """A product restyles consent without reimplementing the binding it carries."""
         from fastapi.responses import HTMLResponse
-
-        from webbpulse.identity.oauth_server import ConsentContext
 
         seen: list[ConsentContext] = []
 
@@ -1373,3 +1379,282 @@ class TestLoginSettings:
         """Zero turns the check off; below zero is a mistake."""
         with pytest.raises(ValueError, match="mcp_consent_max_age"):
             build_settings(mcp_consent_max_age="-PT1H")
+
+
+CONSENT_PNG = "data:image/png;base64,iVBORw0KGgo="
+
+
+def consent_context(**overrides: Any) -> ConsentContext:
+    """A consent context for a named client asking for two scopes."""
+    request = AuthorizationRequest(
+        client=OAuthClientRecord(client_id="c1", redirect_uris=(REDIRECT,), client_name="Claude Code"),
+        redirect_uri=REDIRECT,
+        resource=RESOURCE,
+        scopes=("mcp:read", "mcp:write"),
+        code_challenge="x" * 43,
+        state="s",
+    )
+    values: dict[str, Any] = {
+        "request": request,
+        "user_id": "u1",
+        "tenants": (TenantChoice(id=TENANT, name="Workspace One"),),
+        "form_action": "/api/auth/authorize/consent",
+        "form_fields": {"client_id": "c1", "signature": "sig"},
+        "tenant_required": True,
+        "product_name": "Acme",
+        "account_email": "person@example.com",
+        "account_name": "Pat Person",
+        "switch_account_url": f"{LOGIN_URL}?prompt=login",
+    }
+    values.update(overrides)
+    return ConsentContext(**values)
+
+
+def csp_of(response: Any) -> dict[str, str]:
+    """The response's CSP as a directive to value map."""
+    policy = response.headers["content-security-policy"]
+    return {name: rest for name, _, rest in (part.strip().partition(" ") for part in policy.split(";"))}
+
+
+class TestDescribeScopes:
+    """Scopes are grouped and worded for people, with the product's labels winning."""
+
+    def test_builtin_scopes_are_worded(self) -> None:
+        """The package's own scopes read as sentences under the right heading."""
+        groups = describe_scopes(["mcp:read", "mcp:write"])
+        assert [(group.access, group.title) for group in groups] == [("read", "Read access"), ("write", "Write access")]
+        assert groups[0].rows[0].label == "Read your data"
+        assert groups[1].rows[0].label == "Make changes on your behalf"
+
+    def test_resource_action_scopes_are_inferred(self) -> None:
+        """A `resource:action` scope reads as a verb and its resource."""
+        groups = describe_scopes(["issues:read", "comments:write"])
+        assert [(row.scope, row.label) for group in groups for row in group.rows] == [
+            ("issues:read", "Read issues"),
+            ("comments:write", "Create and update comments"),
+        ]
+
+    def test_product_labels_win(self) -> None:
+        """A label the product supplies replaces the inferred one, detail included."""
+        labels = {"issues:read": ScopeLabel("Read issues and projects", "Includes archived work.", access="read")}
+        row = describe_scopes(["issues:read"], labels)[0].rows[0]
+        assert (row.label, row.detail) == ("Read issues and projects", "Includes archived work.")
+
+    def test_unknown_scopes_are_verbatim_writes(self) -> None:
+        """A scope with no known shape is shown as is, on the write side."""
+        groups = describe_scopes(["weird"])
+        assert groups[0].access == "write"
+        assert groups[0].rows[0].label == "weird"
+
+    def test_duplicates_are_dropped(self) -> None:
+        """A repeated scope is listed once."""
+        assert len(describe_scopes(["mcp:read", "mcp:read"])[0].rows) == 1
+
+
+class TestThemeValidation:
+    """A theme can carry nothing into the page but colours, names and approved sources."""
+
+    def test_a_palette_refuses_css_injection(self) -> None:
+        """A token that is not a plain colour is refused."""
+        with pytest.raises(ValueError, match="accent"):
+            replace(DARK_PALETTE, accent="red;}body{display:none")
+
+    def test_a_palette_accepts_colour_functions(self) -> None:
+        """Hex, rgb, hsl and oklch values are all accepted."""
+        replace(DARK_PALETTE, accent="oklch(0.7 0.1 40)", line="rgb(1 2 3 / 50%)", text="hsl(10 20% 30%)")
+
+    @pytest.mark.parametrize(
+        "logo",
+        [
+            "http://cdn.example.com/logo.svg",
+            "javascript:alert(1)",
+            "data:text/html;base64,PGI+",
+            "https://a@b.example/",
+        ],
+    )
+    def test_a_logo_must_be_https_or_an_image_data_uri(self, logo: str) -> None:
+        """Plain http, scripts, non-image data and credentialed URLs are refused."""
+        with pytest.raises(ValueError):
+            ConsentTheme(logo_url=logo)
+
+    def test_a_font_family_refuses_markup(self) -> None:
+        """The family string may not close the rule it sits in."""
+        with pytest.raises(ValueError):
+            ConsentTheme(font_family="Inter;}</style><script>")
+
+    def test_a_font_face_must_be_a_font(self) -> None:
+        """A font source that is not a font data URI or https is refused."""
+        with pytest.raises(ValueError):
+            FontFace(weight=400, src="data:image/png;base64,AAAA")
+        assert FontFace.woff2(500, b"wOF2").src.startswith("data:font/woff2;base64,")
+
+    def test_an_unknown_scheme_is_refused(self) -> None:
+        """Only light, dark and system are schemes."""
+        with pytest.raises(ValueError):
+            ConsentTheme(color_scheme="sepia")  # type: ignore[arg-type]
+
+
+class TestRender:
+    """The rendered page and the headers that keep it from being abused."""
+
+    def test_the_security_headers(self) -> None:
+        """Framing is refused, nothing is cached and no referrer leaks."""
+        response = render_consent_page(consent_context(), ConsentTheme())
+        assert response.headers["x-frame-options"] == "DENY"
+        assert response.headers["cache-control"] == "no-store"
+        assert response.headers["referrer-policy"] == "no-referrer"
+        assert response.headers["x-content-type-options"] == "nosniff"
+
+    def test_the_policy_allows_only_what_the_page_needs(self) -> None:
+        """No script source, a nonce for the one style block, and form targets by origin."""
+        theme = ConsentTheme(logo_url=CONSENT_PNG, font_faces=(FontFace.woff2(400, b"wOF2"),))
+        response = render_consent_page(consent_context(), theme)
+        policy = csp_of(response)
+        assert policy["default-src"] == "'none'"
+        assert "script-src" not in policy
+        nonce = policy["style-src"].removeprefix("'nonce-").removesuffix("'")
+        assert f'<style nonce="{nonce}">' in response.body.decode()
+        assert policy["img-src"] == "data:"
+        assert policy["font-src"] == "data:"
+        assert policy["form-action"] == "'self' http://127.0.0.1:33418 https://app.staging.example.com"
+        assert policy["frame-ancestors"] == "'none'"
+        assert policy["base-uri"] == "'none'"
+
+    def test_each_response_has_a_fresh_nonce(self) -> None:
+        """The nonce is never reused between two renders."""
+        first = csp_of(render_consent_page(consent_context(), ConsentTheme()))["style-src"]
+        second = csp_of(render_consent_page(consent_context(), ConsentTheme()))["style-src"]
+        assert first != second
+
+    def test_a_native_redirect_is_a_scheme_source(self) -> None:
+        """A custom-scheme redirect is admitted by its scheme alone."""
+        request = replace(consent_context().request, redirect_uri="cursor://anysphere.cursor-mcp/oauth/callback")
+        policy = consent_security_policy(consent_context(request=request), ConsentTheme(), "n")
+        assert "form-action 'self' cursor: https://app.staging.example.com" in policy
+
+    def test_https_assets_are_admitted_by_origin(self) -> None:
+        """An https logo admits its origin and nothing wider."""
+        theme = ConsentTheme(logo_url="https://CDN.example.com/a/logo.svg")
+        assert "img-src https://cdn.example.com;" in consent_security_policy(consent_context(), theme, "n")
+
+    def test_the_page_shows_the_account_and_switch_link(self) -> None:
+        """The signed-in account is named and the switch link goes to sign-in."""
+        page = render_consent_page(consent_context(), ConsentTheme()).body.decode()
+        assert "Signed in as Pat Person" in page
+        assert "person@example.com" in page
+        assert f'href="{LOGIN_URL}?prompt=login">Switch account</a>' in page
+        assert "Connect Claude Code to Acme" in page
+
+    def test_the_page_escapes_what_the_client_named_itself(self) -> None:
+        """A dynamically registered client's name is text, never markup."""
+        request = replace(
+            consent_context().request,
+            client=OAuthClientRecord(client_id="c1", redirect_uris=(REDIRECT,), client_name="<img src=x>"),
+        )
+        page = render_consent_page(consent_context(request=request), ConsentTheme()).body.decode()
+        assert "<img src=x>" not in page
+        assert "&lt;img src=x&gt;" in page
+
+    def test_scope_labels_and_revoke_note_render(self) -> None:
+        """The product's wording and its revoke note reach the page."""
+        theme = ConsentTheme(
+            scope_labels={"mcp:write": ScopeLabel("Post comments as you")},
+            revoke_note="Disconnect it any time in Settings.",
+        )
+        page = render_consent_page(consent_context(), theme).body.decode()
+        assert "Post comments as you" in page
+        assert "Disconnect it any time in Settings." in page
+
+    def test_the_workspace_picker_checks_the_first(self) -> None:
+        """Each workspace is a required radio and the first is preselected."""
+        tenants = (TenantChoice(id="w1", name="One"), TenantChoice(id="w2", name="Two"))
+        page = render_consent_page(consent_context(tenants=tenants), ConsentTheme()).body.decode()
+        assert 'name="tenant_id" value="w1" required checked' in page
+        assert 'name="tenant_id" value="w2" required>' in page
+
+    def test_no_workspace_disables_allow(self) -> None:
+        """With a resolver mounted and nothing to grant, Allow is disabled and the reason shown."""
+        page = render_consent_page(consent_context(tenants=()), ConsentTheme()).body.decode()
+        assert 'value="allow" disabled>' in page
+        assert "not in a workspace" in page
+
+    def test_no_resolver_needs_no_workspace(self) -> None:
+        """A product with no tenants gets no picker and an enabled Allow."""
+        page = render_consent_page(consent_context(tenants=(), tenant_required=False), ConsentTheme()).body.decode()
+        assert 'name="tenant_id"' not in page
+        assert 'value="allow">' in page
+
+    def test_the_scheme_and_palettes_reach_the_page(self) -> None:
+        """A pinned scheme is written on the root and both palettes are in the stylesheet."""
+        light = replace(ConsentTheme().light, accent="#b8451a")
+        page = render_consent_page(consent_context(), ConsentTheme(light=light, color_scheme="dark")).body.decode()
+        assert 'data-scheme="dark"' in page
+        assert "--accent:#b8451a" in page
+        assert f"--accent:{DARK_PALETTE.accent}" in page
+
+    def test_only_one_logo_shows_per_scheme(self) -> None:
+        """The dark logo is hidden by a rule at least as specific as the one sizing tile images."""
+        page = render_consent_page(consent_context(), ConsentTheme(logo_url=CONSENT_PNG, logo_dark_url=CONSENT_PNG))
+        body = page.body.decode()
+        assert '<span class="tile has-dark">' in body
+        assert ".tile .logo-dark {\n  display: none;" in body
+
+
+class TestRouterWiring:
+    """The theme is threaded through `build_identity_router` to the live endpoint."""
+
+    def test_a_themed_router_serves_the_theme(self, fake_kms: Any) -> None:
+        """The authorize page carries the product's wording and the account's email."""
+        settings = build_settings(product_name="Acme")
+        app = FastAPI()
+        app.include_router(
+            build_identity_router(
+                settings,
+                Hooks(),
+                IdentityStores(credentials=InMemoryCredentialStore(), refresh_tokens=InMemoryRefreshTokenStore()),
+                tokens=TokenService(settings, fake_kms),
+                oauth_server_stores=build_stores(),
+                tenant_resolver=tenants_for,
+                consent_theme=ConsentTheme(scope_labels={"mcp:read": ScopeLabel("Read your widgets", access="read")}),
+                limiter_enabled=False,
+            )
+        )
+        client = TestClient(app)
+        response = client.get(
+            f"{identity_prefix(settings)}{AUTHORIZE_PATH}",
+            params=authorize_params(new_pkce_verifier()),
+            headers=signed_in(client, fake_kms),
+        )
+        assert response.status_code == 200
+        assert "Read your widgets" in response.text
+        assert "person@example.com" in response.text
+        assert "Workspace One" in response.text
+        assert csp_of(response)["frame-ancestors"] == "'none'"
+
+    def test_switch_account_forces_a_fresh_sign_in_on_the_issuer(self, fake_kms: Any) -> None:
+        """The switch link goes to sign-in with prompt=login and returns to the issuer's authorize."""
+        import html
+        import re
+        from urllib.parse import parse_qs, urlsplit
+
+        browser = Browser(fake_kms, mcp_login_url=LOGIN_URL)
+        browser.sign_in()
+        page = browser.authorize().text
+        href = html.unescape(re.search(r'href="([^"]+)">Switch account', page).group(1))  # type: ignore[union-attr]
+        location = urlsplit(href)
+        assert f"{location.scheme}://{location.netloc}{location.path}" == LOGIN_URL
+        query = parse_qs(location.query)
+        assert query["prompt"] == ["login"]
+        assert query["returnTo"][0].startswith(f"{build_settings().issuer}{AUTHORIZE_PATH}?")
+
+
+def test_the_default_renderer_is_themed() -> None:
+    """`build_consent_renderer` with no theme paints the neutral default."""
+    response = build_consent_renderer()(consent_context())
+    assert response.status_code == 200
+    assert "Allow access" in response.body.decode()
+
+
+def test_palette_is_exported() -> None:
+    """The palette type is part of the public surface."""
+    assert ConsentPalette is type(DARK_PALETTE)

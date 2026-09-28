@@ -35,6 +35,7 @@ if TYPE_CHECKING:  # pragma: no cover
     from fastapi import APIRouter, Request
     from fastapi.responses import JSONResponse
 
+    from webbpulse.identity.consent_page import ConsentTheme
     from webbpulse.identity.flows import IdentityFlows
     from webbpulse.identity.service import TokenService
     from webbpulse.identity.settings import IdentitySettings
@@ -188,12 +189,15 @@ class AuthorizationSubject:
 
     `auth_time` is when that user last authenticated, in epoch seconds, or 0 when unknown;
     `session_id` is the refresh family the request rode on, when there is one. Resolved from
-    a bearer or authorizer claims first, then from the refresh cookie, read-only.
+    a bearer or authorizer claims first, then from the refresh cookie, read-only. `email`
+    and `name` are what the consent screen shows as the signed-in account, when known.
     """
 
     user_id: str
     auth_time: int = 0
     session_id: str = ""
+    email: str = ""
+    name: str = ""
 
 
 @dataclass(frozen=True, slots=True)
@@ -215,6 +219,9 @@ class ConsentContext:
     Passed to the `ConsentRenderer` a product supplies. The `form_action` and
     `form_fields` are what a replacement UI must post back unchanged, so a restyled screen
     cannot accidentally drop the binding between the consent and the request it approves.
+    `tenant_required` is set when a tenant resolver is mounted, so an empty `tenants` means
+    nothing to grant rather than a product with no tenants. `switch_account_url` sends the
+    browser through the product's sign-in page with `prompt=login` and back here.
     """
 
     request: AuthorizationRequest
@@ -222,13 +229,18 @@ class ConsentContext:
     tenants: tuple[TenantChoice, ...]
     form_action: str
     form_fields: Mapping[str, str]
+    tenant_required: bool = False
+    product_name: str = ""
+    account_email: str = ""
+    account_name: str = ""
+    switch_account_url: str = ""
 
 
 type ConsentRenderer = Callable[[ConsentContext], Any]
 """What a product supplies to restyle the consent step.
 
-Returns any Starlette response. The default renders a minimal self-contained form, so a
-product that supplies nothing still has a working, if plain, authorization screen.
+Returns any Starlette response. Most products pass a `ConsentTheme` instead and keep the
+built-in screen; this replaces it wholesale.
 """
 
 type TenantResolver = Callable[[str], Sequence[TenantChoice]]
@@ -844,55 +856,13 @@ def _consent_signature(settings: IdentitySettings, payload: Mapping[str, str], *
 
 
 def default_consent_renderer(context: ConsentContext) -> Any:
-    """Render the built-in consent screen: one plain self-contained HTML form.
+    """Render the built-in consent screen in the package's neutral theme.
 
-    Deliberately minimal and unstyled. It exists so a product has a working authorization
-    screen on day one, not so it ships this one; `consent_renderer` replaces it wholesale.
+    A product brands it by passing a `ConsentTheme`, or replaces it with `consent_renderer`.
     """
-    from fastapi.responses import HTMLResponse
+    from webbpulse.identity.consent_page import ConsentTheme, render_consent_page
 
-    request = context.request
-    client_name = request.client.client_name or request.client.client_id
-    scopes = "".join(f"<li><code>{_escape(scope)}</code></li>" for scope in request.scopes)
-    if context.tenants:
-        options = "".join(
-            f'<option value="{_escape(tenant.id)}">{_escape(tenant.name or tenant.id)}</option>'
-            for tenant in context.tenants
-        )
-        tenant_field = f'<label>Workspace<select name="tenant_id" required>{options}</select></label>'
-    else:
-        tenant_field = "<p>No workspace is available for this account.</p>"
-    hidden = "".join(
-        f'<input type="hidden" name="{_escape(key)}" value="{_escape(value)}">'
-        for key, value in context.form_fields.items()
-    )
-    body = f"""<!doctype html>
-<html lang="en"><head><meta charset="utf-8"><title>Authorize {_escape(client_name)}</title>
-<meta name="viewport" content="width=device-width, initial-scale=1"></head>
-<body>
-<h1>Authorize {_escape(client_name)}</h1>
-<p><strong>{_escape(client_name)}</strong> is asking to access your account.</p>
-<p>It will be able to:</p>
-<ul>{scopes}</ul>
-<form method="post" action="{_escape(context.form_action)}">
-{hidden}
-{tenant_field}
-<button type="submit" name="decision" value="allow">Allow</button>
-<button type="submit" name="decision" value="deny">Deny</button>
-</form>
-</body></html>"""
-    return HTMLResponse(body, headers={"Cache-Control": "no-store", "X-Frame-Options": "DENY"})
-
-
-def _escape(value: str) -> str:
-    """HTML-escape a value bound for the consent page, quotes included.
-
-    Every value on that page is attacker-influenced: a client name comes from an open
-    registration endpoint, and the form fields echo query parameters back.
-    """
-    import html
-
-    return html.escape(value, quote=True)
+    return render_consent_page(context, ConsentTheme())
 
 
 def build_oauth_server_router(
@@ -903,6 +873,7 @@ def build_oauth_server_router(
     tokens: TokenService,
     prefix: str = "",
     consent_renderer: ConsentRenderer | None = None,
+    consent_theme: ConsentTheme | None = None,
     tenant_resolver: TenantResolver | None = None,
     limits: Callable[..., list[Any]] | None = None,
     subject_resolver: Callable[[Request], str] | None = None,
@@ -916,6 +887,7 @@ def build_oauth_server_router(
 
     `authorization_subject_resolver` wins over the older `subject_resolver`, which carries
     no `auth_time` and so always counts as stale when `mcp_consent_max_age` is set.
+    `consent_renderer` wins over `consent_theme`, which brands the built-in screen.
     """
     from fastapi import APIRouter
     from fastapi.responses import JSONResponse, RedirectResponse
@@ -923,7 +895,9 @@ def build_oauth_server_router(
     _bind_fastapi_request()
 
     service = OAuthServerService(settings, stores, tokens, flows=flows)
-    render = consent_renderer or default_consent_renderer
+    from webbpulse.identity.consent_page import build_consent_renderer
+
+    render = consent_renderer or build_consent_renderer(consent_theme)
     metadata = build_authorization_server_metadata(settings)
     resource_metadata = build_protected_resource_metadata(settings)
 
@@ -952,13 +926,23 @@ def build_oauth_server_router(
             return False
         return subject.auth_time <= 0 or int(time.time()) - subject.auth_time > max_age
 
-    def sign_in_response(params: Mapping[str, str], *, stale: bool, status: int) -> Any:
-        """Send the browser to the product's login page, or answer 401 when none is set.
+    def sign_in_url(params: Mapping[str, str], *, fresh: bool) -> str:
+        """The product's sign-in URL carrying this authorize request back, or empty when unset.
 
         The return URL is rebuilt from the issuer and the authorize path, never taken from
         the request, so the login page can only ever be handed this server's own authorize
         endpoint to come back to.
         """
+        if not settings.mcp_login_url:
+            return ""
+        return_to = f"{settings.issuer}{AUTHORIZE_PATH}?{urlencode(list(params.items()))}"
+        extra = {settings.mcp_login_return_param: return_to}
+        if fresh:
+            extra["prompt"] = "login"
+        return _redirect_with(settings.mcp_login_url, extra)
+
+    def sign_in_response(params: Mapping[str, str], *, stale: bool, status: int) -> Any:
+        """Send the browser to the product's login page, or answer 401 when none is set."""
         if not settings.mcp_login_url:
             return JSONResponse(
                 {
@@ -968,12 +952,8 @@ def build_oauth_server_router(
                 status_code=401,
                 headers={"Cache-Control": "no-store"},
             )
-        return_to = f"{settings.issuer}{AUTHORIZE_PATH}?{urlencode(list(params.items()))}"
-        extra = {settings.mcp_login_return_param: return_to}
-        if stale:
-            extra["prompt"] = "login"
         return RedirectResponse(
-            _redirect_with(settings.mcp_login_url, extra),
+            sign_in_url(params, fresh=stale),
             status_code=status,
             headers={"Cache-Control": "no-store"},
         )
@@ -1042,6 +1022,11 @@ def build_oauth_server_router(
                 tenants=tenants,
                 form_action=f"{prefix}{CONSENT_PATH}",
                 form_fields=fields,
+                tenant_required=tenant_resolver is not None,
+                product_name=settings.product_name,
+                account_email=subject.email,
+                account_name=subject.name,
+                switch_account_url=sign_in_url(query, fresh=True),
             )
         )
 
