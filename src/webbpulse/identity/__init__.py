@@ -306,6 +306,8 @@ from webbpulse.identity.router import (
 )
 from webbpulse.identity.scopes import (
     FORBIDDEN_ERROR_CODE,
+    STEP_UP_REQUIRED_ERROR_CODE,
+    STEP_UP_REQUIRED_MESSAGE,
     UNAUTHENTICATED_ERROR_CODE,
     bearer_credential,
     claims_or_api_key,
@@ -314,8 +316,10 @@ from webbpulse.identity.scopes import (
     has_scopes,
     is_api_key_actor,
     missing_scopes,
+    require_recent_auth,
     require_scopes,
     require_tenant,
+    step_up_challenge,
     tenant_matches,
 )
 from webbpulse.identity.service import (
@@ -580,6 +584,8 @@ __all__ = [
     "SCHEME_SECRET_HKDF",
     "STEP_UP_PASSKEY_OPTIONS_PATH",
     "STEP_UP_PATH",
+    "STEP_UP_REQUIRED_ERROR_CODE",
+    "STEP_UP_REQUIRED_MESSAGE",
     "TABLES",
     "TENANT_CLAIM",
     "TOKEN_ENDPOINT_AUTH_METHODS",
@@ -808,6 +814,7 @@ __all__ = [
     "render_password_reset",
     "render_registration_notice",
     "render_verification",
+    "require_recent_auth",
     "require_scopes",
     "revoke_api_key",
     "revoke_api_key_by_id",
@@ -850,6 +857,7 @@ __all__ += [
     "share_target_key",
     "share_token_capability",
     "share_token_credential",
+    "step_up_challenge",
     "tenant_matches",
     "verify_api_key_for_tenant",
     "verify_share_token",

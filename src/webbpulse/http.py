@@ -834,6 +834,10 @@ type ErrorEnvelope = str | ErrorRenderer
 
 _ENVELOPE_SHAPES: Final = ("default", "detailed")
 
+_ENVELOPE_BASE_KEYS: Final = frozenset(
+    {"success", "status", "message", "request_id", "error_code", "details", "errors"}
+)
+
 
 def _render_default(context: ErrorContext) -> Mapping[str, Any]:
     """Render the historical envelope, where `error_code` and `details` are opt in."""
@@ -941,6 +945,10 @@ def register_error_handlers(
     unmatched-route 404. `"detailed"` implies `error_codes` and `validation_details`, so a
     consumer gets the `{"success", "status", "message", "request_id", "error_code"}` shape with
     a flat 422 `details` list and no `errors` key.
+
+    An `HTTPException` whose `detail` is a mapping may carry `message`, `error_code`, `details`
+    and an `extra` mapping of further top-level keys, such as `max_age`. `extra` never
+    overrides a base key and is dropped from a 5xx.
     """
     renderer = resolve_error_envelope(error_envelope)
     detailed = renderer is _render_detailed
@@ -962,6 +970,7 @@ def register_error_handlers(
         """Render any `HTTPException`, including Starlette's own 404 and 405, as the envelope."""
         override_code: str | None = None
         override_details: Any = None
+        override_extra: dict[str, Any] = {}
         raw: Any = exc.detail
         if isinstance(raw, str):
             detail = raw
@@ -971,6 +980,11 @@ def register_error_handlers(
             candidate_code = raw.get("error_code")
             override_code = candidate_code if isinstance(candidate_code, str) else None
             override_details = raw.get("details")
+            candidate_extra = raw.get("extra")
+            if isinstance(candidate_extra, Mapping):
+                override_extra = {
+                    str(key): value for key, value in candidate_extra.items() if key not in _ENVELOPE_BASE_KEYS
+                }
         else:
             detail = "Request failed."
 
@@ -981,6 +995,7 @@ def register_error_handlers(
             _log.error(detail, extra={"status": exc.status_code, "path": request.url.path})
             detail = "Internal server error."
             override_details = None
+            override_extra = {}
 
         return JSONResponse(
             status_code=exc.status_code,
@@ -993,6 +1008,7 @@ def register_error_handlers(
                         error_code=_code(exc.status_code, override_code),
                         details=override_details,
                         exception=exc,
+                        extra=override_extra,
                     )
                 )
             ),

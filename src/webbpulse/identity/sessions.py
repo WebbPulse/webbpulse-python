@@ -44,6 +44,8 @@ class IssuedRefresh:
 
     `token` is the plaintext and exists only long enough to reach `set_cookie`; the stored
     record carries only its hash. `device` is the label the family was started under, which every generation carries.
+    `auth_time` is the family's last authentication in epoch seconds, for the access token
+    minted alongside this generation.
     """
 
     token: str
@@ -52,6 +54,7 @@ class IssuedRefresh:
     generation: int
     expires_at: int
     device: str = ""
+    auth_time: int = 0
 
 
 @dataclass(frozen=True, slots=True)
@@ -89,11 +92,13 @@ class SessionService:
         device: str = "",
         ip: str = "",
         now: datetime | None = None,
+        auth_time: int | None = None,
     ) -> IssuedRefresh:
         """Begin a new family for one login, at generation 1.
 
         `device` and `ip` are recorded for the audit trail only: nothing in the rotation path
-        compares them, since binding a session to either breaks legitimate users.
+        compares them, since binding a session to either breaks legitimate users. `auth_time`
+        defaults to the moment the family starts, which is the login.
         """
         moment = now or datetime.now(UTC)
         return self._mint(
@@ -104,7 +109,32 @@ class SessionService:
             ip=ip,
             family_started_at=moment,
             now=moment,
+            auth_time=int(moment.timestamp()) if auth_time is None else auth_time,
         )
+
+    def record_reauthentication(self, family_id: str, auth_time: int) -> int:
+        """Carry a step-up's `auth_time` into the family, so the next refresh keeps it.
+
+        Best effort and never raises: a store that cannot update a family, or one that
+        fails, leaves refreshes carrying the login's `auth_time`, which only ever asks for
+        another step-up sooner. Returns how many rows changed.
+        """
+        if not family_id:
+            return 0
+        try:
+            return self._store.set_family_auth_time(family_id, auth_time)
+        except NotImplementedError:
+            _log.warning(
+                "This store cannot record a step-up on a refresh family.",
+                extra={"event": "session.reauth_unsupported", "family_id": family_id},
+            )
+        except Exception:
+            _log.warning(
+                "Could not record a step-up on a refresh family.",
+                extra={"event": "session.reauth_write_failed", "family_id": family_id},
+                exc_info=True,
+            )
+        return 0
 
     def _mint(
         self,
@@ -116,6 +146,7 @@ class SessionService:
         ip: str,
         family_started_at: datetime,
         now: datetime,
+        auth_time: int,
     ) -> IssuedRefresh:
         """Write one generation of a family and return its plaintext token.
 
@@ -137,6 +168,7 @@ class SessionService:
                 device=device,
                 ip_first_seen=ip,
                 family_started_at=_iso(family_started_at),
+                auth_time=auth_time,
             )
         )
         return IssuedRefresh(
@@ -146,6 +178,7 @@ class SessionService:
             generation=generation,
             expires_at=expires_at,
             device=device,
+            auth_time=auth_time,
         )
 
     def rotate(
@@ -188,6 +221,7 @@ class SessionService:
             ip=record.ip_first_seen or ip,
             family_started_at=self._family_started_at(record),
             now=moment,
+            auth_time=self._auth_time(record),
         )
 
         previous = self._store.consume(
@@ -264,6 +298,7 @@ class SessionService:
             ip=current.ip_first_seen,
             family_started_at=self._family_started_at(current),
             now=moment,
+            auth_time=max(self._auth_time(current), self._auth_time(successor_record)),
         )
         _log.info(
             "Concurrent refresh inside the grace window; replaying rather than revoking.",
@@ -372,6 +407,16 @@ class SessionService:
         """
         parsed = _parse(record.family_started_at) or _parse(record.created_at)
         return parsed or datetime.now(UTC)
+
+    def _auth_time(self, record: RefreshTokenRecord) -> int:
+        """The family's last authentication, carried from `record` and never bumped.
+
+        Falls back to when the family began for a record written before `auth_time` existed,
+        which is exactly the login for a family that never stepped up.
+        """
+        if record.auth_time > 0:
+            return record.auth_time
+        return int(self._family_started_at(record).timestamp())
 
     def _past_absolute_cap(self, record: RefreshTokenRecord, moment: datetime) -> bool:
         """Whether this family has outlived `refresh_absolute_ttl`."""

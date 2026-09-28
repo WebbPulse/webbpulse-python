@@ -21,6 +21,7 @@ if TYPE_CHECKING:  # pragma: no cover
     from webbpulse.identity.email import EmailSender
     from webbpulse.identity.hooks import IdentityHooks
     from webbpulse.identity.lockout import LoginAttemptStore
+    from webbpulse.identity.mfa import MfaRejected
     from webbpulse.identity.oauth_server import ConsentRenderer, TenantResolver
     from webbpulse.identity.oauth_server_storage import OAuthServerStores
     from webbpulse.identity.passkeys import PasskeyRejected
@@ -680,6 +681,17 @@ def _mount_flows(
         )
         return clear_refresh_cookie(JSONResponse({"signed_out": True}))
 
+    _mount_step_up(
+        router,
+        prefix=prefix,
+        flows=flows,
+        tokens=tokens,
+        limits=limits,
+        context=context,
+        rejected=rejected,
+        success_body=success_body,
+    )
+
     if flows.mfa is not None:
         _mount_mfa(
             router,
@@ -842,25 +854,17 @@ def _mount_mfa(
     success_body: Callable[[Any], dict[str, Any]],
     set_refresh_cookie: Callable[[JSONResponse, str], JSONResponse],
 ) -> None:
-    """Add M4's six MFA routes, given the closures `_mount_flows` already built.
+    """Add M4's five MFA routes, given the closures `_mount_flows` already built.
 
     `login/totp` stays outside the gateway authorizer because it carries an MFA ticket
-    audienced to `<issuer>/mfa`; the other five sit behind it.
+    audienced to `<issuer>/mfa`; the other four sit behind it. Step-up is mounted by
+    `_mount_step_up`, since a password step-up needs no MFA.
     """
     from fastapi import Body
     from fastapi.responses import JSONResponse
 
     from webbpulse.identity.flows import LoginRejected
     from webbpulse.identity.mfa import MfaRejected
-
-    def mfa_refused(request: Request, exc: MfaRejected) -> JSONResponse:
-        """Render an MFA refusal in the shared envelope."""
-        from webbpulse.http import error_body
-
-        return JSONResponse(
-            error_body(exc.status_code, exc.message, request, error_code=exc.error_code),
-            status_code=exc.status_code,
-        )
 
     def require_subject(request: Request) -> str:
         """The verified subject of the request, or a `LoginRejected` when there is none."""
@@ -886,7 +890,7 @@ def _mount_mfa(
                 )
             )
         except MfaRejected as exc:
-            return mfa_refused(request, exc)
+            return _mfa_refused(request, exc)
         except LoginRejected as exc:
             return rejected(request, exc)
         return set_refresh_cookie(JSONResponse(success_body(result)), result.refresh_token)
@@ -907,7 +911,7 @@ def _mount_mfa(
         try:
             enrolment = await run_sync(lambda: flows.mfa.begin_enrolment(subject, account_name=account))
         except MfaRejected as exc:
-            return mfa_refused(request, exc)
+            return _mfa_refused(request, exc)
         return JSONResponse(
             {
                 "secret": enrolment.secret,
@@ -928,7 +932,7 @@ def _mount_mfa(
         try:
             codes = await run_sync(lambda: flows.mfa.confirm_enrolment(subject, str(payload.get("code", ""))))
         except MfaRejected as exc:
-            return mfa_refused(request, exc)
+            return _mfa_refused(request, exc)
         return JSONResponse({"activated": True, "recovery_codes": codes.codes})
 
     @router.post(
@@ -945,7 +949,7 @@ def _mount_mfa(
         try:
             await run_sync(lambda: flows.disable_totp(user_id=subject, code=code))
         except MfaRejected as exc:
-            return mfa_refused(request, exc)
+            return _mfa_refused(request, exc)
         return JSONResponse({"disabled": True})
 
     @router.post(
@@ -962,37 +966,72 @@ def _mount_mfa(
         try:
             codes = await run_sync(lambda: flows.regenerate_recovery_codes(user_id=subject, code=code))
         except MfaRejected as exc:
-            return mfa_refused(request, exc)
+            return _mfa_refused(request, exc)
         return JSONResponse({"recovery_codes": codes.codes})
+
+
+def _mount_step_up(
+    router: APIRouter,
+    *,
+    prefix: str,
+    flows: Any,
+    tokens: TokenService,
+    limits: Callable[..., list[Any]],
+    context: Callable[[Request], tuple[str, str]],
+    rejected: Callable[[Request, Any], JSONResponse],
+    success_body: Callable[[Any], dict[str, Any]],
+) -> None:
+    """Add the step-up route, mounted whenever the flows are, since a password needs no MFA."""
+    from fastapi import Body
+    from fastapi.responses import JSONResponse
+
+    from webbpulse.identity.flows import LoginRejected
+    from webbpulse.identity.mfa import MfaRejected
 
     @router.post(
         f"{prefix}{STEP_UP_PATH}",
         dependencies=limits(("mfa-verify", TOTP_VERIFY_LIMIT, "ip")),
     )
     async def step_up(request: _FastAPIRequest, payload: dict[str, Any] = Body(...)) -> JSONResponse:
-        """Re-assert a factor with a code or a passkey, returning a fresher token and no cookie.
+        """Re-authenticate inside the session, returning a fresher token and no cookie.
 
-        One route and two bodies: `{"code": ...}` or `{"challenge_id": ..., "credential": ...}`.
-        Neither and both are the same 422, so a client is told what it sent rather than that
-        its factor was wrong.
+        One route and three bodies: `{"password": ...}`, `{"code": ...}` or
+        `{"challenge_id": ..., "credential": ...}`. None, or more than one, is the same 422,
+        so a client is told what it sent rather than that its factor was wrong.
         """
-        try:
-            subject = require_subject(request)
-        except LoginRejected as exc:
-            return rejected(request, exc)
+        subject = _subject_from_request(request, tokens)
+        if not subject:
+            return rejected(
+                request,
+                LoginRejected("Sign in first.", error_code="NOT_AUTHENTICATED", status_code=401),
+            )
+        session_id = _session_from_request(request, tokens)
+        password = _step_up_password(payload)
+        if password is not None:
+            ip, user_agent = context(request)
+            try:
+                result = await run_sync(
+                    lambda: flows.step_up_with_password(
+                        user_id=subject,
+                        session_id=session_id,
+                        password=password,
+                        ip=ip,
+                        user_agent=user_agent,
+                    )
+                )
+            except MfaRejected as exc:
+                return _mfa_refused(request, exc)
+            except LoginRejected as exc:
+                return rejected(request, exc)
+            return JSONResponse(success_body(result))
+
         credential = _step_up_credential(payload)
         if credential is None:
             code = _required_code(payload)
             try:
-                result = await run_sync(
-                    lambda: flows.step_up(
-                        user_id=subject,
-                        session_id=_session_from_request(request, tokens),
-                        code=code,
-                    )
-                )
+                result = await run_sync(lambda: flows.step_up(user_id=subject, session_id=session_id, code=code))
             except MfaRejected as exc:
-                return mfa_refused(request, exc)
+                return _mfa_refused(request, exc)
             return JSONResponse(success_body(result))
 
         from webbpulse.identity.passkeys import PasskeyRejected
@@ -1001,7 +1040,7 @@ def _mount_mfa(
             result = await run_sync(
                 lambda: flows.step_up_with_passkey(
                     user_id=subject,
-                    session_id=_session_from_request(request, tokens),
+                    session_id=session_id,
                     challenge_id=str(payload.get("challenge_id", "")),
                     credential=credential,
                 )
@@ -1011,6 +1050,44 @@ def _mount_mfa(
         except LoginRejected as exc:
             return rejected(request, exc)
         return JSONResponse(success_body(result))
+
+
+def _mfa_refused(request: Request, exc: MfaRejected) -> JSONResponse:
+    """Render an MFA refusal in the shared envelope."""
+    from fastapi.responses import JSONResponse
+
+    from webbpulse.http import error_body
+
+    return JSONResponse(
+        error_body(exc.status_code, exc.message, request, error_code=exc.error_code),
+        status_code=exc.status_code,
+    )
+
+
+def _step_up_password(payload: Mapping[str, Any]) -> str | None:
+    """The `password` of a password step-up body, or `None` when the body is another kind.
+
+    A blank password, or one sent alongside a code or a credential, is a 422.
+    """
+    from fastapi.exceptions import RequestValidationError
+
+    if "password" not in payload:
+        return None
+    value = payload.get("password")
+    code = payload.get("code")
+    if (isinstance(code, str) and code.strip()) or payload.get("credential") is not None:
+        raise RequestValidationError(
+            [
+                {
+                    "loc": ("body", "password"),
+                    "msg": "Send one of a password, a code or a passkey credential.",
+                    "type": "value_error",
+                }
+            ]
+        )
+    if not isinstance(value, str) or not value:
+        raise RequestValidationError([{"loc": ("body", "password"), "msg": "Field required", "type": "missing"}])
+    return value
 
 
 def _step_up_credential(payload: Mapping[str, Any]) -> dict[str, Any] | None:
@@ -1216,9 +1293,11 @@ IDENTITY_ROUTE_RESPONSES: Final[dict[tuple[str, str], dict[int, str]]] = {
         429: "Too many attempts from this address",
     },
     ("POST", STEP_UP_PATH): {
-        401: "No bearer token was presented, or the factor was refused",
-        429: "Too many attempts from this address",
+        401: "No bearer token was presented, or the password or factor was refused",
+        403: "Password sign in is closed on this deployment",
+        429: "Too many attempts from this address, or the account is locked",
         501: "A passkey step-up was sent to a deployment with passkeys off",
+        503: "Neither a password nor a second factor is available to this user",
     },
 }
 """The statuses the identity routes really answer, keyed by method and unprefixed path.

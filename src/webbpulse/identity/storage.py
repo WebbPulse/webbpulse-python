@@ -157,6 +157,9 @@ class RefreshTokenRecord:
 
     A family is one login. Rotation writes a new record and marks this one consumed,
     recording `successor_hash` so a replay inside the grace window gets that successor.
+    `auth_time` is when the person last proved who they are in this family, in epoch
+    seconds: the login, or a later step-up. Rotation copies it rather than bumping it, and
+    `0` means a record written before the field existed.
     """
 
     token_hash: str
@@ -171,6 +174,7 @@ class RefreshTokenRecord:
     device: str = ""
     ip_first_seen: str = ""
     family_started_at: str = ""
+    auth_time: int = 0
 
     @property
     def is_consumed(self) -> bool:
@@ -352,6 +356,16 @@ class RefreshTokenStore(ABC):
         user's families does for `revoke_all_for_user`.
         """
         raise NotImplementedError("This store cannot enumerate a user's refresh families by device.")
+
+    def set_family_auth_time(self, family_id: str, auth_time: int) -> int:
+        """Record a step-up on every generation of a family. Returns how many rows changed.
+
+        What keeps a step-up alive across the next refresh, since rotation copies `auth_time`
+        from the generation it consumes. Never moves `auth_time` backwards. The base raises
+        `NotImplementedError`, which `SessionService.record_reauthentication` reports as
+        nothing recorded.
+        """
+        raise NotImplementedError("This store cannot update a refresh family's auth_time.")
 
     @abstractmethod
     def delete_all_for_user(self, user_id: str) -> int:
@@ -688,6 +702,15 @@ class InMemoryRefreshTokenStore(RefreshTokenStore):
                 count += 1
         return count
 
+    def set_family_auth_time(self, family_id: str, auth_time: int) -> int:
+        """Record a step-up on every generation of a family, never moving it backwards."""
+        count = 0
+        for token_hash, record in list(self._items.items()):
+            if record.family_id == family_id and record.auth_time < auth_time:
+                self._items[token_hash] = dataclasses.replace(record, auth_time=auth_time)
+                count += 1
+        return count
+
     def revoke_all_for_user(self, user_id: str, *, except_family_id: str = "") -> int:
         """Revoke every family for a user. What a password reset and "sign out everywhere" call."""
         count = 0
@@ -1010,6 +1033,7 @@ class DynamoRefreshTokenStore(RefreshTokenStore):
                 "device": record.device,
                 "ip_first_seen": record.ip_first_seen,
                 "family_started_at": record.family_started_at,
+                "auth_time": record.auth_time,
             }
         )
 
@@ -1048,6 +1072,31 @@ class DynamoRefreshTokenStore(RefreshTokenStore):
                 index_name=REFRESH_FAMILY_INDEX,
             )
         )
+
+    def set_family_auth_time(self, family_id: str, auth_time: int) -> int:
+        """Record a step-up on every generation of a family, never moving it backwards.
+
+        Queries the family index for the keys, then makes one conditional point update per
+        row, so a row that already carries a later `auth_time` or has gone is left alone.
+        """
+        from boto3.dynamodb.conditions import Attr, Key
+
+        from webbpulse.dynamodb import ConditionFailed
+
+        count = 0
+        for item in self._repo.iter_query(Key("family_id").eq(family_id), index_name=REFRESH_FAMILY_INDEX):
+            try:
+                self._repo.update(
+                    {"token_hash": item["token_hash"]},
+                    update_expression="SET auth_time = :auth_time",
+                    expression_values={":auth_time": auth_time},
+                    condition=Attr("token_hash").exists()
+                    & (Attr("auth_time").not_exists() | Attr("auth_time").lt(auth_time)),
+                )
+            except ConditionFailed:
+                continue
+            count += 1
+        return count
 
     def revoke_all_for_user(self, user_id: str, *, except_family_id: str = "") -> int:
         """Revoke every family for a user. What a password reset and "sign out everywhere" call.
@@ -1546,6 +1595,7 @@ def _refresh_record_from_item(item: Mapping[str, Any]) -> RefreshTokenRecord:
         device=str(item.get("device", "")),
         ip_first_seen=str(item.get("ip_first_seen", "")),
         family_started_at=str(item.get("family_started_at", "")),
+        auth_time=int(item.get("auth_time", 0) or 0),
     )
 
 

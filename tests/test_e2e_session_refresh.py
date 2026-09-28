@@ -30,10 +30,13 @@ from webbpulse.e2e.identity import (
     DEFAULT_ACCESS_TOKEN_TTL,
     DEFAULT_REFRESH_PATH,
     DEFAULT_REFRESH_SKEW,
+    DEFAULT_STEP_UP_PATH,
     IdentitySession,
     RefreshFailed,
+    StepUpFailed,
     decode_claims,
     login,
+    step_up,
     token_expiry,
 )
 
@@ -803,3 +806,63 @@ class TestRefreshCookieOwnership:
         refresh_request = next(r for r in recorder.requests if r.url.path == DEFAULT_REFRESH_PATH)
         assert refresh_request.headers.get("cookie", "") == "refresh_token=cookie-1"
         assert session.refreshes == 1
+
+
+def dated_token(auth_time: int, *, marker: str) -> str:
+    """An unsigned token carrying `auth_time`, for the step-up helper's checks."""
+    claims = {"sub": SUBJECT, "exp": 2_000_000_000, "auth_time": auth_time, "marker": marker}
+    return f"{segment({'alg': 'RS256', 'typ': 'JWT'})}.{segment(claims)}.signature"
+
+
+class TestStepUp:
+    """Tests for `step_up`, which re-authenticates a session through the password path."""
+
+    def scripted(self, *, step_status: int = 200, refreshed_auth_time: int = 2_000) -> Recorder:
+        """A backend answering step-up with `auth_time` 2000 and refresh with `refreshed_auth_time`."""
+
+        def answer(request: httpx.Request, index: int) -> httpx.Response:
+            """Script the step-up and refresh routes."""
+            if request.url.path == DEFAULT_STEP_UP_PATH:
+                if step_status != 200:
+                    return httpx.Response(step_status, json={"success": False, "error_code": "INVALID_CREDENTIALS"})
+                return httpx.Response(200, json={"access_token": dated_token(2_000, marker="stepped")})
+            return httpx.Response(
+                200,
+                json={"access_token": dated_token(refreshed_auth_time, marker="refreshed"), "refresh_token": "r-2"},
+            )
+
+        return Recorder(answer)
+
+    def test_steps_up_then_refreshes_onto_the_new_auth_time(self) -> None:
+        """The password goes to the step-up route, then one refresh adopts a token keeping its `auth_time`."""
+        recorder = self.scripted()
+        session = session_for(recorder, Clock(), expires_at=2_000_000_000)
+
+        returned = step_up(session, "hunter2")
+
+        assert returned is session
+        assert recorder.paths == [DEFAULT_STEP_UP_PATH, DEFAULT_REFRESH_PATH]
+        assert json.loads(recorder.requests[0].content) == {"password": "hunter2"}
+        assert session.claims["auth_time"] == 2_000
+        assert session.claims["marker"] == "refreshed"
+        assert session.refresh_token == "r-2"
+        assert session.refreshes == 1
+
+    def test_a_refused_step_up_raises_without_the_password(self) -> None:
+        """A 401 raises `StepUpFailed`, never retries as an expired token, and hides the password."""
+        recorder = self.scripted(step_status=401)
+        session = session_for(recorder, Clock(), expires_at=2_000_000_000)
+
+        with pytest.raises(StepUpFailed) as caught:
+            step_up(session, "hunter2")
+
+        assert "hunter2" not in str(caught.value)
+        assert recorder.paths == [DEFAULT_STEP_UP_PATH]
+
+    def test_a_refresh_that_loses_the_step_up_raises(self) -> None:
+        """A refreshed token older than the step-up means the family never recorded it."""
+        recorder = self.scripted(refreshed_auth_time=1_000)
+        session = session_for(recorder, Clock(), expires_at=2_000_000_000)
+
+        with pytest.raises(StepUpFailed, match="auth_time 1000"):
+            step_up(session, "hunter2")

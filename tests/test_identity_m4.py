@@ -1968,3 +1968,288 @@ def test_the_environment_wins_over_the_app_secret(monkeypatch: pytest.MonkeyPatc
 
     monkeypatch.setenv("IDENTITY_TOTP_MASTER_KEY", MASTER_KEY)
     assert resolve_totp_master_key(secret_arn="") == MASTER_KEY
+
+
+def _password_session(flows: IdentityFlows, hooks: FakeHooks, stores: IdentityStores) -> Any:
+    """A seeded account signed in with its password, with no factor enrolled."""
+    seed_account(hooks, stores)
+    return flows.login(email=EMAIL, password=PASSWORD)
+
+
+def test_refresh_carries_the_login_auth_time_without_bumping_it(
+    flows: IdentityFlows, hooks: FakeHooks, stores: IdentityStores, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A refreshed token keeps the login's `auth_time`, so refreshing never looks like a fresh login."""
+    first = _password_session(flows, hooks, stores)
+    login_auth_time = int(claims_of(first.access_token)["auth_time"])
+
+    with clock_advanced(monkeypatch, 20):
+        refreshed = flows.refresh(first.refresh_token)
+        again = flows.refresh(refreshed.refresh_token)
+
+    assert int(claims_of(refreshed.access_token)["auth_time"]) == login_auth_time
+    assert int(claims_of(again.access_token)["auth_time"]) == login_auth_time
+
+
+def test_a_step_up_survives_the_next_refresh(
+    flows: IdentityFlows, hooks: FakeHooks, stores: IdentityStores, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Step-up records its `auth_time` on the refresh family, so the next refresh carries it."""
+    first = _password_session(flows, hooks, stores)
+    session_id = str(claims_of(first.access_token)["sid"])
+    login_auth_time = int(claims_of(first.access_token)["auth_time"])
+
+    with clock_advanced(monkeypatch, 20):
+        stepped = flows.step_up_with_password(user_id=USER_ID, session_id=session_id, password=PASSWORD)
+        refreshed = flows.refresh(first.refresh_token)
+
+    stepped_auth_time = int(claims_of(stepped.access_token)["auth_time"])
+    assert stepped_auth_time > login_auth_time
+    assert int(claims_of(refreshed.access_token)["auth_time"]) == stepped_auth_time
+
+
+def test_a_totp_step_up_survives_the_next_refresh(
+    flows: IdentityFlows,
+    mfa: MfaService,
+    hooks: FakeHooks,
+    stores: IdentityStores,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The TOTP step-up records its `auth_time` on the family as the password one does."""
+    seed_account(hooks, stores)
+    seed, _ = enrol(mfa)
+    with pytest.raises(MfaChallengeRequired) as caught:
+        flows.login(email=EMAIL, password=PASSWORD)
+    first = flows.complete_mfa(ticket=caught.value.challenge.ticket, code=code_now(seed, offset=1))
+    session_id = str(claims_of(first.access_token)["sid"])
+
+    with clock_advanced(monkeypatch, 3):
+        stepped = flows.step_up(user_id=USER_ID, session_id=session_id, code=code_now(seed))
+        refreshed = flows.refresh(first.refresh_token)
+
+    assert int(claims_of(refreshed.access_token)["auth_time"]) == int(claims_of(stepped.access_token)["auth_time"])
+
+
+def test_password_step_up_mints_a_fresher_token_in_the_same_session(
+    flows: IdentityFlows, hooks: FakeHooks, stores: IdentityStores
+) -> None:
+    """A password step-up keeps the session, issues no refresh token and claims `pwd` alone."""
+    first = _password_session(flows, hooks, stores)
+    session_id = str(claims_of(first.access_token)["sid"])
+
+    stepped = flows.step_up_with_password(user_id=USER_ID, session_id=session_id, password=PASSWORD)
+
+    claims = claims_of(stepped.access_token)
+    assert claims["sid"] == session_id
+    assert claims["amr"] == [AMR_PASSWORD]
+    assert stepped.refresh_token == ""
+    assert stepped.family_id == session_id
+    assert abs(int(claims["auth_time"]) - int(time.time())) < 5
+
+
+def test_a_wrong_step_up_password_is_logins_refusal_and_counts_toward_lockout(
+    flows: IdentityFlows, hooks: FakeHooks, stores: IdentityStores, attempts: InMemoryLoginAttemptStore
+) -> None:
+    """A wrong password gives login's own 401 and records a failure under the account's email key."""
+    from webbpulse.identity.flows import LoginRejected
+    from webbpulse.identity.lockout import email_key
+
+    seed_account(hooks, stores)
+    with pytest.raises(LoginRejected) as by_login:
+        flows.login(email=EMAIL, password="not the password")
+    with pytest.raises(LoginRejected) as by_step_up:
+        flows.step_up_with_password(user_id=USER_ID, session_id="session-1", password="not the password")
+
+    assert (by_step_up.value.status_code, by_step_up.value.error_code, by_step_up.value.message) == (
+        by_login.value.status_code,
+        by_login.value.error_code,
+        by_login.value.message,
+    )
+    assert by_step_up.value.status_code == 401
+    assert [row.outcome for row in attempts.recent(email_key(EMAIL))].count("failure") == 2
+
+
+def test_step_up_failures_lock_login_and_login_failures_lock_step_up(
+    flows: IdentityFlows, hooks: FakeHooks, stores: IdentityStores
+) -> None:
+    """Both routes share one lockout: five mixed failures make the next attempt on either a 429."""
+    from webbpulse.identity.flows import LoginRejected, RateLimited
+
+    seed_account(hooks, stores)
+    for index in range(5):
+        with pytest.raises(LoginRejected):
+            if index % 2:
+                flows.login(email=EMAIL, password="wrong")
+            else:
+                flows.step_up_with_password(user_id=USER_ID, session_id="session-1", password="wrong")
+
+    with pytest.raises(RateLimited):
+        flows.step_up_with_password(user_id=USER_ID, session_id="session-1", password=PASSWORD)
+    with pytest.raises(RateLimited):
+        flows.login(email=EMAIL, password=PASSWORD)
+
+
+def test_a_user_with_mfa_may_step_up_with_the_password_alone(
+    flows: IdentityFlows, mfa: MfaService, hooks: FakeHooks, stores: IdentityStores
+) -> None:
+    """The password is enough for step-up even with TOTP enrolled, as in GitHub sudo mode."""
+    seed_account(hooks, stores)
+    enrol(mfa)
+
+    stepped = flows.step_up_with_password(user_id=USER_ID, session_id="session-1", password=PASSWORD)
+
+    assert claims_of(stepped.access_token)["amr"] == [AMR_PASSWORD]
+
+
+def test_a_user_with_mfa_and_no_password_is_refused_as_a_wrong_password(
+    flows: IdentityFlows,
+    mfa: MfaService,
+    hooks: FakeHooks,
+    stores: IdentityStores,
+    attempts: InMemoryLoginAttemptStore,
+) -> None:
+    """With a factor but no password the attempt is login's 401, counted, rather than a 503."""
+    from webbpulse.identity.flows import LoginRejected
+    from webbpulse.identity.lockout import email_key
+
+    hooks.add(EMAIL, user_id=USER_ID)
+    enrol(mfa)
+
+    with pytest.raises(LoginRejected) as caught:
+        flows.step_up_with_password(user_id=USER_ID, session_id="session-1", password=PASSWORD)
+
+    assert caught.value.status_code == 401
+    assert caught.value.error_code == "INVALID_CREDENTIALS"
+    assert [row.outcome for row in attempts.recent(email_key(EMAIL))] == ["failure"]
+
+
+def test_a_user_with_neither_password_nor_mfa_gets_mfa_not_configured(flows: IdentityFlows, hooks: FakeHooks) -> None:
+    """Nothing to re-prove is the 503 `MFA_NOT_CONFIGURED`, kept for exactly this case."""
+    hooks.add(EMAIL, user_id=USER_ID)
+
+    with pytest.raises(MfaRejected) as caught:
+        flows.step_up_with_password(user_id=USER_ID, session_id="session-1", password=PASSWORD)
+
+    assert caught.value.status_code == 503
+    assert caught.value.error_code == "MFA_NOT_CONFIGURED"
+
+
+def test_password_step_up_is_refused_when_passwords_are_off(
+    hooks: FakeHooks, stores: IdentityStores, kms: FakeKms
+) -> None:
+    """A deployment with password sign-in closed refuses a password step-up with the same 403."""
+    from webbpulse.identity.flows import LoginRejected
+
+    settings = make_settings(passwords_enabled=False)
+    flows = IdentityFlows(settings, hooks, stores, TokenService(settings, kms), kms_client=kms)
+    seed_account(hooks, stores)
+
+    with pytest.raises(LoginRejected) as caught:
+        flows.step_up_with_password(user_id=USER_ID, session_id="session-1", password=PASSWORD)
+
+    assert (caught.value.status_code, caught.value.error_code) == (403, "PASSWORDS_DISABLED")
+
+
+def test_password_step_up_over_http_without_mfa_stores(hooks: FakeHooks, kms: FakeKms) -> None:
+    """The step-up route is mounted without MFA, and a password body steps up with no cookie."""
+    from webbpulse.http import register_error_handlers
+
+    stores = IdentityStores(
+        credentials=InMemoryCredentialStore(),
+        refresh_tokens=InMemoryRefreshTokenStore(),
+        identity_tokens=InMemoryIdentityTokenStore(),
+    )
+    seed_account(hooks, stores)
+    app = FastAPI()
+    register_error_handlers(app, error_codes=True)
+    app.include_router(
+        build_identity_router(
+            make_settings(),
+            hooks,
+            stores,
+            kms_client=kms,
+            attempts=InMemoryLoginAttemptStore(),
+            limiter_enabled=False,
+        )
+    )
+    with TestClient(app, base_url="https://api.example.com") as client:
+        login = client.post(f"{prefix()}{LOGIN_PATH}", json={"email": EMAIL, "password": PASSWORD})
+        auth = {"Authorization": f"Bearer {login.json()['access_token']}"}
+        response = client.post(f"{prefix()}{STEP_UP_PATH}", headers=auth, json={"password": PASSWORD})
+        code_body = client.post(f"{prefix()}{STEP_UP_PATH}", headers=auth, json={"code": "123456"})
+
+    assert response.status_code == 200
+    assert set(response.json()) == {"access_token", "token_type", "expires_in"}
+    assert response.json()["token_type"] == "Bearer"
+    assert "set-cookie" not in {name.lower() for name in response.headers}
+    assert claims_of(response.json()["access_token"])["amr"] == [AMR_PASSWORD]
+    assert code_body.status_code == 503
+    assert code_body.json()["error_code"] == "MFA_NOT_CONFIGURED"
+
+
+def test_a_wrong_password_over_http_is_logins_envelope(
+    client: TestClient, hooks: FakeHooks, stores: IdentityStores
+) -> None:
+    """The route answers a wrong password with the same envelope the login route does."""
+    seed_account(hooks, stores)
+    login = client.post(f"{prefix()}{LOGIN_PATH}", json={"email": EMAIL, "password": PASSWORD})
+    auth = {"Authorization": f"Bearer {login.json()['access_token']}"}
+
+    stepped = client.post(f"{prefix()}{STEP_UP_PATH}", headers=auth, json={"password": "wrong"})
+    logged = client.post(f"{prefix()}{LOGIN_PATH}", json={"email": EMAIL, "password": "wrong"})
+
+    assert stepped.status_code == logged.status_code == 401
+    assert {k: v for k, v in stepped.json().items() if k != "request_id"} == {
+        k: v for k, v in logged.json().items() if k != "request_id"
+    }
+
+
+def test_a_locked_account_step_up_over_http_is_a_429_with_retry_after(
+    client: TestClient, hooks: FakeHooks, stores: IdentityStores
+) -> None:
+    """Lockout reaches the step-up route as a 429 carrying `Retry-After`."""
+    seed_account(hooks, stores)
+    login = client.post(f"{prefix()}{LOGIN_PATH}", json={"email": EMAIL, "password": PASSWORD})
+    auth = {"Authorization": f"Bearer {login.json()['access_token']}"}
+    for _ in range(5):
+        client.post(f"{prefix()}{STEP_UP_PATH}", headers=auth, json={"password": "wrong"})
+
+    response = client.post(f"{prefix()}{STEP_UP_PATH}", headers=auth, json={"password": PASSWORD})
+
+    assert response.status_code == 429
+    assert response.json()["error_code"] == "TOO_MANY_ATTEMPTS"
+    assert int(response.headers["retry-after"]) >= 1
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        {"password": PASSWORD, "code": "123456"},
+        {"password": PASSWORD, "credential": {}, "challenge_id": "c"},
+        {"password": ""},
+        {"password": 12345},
+    ],
+)
+def test_a_malformed_password_step_up_body_is_a_422(
+    client: TestClient, hooks: FakeHooks, stores: IdentityStores, body: dict[str, Any]
+) -> None:
+    """A blank or non-string password, or one sent with another factor, is a 422 and no attempt."""
+    seed_account(hooks, stores)
+    login = client.post(f"{prefix()}{LOGIN_PATH}", json={"email": EMAIL, "password": PASSWORD})
+    auth = {"Authorization": f"Bearer {login.json()['access_token']}"}
+
+    response = client.post(f"{prefix()}{STEP_UP_PATH}", headers=auth, json=body)
+
+    assert response.status_code == 422
+
+
+def test_password_step_up_without_a_bearer_is_a_401(
+    client: TestClient, hooks: FakeHooks, stores: IdentityStores
+) -> None:
+    """The route needs a signed-in caller before it looks at the password."""
+    seed_account(hooks, stores)
+
+    response = client.post(f"{prefix()}{STEP_UP_PATH}", json={"password": PASSWORD})
+
+    assert response.status_code == 401
+    assert response.json()["error_code"] == "NOT_AUTHENTICATED"

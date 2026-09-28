@@ -379,66 +379,9 @@ class IdentityFlows:
             raise LoginRejected()
         identity = email_key(normalised_email)
 
-        state = self._lockout_state(identity, now=moment)
-        if state.locked:
-            self._record(identity, "locked", ip=ip, user_agent=user_agent)
-            _log.warning(
-                "Login refused by progressive lockout.",
-                extra={"event": "login.locked", "ip": ip, "failures": state.failures},
-            )
-            raise RateLimited(state.retry_after_seconds(now=moment))
-
+        self._refuse_when_locked(identity, ip=ip, user_agent=user_agent, now=moment)
         user = self._hooks.load_user_by_email(normalised_email) if normalised_email else None
-        presented = normalise_password(password)
-
-        credential = None
-        if user is not None:
-            credential = self._stores.require_credentials().get(_user_id(user), PASSWORD_CREDENTIAL_TYPE)
-
-        if user is None or credential is None or not credential.secret:
-            equalise_password_timing(presented)
-            self._fail(identity, ip=ip, user_agent=user_agent, reason="unknown_or_no_credential")
-
-        from webbpulse.security import needs_rehash, verify_password
-
-        if not verify_password(presented, credential.secret):
-            self._fail(
-                identity,
-                ip=ip,
-                user_agent=user_agent,
-                user_id=_user_id(user),
-                reason="wrong_password",
-            )
-
-        try:
-            self._hooks.may_authenticate(user)
-        except AuthenticationRefused as refused:
-            self._fail(
-                identity,
-                ip=ip,
-                user_agent=user_agent,
-                user_id=_user_id(user),
-                reason="refused_by_hook",
-                message=refused.message,
-                error_code=refused.error_code,
-            )
-
-        if needs_rehash(credential.secret):
-            from webbpulse.identity.storage import CredentialRecord
-            from webbpulse.security import hash_password
-
-            self._stores.require_credentials().put(
-                CredentialRecord(
-                    user_id=_user_id(user),
-                    credential_type=PASSWORD_CREDENTIAL_TYPE,
-                    secret=hash_password(presented),
-                    created_at=credential.created_at,
-                    updated_at=now_iso(),
-                    attributes=credential.attributes,
-                )
-            )
-
-        self._record(identity, "success", user_id=_user_id(user), ip=ip, user_agent=user_agent)
+        user = self._check_password(identity, user, password, ip=ip, user_agent=user_agent)
         _log.info(
             "Login succeeded.",
             extra={
@@ -546,11 +489,13 @@ class IdentityFlows:
             raise MfaRejected()
 
         method = service.verify_challenge(user_id, code)
+        auth_time = int(time.time())
+        self._sessions.record_reauthentication(session_id, auth_time)
         access = self._mint_access(
             user,
             session_id=session_id,
             amr=[AMR_PASSWORD, method],
-            auth_time=int(time.time()),
+            auth_time=auth_time,
         )
         _log.info(
             "Step-up authentication succeeded.",
@@ -604,11 +549,13 @@ class IdentityFlows:
         from webbpulse.identity.passkeys import AMR_PASSKEY
 
         service.finish_step_up(user_id, challenge_id=challenge_id, credential=credential)
+        auth_time = int(time.time())
+        self._sessions.record_reauthentication(session_id, auth_time)
         access = self._mint_access(
             user,
             session_id=session_id,
             amr=[AMR_PASSWORD, AMR_PASSKEY],
-            auth_time=int(time.time()),
+            auth_time=auth_time,
         )
         _log.info(
             "Step-up authentication succeeded.",
@@ -621,6 +568,74 @@ class IdentityFlows:
             refresh_token="",
             family_id=session_id,
         )
+
+    def step_up_with_password(
+        self,
+        *,
+        user_id: str,
+        session_id: str,
+        password: str,
+        ip: str = "",
+        user_agent: str = "",
+        now: datetime | None = None,
+    ) -> AuthResult:
+        """Re-authenticate inside an existing session with the account password.
+
+        The same result as `step_up`, with `amr` of `pwd`. The password goes through the check
+        login uses, under the same lockout key, so a wrong password here gives login's
+        refusal and counts toward the account's lockout. A password alone is enough even
+        when the user has MFA, as in GitHub sudo mode. A user with neither a password nor a
+        second factor gets the 503 `MFA_NOT_CONFIGURED`.
+        """
+        moment = now or datetime.now(UTC)
+        if not self._settings.passwords_enabled:
+            raise LoginRejected(
+                "Password sign-in is not available.",
+                error_code="PASSWORDS_DISABLED",
+                status_code=403,
+            )
+        user = self._hooks.load_user_by_id(user_id)
+        if user is None:
+            raise LoginRejected()
+
+        if not self._has_password(user_id) and not self._has_second_factor(user_id):
+            raise MfaRejected(
+                "Multi-factor authentication is not available.",
+                error_code="MFA_NOT_CONFIGURED",
+                status_code=503,
+            )
+
+        email = _normalise_email(str(user.get("email", "")))
+        identity = email_key(email) if email else f"user#{user_id}"
+        self._refuse_when_locked(identity, ip=ip, user_agent=user_agent, now=moment, purpose="step_up")
+        self._check_password(identity, user, password, ip=ip, user_agent=user_agent, purpose="step_up")
+
+        auth_time = int(time.time())
+        self._sessions.record_reauthentication(session_id, auth_time)
+        access = self._mint_access(user, session_id=session_id, amr=[AMR_PASSWORD], auth_time=auth_time)
+        _log.info(
+            "Step-up authentication succeeded.",
+            extra={"event": "mfa.step_up", "user_id": user_id, "method": AMR_PASSWORD},
+        )
+        return AuthResult(
+            access_token=access,
+            expires_in=int(self._settings.access_token_ttl.total_seconds()),
+            user=user,
+            refresh_token="",
+            family_id=session_id,
+        )
+
+    def _has_password(self, user_id: str) -> bool:
+        """Whether the user has a stored password hash."""
+        credential = self._stores.require_credentials().get(user_id, PASSWORD_CREDENTIAL_TYPE)
+        return credential is not None and bool(credential.secret)
+
+    def _has_second_factor(self, user_id: str) -> bool:
+        """Whether the user has an active TOTP factor or a registered passkey."""
+        if self.mfa is not None and self.mfa.factors_for(user_id):
+            return True
+        passkeys = self.passkeys
+        return passkeys is not None and bool(passkeys.list_passkeys(user_id))
 
     def disable_totp(self, *, user_id: str, code: str) -> None:
         """Remove the factor and every recovery code, after proving possession of the factor.
@@ -919,7 +934,11 @@ class IdentityFlows:
             )
             raise LoginRejected(refused.message, error_code=refused.error_code) from refused
 
-        access = self._mint_access(user, session_id=result.issued.family_id)
+        access = self._mint_access(
+            user,
+            session_id=result.issued.family_id,
+            auth_time=result.issued.auth_time or None,
+        )
         _log.info(
             "Session refreshed.",
             extra={
@@ -1475,7 +1494,7 @@ class IdentityFlows:
         """Start a family and mint the first access token for it."""
         user_id = _user_id(user)
         issued = self._sessions.start_family(user_id, device=_device_class(user_agent), ip=ip)
-        access = self._mint_access(user, session_id=issued.family_id, amr=amr)
+        access = self._mint_access(user, session_id=issued.family_id, amr=amr, auth_time=issued.auth_time)
         return AuthResult(
             access_token=access,
             expires_in=int(self._settings.access_token_ttl.total_seconds()),
@@ -1572,6 +1591,95 @@ class IdentityFlows:
                     extra={"event": "login.attempt_write_failed", "outcome": outcome},
                 )
 
+    def _refuse_when_locked(
+        self, identity: str, *, ip: str, user_agent: str, now: datetime, purpose: str = "login"
+    ) -> None:
+        """Raise `RateLimited` when progressive lockout is in effect for `identity`."""
+        state = self._lockout_state(identity, now=now)
+        if state.locked:
+            self._record(identity, "locked", ip=ip, user_agent=user_agent)
+            _log.warning(
+                "Password attempt refused by progressive lockout.",
+                extra={"event": f"{purpose}.locked", "ip": ip, "failures": state.failures},
+            )
+            raise RateLimited(state.retry_after_seconds(now=now))
+
+    def _check_password(
+        self,
+        identity: str,
+        user: Mapping[str, Any] | None,
+        password: str,
+        *,
+        ip: str,
+        user_agent: str,
+        purpose: str = "login",
+    ) -> Mapping[str, Any]:
+        """Verify a password against the stored hash, the one check login and step-up share.
+
+        Always verifies against a real or dummy hash, asks the product, rehashes a stale hash
+        and records the attempt under `identity`, so a failure here counts toward the same
+        lockout whichever route it came through. Every refusal raises the same
+        `LoginRejected` that login gives a wrong password. Returns the verified user.
+        """
+        presented = normalise_password(password)
+        credential = None
+        if user is not None:
+            credential = self._stores.require_credentials().get(_user_id(user), PASSWORD_CREDENTIAL_TYPE)
+
+        if user is None or credential is None or not credential.secret:
+            equalise_password_timing(presented)
+            self._fail(
+                identity,
+                ip=ip,
+                user_agent=user_agent,
+                reason="unknown_or_no_credential",
+                purpose=purpose,
+            )
+
+        from webbpulse.security import needs_rehash, verify_password
+
+        if not verify_password(presented, credential.secret):
+            self._fail(
+                identity,
+                ip=ip,
+                user_agent=user_agent,
+                user_id=_user_id(user),
+                reason="wrong_password",
+                purpose=purpose,
+            )
+
+        try:
+            self._hooks.may_authenticate(user)
+        except AuthenticationRefused as refused:
+            self._fail(
+                identity,
+                ip=ip,
+                user_agent=user_agent,
+                user_id=_user_id(user),
+                reason="refused_by_hook",
+                message=refused.message,
+                error_code=refused.error_code,
+                purpose=purpose,
+            )
+
+        if needs_rehash(credential.secret):
+            from webbpulse.identity.storage import CredentialRecord
+            from webbpulse.security import hash_password
+
+            self._stores.require_credentials().put(
+                CredentialRecord(
+                    user_id=_user_id(user),
+                    credential_type=PASSWORD_CREDENTIAL_TYPE,
+                    secret=hash_password(presented),
+                    created_at=credential.created_at,
+                    updated_at=now_iso(),
+                    attributes=credential.attributes,
+                )
+            )
+
+        self._record(identity, "success", user_id=_user_id(user), ip=ip, user_agent=user_agent)
+        return user
+
     def _fail(
         self,
         identity: str,
@@ -1582,17 +1690,18 @@ class IdentityFlows:
         reason: str,
         message: str = INVALID_CREDENTIALS_MESSAGE,
         error_code: str = "INVALID_CREDENTIALS",
+        purpose: str = "login",
     ) -> NoReturn:
-        """Record a failed login and raise. Never returns.
+        """Record a failed password attempt and raise. Never returns.
 
         `NoReturn` so the type checker narrows after each call site. `reason` reaches the log
-        and never the response.
+        and never the response. `purpose` names the route in the log event.
         """
         self._record(identity, "failure", user_id=user_id, ip=ip, user_agent=user_agent)
         _log.info(
-            "Login failed.",
+            "Password attempt failed.",
             extra={
-                "event": "login.failure",
+                "event": f"{purpose}.failure",
                 "reason": reason,
                 "user_id": user_id,
                 "ip": ip,
