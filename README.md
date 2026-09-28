@@ -426,6 +426,10 @@ app.include_router(build_identity_router(settings, hooks, stores, tokens=tokens)
   `user_id` reads `"-"` for the rest of the request. Nothing raises. Use
   `webbpulse.http.user_id_dependency`, which wraps the resolver in an `async def`, or `await
   webbpulse.http.bind_user_id(...)`. Portfolio shipped the broken shape to production.
+- **MCP `/authorize` reads the refresh cookie, so keep `cookie_path` at or above the
+  issuer path.** A browser tab opened by an MCP client carries no bearer. Narrow the cookie
+  path and a signed-in user is sent to `mcp_login_url`, or answered 401, every time. The
+  login page must allowlist the returned authorize URL by exact origin and path.
 - **Mount the identity router with no prefix.** The gateway builds the discovery URL as
   `issuer + "/.well-known/openid-configuration"`, so the issuer decides where the routes
   live and `build_identity_router` places itself there. A prefix of your own doubles the

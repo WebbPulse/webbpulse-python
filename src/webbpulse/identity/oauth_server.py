@@ -54,6 +54,7 @@ __all__ = [
     "TOKEN_PATH",
     "AuthorizationRequest",
     "AuthorizationRevocation",
+    "AuthorizationSubject",
     "ConsentContext",
     "ConsentRenderer",
     "OAuthServerError",
@@ -179,6 +180,20 @@ class AuthorizationRevocation:
 
     consents: tuple[ConsentRecord, ...]
     refresh_records_revoked: int = 0
+
+
+@dataclass(frozen=True, slots=True)
+class AuthorizationSubject:
+    """The signed-in user behind an `/authorize` or consent request.
+
+    `auth_time` is when that user last authenticated, in epoch seconds, or 0 when unknown;
+    `session_id` is the refresh family the request rode on, when there is one. Resolved from
+    a bearer or authorizer claims first, then from the refresh cookie, read-only.
+    """
+
+    user_id: str
+    auth_time: int = 0
+    session_id: str = ""
 
 
 @dataclass(frozen=True, slots=True)
@@ -811,16 +826,19 @@ def _iso(moment: int) -> str:
     return datetime.fromtimestamp(moment, UTC).isoformat().replace("+00:00", "Z")
 
 
-def _consent_signature(settings: IdentitySettings, payload: Mapping[str, str]) -> str:
-    """An HMAC binding a consent form to the request it approves.
+def _consent_signature(settings: IdentitySettings, payload: Mapping[str, str], *, subject: str = "") -> str:
+    """An HMAC binding a consent form to the request it approves and the user shown it.
 
     The form carries the authorization parameters through the user's browser, so without
     this a user could be induced to post a form whose scopes or tenant differ from the ones
-    they were shown. Keyed on the signing material the deployment already holds.
+    they were shown. The signed-in user id is mixed in but never sent, so a form minted for
+    one account cannot be replayed into another account's session. Keyed on the signing
+    material the deployment already holds.
     """
     import hmac
 
-    material = "|".join(f"{key}={payload.get(key, '')}" for key in sorted(payload))
+    bound = {**payload, "\x00subject": subject}
+    material = "|".join(f"{key}={bound.get(key, '')}" for key in sorted(bound))
     key = (settings.totp_master_key or settings.issuer).encode("utf-8")
     return hmac.new(key, material.encode("utf-8"), hashlib.sha256).hexdigest()
 
@@ -888,12 +906,16 @@ def build_oauth_server_router(
     tenant_resolver: TenantResolver | None = None,
     limits: Callable[..., list[Any]] | None = None,
     subject_resolver: Callable[[Request], str] | None = None,
+    authorization_subject_resolver: Callable[[Request], AuthorizationSubject | None] | None = None,
 ) -> APIRouter:
     """The OAuth 2.1 authorization server router, mounted behind `mcp_oauth_enabled`.
 
     Mounted by `build_identity_router` at the issuer's prefix, so every endpoint sits under
     the same issuer the discovery documents advertise. The two `.well-known` documents must
     be reachable with no authorizer, exactly as the OIDC ones are.
+
+    `authorization_subject_resolver` wins over the older `subject_resolver`, which carries
+    no `auth_time` and so always counts as stale when `mcp_consent_max_age` is set.
     """
     from fastapi import APIRouter
     from fastapi.responses import JSONResponse, RedirectResponse
@@ -911,13 +933,50 @@ def build_oauth_server_router(
         """The rate limit dependencies for one route, or none when the product supplied no builder."""
         return limits(*specs) if limits is not None else []
 
-    def subject_of(request: Request) -> str:
-        """The signed-in user for this request, or an empty string.
+    def subject_of(request: Request) -> AuthorizationSubject | None:
+        """The signed-in user for this request, or None.
 
-        Delegates to the resolver `build_identity_router` passes, which is the same bearer
-        and authorizer-context path every other authenticated identity route uses.
+        Delegates to the resolver `build_identity_router` passes: the bearer and authorizer
+        context every other identity route uses, then the refresh cookie, read-only.
         """
-        return subject_resolver(request) if subject_resolver is not None else ""
+        if authorization_subject_resolver is not None:
+            found = authorization_subject_resolver(request)
+            return found if found is not None and found.user_id else None
+        user_id = subject_resolver(request) if subject_resolver is not None else ""
+        return AuthorizationSubject(user_id=user_id) if user_id else None
+
+    def is_stale(subject: AuthorizationSubject) -> bool:
+        """Whether the user's last authentication is older than `mcp_consent_max_age` allows."""
+        max_age = int(settings.mcp_consent_max_age.total_seconds())
+        if max_age <= 0:
+            return False
+        return subject.auth_time <= 0 or int(time.time()) - subject.auth_time > max_age
+
+    def sign_in_response(params: Mapping[str, str], *, stale: bool, status: int) -> Any:
+        """Send the browser to the product's login page, or answer 401 when none is set.
+
+        The return URL is rebuilt from the issuer and the authorize path, never taken from
+        the request, so the login page can only ever be handed this server's own authorize
+        endpoint to come back to.
+        """
+        if not settings.mcp_login_url:
+            return JSONResponse(
+                {
+                    "error": "login_required",
+                    "error_description": "Sign in to this product, then retry the authorization request.",
+                },
+                status_code=401,
+                headers={"Cache-Control": "no-store"},
+            )
+        return_to = f"{settings.issuer}{AUTHORIZE_PATH}?{urlencode(list(params.items()))}"
+        extra = {settings.mcp_login_return_param: return_to}
+        if stale:
+            extra["prompt"] = "login"
+        return RedirectResponse(
+            _redirect_with(settings.mcp_login_url, extra),
+            status_code=status,
+            headers={"Cache-Control": "no-store"},
+        )
 
     def error_response(exc: OAuthServerError) -> JSONResponse:
         """The RFC 6749 error body, which is a flat object rather than this package's envelope.
@@ -953,21 +1012,16 @@ def build_oauth_server_router(
         than a redirect: there is no validated place to send the user, and redirecting to an
         unvalidated URI is the open redirect this check exists to prevent.
         """
+        query = dict(request.query_params)
         try:
-            parsed = service.parse_authorization_request(dict(request.query_params))
+            parsed = service.parse_authorization_request(query)
         except OAuthServerError as exc:
             return error_response(exc)
 
-        user_id = subject_of(request)
-        if not user_id:
-            return JSONResponse(
-                {
-                    "error": "login_required",
-                    "error_description": "Sign in to this product, then retry the authorization request.",
-                },
-                status_code=401,
-                headers={"Cache-Control": "no-store"},
-            )
+        subject = subject_of(request)
+        if subject is None or is_stale(subject):
+            return sign_in_response(query, stale=subject is not None, status=302)
+        user_id = subject.user_id
 
         tenants = tuple(tenant_resolver(user_id)) if tenant_resolver is not None else ()
         fields = {
@@ -980,7 +1034,7 @@ def build_oauth_server_router(
             "code_challenge": parsed.code_challenge,
             "code_challenge_method": parsed.code_challenge_method,
         }
-        fields["signature"] = _consent_signature(settings, fields)
+        fields["signature"] = _consent_signature(settings, fields, subject=user_id)
         return render(
             ConsentContext(
                 request=parsed,
@@ -1003,28 +1057,29 @@ def build_oauth_server_router(
         form posted from elsewhere, or one whose scope or tenant was edited in the browser,
         cannot mint a code for something the user was never shown.
         """
+        if request.headers.get("sec-fetch-site", "").lower() == "cross-site":
+            return error_response(
+                OAuthServerError("invalid_request", "The consent form must be posted from this server.", status=403)
+            )
         params = await _form_params(request)
         signature = params.pop("signature", "")
         decision = params.pop("decision", "")
         tenant_id = params.pop("tenant_id", "")
-
-        expected = _consent_signature(settings, params)
-        if not constant_time_equals(signature, expected):
-            return error_response(
-                OAuthServerError("invalid_request", "The consent form did not match the request it approves.")
-            )
 
         try:
             parsed = service.parse_authorization_request(params)
         except OAuthServerError as exc:
             return error_response(exc)
 
-        user_id = subject_of(request)
-        if not user_id:
-            return JSONResponse(
-                {"error": "login_required", "error_description": "Sign in and retry the authorization request."},
-                status_code=401,
-                headers={"Cache-Control": "no-store"},
+        subject = subject_of(request)
+        if subject is None or is_stale(subject):
+            return sign_in_response(params, stale=subject is not None, status=303)
+        user_id = subject.user_id
+
+        expected = _consent_signature(settings, params, subject=user_id)
+        if not constant_time_equals(signature, expected):
+            return error_response(
+                OAuthServerError("invalid_request", "The consent form did not match the request it approves.")
             )
 
         if decision != "allow":
@@ -1141,9 +1196,10 @@ def build_oauth_server_router(
 OAUTH_SERVER_ROUTE_RESPONSES: Final[dict[tuple[str, str], dict[int, str]]] = {
     ("GET", AUTHORIZE_PATH): {
         200: "The consent screen is rendered",
+        302: "The user is not signed in, or signed in too long ago, and is sent to the login page",
         303: "The browser is redirected back to the client with a code or an error",
         400: "The authorization request is malformed, or its PKCE, scope or resource is refused",
-        401: "The user is not signed in, or the client is unknown",
+        401: "The user is not signed in and no login page is configured, or the client is unknown",
     },
     ("POST", TOKEN_PATH): {
         200: "An access token, and a refresh token where one is offered",

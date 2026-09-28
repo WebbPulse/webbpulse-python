@@ -26,6 +26,7 @@ if TYPE_CHECKING:  # pragma: no cover
 
 __all__ = [
     "IssuedRefresh",
+    "PresentedSession",
     "RotationOutcome",
     "RotationResult",
     "SessionService",
@@ -55,6 +56,19 @@ class IssuedRefresh:
     expires_at: int
     device: str = ""
     auth_time: int = 0
+
+
+@dataclass(frozen=True, slots=True)
+class PresentedSession:
+    """A live refresh family, as `SessionService.peek` read it without touching it.
+
+    `auth_time` is the family's last authentication in epoch seconds: the login, or a
+    later step-up.
+    """
+
+    user_id: str
+    family_id: str
+    auth_time: int
 
 
 @dataclass(frozen=True, slots=True)
@@ -314,6 +328,31 @@ class SessionService:
             issued=issued,
             family_id=current.family_id,
             user_id=current.user_id,
+        )
+
+    def peek(self, presented: str, *, now: datetime | None = None) -> PresentedSession | None:
+        """Read the live family a presented refresh token belongs to, writing nothing.
+
+        For a browser request that must know who is signed in without spending the cookie,
+        such as the OAuth authorization screen. Returns `None` for an unknown, revoked,
+        expired, past-cap, consumed or rotated-out token. A spent token is refused rather
+        than treated as reuse: this path never rotates, never revokes and never updates a
+        row, so it cannot trip reuse detection or race a concurrent refresh.
+        """
+        if not presented:
+            return None
+        moment = now or datetime.now(UTC)
+        record = self._store.get(hash_token(presented))
+        if record is None or record.revoked:
+            return None
+        if record.is_consumed or record.successor_hash:
+            return None
+        if is_expired(record.expires_at, now=moment) or self._past_absolute_cap(record, moment):
+            return None
+        return PresentedSession(
+            user_id=record.user_id,
+            family_id=record.family_id,
+            auth_time=self._auth_time(record),
         )
 
     def revoke_family(self, family_id: str) -> int:

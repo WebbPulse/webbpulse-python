@@ -5,6 +5,26 @@ Notable changes to the `webbpulse` package. The version here is the one in
 
 This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## Unreleased
+
+### `identity`: browser sign-in for the MCP authorization server (minor)
+
+`/authorize` and its consent post now recognise a browser signed in by its refresh cookie.
+An MCP client opens the authorize URL in a plain tab that carries no bearer, so a signed-in
+user used to get 401 `login_required`. The subject is resolved from the bearer or authorizer
+claims first, then from the `cookie_name` cookie through the new read-only
+`SessionService.peek`, which refuses revoked, expired, capped and rotated-out tokens, writes
+nothing and never trips reuse detection. The user must still load and pass
+`may_authenticate`.
+
+New settings: `mcp_login_url` (`IDENTITY_MCP_LOGIN_URL`) sends a browser with no session to
+the product's login page with `mcp_login_return_param` (default `returnTo`) set to the full
+authorize URL, rebuilt from the issuer; unset keeps the 401. `mcp_consent_max_age` (default
+off) sends a session whose `auth_time` is older than the window back through that login page
+with `prompt=login`. The consent signature now also binds the signed-in user id, and a consent
+post with `Sec-Fetch-Site: cross-site` is refused with 403. `build_oauth_server_router` gains
+`authorization_subject_resolver`, returning the new `AuthorizationSubject`.
+
 ## 0.62.0
 
 ### `identity`: `require_recent_auth` step-up gate and password step-up (minor)
