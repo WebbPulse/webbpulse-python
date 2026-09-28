@@ -61,7 +61,7 @@ from .journeys import (
     Record,
     RouteSpec,
 )
-from .xdist import SHARED_STATE_GROUP, apply_groups, worker_id
+from .xdist import SHARED_STATE_GROUP, GroupingPlugin, worker_id
 
 __all__ = [
     "CREATE_PATH",
@@ -341,8 +341,18 @@ def pytest_addhooks(pluginmanager: Any) -> None:
     pluginmanager.add_hookspecs(hookspecs)
 
 
+GROUPING_PLUGIN_NAME = "webbpulse-e2e-xdist-grouping"
+
+
 def pytest_configure(config: pytest.Config) -> None:
-    """Register the `e2e_writes` marker, so `--strict-markers` accepts it."""
+    """Register the `e2e_writes` marker and the xdist grouping pass.
+
+    The grouping is its own `tryfirst` plugin so it runs ahead of xdist's worker hook, which
+    reads the group markers, while the rest of this plugin's collection hook keeps its order
+    relative to a product's conftest.
+    """
+    if not config.pluginmanager.has_plugin(GROUPING_PLUGIN_NAME):
+        config.pluginmanager.register(GroupingPlugin(), GROUPING_PLUGIN_NAME)
     config.addinivalue_line(
         "markers",
         f"{WRITES_MARKER}: this case signs in as the e2e user, writes, or mutates state. "
@@ -370,10 +380,10 @@ LOCAL_SKIPPED_CASES: Mapping[str, str] = {
 
 
 def pytest_collection_modifyitems(config: pytest.Config, items: list[pytest.Item]) -> None:
-    """Group the shared-state cases for xdist, then skip what this environment cannot run.
+    """Order the run-wide groups, then skip what this environment cannot run.
 
-    The grouping runs on every collection, distributed or not: an `xdist_group` marker is
-    inert without xdist, so one pass serves both.
+    The shared-state `xdist_group` markers are applied earlier, by `GroupingPlugin`, on every
+    collection distributed or not: an `xdist_group` marker is inert without xdist.
 
     One place rather than a conditional in each case, so a product that marks a new mutating
     test gets the production skip for free and cannot accidentally ship one that runs there,
@@ -381,7 +391,6 @@ def pytest_collection_modifyitems(config: pytest.Config, items: list[pytest.Item
     environment is read directly rather than through the `e2e_env` fixture because
     collection happens before any fixture runs.
     """
-    apply_groups(items)
     _arrange_run_wide_groups(config, items)
     if _local_from_environ():
         _skip_gateway_only_cases(items)

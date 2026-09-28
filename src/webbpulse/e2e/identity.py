@@ -199,7 +199,7 @@ class IdentitySession:
         would send a spent token on the next refresh, which the rotation detection treats as
         a replay and answers by revoking the whole family.
         """
-        response = refresh(self, refresh_path=self.refresh_path)
+        response = _post_refresh(self, self.refresh_path)
         status = getattr(response, "status_code", 0)
         if status != 200:
             raise RefreshFailed(
@@ -211,30 +211,41 @@ class IdentitySession:
         try:
             payload = response.json()
         except ValueError as error:
+            self._absorb_refresh(response, None)
             raise RefreshFailed(
                 f"POST {self.refresh_path} answered 200 with a body that is not JSON, so the "
                 f"session for user {self.user_id or '<unknown>'} has no new access token."
             ) from error
 
-        access_token = _extract_token(payload, "access_token", "accessToken", "token")
-        if not access_token:
+        if not self._absorb_refresh(response, payload):
             raise RefreshFailed(
                 f"POST {self.refresh_path} answered 200 with no access token in the body, so the "
                 f"session for user {self.user_id or '<unknown>'} cannot continue."
             )
 
+    def _absorb_refresh(self, response: Any, payload: Any) -> str:
+        """Store what a 200 refresh answer rotated, returning the new access token or "".
+
+        The caller holds `_lock`. Rotated cookies and a rotated body refresh token are kept
+        even when the body carries no access token, because the server has already spent the
+        old material and presenting it again would revoke the family.
+        """
+        cookies = dict(getattr(response, "cookies", {}) or {})
+        if cookies:
+            self.refresh_cookies = {**self.refresh_cookies, **cookies}
+        rotated = _extract_token(payload, "refresh_token", "refreshToken")
+        if rotated:
+            self.refresh_token = rotated
+        access_token = _extract_token(payload, "access_token", "accessToken", "token")
+        if not access_token:
+            return ""
         header, claims = decode_claims(access_token)
         self.access_token = access_token
         self.header = header
         self.claims = claims
         self.issued_at = self.clock()
         self.refreshes += 1
-        rotated = _extract_token(payload, "refresh_token", "refreshToken")
-        if rotated:
-            self.refresh_token = rotated
-        cookies = dict(getattr(response, "cookies", {}) or {})
-        if cookies:
-            self.refresh_cookies = {**self.refresh_cookies, **cookies}
+        return access_token
 
     @property
     def algorithm(self) -> str:
@@ -323,12 +334,35 @@ def login(
 def refresh(
     session: IdentitySession,
     *,
-    refresh_path: str = DEFAULT_REFRESH_PATH,
+    refresh_path: str | None = None,
 ) -> Any:
-    """Exchange the refresh material for a new access token, however the product carries it.
+    """Refresh the session through the real route and keep what it rotated, returning the response.
 
-    The refresh token is sent in the body when the login response returned one and left to
-    the cookie jar otherwise, so this works for both conventions without a product flag.
+    The raw response is handed back so a caller can assert on the route itself, but a 200 is
+    also stored on the session exactly as a lazy refresh stores it: the rotated refresh token
+    or cookie and the new access token. The refresh route rotates on every call, so a helper
+    that left the spent material on the session had the next refresh present it as a replay,
+    and the rotation detection revoked the whole family and every later case on that session.
+    Takes the session's lock, so it never races a lazy refresh for the same material.
+    `refresh_path` defaults to the session's own.
+    """
+    with session._lock:
+        response = _post_refresh(session, refresh_path or session.refresh_path)
+        if getattr(response, "status_code", 0) == 200:
+            try:
+                payload = response.json()
+            except ValueError:
+                payload = None
+            session._absorb_refresh(response, payload)
+    return response
+
+
+def _post_refresh(session: IdentitySession, refresh_path: str) -> Any:
+    """Send the refresh material to the refresh route, however the product carries it.
+
+    The refresh token is sent in the body when the login response returned one and as the
+    session's own cookie header otherwise, so this works for both conventions without a
+    product flag. Nothing is stored here: the callers do that under the session's lock.
 
     Sent through a clone carrying no bearer credential, because the refresh token is the whole
     authorisation here. A clone also carries no token source, which matters twice: asking the
@@ -337,11 +371,19 @@ def refresh(
     revoke the whole family as a replay. The 429 pacing and retry still apply.
     """
     body = {"refresh_token": session.refresh_token} if session.refresh_token else None
-    headers = {}
-    if session.refresh_cookies:
-        headers["cookie"] = "; ".join(f"{name}={value}" for name, value in session.refresh_cookies.items())
     anonymous = session.client.with_token(None)
-    return anonymous.post(refresh_path, json=body, headers=headers)
+    return anonymous.post(refresh_path, json=body, headers=_cookie_header(session))
+
+
+def _cookie_header(session: IdentitySession) -> dict[str, str]:
+    """The session's refresh cookies as a request header, or no header when it holds none.
+
+    The e2e client keeps no cookie jar, so the session passes its own refresh cookie on the
+    calls that need it rather than letting a shared client carry one between identities.
+    """
+    if not session.refresh_cookies:
+        return {}
+    return {"cookie": "; ".join(f"{name}={value}" for name, value in session.refresh_cookies.items())}
 
 
 def _auth_time_of(claims: Mapping[str, Any]) -> int:
@@ -396,8 +438,13 @@ def step_up(
 
 
 def logout(session: IdentitySession, *, logout_path: str = DEFAULT_LOGOUT_PATH) -> Any:
-    """End the session through the real logout route."""
-    return session.client.post(logout_path, json={})
+    """End the session through the real logout route, presenting its refresh cookie.
+
+    The identity logout route ends the family named by the refresh cookie, and the e2e client
+    keeps no cookie jar, so the session's cookie is sent explicitly. Without it the route
+    answered 200 and ended nothing.
+    """
+    return session.client.post(logout_path, json={}, headers=_cookie_header(session))
 
 
 def mint(

@@ -16,16 +16,19 @@ an authorizer, which is what an expired token looks like from outside.
 from __future__ import annotations
 
 import base64
+import itertools
 import json
 import threading
 import time
 from collections.abc import Callable
+from types import SimpleNamespace
 from typing import Any
 
 import httpx
 import pytest
 
 from webbpulse.e2e.client import E2EClient, carries_error_envelope, is_expired_credential
+from webbpulse.e2e.ephemeral import Credentials
 from webbpulse.e2e.identity import (
     DEFAULT_ACCESS_TOKEN_TTL,
     DEFAULT_REFRESH_PATH,
@@ -36,9 +39,12 @@ from webbpulse.e2e.identity import (
     StepUpFailed,
     decode_claims,
     login,
+    logout,
+    refresh,
     step_up,
     token_expiry,
 )
+from webbpulse.e2e.suite import TestIdentity as IdentityGroup
 
 SUBJECT = "2f6c1a7e-6b5f-4a1f-9a8e-0d2b3c4d5e6f"
 PROTECTED = "/api/things"
@@ -866,3 +872,224 @@ class TestStepUp:
 
         with pytest.raises(StepUpFailed, match="auth_time 1000"):
             step_up(session, "hunter2")
+
+
+class RotatingIdentity:
+    """A fake identity backend with the real refresh contract: rotate on use, revoke on reuse.
+
+    Refresh tokens travel in a cookie, as the identity package sends them. Presenting a
+    refresh token that was already rotated away revokes its whole family, and a revoked
+    family's access tokens are refused with the gateway's bare 401, which is what turned one
+    unsaved rotation into a column of failures on a real run.
+    """
+
+    PASSWORD = "correct horse"
+
+    def __init__(self) -> None:
+        """Start with no families."""
+        self.current: dict[str, str] = {}
+        self.family_of: dict[str, str] = {}
+        self.access_family: dict[str, str] = {}
+        self.auth_time: dict[str, int] = {}
+        self.revoked: set[str] = set()
+        self.reused: list[str] = []
+        self.counter = 0
+        self.clock = 1_000
+
+    def _next(self, prefix: str) -> str:
+        """A fresh opaque identifier."""
+        self.counter += 1
+        return f"{prefix}-{self.counter}"
+
+    def _access_for(self, family: str, auth_time: int) -> str:
+        """A long lived access token bound to `family`."""
+        token = dated_token(auth_time, marker=self._next(family))
+        self.access_family[token] = family
+        return token
+
+    def _rotate(self, family: str) -> httpx.Response:
+        """Issue a new refresh cookie and access token for `family`."""
+        refresh_token = self._next(f"{family}-refresh")
+        self.current[family] = refresh_token
+        self.family_of[refresh_token] = family
+        return httpx.Response(
+            200,
+            json={"access_token": self._access_for(family, self.auth_time[family])},
+            headers={"set-cookie": f"refresh_token={refresh_token}; Path=/; HttpOnly"},
+        )
+
+    def _presented(self, request: httpx.Request) -> str:
+        """The refresh cookie a request carried, or ""."""
+        for part in str(request.headers.get("cookie", "")).split(";"):
+            name, _, value = part.strip().partition("=")
+            if name == "refresh_token":
+                return value
+        return ""
+
+    def _bearer_family(self, request: httpx.Request) -> str:
+        """The live family the request's bearer token belongs to, or ""."""
+        token = request.headers.get("authorization", "").removeprefix("Bearer ")
+        family = self.access_family.get(token, "")
+        return "" if family in self.revoked else family
+
+    def __call__(self, request: httpx.Request, index: int) -> httpx.Response:
+        """Serve login, refresh, step-up, logout and one protected route."""
+        path = request.url.path
+        if path == "/api/auth/login":
+            family = self._next("family")
+            self.auth_time[family] = self.clock
+            return self._rotate(family)
+        if path == DEFAULT_REFRESH_PATH:
+            presented = self._presented(request)
+            family = self.family_of.get(presented, "")
+            if not family or family in self.revoked:
+                return httpx.Response(401, json={"error_code": "NO_SESSION"})
+            if presented != self.current[family]:
+                self.reused.append(family)
+                self.revoked.add(family)
+                return httpx.Response(401, json={"error_code": "TOKEN_REUSED"})
+            return self._rotate(family)
+        if path == DEFAULT_STEP_UP_PATH:
+            family = self._bearer_family(request)
+            if not family or json.loads(request.content).get("password") != self.PASSWORD:
+                return httpx.Response(401, json={"error_code": "INVALID_CREDENTIALS"})
+            self.clock += 60
+            self.auth_time[family] = self.clock
+            return httpx.Response(200, json={"access_token": self._access_for(family, self.clock)})
+        if path == "/api/auth/logout":
+            family = self.family_of.get(self._presented(request), "")
+            if family:
+                self.revoked.add(family)
+            return httpx.Response(200, json={"signed_out": True})
+        if self._bearer_family(request):
+            return httpx.Response(200, json={"ok": True})
+        return httpx.Response(401, json={"message": "Unauthorized"})
+
+
+def rotating_backend() -> tuple[RotatingIdentity, E2EClient]:
+    """A rotating fake backend and an anonymous client over it."""
+    backend = RotatingIdentity()
+    return backend, client_for(Recorder(backend))
+
+
+def signed_in(anon: E2EClient) -> IdentitySession:
+    """A session signed in through the real `login` helper against the fake backend."""
+    return login(anon, "e2e@example.invalid", RotatingIdentity.PASSWORD)
+
+
+class TestRefreshHelperKeepsTheRotation:
+    """Tests that the public `refresh` helper stores what the route rotated."""
+
+    def test_two_refreshes_then_a_stepped_up_call_all_succeed(self) -> None:
+        """The session survives consecutive explicit refreshes and still steps up and calls."""
+        backend, anon = rotating_backend()
+        session = signed_in(anon)
+
+        assert refresh(session).status_code == 200
+        assert refresh(session).status_code == 200
+        step_up(session, RotatingIdentity.PASSWORD)
+
+        assert session.client.get(PROTECTED).status_code == 200
+        assert backend.reused == []
+        assert session.refreshes == 3
+
+    def test_the_rotated_cookie_is_what_the_next_refresh_presents(self) -> None:
+        """Each explicit refresh presents the cookie the one before it was handed."""
+        backend, anon = rotating_backend()
+        session = signed_in(anon)
+        first = session.refresh_cookies["refresh_token"]
+
+        refresh(session)
+        second = session.refresh_cookies["refresh_token"]
+        refresh(session)
+
+        assert first != second != session.refresh_cookies["refresh_token"]
+        assert backend.reused == []
+
+    def test_a_body_rotated_token_is_stored(self) -> None:
+        """A product returning the refresh token in the body has the rotated one kept."""
+        clock = Clock()
+        recorder = Recorder(
+            lambda request, index: httpx.Response(200, json=refresh_body("b", expires_at=clock() + 600, rotated="r-2"))
+        )
+        session = session_for(recorder, clock, expires_at=clock() + 600)
+
+        response = refresh(session)
+
+        assert response.status_code == 200
+        assert session.refresh_token == "r-2"
+        assert session.claims["marker"] == "b"
+
+    def test_a_refused_refresh_leaves_the_session_as_it_was(self) -> None:
+        """A non-200 is handed back for the caller to assert on and changes nothing."""
+        clock = Clock()
+        recorder = Recorder(lambda request, index: httpx.Response(401, json={"error_code": "NO_SESSION"}))
+        session = session_for(recorder, clock, expires_at=clock() + 600)
+        before = session.access_token
+
+        assert refresh(session).status_code == 401
+        assert session.access_token == before
+        assert session.refresh_token == "refresh-1"
+        assert session.refreshes == 0
+
+
+class TestLogoutHelper:
+    """Tests that `logout` ends the family the session holds."""
+
+    def test_logout_presents_the_refresh_cookie(self) -> None:
+        """The client keeps no cookie jar, so the session sends its own cookie."""
+        backend, anon = rotating_backend()
+        session = signed_in(anon)
+
+        assert logout(session).status_code == 200
+        assert len(backend.revoked) == 1
+        with pytest.raises(RefreshFailed):
+            session.client.get(PROTECTED)
+
+
+class TestSharedSuiteLeavesTheSessionUsable:
+    """The shared identity cases must not spend or end `user_session`, in any order."""
+
+    @staticmethod
+    def run_case(name: str, user_session: IdentitySession, anon: E2EClient) -> None:
+        """Run one shared suite case, or the `stepped_up_session` fixture's step-up, by name."""
+        group = IdentityGroup()
+        if name == "refresh":
+            group.test_refresh_issues_a_new_token(user_session)
+        elif name == "logout":
+            group.test_logout_ends_the_session(
+                anon,
+                SimpleNamespace(signs_in=True),
+                Credentials(email="e2e@example.invalid", password=RotatingIdentity.PASSWORD),
+            )
+        else:
+            step_up(user_session, RotatingIdentity.PASSWORD)
+            assert user_session.client.get(PROTECTED).status_code == 200
+
+    def test_logout_case_leaves_user_session_usable(self) -> None:
+        """The logout case ends a session of its own, never the shared one."""
+        backend, anon = rotating_backend()
+        user_session = signed_in(anon)
+
+        self.run_case("logout", user_session, anon)
+
+        assert len(backend.revoked) == 1
+        assert refresh(user_session).status_code == 200
+        assert user_session.client.get(PROTECTED).status_code == 200
+
+    @pytest.mark.parametrize(
+        "order",
+        list(itertools.permutations(("refresh", "logout", "stepped_up"))),
+        ids="-".join,
+    )
+    def test_order_does_not_matter(self, order: tuple[str, ...]) -> None:
+        """Every order of refresh, logout and a stepped-up call leaves the session working."""
+        backend, anon = rotating_backend()
+        user_session = signed_in(anon)
+
+        for name in order:
+            self.run_case(name, user_session, anon)
+
+        assert backend.reused == []
+        assert user_session.client.get(PROTECTED).status_code == 200
+        step_up(user_session, RotatingIdentity.PASSWORD)

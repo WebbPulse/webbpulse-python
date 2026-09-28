@@ -7,6 +7,25 @@ This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## Unreleased
 
+### `e2e`: the shared identity cases no longer spend or end `user_session` (patch)
+
+`refresh(session)` now stores what a 200 rotated on the session it was given: the rotated
+refresh token or cookie and the new access token, under the session's lock, the same way a
+lazy refresh does. It used to return the response and keep the spent token, so the next
+refresh presented it as a replay, the rotation detection revoked the family, and every later
+case on `user_session` failed, `stepped_up_session` first. Its `refresh_path` now defaults to
+the session's own. `logout(session)` now sends the session's refresh cookie, without which the
+identity logout route ended nothing, and `TestIdentity.test_logout_ends_the_session` signs in
+a session of its own instead of logging out the shared one. Adopters can drop any conftest
+hook that reordered those two cases last.
+
+The `xdist_group` markers now reach `--dist loadgroup`. xdist's worker writes the `@group`
+node id suffix it schedules by in its own `pytest_collection_modifyitems`, which pluggy called
+before this plugin's, so the markers arrived too late and no case was ever grouped. The
+grouping now runs as a `tryfirst` plugin (`GroupingPlugin`), and the plugin's own probe classes
+(`INDEPENDENT_PREFIXES`) stay schedulable even when a case carries `e2e_writes`, so the
+authenticated reachability probes still spread across workers.
+
 ## 0.63.0
 
 ### `identity`: browser sign-in for the MCP authorization server (minor)

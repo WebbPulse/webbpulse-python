@@ -8,6 +8,7 @@ the secret: the generated password must not reach a repr, a message or an except
 
 from __future__ import annotations
 
+import re
 from typing import Any, ClassVar
 
 import pytest
@@ -33,6 +34,8 @@ from webbpulse.e2e.xdist import (
     group_for,
     worker_id,
 )
+
+pytest_plugins = ["pytester"]
 
 RUN_ID = "run-1234"
 ADMIN_TOKEN = "minted-admin-token"
@@ -484,6 +487,14 @@ class TestGrouping:
         item = FakeItem("tests/test_product.py::TestOwnThing::test_it", markers=("e2e_writes",))
         assert group_for(item) == SHARED_STATE_GROUP
 
+    def test_the_marked_reachability_probe_stays_schedulable(self) -> None:
+        """The authenticated probe carries `e2e_writes` for the read-only skip, not for grouping."""
+        item = FakeItem(
+            "tests/test_e2e.py::TestReachability::test_authenticated_call_is_answered_by_the_api[GET /x]",
+            markers=("e2e_writes",),
+        )
+        assert group_for(item) == ""
+
     def test_a_module_level_function_is_not_grouped(self) -> None:
         """A node id with no class is read without falling over."""
         assert group_for(FakeItem("tests/test_e2e.py::test_loose")) == ""
@@ -497,6 +508,77 @@ class TestGrouping:
         ]
         assert apply_groups(items) == 2
         assert [len(item.added) for item in items] == [1, 0, 1]
+
+
+LOADGROUP_CONFTEST = """
+import os
+
+for name in [name for name in os.environ if name.startswith("E2E_")]:
+    del os.environ[name]
+
+pytest_plugins = ["webbpulse.e2e"]
+"""
+
+LOADGROUP_CASES = """
+import pytest
+
+
+class TestIdentity:
+    def test_identity_one(self):
+        pass
+
+    def test_identity_two(self):
+        pass
+
+
+class TestOwnThing:
+    @pytest.mark.e2e_writes
+    def test_product_write(self):
+        pass
+
+
+def test_free_one():
+    pass
+
+
+def test_free_two():
+    pass
+
+
+def test_free_three():
+    pass
+"""
+
+
+class TestLoadgroupScheduling:
+    """The grouping must reach xdist's own scheduler, not only the item's markers."""
+
+    def run(self, pytester: pytest.Pytester) -> pytest.RunResult:
+        """Run the cases under `--dist loadgroup` on two workers."""
+        pytester.makeconftest(LOADGROUP_CONFTEST)
+        pytester.makepyfile(test_grouping=LOADGROUP_CASES)
+        return pytester.runpytest_subprocess("-p", "no:cacheprovider", "-n", "2", "--dist", "loadgroup", "-v")
+
+    def test_shared_state_cases_share_one_worker(self, pytester: pytest.Pytester) -> None:
+        """TestIdentity and a product's `e2e_writes` case carry the group suffix and one worker.
+
+        Run with no `E2E_*` set, so every case skips for want of an environment; the report
+        still names the worker each was scheduled on, which is what is under test.
+        """
+        result = self.run(pytester)
+        result.assert_outcomes(skipped=6)
+        workers = {
+            match.group(2): match.group(1)
+            for line in result.outlines
+            if (match := re.search(r"\[(gw\d+)\].*SKIPPED test_grouping\.py::(\S+)", line))
+        }
+        grouped = [name for name in workers if name.endswith(f"@{SHARED_STATE_GROUP}")]
+        assert sorted(name.split("@")[0] for name in grouped) == [
+            "TestIdentity::test_identity_one",
+            "TestIdentity::test_identity_two",
+            "TestOwnThing::test_product_write",
+        ]
+        assert len({workers[name] for name in grouped}) == 1
 
 
 class TestWorkerId:
