@@ -7,6 +7,15 @@ This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## Unreleased
 
+### Fixed
+
+- `otel`: the per-request flush middleware now holds back the final `http.response.body`
+  message until the trace has been flushed. Under the Lambda Web Adapter that message ends
+  the invocation, so the flush used to be frozen mid-export and sent later with an expired
+  SigV4 signature, which X-Ray rejected with 403 "Signature expired". Earlier streaming
+  chunks still pass through, the flush keeps its timeout bound, and a request that raises
+  still flushes before the exception propagates.
+
 ## 0.67.0
 
 ### `e2e`: gate cookies for a gated production smoke (minor)

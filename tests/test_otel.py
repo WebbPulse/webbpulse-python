@@ -1217,6 +1217,146 @@ async def _noop_send(message: dict[str, Any]) -> None:
     return None
 
 
+def _drive_flush_middleware(
+    monkeypatch: MonkeyPatch, app: Any, scope_type: str = "http"
+) -> tuple[list[str], BaseException | None]:
+    """Run the flush middleware around `app` and return the ordered send and flush events."""
+    import asyncio
+
+    events: list[str] = []
+
+    def flush(timeout_millis: int = 30000) -> bool:
+        """Record the flush in the event order."""
+        events.append(f"flush:{timeout_millis}")
+        return True
+
+    monkeypatch.setattr(otel, "flush_tracing", flush)
+
+    async def send(message: dict[str, Any]) -> None:
+        """Record each outgoing message in the event order."""
+        more = "more" if message.get("more_body") else "last"
+        suffix = f":{more}" if message["type"] == "http.response.body" else ""
+        events.append(f"{message['type']}{suffix}")
+
+    middleware = otel._FlushTracingASGIMiddleware(app, 750)
+    error: BaseException | None = None
+    try:
+        asyncio.run(middleware({"type": scope_type}, _noop_receive, send))
+    except Exception as exc:
+        error = exc
+    return events, error
+
+
+def test_the_final_body_is_sent_only_after_the_flush(monkeypatch: MonkeyPatch) -> None:
+    """The last body message ends a Lambda invocation, so it must wait for the flush."""
+
+    async def app(scope: Any, receive: Any, send: Any) -> None:
+        """Send a complete single-message response."""
+        await send({"type": "http.response.start", "status": 200, "headers": []})
+        await send({"type": "http.response.body", "body": b"ok"})
+
+    events, error = _drive_flush_middleware(monkeypatch, app)
+
+    assert error is None
+    assert events == ["http.response.start", "flush:750", "http.response.body:last"]
+
+
+def test_streaming_chunks_pass_through_and_only_the_last_is_held(monkeypatch: MonkeyPatch) -> None:
+    """Earlier chunks of a streaming response are forwarded as they are produced."""
+    forwarded_before_return: list[int] = []
+
+    async def app(scope: Any, receive: Any, send: Any) -> None:
+        """Stream two chunks and then an explicit final chunk."""
+        await send({"type": "http.response.start", "status": 200, "headers": []})
+        await send({"type": "http.response.body", "body": b"a", "more_body": True})
+        await send({"type": "http.response.body", "body": b"b", "more_body": True})
+        await send({"type": "http.response.body", "body": b"", "more_body": False})
+        forwarded_before_return.append(1)
+
+    events, error = _drive_flush_middleware(monkeypatch, app)
+
+    assert error is None
+    assert forwarded_before_return == [1]
+    assert events == [
+        "http.response.start",
+        "http.response.body:more",
+        "http.response.body:more",
+        "flush:750",
+        "http.response.body:last",
+    ]
+
+
+def test_a_request_that_raises_flushes_then_raises(monkeypatch: MonkeyPatch) -> None:
+    """An exception still flushes first, and a held final body is still delivered."""
+
+    async def fails_after_body(scope: Any, receive: Any, send: Any) -> None:
+        """Complete the response, then fail."""
+        await send({"type": "http.response.start", "status": 200, "headers": []})
+        await send({"type": "http.response.body", "body": b"ok"})
+        raise RuntimeError("after the body")
+
+    events, error = _drive_flush_middleware(monkeypatch, fails_after_body)
+    assert isinstance(error, RuntimeError)
+    assert events == ["http.response.start", "flush:750", "http.response.body:last"]
+
+    async def fails_before_response(scope: Any, receive: Any, send: Any) -> None:
+        """Fail before sending anything."""
+        raise RuntimeError("before the response")
+
+    events, error = _drive_flush_middleware(monkeypatch, fails_before_response)
+    assert isinstance(error, RuntimeError)
+    assert events == ["flush:750"]
+
+
+def test_a_response_with_no_body_message_still_flushes(monkeypatch: MonkeyPatch) -> None:
+    """With nothing to hold, the middleware flushes after the app returns and sends nothing."""
+
+    async def app(scope: Any, receive: Any, send: Any) -> None:
+        """Send only the response start."""
+        await send({"type": "http.response.start", "status": 204, "headers": []})
+
+    events, error = _drive_flush_middleware(monkeypatch, app)
+
+    assert error is None
+    assert events == ["http.response.start", "flush:750"]
+
+
+def test_non_http_scopes_are_passed_through_without_a_flush(monkeypatch: MonkeyPatch) -> None:
+    """A websocket or lifespan scope is served untouched and never flushed."""
+
+    async def app(scope: Any, receive: Any, send: Any) -> None:
+        """Send one message that would be held on an http scope."""
+        await send({"type": "http.response.body", "body": b"x"})
+
+    events, error = _drive_flush_middleware(monkeypatch, app, scope_type="websocket")
+
+    assert error is None
+    assert events == ["http.response.body:last"]
+
+
+def test_a_fastapi_response_body_arrives_after_the_flush(monkeypatch: MonkeyPatch) -> None:
+    """End to end through FastAPI, the body is intact and the flush ran first."""
+    from fastapi.testclient import TestClient
+
+    monkeypatch.delenv(OTEL_DISABLED_ENV, raising=False)
+    order: list[str] = []
+
+    def flush(timeout_millis: int = 30000) -> bool:
+        """Record the flush."""
+        order.append("flush")
+        return True
+
+    monkeypatch.setattr(otel, "flush_tracing", flush)
+    app = _app_with_flush_middleware()
+    with TestClient(app) as client:
+        response = client.get("/thing")
+
+    assert response.status_code == 200
+    assert response.json() == {"ok": "yes"}
+    assert order == ["flush"]
+    shutdown_tracing()
+
+
 def test_a_slow_export_does_not_stall_the_whole_event_loop() -> None:
     """The synchronous flush runs off the event loop, so other coroutines keep making progress."""
     import asyncio
