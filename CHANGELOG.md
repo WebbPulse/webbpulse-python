@@ -5,6 +5,18 @@ Notable changes to the `webbpulse` package. The version here is the one in
 
 This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## Unreleased
+
+### `ops.config`: `config set` creates a missing parameter (minor)
+
+`webbpulse-config config set KEY VALUE` no longer exits `3` when `/<prefix>/config` does not
+exist. It creates the parameter as a Standard tier `String` holding `{"KEY": VALUE}`, with the
+description the platform-modules `operator-config` module sets (`CONFIG_PARAMETER_DESCRIPTION`),
+and prints `created parameter ... holding KEY`, so a fresh environment is seeded before the
+module imports it on its first plan. The create uses `Overwrite=False`; if another writer
+creates it first, the key is merged through the usual version-checked path. `WriteResult`
+gains `created`. An existing parameter, `config get` and `config unset` behave as before.
+
 ## 0.60.0
 
 ### `integrations.stripe`: Stripe settings, client and webhook receiver (minor)

@@ -3,7 +3,9 @@
 Every product keeps its secrets in one Secrets Manager JSON secret, `<prefix>/app`, and its
 private non-secret configuration in one SSM String parameter, `/<prefix>/config`, holding a
 JSON object. Terraform creates both and ignores their values, so an operator sets the values
-with their own AWS identity through this tool:
+with their own AWS identity through this tool. `config set` creates a missing parameter the way
+the platform-modules operator-config module expects to import it, so a fresh environment can be
+seeded before its first plan:
 
     uv run webbpulse-config --profile CarModPicker-Staging/AgentToolkit \\
         --prefix carmodpicker-staging secret set OAUTH_GITHUB_CLIENT_SECRET
@@ -44,6 +46,11 @@ EXIT_CONFLICT = 5
 EXIT_KEY_ABSENT = 6
 
 DEFAULT_RETRIES = 3
+
+CONFIG_PARAMETER_DESCRIPTION = (
+    "Operator-owned JSON object of private non-secret config read by Terraform. "
+    "Terraform seeds it once and never writes it again."
+)
 
 _UPPER_SNAKE = re.compile(r"^[A-Z][A-Z0-9_]*$")
 _MISSING_CODES = frozenset({"ResourceNotFoundException", "ParameterNotFound"})
@@ -98,10 +105,11 @@ class Target:
 
 @dataclass(frozen=True)
 class WriteResult:
-    """The outcome of a merge: whether a new version was written, and the current version."""
+    """The outcome of a merge: whether a new version was written, the current version, and whether it was created."""
 
     changed: bool
     version: str | None
+    created: bool = False
 
 
 def resolve_target(prefix: str | None, secret_id: str | None = None, parameter_name: str | None = None) -> Target:
@@ -349,13 +357,40 @@ class ConfigStore:
             raise _translate(exc, self.where) from None
         return str(response["Version"])
 
+    def _create(self, value: JsonObject) -> WriteResult | None:
+        """Create the parameter holding `value`, or return `None` when another writer created it first."""
+        from botocore.exceptions import ClientError
+
+        try:
+            response = self._client.put_parameter(
+                Name=self.parameter_name,
+                Value=encode_object(value),
+                Type="String",
+                Tier="Standard",
+                Description=CONFIG_PARAMETER_DESCRIPTION,
+                Overwrite=False,
+            )
+        except ClientError as exc:
+            if _error_code(exc) == "ParameterAlreadyExists":
+                return None
+            raise _translate(exc, self.where) from None
+        return WriteResult(changed=True, version=str(response["Version"]), created=True)
+
     def get(self) -> JsonObject:
         """Return the whole config object."""
         return self._read()[1]
 
     def set(self, key: str, value: Any) -> WriteResult:
-        """Merge one key into the object, keeping every other key."""
-        return self._update(_with_key(validate_key(key), value))
+        """Merge one key into the object, creating the parameter as `{key: value}` when it is missing."""
+        key = validate_key(key)
+        mutate = _with_key(key, value)
+        try:
+            return self._update(mutate)
+        except ResourceMissingError:
+            created = self._create({key: value})
+        if created is not None:
+            return created
+        return self._update(mutate)
 
     def unset(self, key: str) -> WriteResult:
         """Remove one key from the object, writing nothing when it is already absent."""
@@ -505,7 +540,11 @@ def _run_config(args: argparse.Namespace, session: Any, parameter_name: str, std
     key = validate_key(args.key)
     if args.action == "set":
         value = parse_config_value(args.value, force_string=args.string)
-        _report(stderr, store.set(key, value), f"set {key} in {where}", f"{key} already holds that value")
+        result = store.set(key, value)
+        if result.created:
+            print(f"created {where} holding {key} (version {result.version})", file=stderr)
+            return
+        _report(stderr, result, f"set {key} in {where}", f"{key} already holds that value")
         return
     _report(stderr, store.unset(key), f"removed {key} from {where}", f"{key} is not in {where}")
 
