@@ -104,3 +104,13 @@ def test_oversized_upload_is_refused(tmp_path: Path, monkeypatch: pytest.MonkeyP
     monkeypatch.setattr("webbpulse.tf.archive.MAX_UPLOAD_BYTES", 10)
     with pytest.raises(ArchiveError, match=r"\.terraformignore"):
         build_tarball(config)
+
+
+def test_local_state_is_never_uploaded(tmp_path: Path) -> None:
+    """Local state files are skipped even without a .terraformignore; tfvars are configuration."""
+    config = _tree(tmp_path)
+    for name in ("terraform.tfstate", "terraform.tfstate.backup", "old.tfstate", "prod.auto.tfvars"):
+        (config / name).write_text("{}")
+    names = _names(build_tarball(config))
+    assert "prod.auto.tfvars" in names
+    assert not any("tfstate" in name for name in names)
