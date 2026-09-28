@@ -5,7 +5,7 @@ Notable changes to the `webbpulse` package. The version here is the one in
 
 This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## Unreleased
+## 0.62.0
 
 ### `identity`: `require_recent_auth` step-up gate and password step-up (minor)
 
