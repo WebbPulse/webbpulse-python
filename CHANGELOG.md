@@ -7,6 +7,8 @@ This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## Unreleased
 
+## 0.67.2
+
 ### Fixed
 
 - `e2e`: `TestBrowser::test_protected_routes_redirect_anonymous_visitors` now runs in
