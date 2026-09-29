@@ -58,3 +58,29 @@ def test_bad_json_is_an_error(tmp_path: Path) -> None:
     with pytest.raises(CredentialsError) as caught:
         resolve_token(HOST, {}, tmp_path)
     assert "wpk_secret" not in str(caught.value)
+
+
+def test_a_login_session_beats_the_file(tmp_path: Path) -> None:
+    """A `wp-tf login` session is used ahead of the key `terraform login` stored."""
+    _write_credentials(tmp_path, HOST, "wpk_file")
+    assert resolve_token(HOST, {}, tmp_path, session_token=lambda: "session-token") == "session-token"
+
+
+def test_the_environment_beats_a_login_session(tmp_path: Path) -> None:
+    """An explicit key wins, and the session is not even consulted."""
+    called: list[bool] = []
+
+    def session() -> str:
+        called.append(True)
+        return "session-token"
+
+    assert resolve_token(HOST, {"WP_TF_TOKEN": "wpk_explicit"}, tmp_path, session_token=session) == "wpk_explicit"
+    assert called == []
+
+
+def test_no_session_falls_through_to_the_file(tmp_path: Path) -> None:
+    """Without a stored login the file is still read, and the error names both logins."""
+    _write_credentials(tmp_path, HOST, "wpk_file")
+    assert resolve_token(HOST, {}, tmp_path, session_token=lambda: None) == "wpk_file"
+    with pytest.raises(CredentialsError, match="wp-tf login"):
+        resolve_token(HOST, {}, tmp_path / "empty", session_token=lambda: None)

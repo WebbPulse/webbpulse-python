@@ -328,3 +328,165 @@ def test_list_workspaces_follows_the_cursor() -> None:
 
     with ControlPlane(API, TOKEN, transport=httpx.MockTransport(handler)) as plane:
         assert [item["workspace_id"] for item in plane.list_workspaces()] == ["ws-a", "ws-b"]
+
+
+class FakeDevice:
+    """A stand-in for `DeviceLoginClient`, recording what the CLI asked of it."""
+
+    def __init__(self, *, session: bool = True, fail: BaseException | None = None, token: str = TOKEN) -> None:
+        """Script whether a session exists and what login does."""
+        from webbpulse.device_login import StoredSession
+
+        self.session = StoredSession("https://api.example.test/api/auth", "wp-tf", token, "wpdr_x.y", 9e9, 9e9, "")
+        self.has_session = session
+        self.fail = fail
+        self.scopes: list[str] | None = None
+        self.logged_out = False
+
+    def login(self, scopes: list[str]) -> Any:
+        """Record the scopes, then succeed or fail as scripted."""
+        from webbpulse.device_login import StoredSession
+
+        self.scopes = scopes
+        if self.fail is not None:
+            raise self.fail
+        return StoredSession(
+            self.session.issuer, "wp-tf", self.session.access_token, "wpdr_x.y", 9e9, 9e9, " ".join(scopes)
+        )
+
+    def logout(self) -> bool:
+        """Sign out when there is a session."""
+        self.logged_out = self.has_session
+        return self.has_session
+
+    def stored(self) -> Any:
+        """The scripted session."""
+        return self.session if self.has_session else None
+
+    def access_token(self) -> str:
+        """The scripted token, or the failure."""
+        if self.fail is not None:
+            raise self.fail
+        return self.session.access_token
+
+
+def _session(argv: list[str], device: FakeDevice) -> tuple[int, str, str]:
+    """Run `login` or `logout` against a fake device client."""
+    out, err = io.StringIO(), io.StringIO()
+    code = cli.main(argv, stdout=out, stderr=err, environ={}, device=lambda args, environ, stderr: device)  # type: ignore[arg-type,return-value]
+    return code, out.getvalue(), err.getvalue()
+
+
+def test_login_requests_the_named_scopes_and_prints_no_token() -> None:
+    """`--scope` repeats, and the success line names the scopes, not the token."""
+    device = FakeDevice()
+    code, out, err = _session(["login", "--scope", "runs:read", "--scope", "runs:apply"], device)
+    assert code == 0
+    assert device.scopes == ["runs:read", "runs:apply"]
+    assert "signed in with runs:read runs:apply" in err
+    assert TOKEN not in out + err
+
+
+def test_login_without_scopes_asks_for_the_default_set() -> None:
+    """No `--scope` sends none, so the server grants its defaults and never apply or admin."""
+    device = FakeDevice()
+    assert _session(["login"], device)[0] == 0
+    assert device.scopes == []
+
+
+def test_a_failed_login_exits_one_with_the_reason() -> None:
+    """A denial is reported on stderr and exits 1."""
+    from webbpulse.device_login import DeviceLoginError
+
+    code, _, err = _session(["login"], FakeDevice(fail=DeviceLoginError("the login was denied in the browser")))
+    assert code == 1
+    assert "denied" in err
+
+
+def test_an_interrupted_login_exits_130() -> None:
+    """Ctrl-C while waiting for approval is an interruption, not a failure."""
+    code, _, err = _session(["login"], FakeDevice(fail=KeyboardInterrupt()))
+    assert code == 130
+    assert "interrupted" in err
+
+
+def test_logout_signs_out_or_says_there_was_nothing() -> None:
+    """`logout` revokes a session, and is quiet success without one."""
+    device = FakeDevice()
+    code, _, err = _session(["logout"], device)
+    assert code == 0
+    assert device.logged_out
+    assert "signed out" in err
+    code, _, err = _session(["logout"], FakeDevice(session=False))
+    assert code == 0
+    assert "no wp-tf login session" in err
+
+
+def test_the_device_client_targets_the_api_issuer_with_the_gate() -> None:
+    """The issuer defaults to `<api>/api/auth`, `--issuer` overrides it, and the gate header rides along."""
+    args = cli.build_parser().parse_args(["login"])
+    client = cli._device_client(args, {}, API, GATE)
+    assert client.issuer == f"{API}/api/auth"
+    assert client._headers == {GATE_HEADER: GATE}
+    args = cli.build_parser().parse_args(["login", "--issuer", "https://id.example.test/api/auth"])
+    assert cli._device_client(args, {}, API, "").issuer == "https://id.example.test/api/auth"
+    args = cli.build_parser().parse_args(["logout"])
+    assert cli._device_client(args, {"WP_TF_ISSUER": "https://env.example.test/auth"}, API, "").issuer == (
+        "https://env.example.test/auth"
+    )
+    assert cli._device_client(args, {}, API, "")._headers == {}
+
+
+def test_commands_use_the_login_session_when_no_key_is_set(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """With no environment key, `workspaces` sends the stored session's access token."""
+    seen: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(request.headers.get("authorization", ""))
+        return httpx.Response(200, json={"items": []})
+
+    real_client = httpx.Client
+
+    def client(**kwargs: Any) -> httpx.Client:
+        kwargs.pop("transport", None)
+        return real_client(transport=httpx.MockTransport(handler), **kwargs)
+
+    monkeypatch.setattr(httpx, "Client", client)
+    monkeypatch.setattr(cli, "_device_client", lambda *args, **kwargs: FakeDevice(token="session-access-token"))
+    err = io.StringIO()
+    code = cli.main(
+        ["--api-url", API, "workspaces"], stdout=io.StringIO(), stderr=err, environ={"WP_TF_GATE": GATE}, home=tmp_path
+    )
+    assert code == 0, err.getvalue()
+    assert seen == ["Bearer session-access-token"]
+    assert "session-access-token" not in err.getvalue()
+
+
+def test_an_ended_session_falls_through_with_a_warning(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """A session that cannot refresh says why, then the usual missing-key error follows."""
+    from webbpulse.device_login import DeviceLoginError
+
+    failing = FakeDevice(fail=DeviceLoginError("the device login was revoked or has ended; run login again"))
+    monkeypatch.setattr(cli, "_device_client", lambda *args, **kwargs: failing)
+    err = io.StringIO()
+    stderr = io.StringIO()
+    monkeypatch.setattr("sys.stderr", stderr)
+    code = cli.main(
+        ["--api-url", API, "workspaces"], stdout=io.StringIO(), stderr=err, environ={"WP_TF_GATE": GATE}, home=tmp_path
+    )
+    assert code == 1
+    assert "run login again" in stderr.getvalue()
+    assert "wp-tf login" in err.getvalue()
+    assert TOKEN not in err.getvalue() + stderr.getvalue()
+
+
+def test_an_unreadable_keyring_is_quiet(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """A machine with no usable keyring falls through to the credentials file without a warning."""
+    from webbpulse.device_login import DeviceLoginError
+
+    broken = FakeDevice()
+    broken.stored = lambda: (_ for _ in ()).throw(DeviceLoginError("could not read the keyring: NoKeyringError"))  # type: ignore[method-assign]
+    stderr = io.StringIO()
+    monkeypatch.setattr("sys.stderr", stderr)
+    assert cli._session_token(broken) is None  # type: ignore[arg-type]
+    assert stderr.getvalue() == ""
