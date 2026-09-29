@@ -53,6 +53,8 @@ __all__ = [
     "classify",
     "default_renderer",
     "identity_from_ip",
+    "identity_from_principal",
+    "principal_identity",
     "rate_limit",
     "rate_limit_headers",
     "rate_limit_middleware",
@@ -215,6 +217,40 @@ def identity_from_ip(request: Request) -> str:
     from webbpulse.http import client_ip
 
     return client_ip(request)
+
+
+def principal_identity(
+    fallback: Callable[[Request], str] = identity_from_ip,
+) -> Callable[[Request], str]:
+    """An identity function keying a signed-in caller by principal and anyone else by `fallback`.
+
+    A verified authorizer `sub` keys as `user:<sub>`. Every other request, a bearer token or
+    API key included, answers `fallback(request)`: the middleware runs before any credential
+    is verified, so keying on a presented one would hand each forged value a fresh bucket.
+    Pass a product's own IP reader as `fallback` where it covers request shapes `identity_from_ip` does not.
+
+    Keying by principal is what stops a browser, a CLI and agents behind one address from
+    sharing a single bucket.
+    """
+
+    def identity(request: Request) -> str:
+        """The principal key for this request, or the fallback identity."""
+        from webbpulse.identity.claims import identity_subject
+
+        subject = identity_subject(request).strip()
+        if subject:
+            return f"user:{subject}"
+        return fallback(request)
+
+    return identity
+
+
+def identity_from_principal(request: Request) -> str:
+    """`principal_identity()` over `identity_from_ip`: verified user first, then source IP."""
+    return _default_principal_identity(request)
+
+
+_default_principal_identity: Final = principal_identity()
 
 
 class RateLimiter(Repository):
