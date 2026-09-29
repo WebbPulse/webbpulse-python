@@ -1,5 +1,8 @@
 """Admin-only routes that create and delete one throwaway login user per e2e run.
 
+A third route sweeps the ephemeral users older than a cutoff, for the run whose teardown
+delete failed: `webbpulse.e2e` calls it once at session start.
+
 Why they exist: the suite's profile, social-link and sign-in journeys all mutate the user
 they run as, so a single durable account forces every run to serialise behind a concurrency
 group. A run that makes its own user and deletes it at the end can run beside any number of
@@ -40,6 +43,7 @@ __all__ = [
     "ADMIN_ROLE",
     "EPHEMERAL_ROUTE_RESPONSES",
     "EPHEMERAL_USERS_PATH",
+    "EPHEMERAL_USERS_SWEEP_PATH",
     "EPHEMERAL_USER_ITEM_PATH",
     "caller_is_admin",
     "caller_roles",
@@ -48,6 +52,7 @@ __all__ = [
 
 EPHEMERAL_USERS_PATH: Final = "/e2e/users"
 EPHEMERAL_USER_ITEM_PATH: Final = "/e2e/users/{user_id}"
+EPHEMERAL_USERS_SWEEP_PATH: Final = "/e2e/users/sweep"
 
 ADMIN_ROLE: Final = "admin"
 
@@ -98,6 +103,13 @@ EPHEMERAL_ROUTE_RESPONSES: Final[Mapping[tuple[str, str], dict[int, str]]] = {
         200: "The ephemeral user was deleted, or was already gone.",
         401: "No access token, or one carrying no subject.",
         403: "The caller is not an admin, or ephemeral users are disabled here.",
+    },
+    ("POST", EPHEMERAL_USERS_SWEEP_PATH): {
+        200: "The leftover ephemeral users older than the cutoff were deleted.",
+        400: "`older_than_seconds` is not a positive whole number.",
+        401: "No access token, or one carrying no subject.",
+        403: "The caller is not an admin, or ephemeral users are disabled here.",
+        501: "The product's users table cannot be enumerated for a sweep.",
     },
 }
 
@@ -158,6 +170,8 @@ def register_ephemeral_routes(
         return
 
     _bind_fastapi_request()
+
+    from datetime import timedelta
 
     from fastapi import Body
     from fastapi.responses import JSONResponse as _JSONResponse
@@ -274,4 +288,39 @@ def register_ephemeral_routes(
             return rejected(request, exc)
         return _JSONResponse({"user_id": user_id, "deleted": deleted}, status_code=200)
 
-    _ = (create_ephemeral_user, delete_ephemeral_user)
+    @router.post(
+        f"{prefix}{EPHEMERAL_USERS_SWEEP_PATH}",
+        tags=["identity"],
+        summary="Delete leftover ephemeral e2e users older than a cutoff",
+        include_in_schema=False,
+        response_model=None,
+    )
+    async def sweep_ephemeral_users(request: _FastAPIRequest, payload: dict[str, Any] | None = Body(None)) -> Any:
+        """Delete every ephemeral user older than `older_than_seconds`, answering which went.
+
+        The body is optional. Only users whose address carries the ephemeral marker are
+        considered, and the flow floors the age so a live run's user is never taken.
+        """
+        refusal = refuse_non_admin(request)
+        if refusal is not None:
+            return refusal
+        raw_age = (payload or {}).get("older_than_seconds")
+        older_than: timedelta | None = None
+        if raw_age is not None:
+            if isinstance(raw_age, bool) or not isinstance(raw_age, int) or raw_age <= 0:
+                return rejected(
+                    request,
+                    LoginRejected(
+                        "older_than_seconds must be a positive whole number.",
+                        error_code="INVALID_SWEEP_AGE",
+                        status_code=400,
+                    ),
+                )
+            older_than = timedelta(seconds=raw_age)
+        try:
+            swept = await run_sync(lambda: flows.sweep_ephemeral_users(older_than=older_than))
+        except LoginRejected as exc:
+            return rejected(request, exc)
+        return _JSONResponse(swept, status_code=200)
+
+    _ = (create_ephemeral_user, delete_ephemeral_user, sweep_ephemeral_users)

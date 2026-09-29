@@ -22,6 +22,7 @@ from webbpulse.identity.crypto import SCHEME_KMS_ENVELOPE
 
 if TYPE_CHECKING:  # pragma: no cover
     from webbpulse.dynamodb import Repository
+    from webbpulse.identity.api_keys import ApiKeyStore
     from webbpulse.identity.oauth import OAuthLinkStore, OAuthStateStore
 
     TABLES: tuple[TableSpec, ...]
@@ -575,6 +576,9 @@ class IdentityStores:
     oauth_links: OAuthLinkStore | None = None
     passkeys: PasskeyStore | None = None
     webauthn_challenges: WebAuthnChallengeStore | None = None
+    api_keys: ApiKeyStore | None = None
+    """The `api-keys` table, set only by a product that has one, so `purge_user` deletes a
+    deleted user's keys. Left `None`, the purge skips it, as it would any absent store."""
 
     def require_credentials(self) -> CredentialStore:
         """The credential store, or a `ValueError` if it was not configured."""
@@ -611,6 +615,10 @@ class IdentityStores:
     def require_webauthn_challenges(self) -> WebAuthnChallengeStore:
         """The WebAuthn challenge store, or a `ValueError` if it was not configured."""
         return _require(self.webauthn_challenges, "webauthn_challenges")
+
+    def require_api_keys(self) -> ApiKeyStore:
+        """The API key store, or a `ValueError` if it was not configured."""
+        return _require(self.api_keys, "api_keys")
 
 
 def _require[StoreT](store: StoreT | None, name: str) -> StoreT:

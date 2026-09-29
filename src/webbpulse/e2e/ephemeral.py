@@ -9,6 +9,11 @@ Falls back to the durable user whenever the route is not there, which covers a p
 has not adopted the flag yet and any environment where the flag is off. A read-only run
 signs in as nobody and asks for neither.
 
+A run whose teardown delete failed leaves its user behind, so the first worker of every run
+asks the sweep route to delete ephemeral users older than `SWEEP_OLDER_THAN_SECONDS`. A
+deployment on a `webbpulse` that predates the route answers 404 or 405, and one whose users
+table cannot be enumerated answers 501; each is read as "no sweep here" and the run goes on.
+
 The generated password lives in memory for the length of the session and reaches only the
 login call and the browser's `fill`. It is never logged, never written to a trace or an
 artifact, and `Credentials` keeps it out of its own repr.
@@ -26,6 +31,9 @@ __all__ = [
     "CREATE_PATH",
     "PASSWORD_LENGTH",
     "RESERVED_EMAIL_DOMAIN",
+    "SWEEP_OLDER_THAN_SECONDS",
+    "SWEEP_PATH",
+    "SWEEP_UNOFFERED_STATUSES",
     "Credentials",
     "EphemeralUser",
     "TokenClient",
@@ -37,6 +45,7 @@ __all__ = [
     "ephemeral_email",
     "generate_password",
     "item_path",
+    "sweep_ephemeral_users",
 ]
 
 CREATE_PATH: Final = "/api/auth/e2e/users"
@@ -46,6 +55,14 @@ PASSWORD_LENGTH: Final = 32
 BODY_EXCERPT_LIMIT: Final = 300
 
 RESERVED_EMAIL_DOMAIN: Final = "e2e.invalid"
+
+SWEEP_PATH: Final = "/api/auth/e2e/users/sweep"
+
+SWEEP_OLDER_THAN_SECONDS: Final = 3 * 60 * 60
+"""Three hours: long enough that no run still in progress loses its user to this sweep."""
+
+SWEEP_UNOFFERED_STATUSES: Final = frozenset({403, 404, 405, 501})
+"""The answers that mean this deployment offers no sweep, rather than that one failed."""
 
 DETAIL_LIMIT: Final = 10
 
@@ -304,3 +321,26 @@ def describe_delete_failure(client: TokenClient, user: EphemeralUser, *, admin_t
     if response.status_code == 200:
         return ""
     return f"DELETE {path} answered {response.status_code}. It said: {describe_error_body(response)}"
+
+
+def sweep_ephemeral_users(
+    client: TokenClient,
+    *,
+    admin_token: str,
+    sweep_path: str = SWEEP_PATH,
+    older_than_seconds: int = SWEEP_OLDER_THAN_SECONDS,
+) -> str:
+    """Ask the deployment to delete leftover ephemeral users, returning why it failed or "".
+
+    Never raises, since a sweep that could not run is no reason to lose a run. An answer in
+    `SWEEP_UNOFFERED_STATUSES` returns the empty string too: an older backend has no such
+    route, and a newer plugin must not break a run against it. Only the response and the
+    exception are read, so the admin token cannot reach the result.
+    """
+    try:
+        response = client.with_token(admin_token).post(sweep_path, json={"older_than_seconds": older_than_seconds})
+    except Exception as error:
+        return f"POST {sweep_path} raised {type(error).__name__}: {error}"
+    if response.status_code == 200 or response.status_code in SWEEP_UNOFFERED_STATUSES:
+        return ""
+    return f"POST {sweep_path} answered {response.status_code}. It said: {describe_error_body(response)}"

@@ -23,6 +23,11 @@ E2E_NAMES = (
     "E2E_USER_EMAIL",
     "E2E_USER_PASSWORD",
     "E2E_RUN_ID",
+    "E2E_MINT_ENABLED",
+    "E2E_KMS_KEY_ID",
+    "E2E_ISSUER",
+    "E2E_AUDIENCE",
+    "E2E_READ_ONLY",
 )
 
 
@@ -121,6 +126,103 @@ class TestOrdering:
         pytester.makepyfile(test_one="def test_nothing(e2e_env): pass")
         pytester.runpytest_inprocess("-p", "no:cacheprovider")
         assert (pytester.path / "prefix.log").read_text().splitlines() == ["e2e-run1-", "e2e-run1-"]
+
+
+def sweeping_conftest(status: int, *, token: str = "admin-token", extra: str = "") -> str:
+    """A minting run whose `anon` and admin token are fakes recording the sweep call."""
+    return (
+        conftest_with('    return ""\n')
+        + f"""
+import os
+
+import pytest
+
+os.environ["E2E_MINT_ENABLED"] = "1"
+os.environ["E2E_KMS_KEY_ID"] = "alias/e2e"
+os.environ["E2E_ISSUER"] = "https://api.staging.example.invalid/api/auth"
+os.environ["E2E_AUDIENCE"] = "example-staging"
+{extra}
+
+
+class _Response:
+    status_code = {status}
+    text = "boom"
+
+    def json(self):
+        return {{"error_code": "BOOM", "message": "boom"}}
+
+
+class _Client:
+    def __init__(self, token=None):
+        self.token = token
+
+    def unrecorded(self, token):
+        return _Client(token)
+
+    def with_token(self, token):
+        return _Client(token)
+
+    def post(self, path, *, json=None):
+        with open("sweep.log", "a") as handle:
+            handle.write(f"{{path}} {{json['older_than_seconds']}} {{self.token}}\\n")
+        return _Response()
+
+
+@pytest.fixture(scope="session")
+def anon():
+    return _Client()
+
+
+@pytest.fixture(scope="session")
+def admin_mint_token():
+    return {token!r}
+"""
+    )
+
+
+class TestEphemeralSweep:
+    """The session start call asking the deployment to delete leftover ephemeral users."""
+
+    def test_a_minting_run_sweeps_once_with_the_admin_token(self, pytester: pytest.Pytester) -> None:
+        """One POST before the tests, carrying the admin token and the three hour age."""
+        pytester.makeconftest(sweeping_conftest(200))
+        pytester.makepyfile(test_one="def test_a(e2e_env): pass\ndef test_b(e2e_env): pass")
+        result = pytester.runpytest_inprocess("-p", "no:cacheprovider")
+        result.assert_outcomes(passed=2)
+        assert (pytester.path / "sweep.log").read_text().splitlines() == ["/api/auth/e2e/users/sweep 10800 admin-token"]
+
+    @pytest.mark.parametrize("status", [404, 405])
+    def test_an_older_backend_without_the_route_is_silent(self, status: int, pytester: pytest.Pytester) -> None:
+        """A deployment that predates the route neither fails the run nor warns."""
+        pytester.makeconftest(sweeping_conftest(status))
+        pytester.makepyfile(test_one="def test_a(e2e_env): pass")
+        result = pytester.runpytest_inprocess("-p", "no:cacheprovider", "-W", "default")
+        result.assert_outcomes(passed=1)
+        assert "Sweeping leftover ephemeral e2e users failed" not in result.stdout.str()
+
+    def test_a_failing_sweep_warns_and_does_not_fail(self, pytester: pytest.Pytester) -> None:
+        """A 500 is a warning, never a lost run."""
+        pytester.makeconftest(sweeping_conftest(500))
+        pytester.makepyfile(test_one="def test_a(e2e_env): pass")
+        result = pytester.runpytest_inprocess("-p", "no:cacheprovider", "-W", "default")
+        result.assert_outcomes(passed=1)
+        result.stdout.fnmatch_lines(["*Sweeping leftover ephemeral e2e users failed*500*"])
+
+    def test_a_run_without_a_token_does_not_sweep(self, pytester: pytest.Pytester) -> None:
+        """A failed mint leaves nothing to authorise the call with."""
+        pytester.makeconftest(sweeping_conftest(200, token=""))
+        pytester.makepyfile(test_one="def test_a(e2e_env): pass")
+        result = pytester.runpytest_inprocess("-p", "no:cacheprovider")
+        result.assert_outcomes(passed=1)
+        assert not (pytester.path / "sweep.log").exists()
+
+    def test_a_read_only_run_does_not_sweep(self, pytester: pytest.Pytester) -> None:
+        """The sweep deletes, which a read-only run must never do."""
+        pytester.makeconftest(sweeping_conftest(200, extra='os.environ["E2E_READ_ONLY"] = "1"'))
+        pytester.makepyfile(test_one="def test_a(e2e_env): pass")
+        result = pytester.runpytest_inprocess("-p", "no:cacheprovider")
+        result.assert_outcomes(passed=1)
+        assert not (pytester.path / "sweep.log").exists()
 
 
 class TestFailureHandling:

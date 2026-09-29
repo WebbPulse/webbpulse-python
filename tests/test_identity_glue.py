@@ -316,6 +316,20 @@ def test_dynamo_stores_builds_no_client() -> None:
     assert dynamo_stores("nonexistent-prefix") is not None
 
 
+def test_dynamo_stores_leaves_the_api_key_store_out_by_default() -> None:
+    """The `api-keys` table is opt-in, so a product that has not created it purges as before."""
+    assert dynamo_stores("nonexistent-prefix").api_keys is None
+
+
+def test_dynamo_stores_builds_the_api_key_store_on_request() -> None:
+    """`api_keys=True` gives the purge a store over the prefixed `api-keys` table."""
+    from webbpulse.identity import DynamoApiKeyStore
+
+    stores = dynamo_stores("nonexistent-prefix", api_keys=True)
+    assert isinstance(stores.api_keys, DynamoApiKeyStore)
+    assert stores.require_api_keys() is stores.api_keys
+
+
 def test_the_login_attempt_store_is_built_separately() -> None:
     """`build_identity_router` takes it as its own argument, not as a store field."""
     assert dynamo_login_attempts(PREFIX) is not None
