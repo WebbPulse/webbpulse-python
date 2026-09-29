@@ -312,6 +312,16 @@ class E2EClient:
         clone._pacer = self._pacer
         return clone
 
+    def unrecorded(self, token: str | None) -> E2EClient:
+        """A `with_token` clone whose requests stay out of this client's `records`.
+
+        For housekeeping calls such as the ephemeral user sweep, which the run-wide access
+        log and coverage checks should neither see nor judge.
+        """
+        clone = self.with_token(token)
+        clone.records = []
+        return clone
+
     def _bearer(self) -> str:
         """The bearer credential to send now, asking the token source first when there is one.
 

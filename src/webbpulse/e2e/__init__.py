@@ -36,6 +36,7 @@ from .ephemeral import (
     EphemeralUser,
     create_ephemeral_user,
     describe_delete_failure,
+    sweep_ephemeral_users,
 )
 from .gate import GateCookies
 from .gateway import (
@@ -683,8 +684,10 @@ def ephemeral_user(
     per user means a worker that dies takes only its own user with it, and no lock file or
     cross-worker handshake is needed.
 
-    Deletion failures are warnings rather than failures. The account carries the sweepable
-    `e2e-` prefix, so the next run's start sweep collects anything left behind.
+    Deletion failures are warnings rather than failures. The account's address carries the
+    ephemeral marker, `e2e-<run>@e2e.invalid`, and `e2e_hygiene` asks the deployment to sweep
+    marked users older than three hours at the start of every run, so a later run against a
+    backend that offers the sweep route collects anything left behind.
 
     The user is created with whatever `ephemeral_user_attributes` yields, so a product that
     needs an admin or verified row overrides that one fixture rather than this whole one.
@@ -707,7 +710,8 @@ def ephemeral_user(
             request.config.issue_config_time_warning(
                 UserWarning(
                     f"The ephemeral e2e user {user.user_id} could not be deleted: {failure} It "
-                    "carries the e2e- prefix, so the next run's start sweep will collect it."
+                    "carries the ephemeral marker, so a later run's start sweep collects it once "
+                    "it is three hours old, where the deployment offers the sweep route."
                 ),
                 stacklevel=2,
             )
@@ -1022,6 +1026,9 @@ def e2e_hygiene(
     worth knowing about and is never a reason to lose the result of the tests that already
     ran.
 
+    The start pass also asks the deployment to delete ephemeral users an earlier run failed
+    to, through `_sweep_ephemeral_users`.
+
     In read-only mode the hook is not invoked at all, in either phase. The run creates
     nothing, so there is nothing of its own to delete, and the start sweep deletes resources,
     which is exactly what a read-only run must not do.
@@ -1031,8 +1038,35 @@ def e2e_hygiene(
         return
     hook = request.config.hook.pytest_e2e_cleanup
     _warn_on_leftovers(request, _call_cleanup(hook, e2e_env, "start", []), "start")
+    _sweep_ephemeral_users(request, e2e_env)
     yield
     _warn_on_leftovers(request, _call_cleanup(hook, e2e_env, "end", created_resources), "end")
+
+
+def _sweep_ephemeral_users(request: pytest.FixtureRequest, env: E2EEnvironment) -> None:
+    """Ask the deployment to delete leftover ephemeral users, once per run, never failing it.
+
+    Only the first worker sweeps, `master` for a serial run and `gw0` under xdist, so a
+    distributed run makes one call rather than one per worker. A run that cannot mint holds
+    no admin token and skips the call. The request goes through an unrecorded client, so the
+    run-wide access log and coverage checks never judge it, and an older backend that has no
+    sweep route answers a status `sweep_ephemeral_users` reads as "no sweep here". Any other
+    failure is a warning.
+    """
+    if env.read_only or not env.mint_enabled:
+        return
+    if worker_id(request.config) not in {"master", "gw0"}:
+        return
+    token = request.getfixturevalue("admin_mint_token")
+    if not token:
+        return
+    anon = request.getfixturevalue("anon")
+    failure = sweep_ephemeral_users(anon.unrecorded(None), admin_token=token)
+    if failure:
+        request.config.issue_config_time_warning(
+            UserWarning(f"Sweeping leftover ephemeral e2e users failed: {failure}"),
+            stacklevel=2,
+        )
 
 
 def _call_cleanup(hook: Any, env: E2EEnvironment, phase: str, created: Sequence[Any]) -> list[Any]:

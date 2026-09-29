@@ -9,7 +9,7 @@ from __future__ import annotations
 import logging
 import time
 from dataclasses import dataclass, field
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING, Any, Final, NoReturn
 
 from webbpulse.dynamodb import now_iso
@@ -164,6 +164,7 @@ class PurgeResult:
     oauth_links: int = 0
     identity_tokens: int = 0
     webauthn_challenges: int = 0
+    api_keys: int = 0
     unsupported: tuple[str, ...] = ()
 
     @property
@@ -178,6 +179,7 @@ class PurgeResult:
             + self.oauth_links
             + self.identity_tokens
             + self.webauthn_challenges
+            + self.api_keys
         )
 
     def counts(self) -> dict[str, int]:
@@ -191,6 +193,7 @@ class PurgeResult:
             "oauth_links": self.oauth_links,
             "identity_tokens": self.identity_tokens,
             "webauthn_challenges": self.webauthn_challenges,
+            "api_keys": self.api_keys,
         }
 
 
@@ -1113,6 +1116,72 @@ class IdentityFlows:
         )
         return deleted
 
+    def sweep_ephemeral_users(
+        self,
+        *,
+        older_than: timedelta | None = None,
+        now: datetime | None = None,
+    ) -> dict[str, Any]:
+        """Delete the ephemeral e2e users an earlier run left behind, returning what went.
+
+        A user qualifies only when its address carries the ephemeral marker,
+        `e2e-<run>@e2e.invalid`, and its `created_at` is older than `older_than`, which
+        defaults to `EPHEMERAL_SWEEP_DEFAULT_AGE` and is never shorter than
+        `EPHEMERAL_SWEEP_MINIMUM_AGE`, so a live run keeps its own user. Each candidate is
+        re-read through `load_user_by_id` and re-checked before `delete_user` runs, and the
+        deletion takes the same stream purge path `delete_ephemeral_user` does. At most
+        `EPHEMERAL_SWEEP_LIMIT` users go per call.
+
+        Raises `LoginRejected` with a 403 when ephemeral users are disabled, and a 501 when
+        the product's users table cannot be enumerated.
+        """
+        from webbpulse.identity.ephemeral_sweep import (
+            EPHEMERAL_SWEEP_DEFAULT_AGE,
+            EPHEMERAL_SWEEP_LIMIT,
+            EPHEMERAL_SWEEP_MINIMUM_AGE,
+            EphemeralSweepUnsupported,
+            ephemeral_candidates,
+            is_ephemeral_email,
+        )
+
+        if not self._settings.ephemeral_users_enabled:
+            raise LoginRejected(
+                "Ephemeral e2e users are not enabled in this environment.",
+                error_code="EPHEMERAL_USERS_DISABLED",
+                status_code=403,
+            )
+        age = max(older_than if older_than is not None else EPHEMERAL_SWEEP_DEFAULT_AGE, EPHEMERAL_SWEEP_MINIMUM_AGE)
+        cutoff = (now or datetime.now(UTC)) - age
+
+        deleted: list[str] = []
+        try:
+            for row in ephemeral_candidates(self._hooks, created_before=cutoff):
+                if len(deleted) >= EPHEMERAL_SWEEP_LIMIT:
+                    break
+                user_id = str(row.get("id", "")).strip()
+                current = self._hooks.load_user_by_id(user_id)
+                if current is None or not is_ephemeral_email(current.get("email") or current.get("email_lower")):
+                    continue
+                if self._hooks.delete_user(user_id):
+                    deleted.append(user_id)
+        except EphemeralSweepUnsupported as exc:
+            raise LoginRejected(
+                str(exc),
+                error_code="EPHEMERAL_SWEEP_UNSUPPORTED",
+                status_code=501,
+            ) from exc
+
+        _log.info(
+            "Swept leftover ephemeral e2e users.",
+            extra={
+                "event": "identity.ephemeral_users_swept",
+                "deleted_count": len(deleted),
+                "user_ids": deleted,
+                "cutoff": cutoff.isoformat(),
+            },
+        )
+        return {"deleted": deleted, "deleted_count": len(deleted), "cutoff": cutoff.isoformat()}
+
     def purge_user(self, user_id: str) -> PurgeResult:
         """Delete every identity row for a user the product has already deleted.
 
@@ -1126,6 +1195,11 @@ class IdentityFlows:
         recorded in `unsupported` rather than failing the purge: every such table has a TTL
         that reclaims the rows within a day. Any other error propagates, so the stream
         retries that record.
+
+        The user's API keys go too when `IdentityStores.api_keys` is set. That table has no
+        TTL, so a failed key delete raises and is retried rather than leaving keys behind
+        forever. Only rows whose `user_id` is this user's are touched, so a key minted for a
+        non-user subject, such as a run or registry token, is never reached.
         """
         cleaned = user_id.strip()
         if not cleaned:
@@ -1184,6 +1258,11 @@ class IdentityFlows:
                     lambda: stores.require_webauthn_challenges().delete_all_for_user(cleaned),
                 )
                 if stores.webauthn_challenges is not None
+                else 0
+            ),
+            api_keys=(
+                counted("api_keys", lambda: stores.require_api_keys().delete_all_for_user(cleaned))
+                if stores.api_keys is not None
                 else 0
             ),
             unsupported=tuple(unsupported),

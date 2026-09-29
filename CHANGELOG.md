@@ -7,6 +7,31 @@ This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## Unreleased
 
+### Added
+
+- `identity`: `POST /e2e/users/sweep`, a staging-only admin route behind the same gate as
+  the other ephemeral e2e routes (`ephemeral_users_enabled`, never mounted in production).
+  It deletes ephemeral users older than `older_than_seconds` (default three hours, floor one
+  hour, at most 100 per call), matched on the `e2e-<run>@e2e.invalid` marker, which no real
+  or durable user can carry. Users are found through an optional
+  `list_ephemeral_users(created_before)` hook, or else by scanning the package `Repository`
+  that `user_repository()` returns or wraps. A product with neither answers 501.
+- `identity`: `IdentityStores.api_keys`, and `api_keys=True` on `dynamo_stores` and
+  `build_dynamo_router`. With a key store configured, `purge_user` deletes the purged user's
+  API keys and counts them in `PurgeResult.api_keys`. A failed delete raises, so the stream
+  retries. Keys whose subject is not that user, such as `run-*` tokens, are untouched. Opt in
+  only where the identity module creates the `api-keys` table and grants the purge access.
+- `e2e`: `e2e_hygiene` asks the deployment to sweep leftover ephemeral users once at session
+  start, from the first worker of a minting, non read-only run, through
+  `E2EClient.unrecorded` so the run-wide checks never see the call. A 403, 404, 405 or 501
+  means the backend offers no sweep and is ignored, so an older deployment keeps working.
+  Any other failure is a warning.
+
+### Fixed
+
+- `e2e`: the `ephemeral_user` docstring and teardown warning no longer promise a start sweep
+  that did not exist.
+
 ## 0.69.0
 
 ### Added

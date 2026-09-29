@@ -276,6 +276,17 @@ class TestGateHeaderAndRequestIds:
         client = client_for(responder([200]), clock)
         assert client.with_token("tok").pacer is client.pacer
 
+    def test_an_unrecorded_clone_keeps_its_requests_out_of_the_run_records(self) -> None:
+        """Housekeeping calls stay out of the access log and coverage checks, even via a further clone."""
+        clock = Clock()
+        client = client_for(responder([200, 200]), clock)
+        quiet = client.unrecorded(None)
+        quiet.with_token("tok").post("/api/auth/e2e/users/sweep")
+        assert client.records == []
+        assert quiet.pacer is client.pacer
+        client.get("/api/me")
+        assert len(client.records) == 1
+
     def test_the_gateway_request_id_is_captured(self) -> None:
         """The id the access log keys on is preferred over the other edge ids."""
         clock = Clock()

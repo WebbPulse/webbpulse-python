@@ -12,6 +12,8 @@ untested by every run that uses this.
 
 from __future__ import annotations
 
+from datetime import UTC, datetime, timedelta
+from decimal import Decimal
 from typing import TYPE_CHECKING, Any
 
 import pytest
@@ -34,6 +36,15 @@ from webbpulse.identity import (
 from webbpulse.identity.ephemeral_routes import (
     EPHEMERAL_USER_ITEM_PATH,
     EPHEMERAL_USERS_PATH,
+    EPHEMERAL_USERS_SWEEP_PATH,
+)
+from webbpulse.identity.ephemeral_sweep import (
+    EPHEMERAL_SWEEP_DEFAULT_AGE,
+    EPHEMERAL_SWEEP_LIMIT,
+    EPHEMERAL_SWEEP_MINIMUM_AGE,
+    created_at_of,
+    is_ephemeral_email,
+    users_scan_source,
 )
 from webbpulse.identity.flows import EPHEMERAL_VIA, IdentityFlows, LoginRejected
 
@@ -506,3 +517,282 @@ class TestEphemeralRoutesOverHttp:
         deleted = client.delete(f"/api/auth/e2e/users/{user_id}", headers=admin)
         assert deleted.status_code == 200, deleted.text
         assert deleted.json() == {"user_id": user_id, "deleted": True}
+
+
+NOW = datetime(2026, 9, 29, 12, 0, tzinfo=UTC)
+OLD = (NOW - timedelta(hours=5)).isoformat()
+FRESH = (NOW - timedelta(minutes=30)).isoformat()
+MIDDLE = (NOW - timedelta(hours=2)).isoformat()
+
+
+class ListingHooks(FakeHooks):
+    """A product that enumerates its own ephemeral users through the optional hook."""
+
+    def __init__(self) -> None:
+        """Start empty and record every cutoff the sweep asked for."""
+        super().__init__()
+        self.cutoffs: list[datetime] = []
+
+    def list_ephemeral_users(self, created_before: datetime) -> list[Mapping[str, Any]]:
+        """Return every row, so the sweep's own re-checks are what narrow it."""
+        self.cutoffs.append(created_before)
+        return list(self.users.values())
+
+
+class FakeScanRepository:
+    """A package `Repository` stand-in that only knows how to scan."""
+
+    def __init__(self, rows: dict[str, dict[str, Any]]) -> None:
+        """Share the hooks' users dict."""
+        self.rows = rows
+        self.filters: list[Any] = []
+
+    def iter_scan(self, *, filter_expression: Any = None) -> list[dict[str, Any]]:
+        """Return every row, recording the filter it was given."""
+        self.filters.append(filter_expression)
+        return list(self.rows.values())
+
+
+class WrappedRepository:
+    """A product repository holding the package `Repository` privately, as TF and Standupless do."""
+
+    def __init__(self, inner: FakeScanRepository) -> None:
+        """Wrap the scanning repository."""
+        self._repository = inner
+
+
+class ScanningHooks(FakeHooks):
+    """A product whose users repository wraps a scannable package `Repository`."""
+
+    def __init__(self) -> None:
+        """Start empty with a scannable repository over the same rows."""
+        super().__init__()
+        self.scan = FakeScanRepository(self.users)
+
+    def user_repository(self) -> object:
+        """The wrapping product repository."""
+        return WrappedRepository(self.scan)
+
+
+def seed(hooks: FakeHooks, user_id: str, email: str, created_at: Any) -> None:
+    """Put one users row in place directly."""
+    hooks.users[user_id] = {"id": user_id, "email": email, "created_at": created_at}
+
+
+def seed_mix(hooks: FakeHooks) -> None:
+    """An old and a fresh ephemeral user, plus durable and real users of every age."""
+    seed(hooks, "old-e2e", "e2e-run-1@e2e.invalid", OLD)
+    seed(hooks, "fresh-e2e", "e2e-run-2@e2e.invalid", FRESH)
+    seed(hooks, "middle-e2e", "e2e-run-3@e2e.invalid", MIDDLE)
+    seed(hooks, "durable", "tyler+e2e-staging@webbpulse.com", OLD)
+    seed(hooks, "real", "someone@example.com", OLD)
+    seed(hooks, "lookalike", "e2e-run-4@e2e.invalid.example.com", OLD)
+    seed(hooks, "undated", "e2e-run-5@e2e.invalid", None)
+
+
+class TestEphemeralSweepHelpers:
+    """The marker and timestamp checks every sweep candidate passes through."""
+
+    @pytest.mark.parametrize(
+        ("value", "expected"),
+        [
+            ("e2e-run-123@e2e.invalid", True),
+            ("E2E-Run-123@E2E.INVALID", True),
+            ("e2e@webbpulse.com", False),
+            ("tyler+e2e-staging@webbpulse.com", False),
+            ("e2e-run@e2e.invalid.example.com", False),
+            ("x-e2e-run@e2e.invalid", False),
+            ("e2e-@e2e.invalid", False),
+            (None, False),
+            (42, False),
+        ],
+    )
+    def test_is_ephemeral_email(self, value: Any, expected: bool) -> None:
+        """Only the exact `e2e-<run>@e2e.invalid` shape carries the marker."""
+        assert is_ephemeral_email(value) is expected
+
+    def test_created_at_reads_every_stored_shape(self) -> None:
+        """ISO strings, datetimes and epoch seconds all come back aware."""
+        assert created_at_of({"created_at": "2026-09-29T12:00:00Z"}) == NOW
+        assert created_at_of({"created_at": NOW.replace(tzinfo=None)}) == NOW
+        assert created_at_of({"created_at": Decimal(int(NOW.timestamp()))}) == NOW
+        assert created_at_of({"created_at": "not a date"}) is None
+        assert created_at_of({"created_at": True}) is None
+        assert created_at_of({}) is None
+
+    def test_scan_source_finds_the_wrapped_repository(self) -> None:
+        """A repository that scans is used directly, a wrapper yields what it holds."""
+        inner = FakeScanRepository({})
+        assert users_scan_source(inner) is inner
+        assert users_scan_source(WrappedRepository(inner)) is inner
+        assert users_scan_source(object()) is None
+
+
+class TestEphemeralSweepFlow:
+    """The sweep deletes old marked users and nothing else."""
+
+    def test_it_deletes_only_old_marked_users_through_the_listing_hook(self, module_key: rsa.RSAPrivateKey) -> None:
+        """Durable, real, fresh, lookalike and undated rows all survive."""
+        hooks = ListingHooks()
+        seed_mix(hooks)
+        flows = make_flows(hooks, module_key, ephemeral_users_enabled=True)
+        result = flows.sweep_ephemeral_users(now=NOW)
+        assert result["deleted"] == ["old-e2e"]
+        assert result["deleted_count"] == 1
+        assert set(hooks.users) == {"fresh-e2e", "middle-e2e", "durable", "real", "lookalike", "undated"}
+        assert hooks.cutoffs == [NOW - EPHEMERAL_SWEEP_DEFAULT_AGE]
+
+    def test_it_scans_a_wrapped_package_repository(self, module_key: rsa.RSAPrivateKey) -> None:
+        """Without the hook the sweep scans the repository the product repository wraps."""
+        pytest.importorskip("boto3")
+        hooks = ScanningHooks()
+        seed_mix(hooks)
+        flows = make_flows(hooks, module_key, ephemeral_users_enabled=True)
+        result = flows.sweep_ephemeral_users(now=NOW)
+        assert result["deleted"] == ["old-e2e"]
+        assert len(hooks.scan.filters) == 1
+        assert hooks.scan.filters[0] is not None
+
+    def test_a_shorter_age_widens_the_cutoff_but_never_below_the_floor(self, module_key: rsa.RSAPrivateKey) -> None:
+        """Ninety minutes reaches the two hour old user; one minute still spares the fresh one."""
+        hooks = ListingHooks()
+        seed_mix(hooks)
+        flows = make_flows(hooks, module_key, ephemeral_users_enabled=True)
+        flows.sweep_ephemeral_users(older_than=timedelta(minutes=1), now=NOW)
+        assert hooks.cutoffs[-1] == NOW - EPHEMERAL_SWEEP_MINIMUM_AGE
+        assert "fresh-e2e" in hooks.users
+        assert "middle-e2e" not in hooks.users
+
+    def test_a_row_whose_address_changed_since_listing_is_spared(self, module_key: rsa.RSAPrivateKey) -> None:
+        """The re-read before each delete wins over a stale listing."""
+
+        class StaleHooks(ListingHooks):
+            def list_ephemeral_users(self, created_before: datetime) -> list[Mapping[str, Any]]:
+                """Return a stale copy claiming the marker."""
+                return [{"id": "real", "email": "e2e-run-9@e2e.invalid", "created_at": OLD}]
+
+        hooks = StaleHooks()
+        seed(hooks, "real", "someone@example.com", OLD)
+        flows = make_flows(hooks, module_key, ephemeral_users_enabled=True)
+        assert flows.sweep_ephemeral_users(now=NOW)["deleted"] == []
+        assert hooks.deleted == []
+
+    def test_one_call_deletes_at_most_the_limit(self, module_key: rsa.RSAPrivateKey) -> None:
+        """The rest wait for the next run."""
+        hooks = ListingHooks()
+        for index in range(EPHEMERAL_SWEEP_LIMIT + 5):
+            seed(hooks, f"e2e-{index}", f"e2e-run-{index}@e2e.invalid", OLD)
+        flows = make_flows(hooks, module_key, ephemeral_users_enabled=True)
+        assert flows.sweep_ephemeral_users(now=NOW)["deleted_count"] == EPHEMERAL_SWEEP_LIMIT
+        assert len(hooks.users) == 5
+
+    def test_it_refuses_when_the_flag_is_off(self, module_key: rsa.RSAPrivateKey) -> None:
+        """The same gate as create and delete."""
+        hooks = ListingHooks()
+        seed_mix(hooks)
+        flows = make_flows(hooks, module_key)
+        with pytest.raises(LoginRejected) as caught:
+            flows.sweep_ephemeral_users(now=NOW)
+        assert caught.value.status_code == 403
+        assert caught.value.error_code == "EPHEMERAL_USERS_DISABLED"
+        assert hooks.deleted == []
+
+    def test_a_product_it_cannot_enumerate_answers_501(self, hooks: FakeHooks, module_key: rsa.RSAPrivateKey) -> None:
+        """No listing hook and no scannable repository is unsupported, not a crash."""
+        flows = make_flows(hooks, module_key, ephemeral_users_enabled=True)
+        with pytest.raises(LoginRejected) as caught:
+            flows.sweep_ephemeral_users(now=NOW)
+        assert caught.value.status_code == 501
+        assert caught.value.error_code == "EPHEMERAL_SWEEP_UNSUPPORTED"
+
+
+class TestEphemeralSweepRoute:
+    """The sweep route over HTTP, behind the same gate as the create and delete routes."""
+
+    def test_it_is_mounted_beside_the_other_routes(self, module_key: rsa.RSAPrivateKey) -> None:
+        """Staging with the flag on offers it."""
+        paths = TestEphemeralRouteMounting.mounted_paths(
+            module_key, ephemeral_users_enabled=True, environment="staging"
+        )
+        assert any(path.endswith(EPHEMERAL_USERS_SWEEP_PATH) for path in paths)
+
+    @pytest.mark.parametrize(
+        "overrides",
+        [
+            {},
+            {"ephemeral_users_enabled": True, "environment": "production"},
+            {"ephemeral_users_enabled": True, "environment": "prod"},
+        ],
+    )
+    def test_it_is_absent_in_production_or_without_the_flag(
+        self, overrides: dict[str, Any], module_key: rsa.RSAPrivateKey
+    ) -> None:
+        """Production never mounts it, whatever the flag says."""
+        paths = TestEphemeralRouteMounting.mounted_paths(module_key, **overrides)
+        assert not any(path.endswith(EPHEMERAL_USERS_SWEEP_PATH) for path in paths)
+
+    def test_an_admin_sweeps(self, module_key: rsa.RSAPrivateKey) -> None:
+        """The plugin's exact payload answers 200 and names what went."""
+        hooks = ListingHooks()
+        seed(hooks, "old-e2e", "e2e-run-1@e2e.invalid", "2000-01-01T00:00:00+00:00")
+        seed(hooks, "durable", "e2e@webbpulse.com", "2000-01-01T00:00:00+00:00")
+        client = TestEphemeralRoutesOverHttp.client(module_key, hooks)
+        response = client.post(
+            "/api/auth/e2e/users/sweep",
+            json={"older_than_seconds": 3 * 60 * 60},
+            headers=TestEphemeralRoutesOverHttp.headers_for(TestEphemeralRoutesOverHttp.ADMIN),
+        )
+        assert response.status_code == 200, response.text
+        assert response.json()["deleted"] == ["old-e2e"]
+        assert set(hooks.users) == {"durable"}
+
+    def test_no_body_uses_the_default_age(self, module_key: rsa.RSAPrivateKey) -> None:
+        """An empty request is valid."""
+        hooks = ListingHooks()
+        client = TestEphemeralRoutesOverHttp.client(module_key, hooks)
+        response = client.post(
+            "/api/auth/e2e/users/sweep",
+            headers=TestEphemeralRoutesOverHttp.headers_for(TestEphemeralRoutesOverHttp.ADMIN),
+        )
+        assert response.status_code == 200, response.text
+        assert response.json()["deleted_count"] == 0
+
+    @pytest.mark.parametrize("age", [0, -5, "3600", True, 1.5])
+    def test_a_bad_age_answers_400(self, age: Any, module_key: rsa.RSAPrivateKey) -> None:
+        """Only a positive whole number of seconds is accepted."""
+        client = TestEphemeralRoutesOverHttp.client(module_key, ListingHooks())
+        response = client.post(
+            "/api/auth/e2e/users/sweep",
+            json={"older_than_seconds": age},
+            headers=TestEphemeralRoutesOverHttp.headers_for(TestEphemeralRoutesOverHttp.ADMIN),
+        )
+        assert response.status_code == 400
+        assert response.json()["error_code"] == "INVALID_SWEEP_AGE"
+
+    def test_a_non_admin_is_refused_and_nothing_goes(self, module_key: rsa.RSAPrivateKey) -> None:
+        """The durable e2e user cannot sweep."""
+        hooks = ListingHooks()
+        seed(hooks, "old-e2e", "e2e-run-1@e2e.invalid", OLD)
+        client = TestEphemeralRoutesOverHttp.client(module_key, hooks)
+        response = client.post(
+            "/api/auth/e2e/users/sweep",
+            headers=TestEphemeralRoutesOverHttp.headers_for({"sub": "user-0001", "roles": ["user"]}),
+        )
+        assert response.status_code == 403
+        assert hooks.deleted == []
+
+    def test_an_anonymous_caller_is_refused(self, module_key: rsa.RSAPrivateKey) -> None:
+        """No claims reads as not signed in."""
+        client = TestEphemeralRoutesOverHttp.client(module_key, ListingHooks())
+        response = client.post("/api/auth/e2e/users/sweep")
+        assert response.status_code == 401
+
+    def test_an_unenumerable_product_answers_501(self, hooks: FakeHooks, module_key: rsa.RSAPrivateKey) -> None:
+        """The plugin reads 501 as a backend that offers no sweep."""
+        client = TestEphemeralRoutesOverHttp.client(module_key, hooks)
+        response = client.post(
+            "/api/auth/e2e/users/sweep",
+            headers=TestEphemeralRoutesOverHttp.headers_for(TestEphemeralRoutesOverHttp.ADMIN),
+        )
+        assert response.status_code == 501
+        assert response.json()["error_code"] == "EPHEMERAL_SWEEP_UNSUPPORTED"

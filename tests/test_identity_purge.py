@@ -6,6 +6,7 @@ store methods in memory and against moto, and the DynamoDB Streams pass-through 
 
 from __future__ import annotations
 
+import dataclasses
 import json
 from typing import TYPE_CHECKING, Any
 
@@ -13,12 +14,14 @@ import pytest
 
 from webbpulse.identity import (
     OAUTH_LINK_USER_INDEX,
+    ApiKeyRecord,
     AuthenticationRefused,
     BaseIdentityHooks,
     CredentialRecord,
     IdentitySettings,
     IdentityStores,
     IdentityTokenRecord,
+    InMemoryApiKeyStore,
     InMemoryCredentialStore,
     InMemoryIdentityTokenStore,
     InMemoryOAuthLinkStore,
@@ -370,6 +373,96 @@ def test_purge_user_skips_a_store_that_was_never_configured(kms: FakeKms) -> Non
     assert result.passkeys == 0
     assert result.oauth_links == 0
     assert result.unsupported == ()
+
+
+def api_key(key_hash: str, user_id: str) -> ApiKeyRecord:
+    """One stored API key for this subject."""
+    return ApiKeyRecord(key_hash=key_hash, user_id=user_id, tenant_id="tenant-1", prefix="wpk_abc")
+
+
+@pytest.fixture
+def keyed_flows(kms: FakeKms, stores: IdentityStores) -> tuple[IdentityFlows, InMemoryApiKeyStore, IdentityStores]:
+    """`IdentityFlows` over the in-memory stores with an API key store configured."""
+    api_keys = InMemoryApiKeyStore()
+    keyed = dataclasses.replace(stores, api_keys=api_keys)
+    settings = make_settings()
+    return IdentityFlows(settings, FakeHooks(), keyed, TokenService(settings, kms)), api_keys, keyed
+
+
+def test_purge_user_deletes_the_users_api_keys(
+    keyed_flows: tuple[IdentityFlows, InMemoryApiKeyStore, IdentityStores],
+) -> None:
+    """A deleted user's keys stop authenticating, and the count includes them."""
+    flows, api_keys, stores = keyed_flows
+    seed_every_table(stores)
+    api_keys.put(api_key("h1", USER_ID))
+    api_keys.put(api_key("h2", USER_ID))
+
+    result = flows.purge_user(USER_ID)
+
+    assert result.api_keys == 2
+    assert result.counts()["api_keys"] == 2
+    assert result.total == 13
+    assert api_keys.get("h1") is None
+    assert api_keys.get("h2") is None
+
+
+def test_purge_user_leaves_run_tokens_and_other_users_keys_alone(
+    keyed_flows: tuple[IdentityFlows, InMemoryApiKeyStore, IdentityStores],
+) -> None:
+    """Keys whose subject is a run, a registry, or another user survive the purge."""
+    flows, api_keys, _ = keyed_flows
+    api_keys.put(api_key("mine", USER_ID))
+    api_keys.put(api_key("run", "run-01J00000000000000000000000"))
+    api_keys.put(api_key("other", OTHER_USER_ID))
+
+    flows.purge_user(USER_ID)
+
+    assert api_keys.get("mine") is None
+    assert api_keys.get("run") is not None
+    assert api_keys.get("other") is not None
+
+
+def test_purge_user_surfaces_an_api_key_store_failure(
+    keyed_flows: tuple[IdentityFlows, InMemoryApiKeyStore, IdentityStores],
+) -> None:
+    """A key delete that fails propagates, so the stream retries rather than leaving live keys."""
+    flows, api_keys, _ = keyed_flows
+
+    def explode(user_id: str) -> int:
+        """Stand in for a missing grant on the api-keys table."""
+        raise RuntimeError("AccessDeniedException")
+
+    api_keys.delete_all_for_user = explode  # type: ignore[method-assign]
+
+    with pytest.raises(RuntimeError):
+        flows.purge_user(USER_ID)
+
+
+def test_purge_user_without_an_api_key_store_counts_zero(flows: IdentityFlows) -> None:
+    """A product that never configured API keys purges as before."""
+    result = flows.purge_user(USER_ID)
+    assert result.api_keys == 0
+    assert result.unsupported == ()
+
+
+def test_a_failing_api_key_delete_is_reported_to_the_stream(kms: FakeKms, stores: IdentityStores) -> None:
+    """The record comes back as a batch item failure, so Lambda retries it."""
+    api_keys = InMemoryApiKeyStore()
+
+    def explode(user_id: str) -> int:
+        """Stand in for a throttled api-keys table."""
+        raise RuntimeError("ProvisionedThroughputExceededException")
+
+    api_keys.delete_all_for_user = explode  # type: ignore[method-assign]
+    keyed = dataclasses.replace(stores, api_keys=api_keys)
+    app = FastAPI()
+    app.include_router(build_identity_router(make_settings(), FakeHooks(), keyed, kms_client=kms))
+    with TestClient(app, raise_server_exceptions=False) as client:
+        response = client.post(DEFAULT_EVENTS_PATH, json={"Records": [remove_record(USER_ID, event_id="evt-keys")]})
+
+    assert response.status_code == 200
+    assert response.json() == {"batchItemFailures": [{"itemIdentifier": "evt-keys"}]}
 
 
 def test_purge_user_refuses_an_empty_user_id(flows: IdentityFlows) -> None:

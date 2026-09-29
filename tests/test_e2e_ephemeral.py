@@ -17,6 +17,8 @@ from webbpulse.e2e.ephemeral import (
     BODY_EXCERPT_LIMIT,
     CREATE_PATH,
     RESERVED_EMAIL_DOMAIN,
+    SWEEP_OLDER_THAN_SECONDS,
+    SWEEP_PATH,
     Credentials,
     EphemeralUser,
     create_ephemeral_user,
@@ -27,6 +29,7 @@ from webbpulse.e2e.ephemeral import (
     ephemeral_email,
     generate_password,
     item_path,
+    sweep_ephemeral_users,
 )
 from webbpulse.e2e.xdist import (
     SHARED_STATE_GROUP,
@@ -601,3 +604,36 @@ class TestWorkerId:
             workerinput: ClassVar[dict[str, str]] = {"workerid": "gw3"}
 
         assert worker_id(Config()) == "gw3"
+
+
+class TestSweepEphemeralUsers:
+    """The session start sweep, which must never break a run against any backend."""
+
+    def test_it_posts_the_age_with_the_admin_token(self) -> None:
+        """One call, to the sweep route, carrying the admin token and the default age."""
+        client = FakeClient([FakeResponse(200, {"deleted": [], "deleted_count": 0})])
+        assert sweep_ephemeral_users(client, admin_token=ADMIN_TOKEN) == ""
+        assert client.tokens == [ADMIN_TOKEN]
+        assert client.calls == [
+            {"method": "POST", "path": SWEEP_PATH, "json": {"older_than_seconds": SWEEP_OLDER_THAN_SECONDS}}
+        ]
+
+    @pytest.mark.parametrize("status", [403, 404, 405, 501])
+    def test_a_backend_without_the_route_is_not_a_failure(self, status: int) -> None:
+        """An older deployment answers 404 or 405, a disabled one 403, an unenumerable one 501."""
+        client = FakeClient([FakeResponse(status, {"detail": "Not Found"})])
+        assert sweep_ephemeral_users(client, admin_token=ADMIN_TOKEN) == ""
+
+    def test_any_other_status_is_described(self) -> None:
+        """A 500 comes back as a message for a warning, not an exception."""
+        client = FakeClient([FakeResponse(500, {"error_code": "INTERNAL", "message": "boom"})])
+        message = sweep_ephemeral_users(client, admin_token=ADMIN_TOKEN)
+        assert "500" in message
+        assert ADMIN_TOKEN not in message
+
+    def test_a_raising_client_is_described_not_raised(self) -> None:
+        """A transport failure is a message too."""
+        client = FakeClient(raises=ConnectionError("unreachable"))
+        message = sweep_ephemeral_users(client, admin_token=ADMIN_TOKEN)
+        assert "ConnectionError" in message
+        assert ADMIN_TOKEN not in message

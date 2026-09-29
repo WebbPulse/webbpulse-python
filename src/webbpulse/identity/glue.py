@@ -41,6 +41,7 @@ def dynamo_stores(
     *,
     region_name: str | None = None,
     endpoint_url: str | None = None,
+    api_keys: bool = False,
 ) -> IdentityStores:
     """Every identity store, backed by the tables under `prefix`.
 
@@ -48,6 +49,11 @@ def dynamo_stores(
     constants rather than names a product restates. The login attempt store is not among
     them because `build_identity_router` takes it separately; `build_dynamo_router` builds
     that one itself.
+
+    `api_keys` adds the `api-keys` store, so the account deletion purge removes a deleted
+    user's keys. It is opt-in because that table is: pass it only where the identity module
+    creates the table and the purge function may write to it, or every purge fails and the
+    stream retries it.
 
     Constructing these makes no AWS call: each repository resolves its table on first use.
     """
@@ -89,7 +95,15 @@ def dynamo_stores(
         oauth_links=DynamoOAuthLinkStore(repository(OAUTH_LINKS_TABLE)),
         passkeys=DynamoPasskeyStore(repository(PASSKEYS_TABLE)),
         webauthn_challenges=DynamoWebAuthnChallengeStore(repository(WEBAUTHN_CHALLENGES_TABLE)),
+        api_keys=_api_key_store(repository) if api_keys else None,
     )
+
+
+def _api_key_store(repository: Any) -> Any:
+    """The `api-keys` store over this prefix's table."""
+    from webbpulse.identity.api_keys import API_KEYS_TABLE, DynamoApiKeyStore
+
+    return DynamoApiKeyStore(repository(API_KEYS_TABLE))
 
 
 def dynamo_login_attempts(
@@ -129,6 +143,7 @@ def build_dynamo_router(
     oauth_server_stores: OAuthServerStores | None = None,
     consent_renderer: ConsentRenderer | None = None,
     tenant_resolver: TenantResolver | None = None,
+    api_keys: bool = False,
 ) -> APIRouter:
     """The identity router over the DynamoDB tables under `prefix`.
 
@@ -140,12 +155,16 @@ def build_dynamo_router(
     `stores`, `attempts` and `kms_client` override what would be built, which is how a test
     substitutes in-memory stores or a fake KMS. The router carries the issuer's own path, so
     mount it with no prefix of its own: a prefix would double every path.
+
+    `api_keys` is `dynamo_stores`'s, and is ignored when `stores` is given.
     """
     from webbpulse.identity.local_signer import signing_client
     from webbpulse.identity.router import build_identity_router
 
     resolved_stores = (
-        stores if stores is not None else dynamo_stores(prefix, region_name=region_name, endpoint_url=endpoint_url)
+        stores
+        if stores is not None
+        else dynamo_stores(prefix, region_name=region_name, endpoint_url=endpoint_url, api_keys=api_keys)
     )
     resolved_attempts = (
         attempts
