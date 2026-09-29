@@ -1100,6 +1100,9 @@ dynamodb = [
     { name = "docker" },
     { name = "py-partiql-parser" },
 ]
+ssm = [
+    { name = "pyyaml" },
+]
 
 [[package]]
 name = "mypy"
@@ -2704,10 +2707,12 @@ stripe = [
 ]
 testing = [
     { name = "httpx2" },
-    { name = "moto", extra = ["dynamodb"] },
+    { name = "moto", extra = ["dynamodb", "ssm"] },
     { name = "pytest" },
 ]
 tf = [
+    { name = "boto3" },
+    { name = "botocore" },
     { name = "httpx" },
 ]
 
@@ -2728,8 +2733,10 @@ requires-dist = [
     { name = "bcrypt", marker = "extra == 'security'", specifier = ">=4.1" },
     { name = "boto3", marker = "extra == 'dynamodb'", specifier = ">=1.35" },
     { name = "boto3", marker = "extra == 'e2e'", specifier = ">=1.35" },
+    { name = "boto3", marker = "extra == 'tf'", specifier = ">=1.35" },
     { name = "botocore", marker = "extra == 'aws-otel'", specifier = ">=1.35" },
     { name = "botocore", marker = "extra == 'dynamodb'", specifier = ">=1.35" },
+    { name = "botocore", marker = "extra == 'tf'", specifier = ">=1.35" },
     { name = "cryptography", marker = "extra == 'e2e'", specifier = ">=43" },
     { name = "fastapi", marker = "extra == 'fastapi'", specifier = ">=0.115" },
     { name = "fastapi", marker = "extra == 'identity'", specifier = ">=0.115" },
@@ -2738,7 +2745,7 @@ requires-dist = [
     { name = "httpx", marker = "extra == 'oauth'", specifier = ">=0.27" },
     { name = "httpx", marker = "extra == 'tf'", specifier = ">=0.27" },
     { name = "httpx2", marker = "extra == 'testing'", specifier = ">=2" },
-    { name = "moto", extras = ["dynamodb", "secretsmanager"], marker = "extra == 'testing'", specifier = ">=5" },
+    { name = "moto", extras = ["dynamodb", "secretsmanager", "ssm"], marker = "extra == 'testing'", specifier = ">=5" },
     { name = "opentelemetry-api", marker = "extra == 'otel'", specifier = ">=1.30" },
     { name = "opentelemetry-exporter-otlp-proto-http", marker = "extra == 'otel'", specifier = ">=1.30" },
     { name = "opentelemetry-instrumentation-botocore", marker = "extra == 'otel'", specifier = ">=0.51b0" },

@@ -11,8 +11,10 @@ The key is the one `terraform login` stored for the host, or `TF_TOKEN_<host>`, 
 `WP_TF_TOKEN`. The host defaults to `terraform.webbpulse.com` and is set with `--host` or
 `WP_TF_HOST`; the API origin is read from the host's discovery document, and must be https
 on the host or a subdomain, unless `--api-url` or `WP_TF_API_URL` names an https origin.
-Staging sits behind an access gate whose value goes in `WP_TF_GATE`. No command confirms,
-applies or reads state, and no token is ever printed.
+The access gate value comes from `WP_TF_GATE`, else from the gate's SSM parameter
+`/<prefix>/access-gate/origin-verify` when AWS credentials can read it, with the prefix
+from `--gate-prefix`, `WP_TF_GATE_PREFIX` or the known host. No command confirms, applies
+or reads state, and no token or gate value is ever printed.
 
 Log lines go to stdout, progress to stderr. Exit codes: 0 when the plan succeeded, 1 on any
 failure, 2 under `--detailed-exitcode` when the plan has changes.
@@ -31,6 +33,7 @@ from typing import IO, TYPE_CHECKING, Any, NoReturn
 
 from .archive import ArchiveError, build_tarball
 from .credentials import CredentialsError, resolve_token
+from .gate import GateError, resolve_gate
 
 if TYPE_CHECKING:
     from .client import ControlPlane
@@ -41,7 +44,6 @@ DEFAULT_HOST = "terraform.webbpulse.com"
 
 HOST_ENV = "WP_TF_HOST"
 API_URL_ENV = "WP_TF_API_URL"
-GATE_ENV = "WP_TF_GATE"
 
 EXIT_OK = 0
 EXIT_ERROR = 1
@@ -74,6 +76,10 @@ def build_parser() -> argparse.ArgumentParser:
     parser = _Parser(prog=PROG, description="Plan-only runs on the WebbPulse Terraform control plane.")
     parser.add_argument("--host", help=f"control plane host, as used with terraform login (default {DEFAULT_HOST})")
     parser.add_argument("--api-url", help="API origin, when it should not be discovered from the host")
+    parser.add_argument(
+        "--gate-prefix",
+        help="SSM prefix of the access gate value, /<prefix>/access-gate/origin-verify (default by host)",
+    )
     commands = parser.add_subparsers(dest="command", required=True)
 
     plan = commands.add_parser("plan", help="upload a directory and stream a plan-only run")
@@ -218,7 +224,10 @@ def _connect(args: argparse.Namespace, environ: Mapping[str, str], home: Path | 
     else:
         with httpx.Client(timeout=30.0) as client:
             api_url = discover_api_url(host, client)
-    return host, ControlPlane(api_url, token, gate=environ.get(GATE_ENV, "").strip())
+    gate = resolve_gate(
+        host, environ, args.gate_prefix, warn=lambda message: print(f"{PROG}: {message}", file=sys.stderr)
+    )
+    return host, ControlPlane(api_url, token, gate=gate)
 
 
 def main(
@@ -266,7 +275,7 @@ def main(
                 row = (item.get("workspace_id", ""), item.get("name", ""), item.get("working_directory") or "")
                 print("\t".join(str(value) for value in row), file=out)
             return EXIT_OK
-    except (UsageError, CredentialsError, ArchiveError, ApiError) as exc:
+    except (UsageError, CredentialsError, GateError, ArchiveError, ApiError) as exc:
         print(f"{PROG}: {exc}", file=err)
         return EXIT_ERROR
     except httpx.HTTPError as exc:
