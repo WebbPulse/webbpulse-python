@@ -294,8 +294,14 @@ wp-tf workspaces
   `terraform.webbpulse.com`. The API origin comes from the host's discovery document and must
   be https on the host or a subdomain. `--api-url` or `WP_TF_API_URL` can name it instead; it
   must be https, except on a local stack (`localhost`).
-- **Staging gate.** Staging sits behind the access gate. Put the gate's origin-verify value in
-  `WP_TF_GATE`.
+- **Access gate.** A gated host needs the gate's origin-verify value. `WP_TF_GATE` wins when
+  set. Otherwise, with AWS credentials that can read it, `wp-tf` reads the SecureString
+  `/<prefix>/access-gate/origin-verify` from SSM. The prefix comes from `--gate-prefix`, then
+  `WP_TF_GATE_PREFIX`, then the host: `webbpulse-terraform-prod` for `terraform.webbpulse.com`
+  and `webbpulse-terraform-stg` for `staging.terraform.webbpulse.com`. The region is the AWS
+  profile's, else `us-west-2`. With no credentials it goes on without a gate. A host default
+  that cannot be read prints a warning naming the parameter, and a prefix named on purpose
+  that cannot be read fails the command.
 - **Working directory.** When a workspace has a working directory, run `wp-tf` from that
   directory. The upload is rooted that many levels up, as HCP Terraform does.
 - **What the upload skips.** A `.terraformignore` at the upload root filters it with

@@ -36,6 +36,10 @@ This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   only to `TARBALL_HOSTS` or `ASSET_HOSTS`, without the token. `CheckRun` gains `name`,
   `head_sha`, `external_id` and `app_id`, and `IssueComment` gains `body`, `user_login` and
   `user_type`, all defaulted.
+- `wp-tf`: when `WP_TF_GATE` is unset and AWS credentials are available, the access gate
+  value is read from SSM `/<prefix>/access-gate/origin-verify` with decryption. The prefix
+  comes from the new `--gate-prefix` flag, then `WP_TF_GATE_PREFIX`, then the known WebbPulse
+  Terraform host. The value is never printed or logged. The `tf` extra now pulls in `boto3`.
 
 ### Fixed
 
