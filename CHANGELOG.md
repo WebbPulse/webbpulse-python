@@ -7,6 +7,13 @@ This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## Unreleased
 
+### Fixed
+
+- `e2e`: `TestBrowser::test_protected_routes_redirect_anonymous_visitors` now runs in
+  read-only mode, including a gated production smoke. It visits every protected route with
+  no session, so the per-parameter read-only skip no longer applies to it. The sign-in, the
+  guest-only redirect and the protected render cases stay skipped.
+
 ## 0.67.1
 
 ### Fixed

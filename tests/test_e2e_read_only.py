@@ -105,6 +105,10 @@ def test_routes(declared_route):
     assert declared_route is not None
 
 
+def test_protected(protected_route):
+    assert protected_route.access == "protected"
+
+
 def test_journeys(journey):
     assert journey.name
 """
@@ -192,7 +196,7 @@ class TestParametrisedCases:
     """Tests for the browser cases, which are skipped per parameter rather than per test."""
 
     def test_read_only_keeps_the_anonymous_cases_and_skips_the_rest(self, pytester: pytest.Pytester) -> None:
-        """Exactly the public routes and the anonymous non-mutating journey survive.
+        """Exactly the public routes, the anonymous redirect cases and the anonymous journey survive.
 
         Asserted by parameter id rather than by count, because a count agrees with the wrong
         three parameters as readily as with the right ones.
@@ -204,6 +208,7 @@ class TestParametrisedCases:
             "test_routes[public:/]": "PASSED",
             "test_routes[public:/about]": "PASSED",
             "test_routes[protected:/garage]": "SKIPPED",
+            "test_protected[protected:/garage]": "PASSED",
             "test_journeys[browse]": "PASSED",
             "test_journeys[dashboard]": "SKIPPED",
             "test_journeys[create]": "SKIPPED",
@@ -214,7 +219,7 @@ class TestParametrisedCases:
         pytester.makeconftest(conftest_for(ROUTE_CONFTEST, SIGNED_IN_ENVIRONMENT))
         pytester.makepyfile(test_cases=ROUTE_CASES)
         result = pytester.runpytest_inprocess("-p", "no:cacheprovider")
-        result.assert_outcomes(passed=6)
+        result.assert_outcomes(passed=7)
 
     def test_a_mutating_journey_is_skipped_even_when_anonymous(self, pytester: pytest.Pytester) -> None:
         """`mutates=True` is enough on its own; a journey need not be signed in to write."""
@@ -222,6 +227,71 @@ class TestParametrisedCases:
         pytester.makepyfile(test_cases=ROUTE_CASES)
         result = pytester.runpytest_inprocess("-p", "no:cacheprovider", "-v")
         assert _outcomes_by_id(result)["test_journeys[create]"] == "SKIPPED"
+
+
+REDIRECT_CONFTEST = """
+pytest_plugins = ["webbpulse.e2e"]
+
+{environment}
+
+import pytest
+
+from webbpulse.e2e import LoginForm, RouteSpec
+
+
+def pytest_e2e_routes(env):
+    'One protected route and one guest-only.'
+    return [
+        RouteSpec(path="/garage", access="protected"),
+        RouteSpec(path="/login", access="guest-only"),
+    ]
+
+
+class _BouncingPage:
+    'A page whose guard sends every visit to the login path.'
+
+    url = "about:blank"
+
+    def goto(self, path, wait_until=None):
+        self.url = "https://www.example.invalid/login"
+
+    def wait_for_timeout(self, ms):
+        return None
+
+
+@pytest.fixture
+def page():
+    'The bouncing page in place of a real browser.'
+    return _BouncingPage()
+
+
+@pytest.fixture
+def login_form():
+    'A login form at /login.'
+    return LoginForm(path="/login")
+"""
+
+SHIPPED_BROWSER_CASES = """
+from webbpulse.e2e.suite import TestBrowser, pytest_generate_tests  # noqa: F401
+"""
+
+
+class TestShippedBrowserCases:
+    """Tests for the shipped `TestBrowser` cases under the read-only flag."""
+
+    def test_the_anonymous_redirect_case_runs_and_the_signed_in_ones_skip(self, pytester: pytest.Pytester) -> None:
+        """The redirect case visits with no session, so a read-only run keeps it.
+
+        The sign-in case and the guest-only case both sign in, so both stay skipped.
+        """
+        pytester.makeconftest(conftest_for(REDIRECT_CONFTEST, READ_ONLY_ENVIRONMENT))
+        pytester.makepyfile(test_shared=SHIPPED_BROWSER_CASES)
+        result = pytester.runpytest_inprocess("-p", "no:cacheprovider", "-v", "-k", "sign_in_and_out or redirect")
+        assert _outcomes_by_id(result) == {
+            "test_sign_in_and_out_through_the_ui": "SKIPPED",
+            "test_protected_routes_redirect_anonymous_visitors[protected:/garage]": "PASSED",
+            "test_guest_only_routes_redirect_signed_in_users[guest-only:/login]": "SKIPPED",
+        }
 
 
 class TestCleanup:

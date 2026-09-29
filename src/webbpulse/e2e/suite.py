@@ -193,6 +193,14 @@ def _parametrise_without_an_environment(metafunc: pytest.Metafunc, names: Sequen
         metafunc.parametrize(name, [pytest.param(None, marks=pytest.mark.skip(reason=NO_ENVIRONMENT_REASON))])
 
 
+_ANONYMOUS_BROWSER_CASES = frozenset({"protected_route"})
+"""The browser parameters whose case visits anonymously whatever the route's access.
+
+The redirect case visits a protected route with no session to prove the guard bounces it,
+so a read-only run keeps every one of its parameters.
+"""
+
+
 def _parametrise_browser_cases(metafunc: pytest.Metafunc) -> None:
     """Parametrise the browser cases from the three product hooks, gathered once.
 
@@ -223,7 +231,8 @@ def _parametrise_browser_cases(metafunc: pytest.Metafunc) -> None:
             metafunc.parametrize(name, [pytest.param(None, marks=pytest.mark.skip(reason=reasons[name]))])
             continue
         ids = [value.label for value in values]
-        params = [_browser_param(value, read_only, READ_ONLY_REASON) for value in values]
+        skips_sessions = read_only and name not in _ANONYMOUS_BROWSER_CASES
+        params = [_browser_param(value, skips_sessions, READ_ONLY_REASON) for value in values]
         metafunc.parametrize(name, params, ids=ids)
 
 
