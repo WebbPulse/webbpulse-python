@@ -45,6 +45,7 @@ tf = ["httpx>=0.27"]
 e2e = ["httpx>=0.27", "boto3>=1.35", "pytest>=8", "playwright>=1.47", "cryptography>=43"]
 
 [project.scripts]
+webbpulse-admin = "webbpulse.ops.admin:main"
 webbpulse-config = "webbpulse.ops.config:main"
 wp-tf = "webbpulse.tf.cli:main"
 

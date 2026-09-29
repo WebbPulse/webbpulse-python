@@ -7,6 +7,16 @@ This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## Unreleased
 
+### Added
+
+- `ops`: the `webbpulse-admin` console script (`webbpulse.ops.admin`) grants, revokes and
+  lists admins in a product's identity `users` table, finding a user by email through
+  `email_lower-index` or by id. It requires an explicit `--profile`, writes with one
+  conditional `UpdateItem` so a repeat is a no-op, records `admin_granted_by` and
+  `admin_granted_at` (or the `admin_revoked_*` pair) from the `sts:GetCallerIdentity` ARN,
+  prints one JSON audit line per change, supports `--dry-run`, and only ever prints masked
+  addresses.
+
 ## 0.67.2
 
 ### Fixed
