@@ -259,8 +259,10 @@ so even an unmarked case that asks for a session can only skip.
 
 The browser cases are skipped per parameter rather than per test, because the render case
 covers a protected route and every public one in the same test. A read-only run keeps the
-public route parameters and skips the protected ones, and skips a journey that declares
-`signed_in=True` or `mutates=True` while keeping the rest.
+public route parameters of the render case and skips the protected ones, and skips a journey
+that declares `signed_in=True` or `mutates=True` while keeping the rest. The anonymous
+redirect case keeps every protected route parameter, because it visits with no session, so
+it also runs in a gated production smoke.
 
 `pytest_e2e_cleanup` is not invoked at all, in either phase. The run creates nothing of its
 own, and the start phase deletes stale resources, which is what a read-only run must not do.
