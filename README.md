@@ -76,6 +76,7 @@ its dev dependencies.
 | `webbpulse.testing` | Pytest fixtures: `test_client`, `create_table`, `rate_limit_table`, `make_request_context_headers`, `FakeKms`, `FakeIdempotencyStore`, `FakePresigner`, `FakeQueue`, `FakeWebhookSender`, `sign_stripe_payload`; `assert_entrypoint_isolation` for the per-domain image check; `primary_keys_only` (or `enforce_primary_keys`) makes moto refuse a key that is not exactly the table's primary key, as DynamoDB does | [packaging.md](docs/packaging.md) |
 | `webbpulse.e2e` | A pytest plugin and generic post-deploy suite: route cut, coverage, reachability, identity, frontend and hygiene against a real stage | [e2e.md](docs/e2e.md) |
 | `webbpulse.ops.config` | The `webbpulse-config` console script: operators set keys in the `<prefix>/app` secret and the `/<prefix>/config` parameter | [Operator config CLI](#operator-config-cli) |
+| `webbpulse.ops.admin` | The `webbpulse-admin` console script: operators grant, revoke and list admins in a product's identity `users` table | [Operator admin CLI](#operator-admin-cli) |
 | `webbpulse.tf` | The `wp-tf` console script: plan-only runs on the WebbPulse Terraform control plane from a directory, with the log streamed | [Terraform plan CLI](#terraform-plan-cli-wp-tf) |
 
 ## Wiring a FastAPI domain Lambda
@@ -227,6 +228,45 @@ Data goes to stdout and diagnostics to stderr. Exit codes: `0` ok, `1` AWS or SD
 usage or a refused value, `3` the secret or parameter does not exist (apply terraform
 first), `4` the stored value is not a JSON object, `5` a concurrent change outlasted the
 retries, `6` `config get` found no such key.
+
+## Operator admin CLI
+
+A product admin is a row in the product's identity `users` table (`<prefix>-users`) with
+`is_admin` set. `webbpulse-admin` grants, revokes and lists admins, finding a user by address
+through the `email_lower-index` or by id:
+
+```bash
+uv run webbpulse-admin --profile CarModPicker-Staging/AdministratorAccess \
+    --prefix carmodpicker-staging grant --email someone@example.com
+uv run webbpulse-admin --profile CarModPicker-Staging/AdministratorAccess \
+    --prefix carmodpicker-staging revoke --user-id 3f2c0e1a-0000-0000-0000-000000000000
+uv run webbpulse-admin --profile CarModPicker-Staging/AdministratorAccess \
+    --prefix carmodpicker-staging grant --email someone@example.com --dry-run
+uv run webbpulse-admin --profile CarModPicker-Staging/AdministratorAccess \
+    --prefix carmodpicker-staging list
+```
+
+| Command | Does |
+| --- | --- |
+| `grant (--email E \| --user-id ID) [--dry-run]` | Sets `is_admin`, `admin_granted_by` and `admin_granted_at`, and removes the revoke attributes |
+| `revoke (--email E \| --user-id ID) [--dry-run]` | Clears `is_admin`, sets `admin_revoked_by` and `admin_revoked_at`, and removes the grant attributes |
+| `list` | Prints each admin as `<user id>\t<masked email>`, sorted by id |
+
+`--profile` is required: the tool never falls back to `AWS_PROFILE` or the default credential
+chain. `--region` defaults to the profile's region. `--prefix` resolves `<prefix>-users` and
+`--table-name` overrides it. Target options go before or after the subcommand.
+
+Each write is one conditional `UpdateItem` requiring the row to exist and to be in the
+opposite state, so a repeated grant or revoke writes nothing and says so, and a lost race
+with another operator reads back as a no-op. The acting identity is the ARN
+`sts:GetCallerIdentity` returns. Every `grant` and `revoke`, dry runs and no-ops included,
+prints one JSON audit line on stdout (`event`, `action`, `user_id`, masked `email`, `table`,
+`actor_arn`, `at`, `changed`, `dry_run`); the row itself keeps who made the latest change and
+when. There is no separate audit table. Addresses are only ever printed masked, as
+`t***@g***.com`.
+
+Data goes to stdout and diagnostics to stderr. Exit codes: `0` ok, `1` AWS or SDK error, `2`
+usage, `3` no such user, `4` the users table does not exist.
 
 ## Terraform plan CLI (`wp-tf`)
 
