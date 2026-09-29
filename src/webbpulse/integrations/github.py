@@ -6,8 +6,12 @@ secret, and `load_github_app_settings` resolves it from the environment and that
 per installation until shortly before it expires, and makes the handful of calls a product
 reports through: check runs, commit statuses and issue comments. It also reads an
 installation's own record, the repositories it covers, and the installation a repository
-belongs to. `convert_manifest_code` finishes the App manifest flow, before any App
-configuration exists. Nothing here routes webhooks or knows any product's naming.
+belongs to. Through an installation it reads commits, comparisons, pull requests with their
+commits and files, check runs, issue comments, tags and releases, and downloads repository
+archives and release assets. Reads retry a transport failure, a 5xx or a refused token with
+backoff, and listings page to a bounded number of pages. `convert_manifest_code` finishes
+the App manifest flow, before any App configuration exists. Nothing here routes webhooks or
+knows any product's naming.
 
 Every failure is a `GitHubError` subclass chosen by status, so a caller can tell a missing
 repository from a rate limit without reading status codes. Only a 2xx is success: redirects
@@ -17,16 +21,19 @@ token stay out of reprs, exception messages and log lines.
 
 from __future__ import annotations
 
+import hashlib
 import logging
 import os
 import re
 import threading
 import time
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Collection, Mapping
 from dataclasses import dataclass, field
 from datetime import datetime
+from pathlib import Path
 from types import TracebackType
 from typing import Any, Final, Literal, Self
+from urllib.parse import quote, urlsplit
 
 import httpx
 import jwt
@@ -39,8 +46,13 @@ __all__ = [
     "API_VERSION",
     "APP_JWT_BACKDATE_SECONDS",
     "APP_JWT_TTL_SECONDS",
+    "ASSET_HOSTS",
+    "DEFAULT_MAX_PAGES",
     "DEFAULT_TIMEOUT_SECONDS",
+    "READ_ATTEMPTS",
+    "READ_BACKOFF_SECONDS",
     "SETTINGS_KEYS",
+    "TARBALL_HOSTS",
     "TOKEN_REFRESH_MARGIN_SECONDS",
     "AppInstallation",
     "AppManifestConversion",
@@ -48,10 +60,14 @@ __all__ = [
     "CheckRunConclusion",
     "CheckRunOutput",
     "CheckRunStatus",
+    "Commit",
+    "CommitComparison",
     "CommitState",
     "CommitStatus",
+    "Download",
     "GitHubAppClient",
     "GitHubAppSettings",
+    "GitHubDownloadTooLarge",
     "GitHubError",
     "GitHubForbidden",
     "GitHubNotConfigured",
@@ -62,6 +78,11 @@ __all__ = [
     "GitHubUnavailable",
     "GitHubUnprocessable",
     "IssueComment",
+    "PullRequest",
+    "PullRequestFile",
+    "Release",
+    "ReleaseAsset",
+    "Tag",
     "convert_manifest_code",
     "load_github_app_settings",
 ]
@@ -85,6 +106,23 @@ TOKEN_REFRESH_MARGIN_SECONDS: Final = 300
 
 DEFAULT_TIMEOUT_SECONDS: Final = 10.0
 
+DEFAULT_MAX_PAGES: Final = 10
+"""How many pages of 100 a listing reads unless the caller names another bound."""
+
+READ_ATTEMPTS: Final = 3
+"""How many times a read or a download is tried before its last failure is raised."""
+
+READ_BACKOFF_SECONDS: Final = 0.5
+"""The wait before the second attempt of a read, doubling for each attempt after it."""
+
+TARBALL_HOSTS: Final = frozenset({"codeload.github.com"})
+"""Where a repository archive redirect may point. Anything else is refused."""
+
+ASSET_HOSTS: Final = frozenset(
+    {"objects.githubusercontent.com", "release-assets.githubusercontent.com", "github-releases.githubusercontent.com"}
+)
+"""Where a release asset redirect may point. Anything else is refused."""
+
 SETTINGS_KEYS: Final = (
     "GITHUB_APP_ID",
     "GITHUB_PRIVATE_KEY",
@@ -104,7 +142,13 @@ _SHA_PATTERN: Final = re.compile(r"^[0-9a-fA-F]{7,64}$")
 _MANIFEST_CODE_PATTERN: Final = re.compile(r"^[A-Za-z0-9_-]+$")
 
 
-_REPOSITORIES_PAGE_SIZE: Final = 100
+_PAGE_SIZE: Final = 100
+
+_REF_REFUSED: Final = re.compile(r"[\x00-\x20\x7f~^:?*\[\\]|\.\.|//|^/|/$|^-")
+
+_REDIRECTS: Final = frozenset({301, 302, 303, 307, 308})
+
+_DOWNLOAD_CHUNK_BYTES: Final = 1024 * 1024
 
 _MESSAGE_LIMIT: Final = 200
 
@@ -181,6 +225,10 @@ class GitHubRedirected(GitHubError):
         """Record where GitHub pointed alongside the failed call."""
         super().__init__(message, **kwargs)
         self.location = location
+
+
+class GitHubDownloadTooLarge(GitHubError):
+    """A download outgrew the byte limit the caller set, so it was abandoned part way."""
 
 
 class GitHubRateLimited(GitHubError):
@@ -289,12 +337,19 @@ class CheckRunOutput:
 
 @dataclass(frozen=True, slots=True)
 class CheckRun:
-    """A check run as GitHub answered it."""
+    """A check run as GitHub answered it.
+
+    `app_id` is the App that created it, which a listing needs to tell this App's runs apart.
+    """
 
     id: int
     status: str
     conclusion: str | None
     html_url: str
+    name: str = ""
+    head_sha: str = ""
+    external_id: str | None = None
+    app_id: int | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -308,10 +363,104 @@ class CommitStatus:
 
 @dataclass(frozen=True, slots=True)
 class IssueComment:
-    """An issue or pull request comment as GitHub answered it."""
+    """An issue or pull request comment as GitHub answered it.
+
+    `user_type` is `Bot` for a comment an App posted, `User` for a person's.
+    """
 
     id: int
     html_url: str
+    body: str = ""
+    user_login: str = ""
+    user_type: str = ""
+
+
+@dataclass(frozen=True, slots=True)
+class Commit:
+    """A commit as GitHub answered it, its parents' shas in order."""
+
+    sha: str
+    message: str
+    parents: tuple[str, ...]
+    html_url: str
+
+
+@dataclass(frozen=True, slots=True)
+class CommitComparison:
+    """How `head` relates to `base`: `status` is `identical`, `ahead`, `behind` or `diverged`."""
+
+    status: str
+    ahead_by: int
+    behind_by: int
+    total_commits: int
+
+
+@dataclass(frozen=True, slots=True)
+class PullRequest:
+    """A pull request as GitHub answered it.
+
+    `mergeable` is None while GitHub is still computing the merge, and `merge_commit_sha`
+    names the test merge commit of an open pull request or the merge of a merged one.
+    """
+
+    number: int
+    state: str
+    html_url: str
+    head_sha: str
+    head_ref: str
+    base_ref: str
+    merge_commit_sha: str | None
+    mergeable: bool | None
+    merged_at: datetime | None
+    draft: bool
+
+
+@dataclass(frozen=True, slots=True)
+class PullRequestFile:
+    """One file a pull request changes, with the path it had before a rename."""
+
+    filename: str
+    status: str
+    previous_filename: str | None
+
+
+@dataclass(frozen=True, slots=True)
+class Tag:
+    """A tag and the commit it names, dereferenced even for an annotated tag."""
+
+    name: str
+    sha: str
+
+
+@dataclass(frozen=True, slots=True)
+class ReleaseAsset:
+    """A file attached to a release."""
+
+    id: int
+    name: str
+    size: int
+    content_type: str
+
+
+@dataclass(frozen=True, slots=True)
+class Release:
+    """A release as GitHub answered it, a draft included when the App can see drafts."""
+
+    id: int
+    tag_name: str
+    name: str
+    draft: bool
+    prerelease: bool
+    html_url: str
+    assets: tuple[ReleaseAsset, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class Download:
+    """What a download wrote: its size in bytes and its hex SHA-256."""
+
+    size: int
+    sha256: str
 
 
 @dataclass(frozen=True, slots=True)
@@ -392,6 +541,13 @@ def _sha(value: str) -> str:
     """A hex commit sha, refusing anything else."""
     if not _SHA_PATTERN.fullmatch(value):
         raise ValueError("sha must be a hex commit sha")
+    return value
+
+
+def _ref(value: str) -> str:
+    """A branch, tag or sha, refusing what git forbids in a ref or could escape its path."""
+    if not value or _REF_REFUSED.search(value):
+        raise ValueError("ref must be a branch, tag or commit sha")
     return value
 
 
@@ -488,6 +644,11 @@ class GitHubAppClient:
     the pinned `installation_id` the client was built with, else the installation GitHub
     reports for that repository, looked up once and cached. Closing the client closes the
     `httpx.Client` it built, never one it was handed.
+
+    Reads and downloads are tried `read_attempts` times, waiting `read_backoff_seconds` and
+    then twice as long each time, when GitHub does not answer, answers a 5xx, or refuses the
+    installation token (which is then minted afresh). Writes are never retried, since a
+    write GitHub applied but did not confirm would be applied twice.
     """
 
     def __init__(
@@ -501,12 +662,17 @@ class GitHubAppClient:
         client: httpx.Client | None = None,
         refresh_margin_seconds: float = TOKEN_REFRESH_MARGIN_SECONDS,
         clock: Callable[[], float] = time.time,
+        read_attempts: int = READ_ATTEMPTS,
+        read_backoff_seconds: float = READ_BACKOFF_SECONDS,
+        sleep: Callable[[float], None] = time.sleep,
     ) -> None:
         """Hold the App id, the private key PEM and an optional pinned installation."""
         if not str(app_id).strip():
             raise ValueError("app_id is required")
         if not private_key.strip():
             raise ValueError("private_key is required")
+        if read_attempts < 1:
+            raise ValueError("read_attempts must be at least 1")
         self._app_id = str(app_id).strip()
         self._private_key = private_key
         self._installation_id = None if installation_id is None else _identifier(installation_id, "installation_id")
@@ -515,6 +681,9 @@ class GitHubAppClient:
         self._client = client if client is not None else httpx.Client(timeout=timeout, follow_redirects=False)
         self._refresh_margin = refresh_margin_seconds
         self._clock = clock
+        self._read_attempts = read_attempts
+        self._read_backoff = read_backoff_seconds
+        self._sleep = sleep
         self._tokens: dict[str, _CachedToken] = {}
         self._installations: dict[str, str] = {}
         self._lock = threading.Lock()
@@ -647,11 +816,11 @@ class GitHubAppClient:
                 None,
                 "GET",
                 "/installation/repositories",
-                params={"per_page": _REPOSITORIES_PAGE_SIZE, "page": page},
+                params={"per_page": _PAGE_SIZE, "page": page},
             )
             batch = body.get("repositories", []) if isinstance(body, dict) else []
             repositories.extend(item for item in batch if isinstance(item, dict))
-            if len(batch) < _REPOSITORIES_PAGE_SIZE:
+            if len(batch) < _PAGE_SIZE:
                 return repositories
             page += 1
 
@@ -750,6 +919,287 @@ class GitHubAppClient:
         )
         return _issue_comment(answer)
 
+    def get_commit(self, repository: str, ref: str, *, installation_id: int | str | None = None) -> Commit:
+        """The commit `ref` names, a sha, branch or tag."""
+        body = self._read(repository, installation_id, f"/commits/{quote(_ref(ref), safe='/')}")
+        return _commit(body)
+
+    def compare_commits(
+        self, repository: str, base: str, head: str, *, installation_id: int | str | None = None
+    ) -> CommitComparison:
+        """How `head` relates to `base`, each a sha, branch or tag."""
+        spec = f"{quote(_ref(base), safe='/')}...{quote(_ref(head), safe='/')}"
+        body = self._read(repository, installation_id, f"/compare/{spec}", params={"per_page": 1})
+        mapping = _object(body)
+        return CommitComparison(
+            status=str(mapping.get("status", "")),
+            ahead_by=_int(mapping.get("ahead_by")),
+            behind_by=_int(mapping.get("behind_by")),
+            total_commits=_int(mapping.get("total_commits")),
+        )
+
+    def get_pull_request(
+        self, repository: str, number: int | str, *, installation_id: int | str | None = None
+    ) -> PullRequest:
+        """One pull request by number."""
+        body = self._read(repository, installation_id, f"/pulls/{_identifier(number, 'number')}")
+        return _pull_request(body)
+
+    def list_pull_request_commits(
+        self,
+        repository: str,
+        number: int | str,
+        *,
+        max_pages: int = DEFAULT_MAX_PAGES,
+        installation_id: int | str | None = None,
+    ) -> list[Commit]:
+        """The commits of a pull request, oldest first. GitHub lists at most 250."""
+        suffix = f"/pulls/{_identifier(number, 'number')}/commits"
+        return [_commit(item) for item in self._read_pages(repository, installation_id, suffix, max_pages=max_pages)]
+
+    def list_pull_request_files(
+        self,
+        repository: str,
+        number: int | str,
+        *,
+        max_pages: int = DEFAULT_MAX_PAGES,
+        installation_id: int | str | None = None,
+    ) -> list[PullRequestFile]:
+        """The files a pull request changes. GitHub lists at most 3000."""
+        suffix = f"/pulls/{_identifier(number, 'number')}/files"
+        return [
+            PullRequestFile(
+                filename=str(item.get("filename", "")),
+                status=str(item.get("status", "")),
+                previous_filename=_optional_str(item.get("previous_filename")),
+            )
+            for item in self._read_pages(repository, installation_id, suffix, max_pages=max_pages)
+        ]
+
+    def list_commit_pull_requests(
+        self,
+        repository: str,
+        sha: str,
+        *,
+        max_pages: int = DEFAULT_MAX_PAGES,
+        installation_id: int | str | None = None,
+    ) -> list[PullRequest]:
+        """The pull requests `sha` belongs to, merged ones included."""
+        suffix = f"/commits/{_sha(sha)}/pulls"
+        listed = self._read_pages(repository, installation_id, suffix, max_pages=max_pages)
+        return [_pull_request(item) for item in listed]
+
+    def list_check_runs(
+        self,
+        repository: str,
+        ref: str,
+        *,
+        check_name: str | None = None,
+        app_id: int | str | None = None,
+        latest: bool = True,
+        max_pages: int = DEFAULT_MAX_PAGES,
+        installation_id: int | str | None = None,
+    ) -> list[CheckRun]:
+        """The check runs on `ref`, narrowed by name and creating App when given.
+
+        `latest` keeps GitHub's default of the newest run per name; False lists every run.
+        """
+        params: dict[str, Any] = {"filter": "latest" if latest else "all"}
+        if check_name is not None:
+            params["check_name"] = check_name
+        if app_id is not None:
+            params["app_id"] = _identifier(app_id, "app_id")
+        suffix = f"/commits/{quote(_ref(ref), safe='/')}/check-runs"
+        listed = self._read_pages(
+            repository, installation_id, suffix, params=params, key="check_runs", max_pages=max_pages
+        )
+        return [_check_run(item) for item in listed]
+
+    def list_issue_comments(
+        self,
+        repository: str,
+        issue_number: int | str,
+        *,
+        max_pages: int = DEFAULT_MAX_PAGES,
+        installation_id: int | str | None = None,
+    ) -> list[IssueComment]:
+        """The comments on an issue or pull request, oldest first."""
+        suffix = f"/issues/{_identifier(issue_number, 'issue_number')}/comments"
+        listed = self._read_pages(repository, installation_id, suffix, max_pages=max_pages)
+        return [_issue_comment(item) for item in listed]
+
+    def list_tags(
+        self, repository: str, *, max_pages: int = DEFAULT_MAX_PAGES, installation_id: int | str | None = None
+    ) -> list[Tag]:
+        """The repository's tags, each with the commit it names."""
+        found: list[Tag] = []
+        for item in self._read_pages(repository, installation_id, "/tags", max_pages=max_pages):
+            name = str(item.get("name") or "")
+            sha = str(_object(item.get("commit")).get("sha") or "")
+            if name and sha:
+                found.append(Tag(name=name, sha=sha))
+        return found
+
+    def list_releases(
+        self, repository: str, *, max_pages: int = DEFAULT_MAX_PAGES, installation_id: int | str | None = None
+    ) -> list[Release]:
+        """The repository's releases, newest first."""
+        listed = self._read_pages(repository, installation_id, "/releases", max_pages=max_pages)
+        return [_release(item) for item in listed]
+
+    def get_release_by_tag(self, repository: str, tag: str, *, installation_id: int | str | None = None) -> Release:
+        """The published release at `tag`. Raises `GitHubNotFound` when there is none."""
+        body = self._read(repository, installation_id, f"/releases/tags/{quote(_ref(tag), safe='')}")
+        return _release(body)
+
+    def download_tarball(
+        self,
+        repository: str,
+        ref: str,
+        target: Path,
+        *,
+        max_bytes: int,
+        installation_id: int | str | None = None,
+    ) -> Download:
+        """Write the gzipped archive of `repository` at `ref` to `target`.
+
+        GitHub redirects to a signed `codeload.github.com` URL, which is fetched without the
+        installation token; a redirect anywhere else is refused. Raises
+        `GitHubDownloadTooLarge` past `max_bytes`, leaving a partial `target` behind.
+        """
+        suffix = f"/tarball/{quote(_ref(ref), safe='/')}"
+        return self._download(repository, installation_id, suffix, target, ACCEPT, TARBALL_HOSTS, max_bytes)
+
+    def download_release_asset(
+        self,
+        repository: str,
+        asset_id: int | str,
+        target: Path,
+        *,
+        max_bytes: int,
+        installation_id: int | str | None = None,
+    ) -> Download:
+        """Write one release asset to `target`.
+
+        GitHub either answers the bytes or redirects to a signed asset host, which is fetched
+        without the installation token; a redirect anywhere else is refused. Raises
+        `GitHubDownloadTooLarge` past `max_bytes`, leaving a partial `target` behind.
+        """
+        suffix = f"/releases/assets/{_identifier(asset_id, 'asset_id')}"
+        return self._download(
+            repository, installation_id, suffix, target, "application/octet-stream", ASSET_HOSTS, max_bytes
+        )
+
+    def _retrying[T](self, attempt: Callable[[], T]) -> T:
+        """Run `attempt`, trying again with backoff on an unavailable GitHub or a refused token."""
+        for number in range(1, self._read_attempts):
+            try:
+                return attempt()
+            except (GitHubUnavailable, GitHubUnauthorized):
+                self._sleep(self._read_backoff * 2 ** (number - 1))
+        return attempt()
+
+    def _read(
+        self,
+        repository: str,
+        installation_id: int | str | None,
+        suffix: str,
+        *,
+        params: Mapping[str, Any] | None = None,
+    ) -> Any:
+        """One GET under `/repos/{repository}`, retried."""
+        name = _repository(repository)
+        return self._retrying(lambda: self._repository_call(name, installation_id, "GET", suffix, params=params))
+
+    def _read_pages(
+        self,
+        repository: str,
+        installation_id: int | str | None,
+        suffix: str,
+        *,
+        max_pages: int,
+        params: Mapping[str, Any] | None = None,
+        key: str | None = None,
+    ) -> list[dict[str, Any]]:
+        """Every object a paged listing answers, stopping at a short page or after `max_pages`.
+
+        `key` names the list inside an object answer, such as `check_runs`.
+        """
+        if max_pages < 1:
+            raise ValueError("max_pages must be at least 1")
+        items: list[dict[str, Any]] = []
+        for page in range(1, max_pages + 1):
+            query = {**(params or {}), "per_page": _PAGE_SIZE, "page": page}
+            body = self._read(repository, installation_id, suffix, params=query)
+            batch = body.get(key) if key is not None and isinstance(body, dict) else body
+            batch = batch if isinstance(batch, list) else []
+            items.extend(item for item in batch if isinstance(item, dict))
+            if len(batch) < _PAGE_SIZE:
+                break
+        return items
+
+    def _download(
+        self,
+        repository: str,
+        installation_id: int | str | None,
+        suffix: str,
+        target: Path,
+        accept: str,
+        hosts: Collection[str],
+        max_bytes: int,
+    ) -> Download:
+        """Fetch `/repos/{repository}{suffix}` into `target`, following one redirect to `hosts`, retried."""
+        if max_bytes < 1:
+            raise ValueError("max_bytes must be at least 1")
+        name = _repository(repository)
+        path = f"/repos/{name}{suffix}"
+
+        def attempt() -> Download:
+            """One try: resolve the installation, then fetch with its token."""
+            key, looked_up = self._installation_for(name, installation_id)
+            return self._with_installation(
+                key, looked_up, lambda token: self._fetch(path, token, target, accept, hosts, max_bytes)
+            )
+
+        return self._retrying(attempt)
+
+    def _fetch(
+        self, path: str, token: str, target: Path, accept: str, hosts: Collection[str], max_bytes: int
+    ) -> Download:
+        """One download: the API call with the token, then any redirect without it."""
+        headers = {"Accept": accept, "X-GitHub-Api-Version": API_VERSION, "Authorization": f"Bearer {token}"}
+        try:
+            with self._client.stream(
+                "GET", f"{self._api_url}{path}", headers=headers, follow_redirects=False
+            ) as response:
+                if response.status_code == 200:
+                    return _save(response, target, max_bytes, path)
+                if response.status_code not in _REDIRECTS:
+                    response.read()
+                    raise _refused(response, "GET", path, self._clock())
+                location = response.headers.get("location", "")
+        except httpx.HTTPError as exc:
+            raise GitHubUnavailable(f"GET {path} did not answer", method="GET", path=path) from exc
+        parts = urlsplit(location)
+        if parts.scheme != "https" or parts.hostname not in hosts:
+            raise GitHubError(f"GET {path} redirected to an unexpected host", method="GET", path=path)
+        try:
+            with self._client.stream("GET", location, follow_redirects=False) as download:
+                if download.status_code != 200:
+                    download.read()
+                    raise _refused(download, "GET", path, self._clock())
+                return _save(download, target, max_bytes, path)
+        except httpx.HTTPError as exc:
+            raise GitHubUnavailable(f"GET {path} download did not answer", method="GET", path=path) from exc
+
+    def _installation_for(self, name: str, installation_id: int | str | None) -> tuple[str, str | None]:
+        """The installation a call on `name` runs as, and the lookup key when it was looked up."""
+        if installation_id is not None:
+            return _identifier(installation_id, "installation_id"), None
+        if self._installation_id is not None:
+            return self._installation_id, None
+        return str(self.repository_installation(name)), name.lower()
+
     def _repository_call(
         self,
         repository: str,
@@ -757,17 +1207,13 @@ class GitHubAppClient:
         method: str,
         suffix: str,
         *,
-        json: Mapping[str, Any],
+        json: Mapping[str, Any] | None = None,
+        params: Mapping[str, Any] | None = None,
     ) -> Any:
         """One call under `/repos/{repository}`, as the installation that resolves for it."""
         name = _repository(repository)
-        if installation_id is not None:
-            key, looked_up = _identifier(installation_id, "installation_id"), None
-        elif self._installation_id is not None:
-            key, looked_up = self._installation_id, None
-        else:
-            key, looked_up = str(self.repository_installation(name)), name.lower()
-        return self._as_installation(key, looked_up, method, f"/repos/{name}{suffix}", json=json)
+        key, looked_up = self._installation_for(name, installation_id)
+        return self._as_installation(key, looked_up, method, f"/repos/{name}{suffix}", json=json, params=params)
 
     def _as_installation(
         self,
@@ -779,7 +1225,13 @@ class GitHubAppClient:
         json: Mapping[str, Any] | None = None,
         params: Mapping[str, Any] | None = None,
     ) -> Any:
-        """One call as installation `key`, forgetting whatever cached state GitHub refused.
+        """One call as installation `key`, forgetting whatever cached state GitHub refused."""
+        return self._with_installation(
+            key, looked_up, lambda token: self._call(method, path, token=token, json=json, params=params)
+        )
+
+    def _with_installation[T](self, key: str, looked_up: str | None, send: Callable[[str], T]) -> T:
+        """Run `send` with installation `key`'s token, forgetting whatever cached state GitHub refused.
 
         A 401 drops the cached token. A 404 on the token exchange for an installation that was
         looked up for `looked_up` drops that lookup, since the App was reinstalled or removed.
@@ -792,7 +1244,7 @@ class GitHubAppClient:
                     self._installations.pop(looked_up, None)
             raise
         try:
-            return self._call(method, path, token=token, json=json, params=params)
+            return send(token)
         except GitHubUnauthorized:
             with self._lock:
                 cached = self._tokens.get(key)
@@ -848,20 +1300,40 @@ def _send(
         )
         raise GitHubUnavailable(f"{method} {path} did not answer", method=method, path=path) from exc
     if not 200 <= response.status_code < 300:
-        error = _error_for(response, method, path, now())
-        _log.warning(
-            "GitHub refused a call.",
-            extra={
-                "event": "integrations.github.error",
-                "method": method,
-                "path": path,
-                "status": response.status_code,
-            },
-        )
-        raise error
+        raise _refused(response, method, path, now())
     if not response.content:
         return None
     return response.json()
+
+
+def _refused(response: httpx.Response, method: str, path: str, now: float) -> GitHubError:
+    """Log a refused call by method, path and status, and answer the error it maps to."""
+    _log.warning(
+        "GitHub refused a call.",
+        extra={
+            "event": "integrations.github.error",
+            "method": method,
+            "path": path,
+            "status": response.status_code,
+        },
+    )
+    return _error_for(response, method, path, now)
+
+
+def _save(response: httpx.Response, target: Path, max_bytes: int, path: str) -> Download:
+    """Stream a download's body into `target`, hashing it and refusing it past `max_bytes`."""
+    digest = hashlib.sha256()
+    size = 0
+    with target.open("wb") as handle:
+        for chunk in response.iter_bytes(_DOWNLOAD_CHUNK_BYTES):
+            size += len(chunk)
+            if size > max_bytes:
+                raise GitHubDownloadTooLarge(
+                    f"GET {path} is larger than {max_bytes} bytes", method="GET", path=path, status_code=200
+                )
+            digest.update(chunk)
+            handle.write(chunk)
+    return Download(size=size, sha256=digest.hexdigest())
 
 
 def convert_manifest_code(
@@ -926,19 +1398,106 @@ def _check_run_fields(
     return fields
 
 
+def _int(value: Any) -> int:
+    """An integer field, or 0 when it is absent or not a number."""
+    return value if isinstance(value, int) and not isinstance(value, bool) else 0
+
+
+def _optional_str(value: Any) -> str | None:
+    """A non-empty string field, or None."""
+    return value if isinstance(value, str) and value else None
+
+
+def _object(value: Any) -> dict[str, Any]:
+    """A nested object field, or an empty one."""
+    return value if isinstance(value, dict) else {}
+
+
 def _check_run(body: Any) -> CheckRun:
     """Read a check run answer into `CheckRun`."""
-    mapping = body if isinstance(body, dict) else {}
+    mapping = _object(body)
     conclusion = mapping.get("conclusion")
+    app_id = _int(_object(mapping.get("app")).get("id"))
     return CheckRun(
         id=int(mapping.get("id", 0)),
         status=str(mapping.get("status", "")),
         conclusion=None if conclusion is None else str(conclusion),
         html_url=str(mapping.get("html_url", "")),
+        name=str(mapping.get("name", "")),
+        head_sha=str(mapping.get("head_sha", "")),
+        external_id=_optional_str(mapping.get("external_id")),
+        app_id=app_id or None,
     )
 
 
 def _issue_comment(body: Any) -> IssueComment:
     """Read a comment answer into `IssueComment`."""
-    mapping = body if isinstance(body, dict) else {}
-    return IssueComment(id=int(mapping.get("id", 0)), html_url=str(mapping.get("html_url", "")))
+    mapping = _object(body)
+    user = _object(mapping.get("user"))
+    return IssueComment(
+        id=int(mapping.get("id", 0)),
+        html_url=str(mapping.get("html_url", "")),
+        body=str(mapping.get("body") or ""),
+        user_login=str(user.get("login", "")),
+        user_type=str(user.get("type", "")),
+    )
+
+
+def _commit(body: Any) -> Commit:
+    """Read a commit answer into `Commit`."""
+    mapping = _object(body)
+    parents = mapping.get("parents")
+    return Commit(
+        sha=str(mapping.get("sha", "")),
+        message=str(_object(mapping.get("commit")).get("message") or ""),
+        parents=tuple(
+            str(parent.get("sha", ""))
+            for parent in (parents if isinstance(parents, list) else [])
+            if isinstance(parent, dict)
+        ),
+        html_url=str(mapping.get("html_url", "")),
+    )
+
+
+def _pull_request(body: Any) -> PullRequest:
+    """Read a pull request answer into `PullRequest`."""
+    mapping = _object(body)
+    head = _object(mapping.get("head"))
+    base = _object(mapping.get("base"))
+    mergeable = mapping.get("mergeable")
+    return PullRequest(
+        number=_int(mapping.get("number")),
+        state=str(mapping.get("state", "")),
+        html_url=str(mapping.get("html_url", "")),
+        head_sha=str(head.get("sha", "")),
+        head_ref=str(head.get("ref", "")),
+        base_ref=str(base.get("ref", "")),
+        merge_commit_sha=_optional_str(mapping.get("merge_commit_sha")),
+        mergeable=mergeable if isinstance(mergeable, bool) else None,
+        merged_at=_timestamp(mapping.get("merged_at")),
+        draft=mapping.get("draft") is True,
+    )
+
+
+def _release(body: Any) -> Release:
+    """Read a release answer into `Release`."""
+    mapping = _object(body)
+    assets = mapping.get("assets")
+    return Release(
+        id=_int(mapping.get("id")),
+        tag_name=str(mapping.get("tag_name") or ""),
+        name=str(mapping.get("name") or ""),
+        draft=mapping.get("draft") is True,
+        prerelease=mapping.get("prerelease") is True,
+        html_url=str(mapping.get("html_url", "")),
+        assets=tuple(
+            ReleaseAsset(
+                id=_int(item.get("id")),
+                name=str(item.get("name") or ""),
+                size=_int(item.get("size")),
+                content_type=str(item.get("content_type") or ""),
+            )
+            for item in (assets if isinstance(assets, list) else [])
+            if isinstance(item, dict)
+        ),
+    )

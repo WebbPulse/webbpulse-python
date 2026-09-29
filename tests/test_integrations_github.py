@@ -2,12 +2,15 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
+from pathlib import Path
 from typing import Any
+from urllib.parse import urlsplit
 
 import httpx
 import jwt
@@ -19,9 +22,14 @@ from webbpulse.integrations.github import (
     APP_JWT_BACKDATE_SECONDS,
     APP_JWT_TTL_SECONDS,
     AppInstallation,
+    CheckRun,
     CheckRunOutput,
+    Commit,
+    CommitComparison,
+    Download,
     GitHubAppClient,
     GitHubAppSettings,
+    GitHubDownloadTooLarge,
     GitHubError,
     GitHubForbidden,
     GitHubNotConfigured,
@@ -31,6 +39,12 @@ from webbpulse.integrations.github import (
     GitHubUnauthorized,
     GitHubUnavailable,
     GitHubUnprocessable,
+    IssueComment,
+    PullRequest,
+    PullRequestFile,
+    Release,
+    ReleaseAsset,
+    Tag,
     convert_manifest_code,
     load_github_app_settings,
 )
@@ -795,3 +809,404 @@ def test_convert_manifest_code_errors() -> None:
     empty = httpx.Client(transport=httpx.MockTransport(lambda _: httpx.Response(201, json={"id": 1})))
     with pytest.raises(GitHubError, match="no App"):
         convert_manifest_code("abc", client=empty)
+
+
+@pytest.fixture
+def sleeps() -> list[float]:
+    """Every backoff wait a retrying client asked for."""
+    return []
+
+
+@pytest.fixture
+def reader(github: GitHub, clock: Clock, sleeps: list[float]) -> GitHubAppClient:
+    """A client over the scripted GitHub whose backoff waits are recorded, not slept."""
+    http = httpx.Client(transport=httpx.MockTransport(github.handler))
+    return GitHubAppClient(
+        app_id=12345,
+        private_key=PRIVATE_PEM,
+        installation_id=INSTALLATION,
+        client=http,
+        clock=clock,
+        sleep=sleeps.append,
+    )
+
+
+def test_get_commit_is_typed(reader: GitHubAppClient, github: GitHub) -> None:
+    """A commit read answers its message and parents in order, with the installation token."""
+    github.on(
+        "GET",
+        f"/repos/{REPO}/commits/{SHA}",
+        200,
+        {
+            "sha": SHA,
+            "html_url": "https://github.com/c",
+            "commit": {"message": "Merge b into a"},
+            "parents": [{"sha": "b" * 40}, {"sha": "c" * 40}],
+        },
+    )
+    commit = reader.get_commit(REPO, SHA)
+    assert commit == Commit(
+        sha=SHA, message="Merge b into a", parents=("b" * 40, "c" * 40), html_url="https://github.com/c"
+    )
+    (request,) = github.api_requests()
+    assert request.headers["authorization"] == "Bearer ghs_token1"
+    assert str(request.url).startswith(f"https://api.github.com/repos/{REPO}/commits/")
+
+
+def test_compare_commits_quotes_a_branch_with_a_slash(reader: GitHubAppClient, github: GitHub) -> None:
+    """The comparison names both refs in one segment and answers the status and counts."""
+    github.on(
+        "GET",
+        f"/repos/{REPO}/compare/feature/x...{SHA}",
+        200,
+        {"status": "behind", "ahead_by": 0, "behind_by": 3, "total_commits": 0},
+    )
+    compared = reader.compare_commits(REPO, "feature/x", SHA)
+    assert compared == CommitComparison(status="behind", ahead_by=0, behind_by=3, total_commits=0)
+
+
+def test_get_pull_request_is_typed(reader: GitHubAppClient, github: GitHub) -> None:
+    """A pull request read answers its head, merge state and merge commit."""
+    github.on(
+        "GET",
+        f"/repos/{REPO}/pulls/7",
+        200,
+        {
+            "number": 7,
+            "state": "open",
+            "html_url": "https://github.com/p/7",
+            "head": {"sha": SHA, "ref": "feature"},
+            "base": {"ref": "main"},
+            "merge_commit_sha": "d" * 40,
+            "mergeable": True,
+            "merged_at": None,
+            "draft": False,
+        },
+    )
+    pull = reader.get_pull_request(REPO, 7)
+    assert pull == PullRequest(
+        number=7,
+        state="open",
+        html_url="https://github.com/p/7",
+        head_sha=SHA,
+        head_ref="feature",
+        base_ref="main",
+        merge_commit_sha="d" * 40,
+        mergeable=True,
+        merged_at=None,
+        draft=False,
+    )
+
+
+def test_pull_request_mergeable_unknown_is_none(reader: GitHubAppClient, github: GitHub) -> None:
+    """A merge GitHub is still computing reads as `None`, never False."""
+    github.on(
+        "GET", f"/repos/{REPO}/pulls/7", 200, {"number": 7, "mergeable": None, "merged_at": "2026-09-01T00:00:00Z"}
+    )
+    pull = reader.get_pull_request(REPO, 7)
+    assert pull.mergeable is None
+    assert pull.merged_at == datetime(2026, 9, 1, tzinfo=UTC)
+
+
+def _paged(total: int, make: Callable[[int], Any], key: str | None = None) -> Callable[[httpx.Request], httpx.Response]:
+    """A listing route answering `total` items in pages of `per_page`."""
+
+    def answer(request: httpx.Request) -> httpx.Response:
+        page, size = int(request.url.params["page"]), int(request.url.params["per_page"])
+        items = [make(i) for i in range((page - 1) * size, min(page * size, total))]
+        return httpx.Response(200, json={"total_count": total, key: items} if key else items)
+
+    return answer
+
+
+def test_listings_page_until_a_short_page(reader: GitHubAppClient, github: GitHub) -> None:
+    """A listing follows full pages of 100 and stops at the first short one."""
+    github.routes[("GET", f"/repos/{REPO}/pulls/7/files")] = _paged(
+        230, lambda i: {"filename": f"f{i}", "status": "renamed", "previous_filename": f"old{i}"}
+    )
+    files = reader.list_pull_request_files(REPO, 7)
+    assert len(files) == 230
+    assert files[0] == PullRequestFile(filename="f0", status="renamed", previous_filename="old0")
+    assert [r.url.params["page"] for r in github.api_requests()] == ["1", "2", "3"]
+    assert all(r.url.params["per_page"] == "100" for r in github.api_requests())
+
+
+def test_listings_stop_at_max_pages(reader: GitHubAppClient, github: GitHub) -> None:
+    """A listing reads no more than `max_pages` pages, so a caller can tell a capped listing by its length."""
+    github.routes[("GET", f"/repos/{REPO}/pulls/7/commits")] = _paged(
+        1000, lambda i: {"sha": f"{i:040x}", "commit": {"message": "m"}, "parents": []}
+    )
+    commits = reader.list_pull_request_commits(REPO, 7, max_pages=2)
+    assert len(commits) == 200
+    assert commits[1].sha == f"{1:040x}"
+    assert len(github.api_requests()) == 2
+    with pytest.raises(ValueError, match="max_pages"):
+        reader.list_pull_request_commits(REPO, 7, max_pages=0)
+
+
+def test_list_check_runs_filters_and_types(reader: GitHubAppClient, github: GitHub) -> None:
+    """The check run listing passes its filters and reads the runs out of their envelope."""
+    github.routes[("GET", f"/repos/{REPO}/commits/{SHA}/check-runs")] = _paged(
+        2,
+        lambda i: {
+            "id": i + 1,
+            "name": "webbpulse-terraform",
+            "status": "completed",
+            "conclusion": "success",
+            "html_url": "u",
+            "head_sha": SHA,
+            "external_id": "run-1" if i else "",
+            "app": {"id": 12345},
+        },
+        key="check_runs",
+    )
+    runs = reader.list_check_runs(REPO, SHA, check_name="webbpulse-terraform", app_id=12345, latest=False)
+    assert runs[1] == CheckRun(
+        id=2,
+        status="completed",
+        conclusion="success",
+        html_url="u",
+        name="webbpulse-terraform",
+        head_sha=SHA,
+        external_id="run-1",
+        app_id=12345,
+    )
+    assert runs[0].external_id is None
+    params = github.api_requests()[0].url.params
+    assert (params["filter"], params["check_name"], params["app_id"]) == ("all", "webbpulse-terraform", "12345")
+
+
+def test_list_issue_comments_carries_body_and_author(reader: GitHubAppClient, github: GitHub) -> None:
+    """Comments come back with their body and author type, so an App can find its own."""
+    github.routes[("GET", f"/repos/{REPO}/issues/7/comments")] = _paged(
+        1, lambda i: {"id": 5, "html_url": "u", "body": "<!-- m -->", "user": {"login": "app[bot]", "type": "Bot"}}
+    )
+    assert reader.list_issue_comments(REPO, 7) == [
+        IssueComment(id=5, html_url="u", body="<!-- m -->", user_login="app[bot]", user_type="Bot")
+    ]
+
+
+def test_list_commit_pull_requests(reader: GitHubAppClient, github: GitHub) -> None:
+    """The pull requests of a commit read as `PullRequest` records."""
+    github.routes[("GET", f"/repos/{REPO}/commits/{SHA}/pulls")] = _paged(
+        1, lambda i: {"number": 3, "merge_commit_sha": SHA, "merged_at": "2026-09-01T00:00:00Z", "html_url": "u"}
+    )
+    (pull,) = reader.list_commit_pull_requests(REPO, SHA)
+    assert (pull.number, pull.merge_commit_sha, pull.html_url) == (3, SHA, "u")
+    assert pull.merged_at is not None
+
+
+def test_list_tags_names_each_commit(reader: GitHubAppClient, github: GitHub) -> None:
+    """Tags come back with their commit, skipping any entry missing either."""
+    github.on(
+        "GET",
+        f"/repos/{REPO}/tags",
+        200,
+        [{"name": "v1.0.0", "commit": {"sha": SHA}}, {"name": "broken", "commit": {}}],
+    )
+    assert reader.list_tags(REPO) == [Tag(name="v1.0.0", sha=SHA)]
+
+
+def test_releases_are_typed_with_assets(reader: GitHubAppClient, github: GitHub) -> None:
+    """Releases list and read by tag with their assets."""
+    release = {
+        "id": 9,
+        "tag_name": "v1.0.0",
+        "name": "1.0.0",
+        "draft": False,
+        "prerelease": True,
+        "html_url": "u",
+        "assets": [{"id": 11, "name": "a.zip", "size": 3, "content_type": "application/zip"}],
+    }
+    github.on("GET", f"/repos/{REPO}/releases", 200, [release])
+    github.on("GET", f"/repos/{REPO}/releases/tags/v1.0.0", 200, release)
+    expected = Release(
+        id=9,
+        tag_name="v1.0.0",
+        name="1.0.0",
+        draft=False,
+        prerelease=True,
+        html_url="u",
+        assets=(ReleaseAsset(id=11, name="a.zip", size=3, content_type="application/zip"),),
+    )
+    assert reader.list_releases(REPO) == [expected]
+    assert reader.get_release_by_tag(REPO, "v1.0.0") == expected
+
+
+def test_missing_release_is_not_found(reader: GitHubAppClient) -> None:
+    """A tag with no release raises `GitHubNotFound`, and a 404 is not retried."""
+    with pytest.raises(GitHubNotFound):
+        reader.get_release_by_tag(REPO, "v9.9.9")
+
+
+@pytest.mark.parametrize(
+    "call",
+    [
+        lambda c: c.get_commit(REPO, "../../x"),
+        lambda c: c.compare_commits(REPO, "main", "a b"),
+        lambda c: c.get_release_by_tag(REPO, ""),
+        lambda c: c.list_check_runs(REPO, "/main"),
+        lambda c: c.list_commit_pull_requests(REPO, "main"),
+        lambda c: c.get_pull_request(REPO, 0),
+    ],
+    ids=["dotdot", "space", "empty", "leading-slash", "not-a-sha", "zero"],
+)
+def test_read_inputs_are_validated(
+    reader: GitHubAppClient, github: GitHub, call: Callable[[GitHubAppClient], Any]
+) -> None:
+    """Refs and numbers that could escape their path segment are refused before any call."""
+    with pytest.raises(ValueError):
+        call(reader)
+    assert github.requests == []
+
+
+def test_reads_retry_an_unavailable_github_with_backoff(
+    reader: GitHubAppClient, github: GitHub, sleeps: list[float]
+) -> None:
+    """A 5xx is retried with doubling waits, and success on the last attempt is returned."""
+    answers = iter([httpx.Response(502), httpx.Response(503), httpx.Response(200, json={"number": 7})])
+    github.routes[("GET", f"/repos/{REPO}/pulls/7")] = lambda _: next(answers)
+    assert reader.get_pull_request(REPO, 7).number == 7
+    assert sleeps == [0.5, 1.0]
+
+
+def test_reads_give_up_after_the_last_attempt(reader: GitHubAppClient, github: GitHub, sleeps: list[float]) -> None:
+    """A GitHub that stays down raises `GitHubUnavailable` after three attempts."""
+    github.on("GET", f"/repos/{REPO}/pulls/7", 500, {"message": "boom"})
+    with pytest.raises(GitHubUnavailable):
+        reader.get_pull_request(REPO, 7)
+    assert len(github.api_requests()) == 3
+    assert len(sleeps) == 2
+
+
+def test_reads_remint_a_refused_token(reader: GitHubAppClient, github: GitHub) -> None:
+    """A 401 drops the cached token and the retry runs with a fresh one."""
+    answers = iter([httpx.Response(401, json={"message": "Bad credentials"}), httpx.Response(200, json={"number": 7})])
+    github.routes[("GET", f"/repos/{REPO}/pulls/7")] = lambda _: next(answers)
+    assert reader.get_pull_request(REPO, 7).number == 7
+    tokens = [r.headers["authorization"] for r in github.api_requests()]
+    assert tokens == ["Bearer ghs_token1", "Bearer ghs_token2"]
+
+
+@pytest.mark.parametrize("status", [403, 404, 422, 429])
+def test_reads_do_not_retry_a_refusal(
+    reader: GitHubAppClient, github: GitHub, sleeps: list[float], status: int
+) -> None:
+    """A refusal that another attempt cannot fix is raised at once."""
+    github.on("GET", f"/repos/{REPO}/pulls/7", status, {"message": "no"})
+    with pytest.raises(GitHubError):
+        reader.get_pull_request(REPO, 7)
+    assert len(github.api_requests()) == 1
+    assert sleeps == []
+
+
+def test_reads_resolve_the_repository_installation(github: GitHub, clock: Clock) -> None:
+    """Without a pinned installation, a read runs as the installation GitHub reports for the repository."""
+    github.on("GET", f"/repos/{REPO}/installation", 200, {"id": 77})
+    github.on("GET", f"/repos/{REPO}/tags", 200, [])
+    http = httpx.Client(transport=httpx.MockTransport(github.handler))
+    unpinned = GitHubAppClient(app_id=1, private_key=PRIVATE_PEM, client=http, clock=clock)
+    assert unpinned.list_tags(REPO) == []
+    minted = [r for r in github.requests if r.url.path.endswith("/access_tokens")]
+    assert [r.url.path for r in minted] == ["/app/installations/77/access_tokens"]
+
+
+CODELOAD = "https://codeload.github.com/WebbPulse/example/legacy.tar.gz/signed?token=signed-secret"
+
+
+def _archive_routes(github: GitHub, payload: bytes, location: str = CODELOAD) -> None:
+    """GitHub redirecting the archive to `location`, and codeload answering `payload`."""
+    github.on("GET", f"/repos/{REPO}/tarball/{SHA}", 302, None, location=location)
+    github.routes[("GET", urlsplit(location).path)] = lambda _: httpx.Response(200, content=payload)
+
+
+def test_download_tarball_follows_codeload_without_the_token(
+    reader: GitHubAppClient, github: GitHub, tmp_path: Path
+) -> None:
+    """The archive is fetched from codeload with no Authorization header, and hashed as written."""
+    payload = b"archive-bytes" * 100
+    _archive_routes(github, payload)
+    target = tmp_path / "a.tar.gz"
+    downloaded = reader.download_tarball(REPO, SHA, target, max_bytes=10_000)
+    assert downloaded == Download(size=len(payload), sha256=hashlib.sha256(payload).hexdigest())
+    assert target.read_bytes() == payload
+    api, archive = github.api_requests()
+    assert api.headers["authorization"] == "Bearer ghs_token1"
+    assert archive.url.host == "codeload.github.com"
+    assert "authorization" not in archive.headers
+
+
+def test_download_refuses_an_unexpected_redirect(reader: GitHubAppClient, github: GitHub, tmp_path: Path) -> None:
+    """A redirect to any host but codeload is refused before anything is fetched from it."""
+    _archive_routes(github, b"x", location="https://evil.example.com/a.tar.gz")
+    with pytest.raises(GitHubError, match="unexpected host") as caught:
+        reader.download_tarball(REPO, SHA, tmp_path / "a", max_bytes=10)
+    assert "evil" not in str(caught.value)
+    assert [r.url.host for r in github.api_requests()] == ["api.github.com"]
+
+
+def test_download_refuses_past_max_bytes(reader: GitHubAppClient, github: GitHub, tmp_path: Path) -> None:
+    """An archive larger than the limit raises `GitHubDownloadTooLarge` and is not retried."""
+    _archive_routes(github, b"x" * 50)
+    with pytest.raises(GitHubDownloadTooLarge):
+        reader.download_tarball(REPO, SHA, tmp_path / "a", max_bytes=10)
+    assert len(github.api_requests()) == 2
+
+
+def test_download_retries_a_failed_codeload(
+    reader: GitHubAppClient, github: GitHub, tmp_path: Path, sleeps: list[float]
+) -> None:
+    """A codeload 5xx retries the whole download, asking the API for a fresh redirect."""
+    github.on("GET", f"/repos/{REPO}/tarball/{SHA}", 302, None, location=CODELOAD)
+    answers = iter([httpx.Response(503), httpx.Response(200, content=b"ok")])
+    github.routes[("GET", urlsplit(CODELOAD).path)] = lambda _: next(answers)
+    assert reader.download_tarball(REPO, SHA, tmp_path / "a", max_bytes=10).size == 2
+    assert len(github.api_requests()) == 4
+    assert sleeps == [0.5]
+
+
+def test_download_failure_never_names_the_signed_url(
+    reader: GitHubAppClient, github: GitHub, tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Neither the error nor the log carries the signed codeload URL or a token."""
+    github.on("GET", f"/repos/{REPO}/tarball/{SHA}", 302, None, location=CODELOAD)
+    github.routes[("GET", urlsplit(CODELOAD).path)] = lambda _: httpx.Response(404, json={"message": "gone"})
+    with (
+        caplog.at_level(logging.WARNING, logger="webbpulse.integrations.github"),
+        pytest.raises(GitHubNotFound) as caught,
+    ):
+        reader.download_tarball(REPO, SHA, tmp_path / "a", max_bytes=10)
+    rendered = (
+        str(caught.value) + caught.value.path + "".join(r.getMessage() + repr(r.__dict__) for r in caplog.records)
+    )
+    assert "signed-secret" not in rendered
+    assert "ghs_token" not in rendered
+
+
+def test_download_release_asset_asks_for_the_bytes(reader: GitHubAppClient, github: GitHub, tmp_path: Path) -> None:
+    """An asset is requested as octet-stream and followed to GitHub's asset host."""
+    location = "https://release-assets.githubusercontent.com/github-production-release-asset/1?sig=secret"
+    github.on("GET", f"/repos/{REPO}/releases/assets/11", 302, None, location=location)
+    github.routes[("GET", urlsplit(location).path)] = lambda _: httpx.Response(200, content=b"zip")
+    downloaded = reader.download_release_asset(REPO, 11, tmp_path / "a.zip", max_bytes=10)
+    assert downloaded.sha256 == hashlib.sha256(b"zip").hexdigest()
+    api, _ = github.api_requests()
+    assert api.headers["accept"] == "application/octet-stream"
+
+
+def test_download_release_asset_answered_directly(reader: GitHubAppClient, github: GitHub, tmp_path: Path) -> None:
+    """GitHub may stream an asset itself rather than redirect, and that is written too."""
+    github.routes[("GET", f"/repos/{REPO}/releases/assets/11")] = lambda _: httpx.Response(200, content=b"zip")
+    assert reader.download_release_asset(REPO, 11, tmp_path / "a.zip", max_bytes=10).size == 3
+
+
+def test_download_needs_a_positive_limit(reader: GitHubAppClient, tmp_path: Path) -> None:
+    """A zero byte limit is refused before any call."""
+    with pytest.raises(ValueError, match="max_bytes"):
+        reader.download_tarball(REPO, SHA, tmp_path / "a", max_bytes=0)
+
+
+def test_read_attempts_must_be_positive() -> None:
+    """A client that would never try is refused at construction."""
+    with pytest.raises(ValueError, match="read_attempts"):
+        GitHubAppClient(app_id=1, private_key=PRIVATE_PEM, read_attempts=0)

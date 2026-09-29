@@ -26,6 +26,16 @@ This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `E2EClient.unrecorded` so the run-wide checks never see the call. A 403, 404, 405 or 501
   means the backend offers no sweep and is ignored, so an older deployment keeps working.
   Any other failure is a warning.
+- `integrations.github`: typed reads for the App client. `get_commit`, `compare_commits`,
+  `get_pull_request`, `list_pull_request_commits`, `list_pull_request_files`,
+  `list_commit_pull_requests`, `list_check_runs`, `list_issue_comments`, `list_tags`,
+  `list_releases` and `get_release_by_tag`, plus `download_tarball` and
+  `download_release_asset`, which stream to a file under `max_bytes` and answer a `Download`
+  with its size and SHA-256. Reads and downloads retry a 5xx, a dropped connection or a
+  refused token with backoff; writes still never retry. Downloads follow GitHub's redirect
+  only to `TARBALL_HOSTS` or `ASSET_HOSTS`, without the token. `CheckRun` gains `name`,
+  `head_sha`, `external_id` and `app_id`, and `IssueComment` gains `body`, `user_login` and
+  `user_type`, all defaulted.
 
 ### Fixed
 
