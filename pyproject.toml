@@ -114,7 +114,7 @@ ignore_missing_imports = true
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
-addopts = "-q --strict-markers --strict-config"
+addopts = "-q --strict-markers --strict-config --maxprocesses=4"
 markers = [
   "e2e_writes: a post-deploy case that signs in, writes or mutates. Skipped when E2E_READ_ONLY is set",
 ]

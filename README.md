@@ -28,7 +28,7 @@ uv sync --locked
 source .venv/bin/activate
 ruff check src tests && ruff format --check src tests
 mypy
-python -m pytest -n auto --cov=webbpulse
+python -m pytest -n 4 --cov=webbpulse
 ```
 
 The base install carries only `pydantic` and `pydantic-settings`. Everything else is opt-in:
