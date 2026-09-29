@@ -7,6 +7,8 @@ This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## Unreleased
 
+## 0.70.0
+
 ### Added
 
 - `identity`: `POST /e2e/users/sweep`, a staging-only admin route behind the same gate as
