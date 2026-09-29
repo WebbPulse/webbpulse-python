@@ -345,6 +345,15 @@ with its `location`. The private key, client secret,
 webhook secret and tokens stay out of reprs, error messages and logs. Webhook routing and
 product naming stay in the product.
 
+Typed reads cover commits, comparisons, pull requests with their commits and files, check
+runs, issue comments, tags and releases. Reads retry a 5xx, a dropped connection or a refused
+token (re-minted) up to `read_attempts` times with doubling backoff; writes never retry.
+Listings take 100 per page and stop at a short page or after `max_pages` (default 10), so a
+result of `100 * max_pages` items may be truncated. `download_tarball` and
+`download_release_asset` stream to a file with a `max_bytes` limit and answer its size and
+SHA-256. The redirect GitHub answers is followed only to its own archive and asset hosts,
+without the installation token, and the signed URL never appears in errors or logs.
+
 An App is created per environment through GitHub's manifest flow: the product posts its
 manifest to `https://github.com/settings/apps/new` (or
 `https://github.com/organizations/<org>/settings/apps/new`) with a `state`, GitHub redirects
