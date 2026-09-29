@@ -7,6 +7,8 @@ This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## Unreleased
 
+## 0.68.1
+
 ### Fixed
 
 - `testing`: the plugin now clears FastAPI's `functools.lru_cache` memos after every test
