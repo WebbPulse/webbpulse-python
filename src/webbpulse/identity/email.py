@@ -1,7 +1,9 @@
 """Sending the two emails identity owns: a verification link and a reset link.
 
-An abstract sender with an SES v2 implementation and a recording one. Bodies are rendered
-with `string.Template`, so escaping the HTML part is this module's own job.
+An abstract sender with an SES v2 implementation and a recording one, plus
+`CappedEmailSender`, which puts any sender behind a `webbpulse.email_cap.EmailSendCap`.
+Bodies are rendered with `string.Template`, so escaping the HTML part is this module's own
+job.
 """
 
 from __future__ import annotations
@@ -14,11 +16,16 @@ from string import Template
 from typing import TYPE_CHECKING, Any, Final, Protocol
 
 if TYPE_CHECKING:  # pragma: no cover
+    from webbpulse.email_cap import EmailCapDecision, EmailCategory, EmailSendCap
     from webbpulse.identity.settings import IdentitySettings
 
 __all__ = [
+    "TRANSACTIONAL_PURPOSES",
+    "CappedEmailSender",
+    "EmailCapExceeded",
     "EmailMessage",
     "EmailSendFailed",
+    "EmailSendResult",
     "EmailSender",
     "RecordingEmailSender",
     "SesV2Client",
@@ -32,6 +39,11 @@ __all__ = [
 _log = logging.getLogger(__name__)
 
 CHARSET: Final = "UTF-8"
+
+TRANSACTIONAL_PURPOSES: Final[frozenset[str]] = frozenset(
+    {"verify_email", "reset_password", "password_changed", "registration_notice"}
+)
+"""The `purpose` tags `CappedEmailSender` counts as transactional, besides any `mfa` prefix."""
 
 
 class EmailSendFailed(Exception):
@@ -151,6 +163,96 @@ class SesV2EmailSender(EmailSender):
             },
         )
         return message_id
+
+
+class EmailCapExceeded(EmailSendFailed):
+    """A send refused by the cap, raised only by a `CappedEmailSender` built with `raise_on_cap`.
+
+    A subclass of `EmailSendFailed`, so identity's flows treat it as any other send failure.
+    """
+
+    def __init__(self, decision: EmailCapDecision) -> None:
+        """Keep the decision that refused the send."""
+        self.decision = decision
+        super().__init__(f"Email send cap reached: {', '.join(decision.exceeded) or 'unknown'}.")
+
+
+@dataclass(frozen=True, slots=True)
+class EmailSendResult:
+    """What `CappedEmailSender.send_checked` did: `sent`, the provider id, and the decision."""
+
+    sent: bool
+    message_id: str
+    decision: EmailCapDecision
+
+
+class CappedEmailSender(EmailSender):
+    """An `EmailSender` that checks an `EmailSendCap` before delegating to another sender.
+
+    A capped send is skipped: `send` returns an empty message id and `send_checked` returns
+    a result with `sent=False`. Pass `raise_on_cap=True` to raise `EmailCapExceeded`
+    instead. A message is transactional when its `purpose` tag is in
+    `transactional_purposes` or starts with `mfa`, and counts against the transactional
+    limits.
+    """
+
+    def __init__(
+        self,
+        sender: EmailSender,
+        cap: EmailSendCap,
+        *,
+        default_tenant: str = "-",
+        raise_on_cap: bool = False,
+        transactional_purposes: frozenset[str] = TRANSACTIONAL_PURPOSES,
+    ) -> None:
+        """Wrap `sender` with `cap`, using `default_tenant` when a send names none."""
+        self.sender = sender
+        self.cap = cap
+        self.default_tenant = default_tenant
+        self.raise_on_cap = raise_on_cap
+        self.transactional_purposes = transactional_purposes
+
+    def category_of(self, message: EmailMessage) -> EmailCategory:
+        """Classify a message by its `purpose` tag."""
+        purpose = message.tags.get("purpose", "")
+        if purpose in self.transactional_purposes or purpose.startswith("mfa"):
+            return "transactional"
+        return "standard"
+
+    def send(self, message: EmailMessage) -> str:
+        """Send under the cap and return the provider id, or an empty string when capped."""
+        return self.send_checked(message).message_id
+
+    def send_checked(
+        self,
+        message: EmailMessage,
+        *,
+        tenant: str | None = None,
+        transactional: bool | None = None,
+        now: float | None = None,
+    ) -> EmailSendResult:
+        """Check the cap, send when allowed, and report what happened.
+
+        `transactional` overrides the purpose classification. Raises `EmailSendFailed` when
+        the wrapped sender does, and `EmailCapExceeded` for a capped send only with
+        `raise_on_cap`.
+        """
+        if transactional is None:
+            category = self.category_of(message)
+        else:
+            category = "transactional" if transactional else "standard"
+        decision = self.cap.check(
+            message.to,
+            tenant=self.default_tenant if tenant is None else tenant,
+            category=category,
+            purpose=message.tags.get("purpose", "unknown"),
+            now=now,
+        )
+        if not decision.allowed:
+            if self.raise_on_cap:
+                raise EmailCapExceeded(decision)
+            return EmailSendResult(sent=False, message_id="", decision=decision)
+        return EmailSendResult(sent=True, message_id=self.sender.send(message), decision=decision)
 
 
 class RecordingEmailSender(EmailSender):
