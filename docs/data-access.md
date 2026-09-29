@@ -484,6 +484,93 @@ else:
     limiter.clear(ip)
 ```
 
+### Plan tiers: per token, user and tenant
+
+Per-IP classes let one tenant spend the shared API Gateway stage limit from many addresses.
+`tiers=` adds keyed limits on plan tiers alongside them. The app supplies a resolver that
+maps a request to a `RateLimitSubject` (the plan name plus any of a tenant, user and token
+key) and a mapping from plan name to `PlanLimits`. The package knows no product nouns: a
+tenant is whatever the app calls a workspace or garage.
+
+```python
+from webbpulse.identity.claims import identity_claims
+from webbpulse.ratelimit import (
+    PlanLimits,
+    Quota,
+    RateLimitSubject,
+    ScopeLimits,
+    TieredLimits,
+    rate_limit_middleware,
+)
+
+PLANS = {
+    "free": PlanLimits(
+        user=ScopeLimits(read=Quota(per_minute=120), write=Quota(per_minute=30)),
+        token=ScopeLimits.combined(Quota(per_minute=30, per_day=5_000)),
+        tenant=ScopeLimits.combined(Quota(per_minute=600)),
+    ),
+    "standard": PlanLimits(...),
+}
+
+
+def resolve(request) -> RateLimitSubject | None:
+    claims = identity_claims(request)
+    if claims is None:
+        return None
+    tenant = claims.get("tenant_id")
+    return RateLimitSubject(plan=plan_for(tenant), tenant=tenant, user=claims["sub"])
+
+
+app.middleware("http")(
+    rate_limit_middleware(
+        CLASSES,
+        tiers=TieredLimits(resolver=resolve, plans=PLANS, default_plan="free", ip_classes=("auth",)),
+        enabled=lambda: get_settings().rate_limiting_enabled,
+    )
+)
+```
+
+- A `Quota` is a requests-per-minute cap plus an optional daily quota. `ScopeLimits` sets
+  reads and writes separately; `ScopeLimits.combined` counts both against one counter, as
+  a workspace aggregate wants. Reads are `read_methods`, `GET` and `HEAD` by default.
+- An unknown plan gets `default_plan`'s limits, and `default_plan` must be in `plans`.
+- A resolved request is counted against its token, user and tenant keys, in that order,
+  and the first refusal stops the rest. It is not also counted against its IP class, so
+  the tiers replace that write rather than adding to it. A class named in `ip_classes`
+  stays per IP for everyone, which keeps a credential class guarding step-up checks.
+- The resolver may be async. `None`, a resolver that raises, or a plan that limits none
+  of the subject's keys leaves the request on the IP classes, so nothing goes uncounted.
+- Name only verified identities. An unverified API key or token id is a fresh bucket per
+  guess, so resolve those to `None` until verified, and pass a key id, never its secret.
+- Refusals are the same 429 as the IP classes, from `renderer`, with `Retry-After` and the
+  `RateLimit`, `RateLimit-Policy` and `X-RateLimit-*` headers. The policy name is
+  `<scope>-<counter>`, such as `user-write` or `tenant-all`, and an allowed response
+  reports whichever of the minute and day quotas has less left.
+- Without `tiers` the middleware behaves exactly as before.
+
+`TieredRateLimiter(tiers).check_key(scope, key, quota)` counts one key directly, for a
+per-route cap such as searches per user per minute.
+
+**Cost.** Each key is one item per UTC day, `tier#<scope>#<key>#<day>`, holding per
+counter the minute count, the minute it belongs to, and the day count, with a TTL at the
+end of the day. A request costs one conditional `UpdateItem` per limited key: the count
+path holds while the stored minute is current, and the first request of a minute takes
+the rollover path, which resets the minute count. In-process state predicts which, so a
+second call happens only when another container rolled the minute first. A typical
+authenticated request with user and tenant limits is two writes, against one per-IP
+write today; a token request with no tenant limit is one.
+
+Two in-process savings cut that for hot keys. A key refused for the minute or the day is
+refused from memory until the window ends, so a caller hammering past a 429 costs no
+writes. A hot key claims a lease of up to `max_lease` counts (10 by default) in one write
+and serves the rest from memory within that minute. A lease is at most one
+`lease_divisor`th (8 by default) of the local request rate and of what remains, so it
+shrinks to 1 near the cap and the cap is never exceeded; the cost is that leased counts
+unused at the minute's end still count toward the day, and other containers may be
+refused slightly early. `max_lease=1` makes every request a write and the count exact.
+The state is an LRU of `cache_size` counters per container. Failures fail open exactly
+as the IP classes do, with the `RateLimitFailedOpen` metric under `LimitClass=tier`.
+
 ### Windows and anchors
 
 `anchor="clock"`, the default, derives the window from the clock, `floor(now / window) * window`,

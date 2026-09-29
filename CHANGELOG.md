@@ -20,6 +20,16 @@ This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `admin_granted_at` (or the `admin_revoked_*` pair) from the `sts:GetCallerIdentity` ARN,
   prints one JSON audit line per change, supports `--dry-run`, and only ever prints masked
   addresses.
+- `ratelimit`: plan-tier limits keyed by API key or token id, user id and tenant id,
+  alongside the per-IP classes. Pass `tiers=TieredLimits(resolver=..., plans=...,
+  default_plan=...)` to `rate_limit_middleware`; the app's resolver returns a
+  `RateLimitSubject` naming the plan and keys, and each plan's `PlanLimits` sets a
+  per-minute cap and optional daily quota for reads and writes per scope. Unknown plans
+  fall back to `default_plan`. A resolved request is counted by key instead of by IP, one
+  conditional `UpdateItem` per limited key holding the minute and day counters together,
+  with an in-process lease for hot keys and in-memory refusal after a 429. Refusals carry
+  `Retry-After` and the `X-RateLimit-*` headers. Without `tiers` nothing changes.
+  `TieredRateLimiter.check_key` counts one key directly.
 
 ## 0.67.2
 
