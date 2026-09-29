@@ -8,6 +8,9 @@ sync dependency, whose context Starlette's threadpool discards.
 `encode_cursor` and `decode_cursor` is the paginated response shape, which carries a
 data-layer cursor across the wire without this module knowing what is in it. `cursor_page`
 builds the same page under an API's own plural key.
+
+`conditional_response` answers a polled GET with a weak `ETag`, a 304 with an empty body
+when `If-None-Match` already holds it, and `Cache-Control: private, no-cache`.
 """
 
 from __future__ import annotations
@@ -27,6 +30,7 @@ from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Final
 
 from fastapi import APIRouter, Depends, FastAPI, Request
+from fastapi.encoders import jsonable_encoder
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
@@ -42,6 +46,7 @@ if TYPE_CHECKING:  # pragma: no cover
     from webbpulse.config import BaseServiceSettings
 
 __all__ = [
+    "CONDITIONAL_CACHE_CONTROL",
     "DEFAULT_CORS_ALLOW_HEADERS",
     "DEFAULT_ERROR_STATUSES",
     "DYNAMODB_ERROR_MESSAGES",
@@ -69,6 +74,7 @@ __all__ = [
     "ValidationErrorDetail",
     "bind_user_id",
     "client_ip",
+    "conditional_response",
     "create_app",
     "cursor_page",
     "decode_cursor",
@@ -76,11 +82,13 @@ __all__ = [
     "encode_cursor",
     "error_body",
     "error_envelope_responses",
+    "etag_matches",
     "guard_exception_groups",
     "health_router",
     "install_dynamodb_error_handlers",
     "install_dynamodb_handlers",
     "mount_all",
+    "not_modified_response",
     "register_error_handlers",
     "request_context",
     "request_id",
@@ -88,6 +96,7 @@ __all__ = [
     "route_key",
     "user_id_dependency",
     "verify_hmac_signature",
+    "weak_etag",
 ]
 
 _log = logging.getLogger(__name__)
@@ -102,6 +111,11 @@ RETRY_ATTEMPT_HEADER: Final = "X-Retry-Attempt"
 
 ROUTE_KEY_HEADER: Final = "X-WebbPulse-Route-Key"
 
+CONDITIONAL_CACHE_CONTROL: Final = "private, no-cache"
+"""The `Cache-Control` every conditional response carries: cache per user, revalidate each time."""
+
+_CONDITIONAL_METHODS: Final = frozenset({"GET", "HEAD"})
+
 DEFAULT_CORS_ALLOW_HEADERS: Final = (
     "Accept",
     "Accept-Language",
@@ -109,6 +123,7 @@ DEFAULT_CORS_ALLOW_HEADERS: Final = (
     "Content-Language",
     "Content-Type",
     "Origin",
+    "If-None-Match",
     REQUEST_ID_HEADER,
     RETRY_ATTEMPT_HEADER,
 )
@@ -1539,6 +1554,7 @@ def create_app(
             allow_headers=allow_headers,
             expose_headers=[
                 REQUEST_ID_HEADER,
+                "ETag",
                 "RateLimit",
                 "RateLimit-Policy",
                 "Retry-After",
@@ -1862,3 +1878,92 @@ def cursor_page[ItemT](
     )
     _CURSOR_PAGE_MODELS[cache_key] = model
     return model
+
+
+def weak_etag(payload: Any = None, *, version: str | int | None = None) -> str:
+    """A weak ETag, `W/"<32 lowercase hex>"`, for a payload or a caller-supplied version.
+
+    With `version` the tag is derived from it alone, so a route can answer 304 without
+    loading anything. Otherwise it is the SHA-256 of the payload's JSON form with sorted keys
+    and compact separators, after `jsonable_encoder`, so a Pydantic model and the dict it
+    dumps to share a tag.
+    """
+    if version is not None:
+        material = f"version:{version}".encode()
+    else:
+        material = json.dumps(
+            jsonable_encoder(payload), sort_keys=True, separators=(",", ":"), ensure_ascii=False
+        ).encode()
+    return f'W/"{hashlib.sha256(material).hexdigest()[:32]}"'
+
+
+def _opaque_tag(tag: str) -> str:
+    """One entity tag with any `W/` prefix removed, for weak comparison."""
+    stripped = tag.strip()
+    return stripped[2:] if stripped[:2] in {"W/", "w/"} else stripped
+
+
+def etag_matches(if_none_match: str | None, etag: str) -> bool:
+    """Whether an `If-None-Match` value matches `etag` under weak comparison.
+
+    The header may list several tags separated by commas, weak or strong, or be `*`. An
+    absent or blank header never matches.
+    """
+    if not if_none_match or not if_none_match.strip():
+        return False
+    if if_none_match.strip() == "*":
+        return True
+    wanted = _opaque_tag(etag)
+    return any(_opaque_tag(candidate) == wanted for candidate in if_none_match.split(",") if candidate.strip())
+
+
+def _conditional_headers(etag: str, headers: Mapping[str, str] | None) -> dict[str, str]:
+    """The caller's headers plus the ETag and the conditional `Cache-Control`."""
+    merged = dict(headers or {})
+    merged["ETag"] = etag
+    merged["Cache-Control"] = CONDITIONAL_CACHE_CONTROL
+    return merged
+
+
+def not_modified_response(
+    request: Request,
+    etag: str,
+    *,
+    headers: Mapping[str, str] | None = None,
+) -> Response | None:
+    """A 304 with an empty body when a GET or HEAD already holds `etag`, else `None`.
+
+    For a route that knows its version before loading the payload: return this response
+    when it is not `None`, and build the 200 with `conditional_response` otherwise.
+    """
+    if request.method.upper() not in _CONDITIONAL_METHODS:
+        return None
+    if not etag_matches(request.headers.get("if-none-match"), etag):
+        return None
+    return Response(status_code=304, headers=_conditional_headers(etag, headers))
+
+
+def conditional_response(
+    request: Request,
+    payload: Any = None,
+    *,
+    version: str | int | None = None,
+    etag: str | None = None,
+    status_code: int = 200,
+    headers: Mapping[str, str] | None = None,
+) -> Response:
+    """Answer a polled GET with the payload and its weak ETag, or a 304 with an empty body.
+
+    The tag is `etag` when given, else `weak_etag(payload, version=version)`. Every answer
+    carries `ETag` and `Cache-Control: private, no-cache`. Only GET and HEAD are answered
+    with 304; any other method gets the full response.
+    """
+    tag = etag if etag is not None else weak_etag(payload, version=version)
+    unchanged = not_modified_response(request, tag, headers=headers)
+    if unchanged is not None:
+        return unchanged
+    return JSONResponse(
+        content=jsonable_encoder(payload),
+        status_code=status_code,
+        headers=_conditional_headers(tag, headers),
+    )

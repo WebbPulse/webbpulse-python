@@ -320,3 +320,66 @@ Models are cached per item type, key and name, so a module-level
 That matters because two structurally identical models sharing a name collide in the OpenAPI
 document and come out as `IssuesPage` and `IssuesPage1`. `model_name` overrides the default,
 which is the item type's name plus `Page`.
+
+## Conditional GET
+
+`conditional_response` lets a polled GET answer 304 when nothing changed, so a poll costs a
+header round trip rather than a body:
+
+```python
+from fastapi import Request
+from starlette.responses import Response
+
+from webbpulse.http import conditional_response, not_modified_response, weak_etag
+
+
+@router.get("/issues")
+async def list_issues(request: Request) -> Response:
+    """The payload is hashed into the tag."""
+    return conditional_response(request, [IssueOut.model_validate(i) for i in load_issues()])
+
+
+@router.get("/board")
+async def board(request: Request) -> Response:
+    """A version known up front answers 304 before loading anything."""
+    tag = weak_etag(version=team.updated_at)
+    return not_modified_response(request, tag) or conditional_response(request, load_board(), etag=tag)
+```
+
+A route returning a `Response` skips `response_model` validation, so validate the payload
+before passing it in, as above.
+
+### The header contract
+
+This is the contract the `usePolledQuery` hook in webbpulse-typescript follows.
+
+- **Every 200** carries `ETag: W/"<32 lowercase hex>"` and `Cache-Control: private, no-cache`,
+  with the JSON body as usual.
+- **The tag is weak and opaque.** It is the first 32 hex characters of a SHA-256, over the
+  payload's JSON with sorted keys and compact separators, or over `version:<version>` when
+  a version is supplied. Clients store it verbatim and never parse it.
+- **The client sends it back** as `If-None-Match: <etag>`, exactly as received. A list of
+  tags and `*` are accepted, and comparison is weak, so `W/"x"` matches `"x"`.
+- **A match answers `304 Not Modified` with an empty body** and no `Content-Type`, carrying
+  the same `ETag` and `Cache-Control`. The client keeps its previous data.
+- **Only GET and HEAD** are ever answered with 304. Any other method gets the full response.
+- **No match, or no header,** is a normal 200 with the new tag.
+
+`Cache-Control: private, no-cache` lets the browser keep the response but makes it
+revalidate on every use, and keeps shared caches from storing a per-user body.
+
+### Behind API Gateway and Lambda
+
+`create_app` adds `If-None-Match` to `DEFAULT_CORS_ALLOW_HEADERS` and `ETag` to the exposed
+headers, so a cross-origin poller can send the one and read the other. A product passing its
+own `cors_allow_headers` must list `If-None-Match` itself.
+
+API Gateway HTTP APIs pass `If-None-Match` through, lowercased, and pass a 304 back
+unchanged. The Lambda Web Adapter behind `lambda_entry` is a plain HTTP proxy, so the route
+sees the same request a local uvicorn does. Starlette sends a 304 with no body and no
+`Content-Length`. A CloudFront distribution in front of `/api` must forward `If-None-Match`,
+which the `AllViewer` origin request policy does, and must not cache the path.
+
+A fetch that sets `If-None-Match` by hand gets the raw 304 back, which is what the hook
+wants. A fetch that leaves it to the browser cache gets a 200 served from the cache instead,
+because the browser revalidates and replays the stored body.

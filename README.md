@@ -59,7 +59,7 @@ its dev dependencies.
 | `webbpulse.log_context` | `set_request_id`, `set_user_id`, `task_context`, `bind_context`, `LogContextFilter`: request and correlation context on ContextVars | [logging-and-metrics.md](docs/logging-and-metrics.md) |
 | `webbpulse.metrics` | `emit`, `timed`, `MetricsEmitter`, `metrics_enabled_from_env`: CloudWatch Embedded Metric Format on stdout | [logging-and-metrics.md](docs/logging-and-metrics.md) |
 | `webbpulse.otel` | `configure_tracing`, `instrument_fastapi`, `TailSamplingSpanProcessor`: tracing with errors always sampled | [tracing.md](docs/tracing.md), [tracing-sampling.md](docs/tracing-sampling.md) |
-| `webbpulse.http` | `create_app`, `mount_all`, `health_router`, `RequestIdMiddleware`, `user_id_dependency`, the shared error envelope, `verify_hmac_signature`, and `CursorPage` with `cursor_page`, `encode_cursor` and `decode_cursor` | [http.md](docs/http.md), [error-handlers.md](docs/error-handlers.md) |
+| `webbpulse.http` | `create_app`, `mount_all`, `health_router`, `RequestIdMiddleware`, `user_id_dependency`, the shared error envelope, `verify_hmac_signature`, `CursorPage` with `cursor_page`, `encode_cursor` and `decode_cursor`, and `conditional_response`, `not_modified_response` and `weak_etag` for ETag and 304 polling | [http.md](docs/http.md), [error-handlers.md](docs/error-handlers.md) |
 | `webbpulse.composition` | `Domain`, `DomainRegistry`, `build_domain_app`, `domain_entrypoint`, `configure_tracing`, `check_secrets`, `local_authorizer`, `scope_for`: the domain registry and the one builder both composition roots go through | [composition.md](docs/composition.md) |
 | `webbpulse.events` | `stream_consumer_app`, `register_stream_consumer`, `events_path`: the one route a DynamoDB Streams or SQS consumer serves behind the Web Adapter; `EventEnvelope`, `enqueue`, `deserialize_image` and `source_table` on the producing side | [events.md](docs/events.md) |
 | `webbpulse.events.webhooks` | `WebhookDispatcher`, `WebhookSender`, `RetryPolicy`, `signature_headers`: signed outbound webhooks with jittered retries and a dead-letter hook | [webhooks.md](docs/webhooks.md) |
@@ -67,6 +67,7 @@ its dev dependencies.
 | `webbpulse.dynamodb` | `Repository` with `set_attributes`, `remove_attributes` and `get_many`, `Page`, `table_name`, `ttl_at`, `ttl_in`, `encode_numbers`, `new_ulid`, `IdempotencyStore`, and the `DynamoError` family, whose `ConditionFailed` every conditional write raises | [data-access.md](docs/data-access.md) |
 | `webbpulse.storage` | `presigned_put`, `PresignedUpload`: a presigned S3 PUT bounded by a signed content type and content length; `presigned_get`, `PresignedDownload`: a presigned S3 GET with optional signed response headers; `UPLOAD_CONTENT_TYPES`, `is_allowed_upload` and `disposition_for` for what an upload may declare and how it is served back | [data-access.md](docs/data-access.md) |
 | `webbpulse.ratelimit` | `rate_limit`, `rate_limit_middleware`, `LimitClass`, `classify`, a fixed window limiter on one DynamoDB table, failing open | [data-access.md](docs/data-access.md) |
+| `webbpulse.email_cap` | `EmailSendCap`, `EmailCapPolicy`, `EmailCapLimits`: outbound email caps per recipient, per tenant and per app day on the rate limits table, off by default, failing open | [email-caps.md](docs/email-caps.md) |
 | `webbpulse.security` | `hash_password`, `verify_password`, `needs_rehash`, `create_token`, `decode_token`, `bearer_claims` | [security.md](docs/security.md) |
 | `webbpulse.identity` | App-managed identity: password, session, email link, TOTP, OAuth and passkey flows, plus a KMS-backed `TokenService` and a JWKS | [identity.md](docs/identity.md), [the standard](docs/identity-standard.md) |
 | `webbpulse.identity.oauth_server` | An OAuth 2.1 authorization server for hosting a remote MCP server: discovery, PKCE code grant, dynamic registration, consent | [oauth-server.md](docs/oauth-server.md) |
@@ -477,7 +478,7 @@ where the data lives.
 | `OAuthStateStore` | ABC | `src/webbpulse/identity/oauth.py` | The in-flight authorization state |
 | `OAuthLinkStore` | ABC | `src/webbpulse/identity/oauth.py` | The provider-to-user attachment |
 | `ApiKeyStore` | ABC | `src/webbpulse/identity/api_keys.py` | Long-lived machine keys, stored as hashes. `DynamoApiKeyStore` and `InMemoryApiKeyStore` ship |
-| `EmailSender` | ABC | `src/webbpulse/identity/email.py` | Sending mail. `SesV2EmailSender` and `RecordingEmailSender` ship |
+| `EmailSender` | ABC | `src/webbpulse/identity/email.py` | Sending mail. `SesV2EmailSender`, `RecordingEmailSender` and `CappedEmailSender` ship |
 | `KmsClient` | Protocol | `src/webbpulse/identity/tokens.py` | The KMS surface `TokenService` signs with, so a test can substitute one |
 | `KmsDataKeyClient` | Protocol | `src/webbpulse/identity/crypto.py` | The KMS surface `EnvelopeCipher` seals TOTP seeds with |
 | `HttpClient` | Protocol | `src/webbpulse/identity/oauth.py` | The OAuth provider leg. `HttpxClient` ships |
@@ -564,7 +565,8 @@ app.include_router(build_identity_router(settings, hooks, stores, tokens=tokens)
 | [docs/identity-oauth.md](docs/identity-oauth.md) | OAuth sign-in and account linking |
 | [docs/oauth-server.md](docs/oauth-server.md) | The OAuth 2.1 authorization server for a remote MCP server |
 | [docs/identity-passkeys.md](docs/identity-passkeys.md) | WebAuthn registration, passwordless sign-in and credential management |
-| [docs/http.md](docs/http.md) | `create_app` and the error envelope shapes |
+| [docs/http.md](docs/http.md) | `create_app`, the error envelope shapes, and conditional GET |
+| [docs/email-caps.md](docs/email-caps.md) | Outbound email send caps and `CappedEmailSender` |
 | [docs/error-handlers.md](docs/error-handlers.md) | DynamoDB and custom exception handlers |
 | [docs/events.md](docs/events.md) | The stream and queue consumer route, and publishing an event |
 | [docs/webhooks.md](docs/webhooks.md) | Signed outbound webhooks: the scheme, the retries and the fake |

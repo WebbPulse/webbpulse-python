@@ -31,6 +31,28 @@ This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `Retry-After` and the `X-RateLimit-*` headers. Without `tiers` nothing changes.
   `TieredRateLimiter.check_key` counts one key directly.
 
+### `email_cap`: outbound email send caps (minor)
+
+New `webbpulse.email_cap` with `EmailSendCap`, `EmailCapPolicy` and `EmailCapLimits`, and
+`CappedEmailSender` in `webbpulse.identity`, which puts any `EmailSender` behind a cap.
+Counters run per recipient within an app-supplied tenant, per tenant, and per app per UTC
+day, on the existing `<prefix>-rate-limits` table with one conditional write per send. A
+capped send is skipped, logged as `email.capped` and counted as `EmailCapped` in
+`WebbPulse/Email`. `send_checked` returns an `EmailSendResult`, and `send` returns an empty
+id. It raises `EmailCapExceeded` only with `raise_on_cap=True`. A DynamoDB failure fails
+open. Transactional identity mail (verification, reset, MFA) has its own counters, and its
+limits may not be lower than the standard ones. Every limit is off by default, so current
+adopters see no change. See [docs/email-caps.md](docs/email-caps.md).
+
+### `http`: conditional GET with weak ETags (minor)
+
+New `conditional_response`, `not_modified_response`, `weak_etag`, `etag_matches` and
+`CONDITIONAL_CACHE_CONTROL`. A GET or HEAD whose `If-None-Match` holds the current weak
+ETag (`W/"<32 lowercase hex>"`) gets a 304 with an empty body. Every answer carries `ETag`
+and `Cache-Control: private, no-cache`. `DEFAULT_CORS_ALLOW_HEADERS` now includes
+`If-None-Match`, and `create_app` exposes `ETag`. The header contract for pollers is in
+[docs/http.md](docs/http.md#conditional-get).
+
 ## 0.67.2
 
 ### Fixed
