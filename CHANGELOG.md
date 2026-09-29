@@ -13,8 +13,8 @@ This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 - `ratelimit`: `identity_from_principal` and `principal_identity(fallback)`, identity functions
   for `rate_limit_middleware` and `rate_limit` that key a verified authorizer `sub` as
-  `user:<sub>` and a presented API key as `key:<sha256 hash>`, falling back to the source IP
-  for anonymous and unverified callers. Two users behind one address no longer share a bucket.
+  `user:<sub>`, falling back to the source IP for anonymous callers and every unverified
+  credential, API keys included. Two users behind one address no longer share a bucket.
 
 ## 0.68.1
 

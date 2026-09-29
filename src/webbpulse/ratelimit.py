@@ -224,11 +224,10 @@ def principal_identity(
 ) -> Callable[[Request], str]:
     """An identity function keying a signed-in caller by principal and anyone else by `fallback`.
 
-    A verified authorizer `sub` keys as `user:<sub>`, and a presented API key as
-    `key:<hash_key(key)>`, the stored key hash, so no table is read per request. Every other
-    request, including an unverified bearer token, answers `fallback(request)`, which keeps
-    anonymous callers keyed by IP. Pass a product's own IP reader as `fallback` where it
-    covers request shapes `identity_from_ip` does not.
+    A verified authorizer `sub` keys as `user:<sub>`. Every other request, a bearer token or
+    API key included, answers `fallback(request)`: the middleware runs before any credential
+    is verified, so keying on a presented one would hand each forged value a fresh bucket.
+    Pass a product's own IP reader as `fallback` where it covers request shapes `identity_from_ip` does not.
 
     Keying by principal is what stops a browser, a CLI and agents behind one address from
     sharing a single bucket.
@@ -236,23 +235,18 @@ def principal_identity(
 
     def identity(request: Request) -> str:
         """The principal key for this request, or the fallback identity."""
-        from webbpulse.identity.api_keys import hash_key, is_api_key
         from webbpulse.identity.claims import identity_subject
-        from webbpulse.identity.scopes import bearer_credential
 
         subject = identity_subject(request).strip()
         if subject:
             return f"user:{subject}"
-        presented = bearer_credential(request)
-        if presented and is_api_key(presented):
-            return f"key:{hash_key(presented)}"
         return fallback(request)
 
     return identity
 
 
 def identity_from_principal(request: Request) -> str:
-    """`principal_identity()` over `identity_from_ip`: user or API key first, then source IP."""
+    """`principal_identity()` over `identity_from_ip`: verified user first, then source IP."""
     return _default_principal_identity(request)
 
 

@@ -1130,15 +1130,17 @@ def test_identity_from_principal_keys_a_verified_user_by_sub() -> None:
     assert ratelimit.identity_from_principal(request) == "user:user-1"
 
 
-def test_identity_from_principal_keys_an_api_key_by_its_hash() -> None:
-    """A presented API key keys by its stored hash, never by the plaintext."""
-    from webbpulse.identity.api_keys import hash_key
+def test_identity_from_principal_keeps_a_key_shaped_bearer_on_the_ip() -> None:
+    """An unverified key-shaped bearer, random each time, never escapes the IP bucket."""
+    import secrets
 
-    key = "wpk_" + "a" * 43
-    request = _principal_request(_principal_headers("198.51.100.71", bearer=key))
-    identity = ratelimit.identity_from_principal(request)
-    assert identity == f"key:{hash_key(key)}"
-    assert key not in identity
+    from webbpulse.identity.api_keys import is_api_key
+
+    for _ in range(3):
+        key = "wpk_" + secrets.token_urlsafe(32)
+        assert is_api_key(key)
+        request = _principal_request(_principal_headers("198.51.100.71", bearer=key))
+        assert ratelimit.identity_from_principal(request) == "198.51.100.71"
 
 
 def test_identity_from_principal_falls_back_to_the_ip_for_anonymous_and_unverified() -> None:
@@ -1173,3 +1175,23 @@ def test_middleware_gives_two_users_behind_one_ip_separate_buckets(rate_limit_ta
     for _ in range(2):
         assert client.get("/api/cars", headers=_principal_headers(ip)).status_code == 200
     assert client.get("/api/cars", headers=_principal_headers(ip)).status_code == 429
+
+
+def test_middleware_keeps_random_key_shaped_bearers_in_one_ip_bucket(rate_limit_table: Any) -> None:
+    """A fresh forged API key per request does not buy a fresh bucket."""
+    import secrets
+
+    from fastapi.testclient import TestClient
+
+    assert rate_limit_table is not None
+    classes = [LimitClass(name="get", limit=2, window_seconds=60, methods=("GET",))]
+    client = TestClient(_middleware_app(classes, identity_fn=ratelimit.identity_from_principal))
+    ip = "198.51.100.75"
+
+    def forged() -> dict[str, str]:
+        """Headers carrying a new random key-shaped bearer."""
+        return _principal_headers(ip, bearer="wpk_" + secrets.token_urlsafe(32))
+
+    for _ in range(2):
+        assert client.get("/api/cars", headers=forged()).status_code == 200
+    assert client.get("/api/cars", headers=forged()).status_code == 429
