@@ -11,12 +11,19 @@ is the composition-layer check: it builds every domain's entrypoint in its own i
 and holds that each one imports its own domain package and no other. Import only from tests;
 it needs the `testing` extra, and `FakeKms` additionally needs `cryptography`, which the
 `identity` extra brings in.
+
+Loading the plugin also installs an autouse fixture that runs `clear_fastapi_caches` after
+every test. FastAPI memoises callable classification with `functools.lru_cache`, so each
+`app.dependency_overrides[dep] = lambda: ...` would otherwise stay pinned, closure and all,
+for the life of a pytest-xdist worker. The fixture only touches FastAPI modules that are
+already imported and does nothing when FastAPI is absent.
 """
 
 from __future__ import annotations
 
 import json
 import os
+import sys
 from collections.abc import Callable, Collection, Iterator, Mapping
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -42,6 +49,7 @@ __all__ = [
     "assert_share_token_store_contract",
     "assert_users_repository_contract",
     "aws_credentials",
+    "clear_fastapi_caches",
     "create_table",
     "dynamodb_reset_hooks",
     "dynamodb_resource",
@@ -58,6 +66,37 @@ __all__ = [
 ]
 
 _RATE_LIMIT_TABLE = "rate-limits"
+
+
+def clear_fastapi_caches() -> int:
+    """Clear every `functools` cache defined in an already-imported FastAPI module.
+
+    Walks `fastapi` and each `fastapi.*` module in `sys.modules` and calls `cache_clear()`
+    on the callables FastAPI defines that expose both `cache_clear` and `cache_info`. It
+    never imports FastAPI, so it is a no-op when FastAPI is absent or not yet loaded.
+    Returns the number of distinct caches cleared.
+    """
+    cleared: set[int] = set()
+    for name, module in list(sys.modules.items()):
+        if not (name == "fastapi" or name.startswith("fastapi.")) or module is None:
+            continue
+        for value in list(vars(module).values()):
+            if id(value) in cleared or isinstance(value, type) or not callable(value):
+                continue
+            if not (hasattr(value, "cache_clear") and hasattr(value, "cache_info")):
+                continue
+            if not str(getattr(value, "__module__", "")).startswith("fastapi"):
+                continue
+            value.cache_clear()
+            cleared.add(id(value))
+    return len(cleared)
+
+
+@pytest.fixture(autouse=True)
+def _clear_fastapi_caches() -> Iterator[None]:
+    """Clear FastAPI's `lru_cache` memos after each test so overridden callables can be freed."""
+    yield
+    clear_fastapi_caches()
 
 
 @pytest.fixture
