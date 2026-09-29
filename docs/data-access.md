@@ -470,6 +470,13 @@ itself) and `exempt_prefixes` (matched by subtree) skip counting altogether, as 
 method in `exempt_methods`, `OPTIONS` by default. `enabled` is consulted per request for a
 product that gates on its own settings flag.
 
+Every class is keyed by `identity_fn`, the source IP by default. Pass
+`identity_fn=identity_from_principal` to key a signed-in caller by who they are instead: a
+verified authorizer `sub` becomes `user:<sub>`, a presented API key `key:<hash>` (the stored
+hash, so no table read), and everything else, an unverified bearer token included, stays on
+the IP. Without it a browser, a CLI and agents behind one address share one bucket.
+`principal_identity(fallback)` builds the same function over a product's own IP reader.
+
 **Directly**, calling `RateLimiter` where a route decides for itself what counts. A login
 lockout counts only failures and forgets them on success:
 

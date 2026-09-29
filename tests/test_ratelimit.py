@@ -1105,3 +1105,71 @@ def test_a_failing_emitter_does_not_break_a_failed_clear(
     records = [r for r in caplog.records if getattr(r, "rate_limit_failed_open", None) is True]
     assert len(records) == 1
     assert getattr(records[0], "rate_limit_operation", None) == "clear"
+
+
+def _principal_headers(source_ip: str, *, sub: str | None = None, bearer: str | None = None) -> dict[str, str]:
+    """Request context headers for one caller, with verified claims when `sub` is given."""
+    from webbpulse.testing import make_request_context_headers
+
+    extra = {"authorizer": {"jwt": {"claims": {"sub": sub}}}} if sub else None
+    headers = make_request_context_headers(source_ip, extra=extra)
+    if bearer:
+        headers["authorization"] = f"Bearer {bearer}"
+    return headers
+
+
+def _principal_request(headers: dict[str, str]) -> Request:
+    """A bare request carrying `headers`, for calling an identity function directly."""
+    raw = [(name.lower().encode(), value.encode()) for name, value in headers.items()]
+    return Request({"type": "http", "method": "GET", "path": "/", "headers": raw, "query_string": b""})
+
+
+def test_identity_from_principal_keys_a_verified_user_by_sub() -> None:
+    """A verified `sub` wins over the source IP."""
+    request = _principal_request(_principal_headers("198.51.100.70", sub="user-1"))
+    assert ratelimit.identity_from_principal(request) == "user:user-1"
+
+
+def test_identity_from_principal_keys_an_api_key_by_its_hash() -> None:
+    """A presented API key keys by its stored hash, never by the plaintext."""
+    from webbpulse.identity.api_keys import hash_key
+
+    key = "wpk_" + "a" * 43
+    request = _principal_request(_principal_headers("198.51.100.71", bearer=key))
+    identity = ratelimit.identity_from_principal(request)
+    assert identity == f"key:{hash_key(key)}"
+    assert key not in identity
+
+
+def test_identity_from_principal_falls_back_to_the_ip_for_anonymous_and_unverified() -> None:
+    """No claims and no API key, including an unverified JWT, stays keyed by source IP."""
+    anonymous = _principal_request(_principal_headers("198.51.100.72"))
+    unverified = _principal_request(_principal_headers("198.51.100.72", bearer="eyJhbGciOi.x.y"))
+    assert ratelimit.identity_from_principal(anonymous) == "198.51.100.72"
+    assert ratelimit.identity_from_principal(unverified) == "198.51.100.72"
+
+
+def test_principal_identity_uses_the_given_fallback() -> None:
+    """A product's own IP reader answers for an anonymous caller."""
+    identity = ratelimit.principal_identity(lambda request: "custom")
+    assert identity(_principal_request(_principal_headers("198.51.100.73"))) == "custom"
+    assert identity(_principal_request(_principal_headers("198.51.100.73", sub="u"))) == "user:u"
+
+
+def test_middleware_gives_two_users_behind_one_ip_separate_buckets(rate_limit_table: Any) -> None:
+    """Two signed-in users sharing an address each get the full allowance; anonymous shares the IP."""
+    from fastapi.testclient import TestClient
+
+    assert rate_limit_table is not None
+    classes = [LimitClass(name="get", limit=2, window_seconds=60, methods=("GET",))]
+    client = TestClient(_middleware_app(classes, identity_fn=ratelimit.identity_from_principal))
+    ip = "198.51.100.74"
+
+    for _ in range(2):
+        assert client.get("/api/cars", headers=_principal_headers(ip, sub="alice")).status_code == 200
+    assert client.get("/api/cars", headers=_principal_headers(ip, sub="alice")).status_code == 429
+    assert client.get("/api/cars", headers=_principal_headers(ip, sub="bob")).status_code == 200
+
+    for _ in range(2):
+        assert client.get("/api/cars", headers=_principal_headers(ip)).status_code == 200
+    assert client.get("/api/cars", headers=_principal_headers(ip)).status_code == 429
