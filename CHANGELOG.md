@@ -7,6 +7,8 @@ This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## Unreleased
 
+## 0.68.0
+
 ### Changed
 
 - Local test runs cap pytest-xdist at 4 workers (`--maxprocesses=4` in addopts), so `-n auto` on a many-core box no longer spawns one 0.5 to 2 GB worker per core.
