@@ -19,11 +19,12 @@ if TYPE_CHECKING:  # pragma: no cover
     from fastapi.responses import JSONResponse
 
     from webbpulse.identity.consent_page import ConsentTheme
+    from webbpulse.identity.device_grant_storage import DeviceGrantStores
     from webbpulse.identity.email import EmailSender
     from webbpulse.identity.hooks import IdentityHooks
     from webbpulse.identity.lockout import LoginAttemptStore
     from webbpulse.identity.mfa import MfaRejected
-    from webbpulse.identity.oauth_server import ConsentRenderer, TenantResolver
+    from webbpulse.identity.oauth_server import AuthorizationSubject, ConsentRenderer, TenantResolver
     from webbpulse.identity.oauth_server_storage import OAuthServerStores
     from webbpulse.identity.passkeys import PasskeyRejected
     from webbpulse.identity.service import TokenService
@@ -160,6 +161,7 @@ def build_identity_router(
     consent_renderer: ConsentRenderer | None = None,
     consent_theme: ConsentTheme | None = None,
     tenant_resolver: TenantResolver | None = None,
+    device_grant_stores: DeviceGrantStores | None = None,
 ) -> APIRouter:
     """The identity router for a product, mounted with no prefix.
 
@@ -167,7 +169,8 @@ def build_identity_router(
     mount; the flows mount only when their hooks and stores are supplied. `limiter_enabled`
     left as `None` follows the environment convention, so staging mounts the flows with no
     per-route rate limits and every other environment keeps them. `consent_theme` brands
-    the built-in OAuth consent screen; `consent_renderer` replaces it.
+    the built-in OAuth consent screen; `consent_renderer` replaces it. `device_grant_stores`
+    backs the device authorization grant and is required when `device_grant_enabled` is on.
     """
     from fastapi import APIRouter
     from fastapi.responses import JSONResponse
@@ -188,6 +191,12 @@ def build_identity_router(
         tokens = _TokenService(settings, kms_client)
 
     resolved_stores = stores if stores is not None else IdentityStores()
+    if settings.device_grant_enabled and (device_grant_stores is None or hooks is None):
+        raise ValueError(
+            "device_grant_enabled is on but build_identity_router was given no "
+            "`device_grant_stores` or no hooks. The device grant needs both to issue tokens."
+        )
+    device_stores = device_grant_stores if settings.device_grant_enabled else None
 
     prefix = identity_prefix(settings)
 
@@ -198,6 +207,13 @@ def build_identity_router(
         from webbpulse.identity.oauth_server import extend_discovery_document
 
         discovery_body = extend_discovery_document(discovery_body, settings)
+    if settings.device_grant_enabled:
+        from webbpulse.identity.device_grant import DEVICE_CODE_PATH
+
+        discovery_body = {
+            **discovery_body,
+            "device_authorization_endpoint": f"{settings.issuer}{DEVICE_CODE_PATH}",
+        }
 
     @router.get(f"{prefix}{DISCOVERY_PATH}", include_in_schema=False)
     async def discovery_document() -> JSONResponse:
@@ -248,6 +264,7 @@ def build_identity_router(
             limiter_enabled=limiter_enabled,
             kms_client=kms_client,
             oauth_client_secrets=oauth_client_secrets,
+            device_grant_stores=device_stores,
         )
 
     if settings.mcp_oauth_enabled:
@@ -266,6 +283,22 @@ def build_identity_router(
             consent_renderer=consent_renderer,
             consent_theme=consent_theme,
             tenant_resolver=tenant_resolver,
+        )
+
+    if device_stores is not None and hooks is not None:
+        _mount_device_grant(
+            router,
+            prefix=prefix,
+            settings=settings,
+            hooks=hooks,
+            stores=resolved_stores,
+            device_grant_stores=device_stores,
+            tokens=tokens,
+            attempts=attempts,
+            email_sender=email_sender,
+            limiter_enabled=limiter_enabled,
+            kms_client=kms_client,
+            consent_theme=consent_theme,
         )
 
     _declare_identity_responses(router, prefix)
@@ -295,7 +328,7 @@ def _mount_oauth_server(
     absent: a deployment that advertises an authorization server in its discovery document
     and then answers 404 on `/authorize` is worse than one that fails at startup.
     """
-    from webbpulse.identity.oauth_server import AuthorizationSubject, build_oauth_server_router
+    from webbpulse.identity.oauth_server import build_oauth_server_router
 
     if oauth_server_stores is None:
         raise ValueError(
@@ -305,22 +338,70 @@ def _mount_oauth_server(
             "advertise endpoints that answer 404."
         )
 
-    flows = None
-    if hooks is not None and stores.credentials is not None and stores.refresh_tokens is not None:
-        from webbpulse.identity.flows import IdentityFlows
+    flows = _resolver_flows(
+        settings, hooks, stores, tokens, attempts=attempts, email_sender=email_sender, kms_client=kms_client
+    )
 
-        flows = IdentityFlows(
+    limits = _ip_limits(limiter_enabled)
+
+    subject_resolver = _authorization_subject_resolver(settings, hooks, flows, tokens)
+
+    router.include_router(
+        build_oauth_server_router(
+            settings,
+            flows,
+            oauth_server_stores,
+            tokens=tokens,
+            prefix=prefix,
+            consent_renderer=consent_renderer,
+            consent_theme=consent_theme,
+            tenant_resolver=tenant_resolver,
+            limits=limits,
+            authorization_subject_resolver=subject_resolver,
+        )
+    )
+
+
+def _mount_device_grant(
+    router: APIRouter,
+    *,
+    prefix: str,
+    settings: IdentitySettings,
+    hooks: IdentityHooks,
+    stores: IdentityStores,
+    device_grant_stores: DeviceGrantStores,
+    tokens: TokenService,
+    attempts: LoginAttemptStore | None,
+    email_sender: EmailSender | None,
+    limiter_enabled: bool,
+    kms_client: Any,
+    consent_theme: ConsentTheme | None,
+) -> None:
+    """Mount the RFC 8628 device authorization grant, behind `device_grant_enabled`."""
+    from webbpulse.identity.device_grant import build_device_grant_router
+
+    flows = _resolver_flows(
+        settings, hooks, stores, tokens, attempts=attempts, email_sender=email_sender, kms_client=kms_client
+    )
+    router.include_router(
+        build_device_grant_router(
             settings,
             hooks,
-            stores,
-            tokens,
-            attempts=attempts,
-            email_sender=email_sender,
-            kms_client=kms_client,
+            device_grant_stores,
+            tokens=tokens,
+            subject_resolver=_authorization_subject_resolver(settings, hooks, flows, tokens),
+            prefix=prefix,
+            limits=_ip_limits(limiter_enabled),
+            consent_theme=consent_theme,
         )
+    )
+
+
+def _ip_limits(limiter_enabled: bool) -> Callable[..., list[Any]]:
+    """A builder for per-IP rate limit dependencies, empty when the limiter is off."""
 
     def limits(*specs: tuple[str, tuple[int, int], str]) -> list[Any]:
-        """The rate limit dependencies for one authorization server route."""
+        """The rate limit dependencies for one route."""
         if not limiter_enabled:
             return []
         from fastapi import Depends
@@ -331,6 +412,44 @@ def _mount_oauth_server(
             Depends(rate_limit(identity_from_ip, limit=limit, window_seconds=window, namespace=namespace))
             for namespace, (limit, window), _ in specs
         ]
+
+    return limits
+
+
+def _resolver_flows(
+    settings: IdentitySettings,
+    hooks: IdentityHooks | None,
+    stores: IdentityStores,
+    tokens: TokenService,
+    *,
+    attempts: LoginAttemptStore | None,
+    email_sender: EmailSender | None,
+    kms_client: Any,
+) -> Any:
+    """The `IdentityFlows` a browser subject resolver peeks sessions through, or `None` without stores."""
+    if hooks is None or stores.credentials is None or stores.refresh_tokens is None:
+        return None
+    from webbpulse.identity.flows import IdentityFlows
+
+    return IdentityFlows(
+        settings,
+        hooks,
+        stores,
+        tokens,
+        attempts=attempts,
+        email_sender=email_sender,
+        kms_client=kms_client,
+    )
+
+
+def _authorization_subject_resolver(
+    settings: IdentitySettings,
+    hooks: IdentityHooks | None,
+    flows: Any,
+    tokens: TokenService,
+) -> Callable[[Request], AuthorizationSubject | None]:
+    """The resolver for the signed-in person behind a browser page, shared by OAuth and the device grant."""
+    from webbpulse.identity.oauth_server import AuthorizationSubject
 
     def subject_resolver(request: Request) -> AuthorizationSubject | None:
         """The signed-in user for an authorization request.
@@ -376,20 +495,7 @@ def _mount_oauth_server(
             name=name,
         )
 
-    router.include_router(
-        build_oauth_server_router(
-            settings,
-            flows,
-            oauth_server_stores,
-            tokens=tokens,
-            prefix=prefix,
-            consent_renderer=consent_renderer,
-            consent_theme=consent_theme,
-            tenant_resolver=tenant_resolver,
-            limits=limits,
-            authorization_subject_resolver=subject_resolver,
-        )
-    )
+    return subject_resolver
 
 
 def _declare_identity_responses(router: APIRouter, prefix: str) -> None:
@@ -457,6 +563,7 @@ def _mount_flows(
     limiter_enabled: bool,
     kms_client: Any = None,
     oauth_client_secrets: Mapping[str, str] | None = None,
+    device_grant_stores: DeviceGrantStores | None = None,
 ) -> None:
     """Add the M2 flow routes, and M3's four email routes, to an already-built router.
 
@@ -709,7 +816,7 @@ def _mount_flows(
 
     @router.post(f"{prefix}{LOGOUT_ALL_PATH}")
     async def logout_all(request: _FastAPIRequest) -> JSONResponse:
-        """Revoke every session for the caller and clear the refresh cookie."""
+        """Revoke every session and device login for the caller and clear the refresh cookie."""
         subject = _subject_from_request(request, tokens)
         if not subject:
             return rejected(
@@ -726,6 +833,8 @@ def _mount_flows(
         await run_sync(
             lambda: flows.logout_all(subject, ip=ip, family_ids=[session_id] if session_id else [], presented=presented)
         )
+        if device_grant_stores is not None:
+            await run_sync(lambda: device_grant_stores.grants.revoke_all_for_user(subject))
         return clear_refresh_cookie(JSONResponse({"signed_out": True}))
 
     _mount_step_up(

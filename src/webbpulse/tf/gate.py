@@ -79,8 +79,12 @@ def resolve_gate(
         from botocore.exceptions import BotoCoreError, ClientError
     except ImportError:
         return skipped("boto3 is not installed") if named else ""
-    session = session_factory() if session_factory is not None else boto3.session.Session()
-    if session.get_credentials() is None:
+    try:
+        session = session_factory() if session_factory is not None else boto3.session.Session()
+        credentials = session.get_credentials()
+    except BotoCoreError as exc:
+        return skipped(type(exc).__name__)
+    if credentials is None:
         return skipped("no AWS credentials") if named else ""
     try:
         client = session.client("ssm", region_name=session.region_name or DEFAULT_REGION)

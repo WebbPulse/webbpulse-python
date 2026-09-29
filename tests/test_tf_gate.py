@@ -174,3 +174,23 @@ def test_parser_takes_gate_prefix() -> None:
     args = cli.build_parser().parse_args(["--gate-prefix", "p", "workspaces"])
     assert isinstance(args, argparse.Namespace)
     assert args.gate_prefix == "p"
+
+
+def test_a_failing_credential_provider_warns_and_goes_on() -> None:
+    """A credential provider that raises, such as one missing an optional dependency, is a skipped read."""
+    from botocore.exceptions import MissingDependencyException
+
+    class Broken:
+        """A session whose credential chain cannot load."""
+
+        region_name = REGION
+
+        def get_credentials(self) -> Any:
+            """Fail the way the login provider does without botocore[crt]."""
+            raise MissingDependencyException(msg="crt")
+
+    warnings: list[str] = []
+    assert resolve_gate(STAGING, {}, session_factory=Broken, warn=warnings.append) == ""
+    assert warnings and "MissingDependencyException" in warnings[0]
+    with pytest.raises(GateError):
+        resolve_gate(STAGING, {}, "webbpulse-terraform-stg", session_factory=Broken)

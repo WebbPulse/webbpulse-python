@@ -7,6 +7,41 @@ This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## Unreleased
 
+### Added
+
+- `identity`: the RFC 8628 OAuth device authorization grant, so a CLI signs a person in
+  through the browser. Off by default behind `device_grant_enabled`, with
+  `device_clients` and `device_scopes_supported` required when on. Routes under the
+  identity prefix: `POST /device/code`, `POST /device/token` (device code and
+  `refresh_token` grants), `GET /device` and `POST /device/approve` (the approval page,
+  which needs a signed-in person whose sign-in is newer than `device_approval_max_age`,
+  otherwise a step-up through `device_login_url`), `POST /device/revoke`, and
+  `GET`/`DELETE /device/grants` for the person's own sessions. User codes are eight
+  consonants shown as `XXXX-XXXX`. The access token is the usual RS256 JWT for an hour,
+  carrying `grant: "device"`, the grant id as `sid`, and only the approved scopes, which
+  are intersected with the user's held scopes again at every refresh. The refresh token
+  (`wpdr_<grant>.<secret>`) rotates on every use; presenting a used one revokes the grant,
+  and the grant ends `device_session_ttl` (12h) after approval whatever the activity.
+  `device_explicit_scopes`, such as apply and admin scopes, are granted only when named.
+  Polling faster than `device_poll_interval` answers `slow_down`. `device_grant_is_live`
+  lets a resource server refuse a revoked session at once. Storage is two tables with the
+  identity TTL and hashing rules: `device-codes` (hash `device_code_hash`, GSI
+  `user_code_hash-index`, TTL `expires_at`) and `device-grants` (hash `grant_id`, GSI
+  `user_id-index`, TTL `expires_at`), through `dynamo_device_grant_stores`.
+- `device_login`: `DeviceLoginClient`, the client side of the device grant behind the new
+  `device-login` extra. It prints the verification URL and code, polls with `slow_down`
+  backoff, keeps the tokens in the OS keyring and refreshes them transparently. Tokens
+  never reach stdout, logs, argv, exception messages or a repr.
+- `tf`: `wp-tf login [--scope ...]` and `wp-tf logout`. Other commands use the stored
+  session when no `WP_TF_TOKEN` or `TF_TOKEN_<host>` is set, before the `terraform login`
+  file. The session sends the staging access gate header like every other request. The
+  `tf` extra now includes `keyring`.
+
+### Fixed
+
+- `tf`: a credential provider that fails to load, such as the login provider without
+  `botocore[crt]`, is a skipped access gate read rather than an unhandled error.
+
 ## 0.70.0
 
 ### Added

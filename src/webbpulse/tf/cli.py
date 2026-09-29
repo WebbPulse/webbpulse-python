@@ -6,11 +6,16 @@
     wp-tf logs run-01M3... --phase plan --follow
     wp-tf status run-01M3...
     wp-tf workspaces
+    wp-tf login --scope runs:apply
+    wp-tf logout
 
-The key is the one `terraform login` stored for the host, or `TF_TOKEN_<host>`, or
-`WP_TF_TOKEN`. The host defaults to `terraform.webbpulse.com` and is set with `--host` or
-`WP_TF_HOST`; the API origin is read from the host's discovery document, and must be https
-on the host or a subdomain, unless `--api-url` or `WP_TF_API_URL` names an https origin.
+The key is `WP_TF_TOKEN`, or `TF_TOKEN_<host>`, or the session `wp-tf login` keeps in the OS
+keyring (refreshed as needed), or the one `terraform login` stored for the host. `wp-tf
+login` signs in through the browser with the OAuth device grant against the issuer at
+`<api>/api/auth`, or `--issuer` / `WP_TF_ISSUER`. The host defaults to
+`terraform.webbpulse.com` and is set with `--host` or `WP_TF_HOST`; the API origin is read
+from the host's discovery document, and must be https on the host or a subdomain, unless
+`--api-url` or `WP_TF_API_URL` names an https origin.
 The access gate value comes from `WP_TF_GATE`, else from the gate's SSM parameter
 `/<prefix>/access-gate/origin-verify` when AWS credentials can read it, with the prefix
 from `--gate-prefix`, `WP_TF_GATE_PREFIX` or the known host. No command confirms, applies
@@ -36,6 +41,8 @@ from .credentials import CredentialsError, resolve_token
 from .gate import GateError, resolve_gate
 
 if TYPE_CHECKING:
+    from webbpulse.device_login import DeviceLoginClient
+
     from .client import ControlPlane
 
 PROG = "wp-tf"
@@ -44,6 +51,13 @@ DEFAULT_HOST = "terraform.webbpulse.com"
 
 HOST_ENV = "WP_TF_HOST"
 API_URL_ENV = "WP_TF_API_URL"
+ISSUER_ENV = "WP_TF_ISSUER"
+
+DEVICE_CLIENT_ID = "wp-tf"
+"""The client id `wp-tf login` presents to the device grant."""
+
+ISSUER_PATH = "/api/auth"
+"""Where the identity issuer sits under the API origin."""
 
 EXIT_OK = 0
 EXIT_ERROR = 1
@@ -99,6 +113,18 @@ def build_parser() -> argparse.ArgumentParser:
     status.add_argument("run_id")
 
     commands.add_parser("workspaces", help="list workspaces: id, name, working directory")
+
+    login = commands.add_parser("login", help="sign in through the browser and keep the session in the OS keyring")
+    login.add_argument(
+        "--scope",
+        action="append",
+        default=[],
+        help="a scope to request, repeatable; apply and admin scopes must be named (default: the standard set)",
+    )
+    login.add_argument("--issuer", help="identity issuer URL (default <api>/api/auth)")
+
+    logout = commands.add_parser("logout", help="revoke and forget the wp-tf login session")
+    logout.add_argument("--issuer", help="identity issuer URL (default <api>/api/auth)")
     return parser
 
 
@@ -208,26 +234,135 @@ def _plan(
     return EXIT_OK
 
 
-def _connect(args: argparse.Namespace, environ: Mapping[str, str], home: Path | None) -> tuple[str, ControlPlane]:
-    """The host and an authenticated client for it."""
-    import httpx
-
-    from .client import ControlPlane, check_api_url, discover_api_url
-
+def _host(args: argparse.Namespace, environ: Mapping[str, str]) -> str:
+    """The Terraform host this command talks to."""
     host = (args.host or environ.get(HOST_ENV) or DEFAULT_HOST).strip().lower()
     if "/" in host or not host:
         raise UsageError("--host is a hostname such as terraform.webbpulse.com, with no scheme or path")
-    token = resolve_token(host, environ, home)
-    api_url = (args.api_url or environ.get(API_URL_ENV) or "").strip()
-    if api_url:
-        api_url = check_api_url(api_url)
-    else:
-        with httpx.Client(timeout=30.0) as client:
-            api_url = discover_api_url(host, client)
-    gate = resolve_gate(
-        host, environ, args.gate_prefix, warn=lambda message: print(f"{PROG}: {message}", file=sys.stderr)
+    return host
+
+
+class _Endpoint:
+    """The API origin and access gate for a host, each resolved once and only when first needed."""
+
+    def __init__(self, args: argparse.Namespace, environ: Mapping[str, str], host: str) -> None:
+        """Bind to the command line and environment; makes no request."""
+        self._args = args
+        self._environ = environ
+        self.host = host
+        self._api_url: str | None = None
+        self._gate: str | None = None
+
+    @property
+    def api_url(self) -> str:
+        """The https API origin, from `--api-url`, `WP_TF_API_URL` or the host's discovery document."""
+        if self._api_url is None:
+            import httpx
+
+            from .client import check_api_url, discover_api_url
+
+            explicit = (self._args.api_url or self._environ.get(API_URL_ENV) or "").strip()
+            if explicit:
+                self._api_url = check_api_url(explicit)
+            else:
+                with httpx.Client(timeout=30.0) as client:
+                    self._api_url = discover_api_url(self.host, client)
+        return self._api_url
+
+    @property
+    def gate(self) -> str:
+        """The access gate value to send, or an empty string."""
+        if self._gate is None:
+            self._gate = resolve_gate(
+                self.host,
+                self._environ,
+                self._args.gate_prefix,
+                warn=lambda message: print(f"{PROG}: {message}", file=sys.stderr),
+            )
+        return self._gate
+
+
+def _device_client(
+    args: argparse.Namespace, environ: Mapping[str, str], api_url: str, gate: str, *, out: IO[str] | None = None
+) -> DeviceLoginClient:
+    """The device login client for this API origin, sending the gate header when there is one."""
+    from webbpulse.device_login import DeviceLoginClient
+
+    from .client import GATE_HEADER
+
+    issuer = (getattr(args, "issuer", None) or environ.get(ISSUER_ENV) or f"{api_url.rstrip('/')}{ISSUER_PATH}").strip()
+    return DeviceLoginClient(issuer, DEVICE_CLIENT_ID, headers={GATE_HEADER: gate} if gate else None, out=out)
+
+
+def _session_token(client: DeviceLoginClient) -> str | None:
+    """The stored login's access token, refreshed as needed, or None when there is no usable session.
+
+    A keyring that cannot be read is the same as no session, so a machine without one falls
+    through to the credentials file quietly; a session that fails to refresh says why.
+    """
+    from webbpulse.device_login import DeviceLoginError
+
+    try:
+        if client.stored() is None:
+            return None
+    except DeviceLoginError:
+        return None
+    try:
+        return client.access_token()
+    except DeviceLoginError as exc:
+        print(f"{PROG}: {exc}", file=sys.stderr)
+        return None
+
+
+def _stored_session_token(args: argparse.Namespace, environ: Mapping[str, str], endpoint: _Endpoint) -> str | None:
+    """The `wp-tf login` session's token, resolving the gate only when there is a session to refresh."""
+    try:
+        if _device_client(args, environ, endpoint.api_url, "").stored() is None:
+            return None
+    except Exception:
+        return None
+    return _session_token(_device_client(args, environ, endpoint.api_url, endpoint.gate))
+
+
+def _connect(args: argparse.Namespace, environ: Mapping[str, str], home: Path | None) -> tuple[str, ControlPlane]:
+    """The host and an authenticated client for it."""
+    from .client import ControlPlane
+
+    endpoint = _Endpoint(args, environ, _host(args, environ))
+    token = resolve_token(
+        endpoint.host, environ, home, session_token=lambda: _stored_session_token(args, environ, endpoint)
     )
-    return host, ControlPlane(api_url, token, gate=gate)
+    return endpoint.host, ControlPlane(endpoint.api_url, token, gate=endpoint.gate)
+
+
+def _login(args: argparse.Namespace, environ: Mapping[str, str], stderr: IO[str]) -> DeviceLoginClient:
+    """The device login client for `login` and `logout`, printing its progress to stderr."""
+    endpoint = _Endpoint(args, environ, _host(args, environ))
+    return _device_client(args, environ, endpoint.api_url, endpoint.gate, out=stderr)
+
+
+def _session_command(
+    args: argparse.Namespace,
+    environ: Mapping[str, str],
+    stderr: IO[str],
+    device: Callable[[argparse.Namespace, Mapping[str, str], IO[str]], DeviceLoginClient] | None,
+) -> int:
+    """Run `login` or `logout`. Neither prints a token."""
+    client = (device or _login)(args, environ, stderr)
+    if args.command == "login":
+        try:
+            session = client.login(args.scope)
+        except KeyboardInterrupt:
+            print(f"{PROG}: login interrupted", file=stderr, flush=True)
+            return EXIT_INTERRUPTED
+        granted = f" with {session.scope}" if session.scope else ""
+        print(f"{PROG}: signed in{granted}; the session is in the OS keyring", file=stderr, flush=True)
+        return EXIT_OK
+    if client.logout():
+        print(f"{PROG}: signed out", file=stderr, flush=True)
+    else:
+        print(f"{PROG}: no wp-tf login session to sign out of", file=stderr, flush=True)
+    return EXIT_OK
 
 
 def main(
@@ -239,6 +374,7 @@ def main(
     home: Path | None = None,
     connect: Callable[[argparse.Namespace, Mapping[str, str], Path | None], tuple[str, ControlPlane]] | None = None,
     sleep: Callable[[float], None] = time.sleep,
+    device: Callable[[argparse.Namespace, Mapping[str, str], IO[str]], DeviceLoginClient] | None = None,
 ) -> int:
     """Run the CLI and return its exit code."""
     out = stdout if stdout is not None else sys.stdout
@@ -255,9 +391,13 @@ def main(
         print(f"{PROG}: needs httpx; install webbpulse[tf]", file=err)
         return EXIT_ERROR
 
+    from webbpulse.device_login import DeviceLoginError
+
     from .client import ApiError
 
     try:
+        if args.command in ("login", "logout"):
+            return _session_command(args, env, err, device)
         host, plane = (connect or _connect)(args, env, home)
         with plane:
             if args.command == "plan":
@@ -275,7 +415,7 @@ def main(
                 row = (item.get("workspace_id", ""), item.get("name", ""), item.get("working_directory") or "")
                 print("\t".join(str(value) for value in row), file=out)
             return EXIT_OK
-    except (UsageError, CredentialsError, GateError, ArchiveError, ApiError) as exc:
+    except (UsageError, CredentialsError, GateError, ArchiveError, ApiError, DeviceLoginError) as exc:
         print(f"{PROG}: {exc}", file=err)
         return EXIT_ERROR
     except httpx.HTTPError as exc:
