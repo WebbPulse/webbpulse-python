@@ -7,6 +7,15 @@ This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## Unreleased
 
+### Fixed
+
+- `testing`: the plugin now clears FastAPI's `functools.lru_cache` memos after every test
+  through an autouse fixture, and exposes the same step as `clear_fastapi_caches()`.
+  FastAPI 0.141 caches callable classification with `maxsize=4096`, so each
+  `app.dependency_overrides[dep] = lambda: ...` stayed pinned with its closure and
+  long-lived pytest-xdist workers grew to about 3 GB. Only already-imported `fastapi.*`
+  modules are touched, and nothing happens when FastAPI is absent.
+
 ## 0.68.0
 
 ### Changed
