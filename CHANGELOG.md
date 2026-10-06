@@ -7,6 +7,13 @@ This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## Unreleased
 
+## 0.71.1
+
+### Security
+
+- The `security`, `identity` and `github` extras require PyJWT 2.15.1 or later, for
+  PYSEC-2026-4141 and CVE-2026-102275 (PLAT-15).
+
 ## 0.71.0
 
 ### Added
