@@ -7,6 +7,21 @@ This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## Unreleased
 
+## 0.72.0
+
+### Added
+
+- `wp-tf apply`, `wp-tf confirm` and `wp-tf discard` (PLAT-19). `apply` uploads a directory,
+  plans, prints the change counts and asks for `yes` as `terraform apply` does, then confirms
+  the run and streams the apply log. `--auto-approve` skips the prompt. Any other answer
+  discards the run and exits 1, and a stdin that is not a terminal is refused unless
+  `--auto-approve` is given. `confirm` and `discard` act on an existing run and take
+  `--comment`. `ControlPlane` gains `create_apply_run`, `confirm_run` and `discard_run`.
+- `wp-tf login --add-scope SCOPE` asks for the standard set plus the named scope, so asking
+  for one more scope no longer drops the rest. `--scope` still asks for exactly the scopes
+  named, and the two cannot be combined. `wp-tf login --help` explains the choices and lists
+  the standard set.
+
 ## 0.71.2
 
 ### Fixed

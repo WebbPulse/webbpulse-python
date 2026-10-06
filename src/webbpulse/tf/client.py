@@ -23,6 +23,15 @@ TERMINAL_STATUSES = frozenset({"applied", "planned_and_finished", "errored", "ca
 SUCCESS_STATUSES = frozenset({"planned_and_finished", "planned", "awaiting_confirmation", "applied"})
 """The statuses of a run whose plan succeeded."""
 
+CONFIRMABLE_STATUSES = frozenset({"awaiting_confirmation"})
+"""The statuses a run can be confirmed from."""
+
+DISCARDABLE_STATUSES = frozenset({"planned", "awaiting_confirmation"})
+"""The statuses a run's plan can be discarded from."""
+
+APPLY_STATUSES = frozenset({"applying", "applied"})
+"""The statuses of a run whose apply has started or finished."""
+
 
 class ApiError(Exception):
     """A refused or failed API call, carrying the status and the envelope's message and code."""
@@ -229,6 +238,25 @@ class ControlPlane:
         is_destroy: bool = False,
     ) -> dict[str, Any]:
         """Start a plan-only run, a destroy plan when `is_destroy`. Never an applying run."""
+        return self._create_run(workspace_id, config_version_id, message=message, is_destroy=is_destroy, plan_only=True)
+
+    def create_apply_run(
+        self,
+        workspace_id: str,
+        config_version_id: str,
+        *,
+        message: str,
+        is_destroy: bool = False,
+    ) -> dict[str, Any]:
+        """Start a run that plans and then waits for a confirmation before it applies."""
+        return self._create_run(
+            workspace_id, config_version_id, message=message, is_destroy=is_destroy, plan_only=False
+        )
+
+    def _create_run(
+        self, workspace_id: str, config_version_id: str, *, message: str, is_destroy: bool, plan_only: bool
+    ) -> dict[str, Any]:
+        """Start a run with the given shape."""
         return dict(
             self._request(
                 "POST",
@@ -236,7 +264,7 @@ class ControlPlane:
                 json={
                     "workspace_id": workspace_id,
                     "config_version_id": config_version_id,
-                    "plan_only": True,
+                    "plan_only": plan_only,
                     "is_destroy": is_destroy,
                     "message": message,
                 },
@@ -256,6 +284,14 @@ class ControlPlane:
         """Cancel a run that has not finished."""
         return dict(self._request("POST", f"/runs/{run_id}/cancel"))
 
+    def confirm_run(self, run_id: str, comment: str = "") -> dict[str, Any]:
+        """Confirm a run awaiting confirmation, so it applies; the comment is kept on the run."""
+        return dict(self._request("POST", f"/runs/{run_id}/confirm", json={"comment": comment} if comment else None))
+
+    def discard_run(self, run_id: str, comment: str = "") -> dict[str, Any]:
+        """Discard a run's plan without applying it; the comment is kept on the run."""
+        return dict(self._request("POST", f"/runs/{run_id}/discard", json={"comment": comment} if comment else None))
+
     def logs(self, run_id: str, phase: str, after: str | None) -> tuple[list[str], str | None]:
         """One page of a phase's log lines and the token that continues after them."""
         params = {"phase": phase}
@@ -268,6 +304,9 @@ class ControlPlane:
 
 
 __all__ = [
+    "APPLY_STATUSES",
+    "CONFIRMABLE_STATUSES",
+    "DISCARDABLE_STATUSES",
     "GATE_HEADER",
     "SUCCESS_STATUSES",
     "TERMINAL_STATUSES",

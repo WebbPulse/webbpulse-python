@@ -1,12 +1,17 @@
-"""`wp-tf`: start a plan-only run from a directory and stream its log, like a remote `terraform plan`.
+"""`wp-tf`: plan and apply a directory on the control plane and stream the log, like a remote
+`terraform plan` and `terraform apply`.
 
     terraform login terraform.webbpulse.com
     wp-tf plan -w platform-staging
     wp-tf plan ./infra -w ws-01M3G00GJ5VPVR3QDJV8HNBQX1 --detailed-exitcode
+    wp-tf apply ./infra -w platform-staging
+    wp-tf apply -w platform-staging --auto-approve
+    wp-tf confirm run-01M3...
+    wp-tf discard run-01M3...
     wp-tf logs run-01M3... --phase plan --follow
     wp-tf status run-01M3...
     wp-tf workspaces
-    wp-tf login --scope runs:apply
+    wp-tf login --add-scope state:download
     wp-tf logout
 
 The key is `WP_TF_TOKEN`, or `TF_TOKEN_<host>`, or the session `wp-tf login` keeps in the OS
@@ -19,11 +24,13 @@ from the host's discovery document, and must be https on the host or a subdomain
 `--api-url` or `WP_TF_API_URL` names an https origin.
 The access gate value comes from `WP_TF_GATE`, else from the gate's SSM parameter
 `/<prefix>/access-gate/origin-verify` when AWS credentials can read it, with the prefix
-from `--gate-prefix`, `WP_TF_GATE_PREFIX` or the known host. No command confirms, applies
-or reads state, and no token or gate value is ever printed.
+from `--gate-prefix`, `WP_TF_GATE_PREFIX` or the known host. Only `apply` and `confirm`
+apply, and `apply` asks first unless `--auto-approve` is given. No command reads state, and
+no token or gate value is ever printed.
 
-Log lines go to stdout, progress to stderr. Exit codes: 0 when the plan succeeded, 1 on any
-failure, 2 under `--detailed-exitcode` when the plan has changes.
+Log lines go to stdout, progress and the confirmation prompt to stderr. Exit codes: 0 when
+the plan or apply succeeded, 1 on any failure or a declined apply, 2 under
+`--detailed-exitcode` when the plan has changes, 130 after Ctrl-C.
 """
 
 from __future__ import annotations
@@ -32,6 +39,7 @@ import argparse
 import json
 import os
 import sys
+import textwrap
 import time
 from collections.abc import Callable, Mapping, Sequence
 from pathlib import Path
@@ -69,6 +77,40 @@ DEFAULT_MESSAGE = "Triggered via wp-tf"
 
 POLL_SECONDS = 2.0
 
+CONFIRM_ATTEMPTS = 15
+"""Confirmations tried while the plane still readies a planned run for a decision, which can
+lag the `awaiting_confirmation` status by a moment."""
+
+STANDARD_SCOPES = (
+    "workspaces:read",
+    "workspaces:write",
+    "variables:read",
+    "variables:write",
+    "configs:read",
+    "configs:write",
+    "runs:read",
+    "runs:write",
+    "runs:apply",
+    "registry:read",
+    "registry:write",
+)
+"""The scopes `--add-scope` adds to: everything a person needs to plan and apply, without
+`state:download` or `admin`."""
+
+LOGIN_DESCRIPTION = f"""Sign in through the browser with the OAuth device grant and keep the session in the
+OS keyring for up to 12 hours.
+
+Scopes limit what the session can do, on top of the person's own permissions:
+  no scope flag          the control plane's default set
+  --add-scope SCOPE      the standard set below plus SCOPE, repeatable
+  --scope SCOPE          exactly the scopes named, repeatable, for a narrower session
+
+The standard set is:
+{textwrap.fill(" ".join(STANDARD_SCOPES), width=88, initial_indent="  ", subsequent_indent="  ")}
+
+state:download and admin are never granted unless named. Applying needs runs:apply, so
+when the plane's default set lacks it, sign in with `wp-tf login --add-scope runs:apply`."""
+
 DRAIN_EMPTY_PAGES = 2
 """Empty log pages read after a run ends before the stream counts as complete, since the
 runner's last lines can reach the log group a moment after the status changes."""
@@ -88,7 +130,7 @@ class _Parser(argparse.ArgumentParser):
 
 def build_parser() -> argparse.ArgumentParser:
     """The `wp-tf` command line."""
-    parser = _Parser(prog=PROG, description="Plan-only runs on the WebbPulse Terraform control plane.")
+    parser = _Parser(prog=PROG, description="Plan and apply runs on the WebbPulse Terraform control plane.")
     parser.add_argument("--host", help=f"control plane host, as used with terraform login (default {DEFAULT_HOST})")
     parser.add_argument("--api-url", help="API origin, when it should not be discovered from the host")
     parser.add_argument(
@@ -105,6 +147,28 @@ def build_parser() -> argparse.ArgumentParser:
     plan.add_argument("--detailed-exitcode", action="store_true", help="exit 2 when the plan has changes")
     plan.add_argument("--no-follow", action="store_true", help="print the run id and return without waiting")
 
+    apply = commands.add_parser(
+        "apply", help="upload a directory, plan, confirm and stream the apply, like terraform apply"
+    )
+    apply.add_argument("directory", nargs="?", default=".", help="configuration directory (default .)")
+    apply.add_argument("-w", "--workspace", required=True, help="workspace name or ws- id")
+    apply.add_argument("-m", "--message", default=DEFAULT_MESSAGE, help="run message")
+    apply.add_argument("--destroy", action="store_true", help="destroy every managed resource")
+    apply.add_argument(
+        "--auto-approve",
+        action="store_true",
+        help="apply without asking; without it, stdin must be a terminal to answer the prompt",
+    )
+
+    confirm = commands.add_parser("confirm", help="confirm a run awaiting confirmation and stream its apply")
+    confirm.add_argument("run_id")
+    confirm.add_argument("--comment", default="", help="a comment kept on the run with the decision")
+    confirm.add_argument("--no-follow", action="store_true", help="return once confirmed, without streaming")
+
+    discard = commands.add_parser("discard", help="discard a run's plan without applying it")
+    discard.add_argument("run_id")
+    discard.add_argument("--comment", default="", help="a comment kept on the run with the decision")
+
     logs = commands.add_parser("logs", help="print a run phase's log")
     logs.add_argument("run_id")
     logs.add_argument("--phase", choices=("plan", "apply"), default="plan")
@@ -115,12 +179,26 @@ def build_parser() -> argparse.ArgumentParser:
 
     commands.add_parser("workspaces", help="list workspaces: id, name, working directory")
 
-    login = commands.add_parser("login", help="sign in through the browser and keep the session in the OS keyring")
-    login.add_argument(
+    login = commands.add_parser(
+        "login",
+        help="sign in through the browser and keep the session in the OS keyring",
+        description=LOGIN_DESCRIPTION,
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    scopes = login.add_mutually_exclusive_group()
+    scopes.add_argument(
+        "--add-scope",
+        action="append",
+        default=[],
+        metavar="SCOPE",
+        help="request the standard set plus this scope, repeatable",
+    )
+    scopes.add_argument(
         "--scope",
         action="append",
         default=[],
-        help="a scope to request, repeatable; apply and admin scopes must be named (default: the standard set)",
+        metavar="SCOPE",
+        help="request exactly the scopes named, repeatable, replacing the defaults",
     )
     login.add_argument("--issuer", help="identity issuer URL (default <api>/api/auth)")
 
@@ -153,10 +231,13 @@ def follow_run(
     *,
     sleep: Callable[[float], None] = time.sleep,
     poll_seconds: float = POLL_SECONDS,
+    until: frozenset[str] | None = None,
 ) -> dict[str, Any]:
-    """Stream a phase's log until the run ends, then return the final run."""
+    """Stream a phase's log until the run reaches a status in `until`, by default one that ends
+    it, then return the run."""
     from .client import TERMINAL_STATUSES
 
+    stop = TERMINAL_STATUSES if until is None else until
     after: str | None = None
     last_status = ""
     while True:
@@ -169,7 +250,7 @@ def follow_run(
         lines, after = plane.logs(run_id, phase, after)
         for line in lines:
             print(line, file=stdout, flush=True)
-        if status in TERMINAL_STATUSES:
+        if status in stop:
             empty = 0 if lines else 1
             while empty < DRAIN_EMPTY_PAGES:
                 sleep(poll_seconds)
@@ -193,6 +274,46 @@ def _print_all_logs(plane: ControlPlane, run_id: str, phase: str, stdout: IO[str
         after = next_after
 
 
+def _start_run(
+    args: argparse.Namespace,
+    plane: ControlPlane,
+    host: str,
+    stderr: IO[str],
+    *,
+    plan_only: bool,
+) -> tuple[str, str]:
+    """Upload the directory and start a run on the workspace; return the run id and workspace name."""
+    workspace = plane.resolve_workspace(args.workspace)
+    workspace_id = str(workspace["workspace_id"])
+    name = str(workspace.get("name") or workspace_id)
+    tarball = build_tarball(Path(args.directory), str(workspace.get("working_directory") or ""))
+    print(f"{PROG}: uploading {len(tarball)} bytes to {name}", file=stderr, flush=True)
+    config_version_id = plane.upload_config(workspace_id, tarball)
+    create = plane.create_plan_run if plan_only else plane.create_apply_run
+    run = create(workspace_id, config_version_id, message=args.message, is_destroy=args.destroy)
+    run_id = str(run["run_id"])
+    print(f"{PROG}: run {run_id} https://{host}/runs/{run_id}", file=stderr, flush=True)
+    return run_id, name
+
+
+def _cancel_after_interrupt(plane: ControlPlane, run_id: str, stderr: IO[str]) -> int:
+    """Cancel a run whose plan was interrupted and return the interrupted exit code."""
+    print(f"{PROG}: interrupted, cancelling {run_id}", file=stderr, flush=True)
+    try:
+        plane.cancel_run(run_id)
+    except Exception as exc:
+        print(f"{PROG}: could not cancel {run_id}: {exc}", file=stderr, flush=True)
+    return EXIT_INTERRUPTED
+
+
+def _report_failure(run: Mapping[str, Any], run_id: str, stderr: IO[str]) -> int:
+    """Say how a run ended and return the error exit code."""
+    status = str(run.get("status", ""))
+    error = run.get("error")
+    print(f"{PROG}: run {run_id} ended {status}{f': {error}' if error else ''}", file=stderr, flush=True)
+    return EXIT_ERROR
+
+
 def _plan(
     args: argparse.Namespace,
     plane: ControlPlane,
@@ -204,35 +325,181 @@ def _plan(
     """Upload the directory, start a plan-only run and stream it."""
     from .client import SUCCESS_STATUSES
 
-    workspace = plane.resolve_workspace(args.workspace)
-    workspace_id = str(workspace["workspace_id"])
-    tarball = build_tarball(Path(args.directory), str(workspace.get("working_directory") or ""))
-    print(f"{PROG}: uploading {len(tarball)} bytes to {workspace.get('name', workspace_id)}", file=stderr, flush=True)
-    config_version_id = plane.upload_config(workspace_id, tarball)
-    run = plane.create_plan_run(workspace_id, config_version_id, message=args.message, is_destroy=args.destroy)
-    run_id = str(run["run_id"])
-    print(f"{PROG}: run {run_id} https://{host}/runs/{run_id}", file=stderr, flush=True)
+    run_id, _ = _start_run(args, plane, host, stderr, plan_only=True)
     if args.no_follow:
         print(run_id, file=stdout, flush=True)
         return EXIT_OK
     try:
         final = follow_run(plane, run_id, "plan", stdout, stderr, sleep=sleep)
     except KeyboardInterrupt:
-        print(f"{PROG}: interrupted, cancelling {run_id}", file=stderr, flush=True)
-        try:
-            plane.cancel_run(run_id)
-        except Exception as exc:
-            print(f"{PROG}: could not cancel {run_id}: {exc}", file=stderr, flush=True)
-        return EXIT_INTERRUPTED
-    status = str(final.get("status", ""))
-    if status not in SUCCESS_STATUSES:
-        error = final.get("error")
-        print(f"{PROG}: run {run_id} ended {status}{f': {error}' if error else ''}", file=stderr, flush=True)
-        return EXIT_ERROR
+        return _cancel_after_interrupt(plane, run_id, stderr)
+    if str(final.get("status", "")) not in SUCCESS_STATUSES:
+        return _report_failure(final, run_id, stderr)
     print(f"{PROG}: {_changes_line(final)}", file=stderr, flush=True)
     if args.detailed_exitcode and _has_changes(final):
         return EXIT_CHANGES
     return EXIT_OK
+
+
+def _interactive(stream: IO[str]) -> bool:
+    """Whether the stream is a terminal someone can answer a prompt on."""
+    try:
+        return bool(stream.isatty())
+    except (AttributeError, ValueError):
+        return False
+
+
+def _approved(workspace: str, destroy: bool, stdin: IO[str], stderr: IO[str]) -> bool:
+    """Ask on stderr, as `terraform apply` does, and read the answer from stdin; only `yes` approves."""
+    question = (
+        f'Do you really want to destroy all resources in workspace "{workspace}"?'
+        if destroy
+        else f'Do you want to perform these actions in workspace "{workspace}"?'
+    )
+    print(f"\n{question}\n  Only 'yes' will be accepted to approve.\n", file=stderr, flush=True)
+    print("  Enter a value: ", end="", file=stderr, flush=True)
+    answer = stdin.readline()
+    print("", file=stderr, flush=True)
+    return answer.strip() == "yes"
+
+
+def _discard_declined(plane: ControlPlane, run_id: str, stderr: IO[str]) -> None:
+    """Discard a run whose apply was declined, saying so whether or not the plane agreed."""
+    try:
+        plane.discard_run(run_id, "Declined at the wp-tf prompt")
+    except Exception as exc:
+        print(f"{PROG}: could not discard {run_id}: {exc}", file=stderr, flush=True)
+        return
+    print(f"{PROG}: apply discarded; run {run_id} was not applied", file=stderr, flush=True)
+
+
+def _confirm(
+    plane: ControlPlane,
+    run_id: str,
+    comment: str,
+    sleep: Callable[[float], None],
+    *,
+    poll_seconds: float = POLL_SECONDS,
+) -> dict[str, Any]:
+    """Confirm a run, retrying while it awaits confirmation but the plane is not ready for it yet.
+
+    Raises:
+        ApiError: The plane refused, with a hint about the apply scope on a 403.
+    """
+    from .client import CONFIRMABLE_STATUSES, ApiError
+
+    attempt = 1
+    while True:
+        try:
+            return plane.confirm_run(run_id, comment)
+        except ApiError as exc:
+            if exc.status == 403:
+                raise ApiError(
+                    exc.status,
+                    f"{exc.message}; confirming needs the runs:apply scope and a recent sign-in, "
+                    "so run `wp-tf login --add-scope runs:apply`",
+                    exc.error_code,
+                ) from exc
+            ready_later = exc.status == 409 and attempt < CONFIRM_ATTEMPTS
+            if not ready_later or str(plane.get_run(run_id).get("status", "")) not in CONFIRMABLE_STATUSES:
+                raise
+        attempt += 1
+        sleep(poll_seconds)
+
+
+def _follow_apply(
+    plane: ControlPlane, run_id: str, stdout: IO[str], stderr: IO[str], sleep: Callable[[float], None]
+) -> int:
+    """Stream a confirmed run's apply and report how it ended. Ctrl-C stops following, not the apply."""
+    try:
+        final = follow_run(plane, run_id, "apply", stdout, stderr, sleep=sleep)
+    except KeyboardInterrupt:
+        print(
+            f"{PROG}: stopped following; the apply goes on. Resume with: {PROG} logs {run_id} --phase apply -f",
+            file=stderr,
+            flush=True,
+        )
+        return EXIT_INTERRUPTED
+    if str(final.get("status", "")) != "applied":
+        return _report_failure(final, run_id, stderr)
+    done = final.get("apply_changes") or final.get("changes") or {}
+    print(
+        f"{PROG}: Apply complete! Resources: {int(done.get('add', 0))} added, {int(done.get('change', 0))} changed, "
+        f"{int(done.get('destroy', 0))} destroyed.",
+        file=stderr,
+        flush=True,
+    )
+    return EXIT_OK
+
+
+def _apply(
+    args: argparse.Namespace,
+    plane: ControlPlane,
+    host: str,
+    stdin: IO[str],
+    stdout: IO[str],
+    stderr: IO[str],
+    sleep: Callable[[float], None],
+) -> int:
+    """Upload the directory, plan, ask for a confirmation unless auto-approved, and stream the apply.
+
+    `main` has already refused a prompt that stdin could not answer.
+    """
+    from .client import APPLY_STATUSES, CONFIRMABLE_STATUSES, DISCARDABLE_STATUSES, TERMINAL_STATUSES
+
+    run_id, workspace = _start_run(args, plane, host, stderr, plan_only=False)
+    try:
+        planned = follow_run(
+            plane,
+            run_id,
+            "plan",
+            stdout,
+            stderr,
+            sleep=sleep,
+            until=TERMINAL_STATUSES | DISCARDABLE_STATUSES | APPLY_STATUSES,
+        )
+    except KeyboardInterrupt:
+        return _cancel_after_interrupt(plane, run_id, stderr)
+    status = str(planned.get("status", ""))
+    if status == "planned_and_finished":
+        print(f"{PROG}: No changes. Your infrastructure matches the configuration.", file=stderr, flush=True)
+        return EXIT_OK
+    if status not in CONFIRMABLE_STATUSES | APPLY_STATUSES:
+        return _report_failure(planned, run_id, stderr)
+    if status in CONFIRMABLE_STATUSES:
+        print(f"{PROG}: {_changes_line(planned)}", file=stderr, flush=True)
+        if not args.auto_approve:
+            try:
+                approved = _approved(workspace, args.destroy, stdin, stderr)
+            except KeyboardInterrupt:
+                _discard_declined(plane, run_id, stderr)
+                return EXIT_INTERRUPTED
+            if not approved:
+                _discard_declined(plane, run_id, stderr)
+                return EXIT_ERROR
+        _confirm(plane, run_id, "", sleep)
+    return _follow_apply(plane, run_id, stdout, stderr, sleep)
+
+
+def _confirm_command(
+    args: argparse.Namespace, plane: ControlPlane, stdout: IO[str], stderr: IO[str], sleep: Callable[[float], None]
+) -> int:
+    """Confirm an existing run and, unless told not to, stream its apply."""
+    run = _confirm(plane, args.run_id, args.comment, sleep)
+    print(f"{PROG}: confirmed {args.run_id}; it is {run.get('status', 'applying')}", file=stderr, flush=True)
+    if args.no_follow:
+        return EXIT_OK
+    return _follow_apply(plane, args.run_id, stdout, stderr, sleep)
+
+
+def _requested_scopes(args: argparse.Namespace) -> list[str]:
+    """The scopes `login` asks for: exactly `--scope`, the standard set plus `--add-scope`, or none
+    so the plane grants its default set."""
+    if args.scope:
+        return list(dict.fromkeys(args.scope))
+    if args.add_scope:
+        return list(dict.fromkeys([*STANDARD_SCOPES, *args.add_scope]))
+    return []
 
 
 def _host(args: argparse.Namespace, environ: Mapping[str, str]) -> str:
@@ -375,7 +642,7 @@ def _session_command(
     client = (device or _login)(args, environ, stderr)
     if args.command == "login":
         try:
-            session = client.login(args.scope)
+            session = client.login(_requested_scopes(args))
         except KeyboardInterrupt:
             print(f"{PROG}: login interrupted", file=stderr, flush=True)
             return EXIT_INTERRUPTED
@@ -401,6 +668,7 @@ def main(
     *,
     stdout: IO[str] | None = None,
     stderr: IO[str] | None = None,
+    stdin: IO[str] | None = None,
     environ: Mapping[str, str] | None = None,
     home: Path | None = None,
     connect: Callable[[argparse.Namespace, Mapping[str, str], Path | None], tuple[str, ControlPlane]] | None = None,
@@ -410,11 +678,15 @@ def main(
     """Run the CLI and return its exit code."""
     out = stdout if stdout is not None else sys.stdout
     err = stderr if stderr is not None else sys.stderr
+    inp = stdin if stdin is not None else sys.stdin
     env = os.environ if environ is None else environ
     try:
         args = build_parser().parse_args(argv)
     except UsageError as exc:
         print(f"{PROG}: {exc}", file=err)
+        return EXIT_ERROR
+    if args.command == "apply" and not args.auto_approve and not _interactive(inp):
+        print(f"{PROG}: stdin is not a terminal, so no one can answer the prompt; pass --auto-approve", file=err)
         return EXIT_ERROR
     try:
         import httpx
@@ -433,6 +705,14 @@ def main(
         with plane:
             if args.command == "plan":
                 return _plan(args, plane, host, out, err, sleep)
+            if args.command == "apply":
+                return _apply(args, plane, host, inp, out, err, sleep)
+            if args.command == "confirm":
+                return _confirm_command(args, plane, out, err, sleep)
+            if args.command == "discard":
+                plane.discard_run(args.run_id, args.comment)
+                print(f"{PROG}: discarded {args.run_id}", file=err, flush=True)
+                return EXIT_OK
             if args.command == "logs":
                 if args.follow:
                     follow_run(plane, args.run_id, args.phase, out, err, sleep=sleep)
