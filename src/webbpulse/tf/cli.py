@@ -12,7 +12,8 @@
 The key is `WP_TF_TOKEN`, or `TF_TOKEN_<host>`, or the session `wp-tf login` keeps in the OS
 keyring (refreshed as needed), or the one `terraform login` stored for the host. `wp-tf
 login` signs in through the browser with the OAuth device grant against the issuer at
-`<api>/api/auth`, or `--issuer` / `WP_TF_ISSUER`. The host defaults to
+`<api>/api/auth`, or `--issuer` / `WP_TF_ISSUER`, which must have exactly the API origin,
+since the gate header and the session go to it. The host defaults to
 `terraform.webbpulse.com` and is set with `--host` or `WP_TF_HOST`; the API origin is read
 from the host's discovery document, and must be https on the host or a subdomain, unless
 `--api-url` or `WP_TF_API_URL` names an https origin.
@@ -291,7 +292,30 @@ def _device_client(
     from .client import GATE_HEADER
 
     issuer = (getattr(args, "issuer", None) or environ.get(ISSUER_ENV) or f"{api_url.rstrip('/')}{ISSUER_PATH}").strip()
+    if not _issuer_matches_api(issuer, api_url):
+        raise UsageError(
+            f"the issuer {issuer!r} is not on the API origin {api_url!r}; the session and the gate "
+            "header are only sent there"
+        )
     return DeviceLoginClient(issuer, DEVICE_CLIENT_ID, headers={GATE_HEADER: gate} if gate else None, out=out)
+
+
+def _issuer_matches_api(issuer: str, api_url: str) -> bool:
+    """Whether the issuer has exactly the API's origin: scheme, host and effective port."""
+    from urllib.parse import urlsplit
+
+    defaults = {"https": 443, "http": 80}
+    try:
+        wanted, api = urlsplit(issuer), urlsplit(api_url)
+        wanted_port = wanted.port or defaults.get(wanted.scheme)
+        api_port = api.port or defaults.get(api.scheme)
+    except ValueError:
+        return False
+    if not wanted.scheme or wanted.scheme.lower() != api.scheme.lower():
+        return False
+    if not wanted.hostname or not api.hostname or wanted.username or wanted.password:
+        return False
+    return wanted.hostname.lower().rstrip(".") == api.hostname.lower().rstrip(".") and wanted_port == api_port
 
 
 def _session_token(client: DeviceLoginClient) -> str | None:
@@ -358,8 +382,15 @@ def _session_command(
         granted = f" with {session.scope}" if session.scope else ""
         print(f"{PROG}: signed in{granted}; the session is in the OS keyring", file=stderr, flush=True)
         return EXIT_OK
-    if client.logout():
+    result = client.logout()
+    if result and result.revoked:
         print(f"{PROG}: signed out", file=stderr, flush=True)
+    elif result:
+        print(
+            f"{PROG}: signed out locally; the server did not confirm, so the session may stay live until it expires",
+            file=stderr,
+            flush=True,
+        )
     else:
         print(f"{PROG}: no wp-tf login session to sign out of", file=stderr, flush=True)
     return EXIT_OK

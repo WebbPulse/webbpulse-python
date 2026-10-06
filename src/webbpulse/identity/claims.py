@@ -27,6 +27,7 @@ __all__ = [
     "gate_claims",
     "identity_claims",
     "identity_subject",
+    "is_browser_session",
     "read_authorizer_claims",
     "subject_dependency",
 ]
@@ -194,6 +195,25 @@ def _coerce_array(value: Any) -> Any:
     if not inner:
         return []
     return [part.strip().strip('"').strip("'") for part in inner.split(",") if part.strip()]
+
+
+def is_browser_session(claims: Mapping[str, Any], audience: str) -> bool:
+    """Whether verified claims belong to a person's browser session, not a client's grant.
+
+    A token minted for a client carries `client_id`, and a device login's also carries
+    `grant`; either is refused. When `aud` is present it must include `audience`, the
+    product's session audience, so a token minted for another audience never passes as a
+    session even behind an authorizer that accepts both. Identity routes that change the
+    account, widen access or approve another client call this before trusting a subject.
+    """
+    if str(claims.get("grant", "") or "") or str(claims.get("client_id", "") or ""):
+        return False
+    if "aud" not in claims:
+        return True
+    audiences = _coerce_array(claims.get("aud"))
+    if isinstance(audiences, str):
+        audiences = [audiences]
+    return isinstance(audiences, list) and audience in [str(item) for item in audiences]
 
 
 def coerce_claims(claims: Mapping[str, Any]) -> dict[str, Any]:

@@ -333,8 +333,10 @@ def test_list_workspaces_follows_the_cursor() -> None:
 class FakeDevice:
     """A stand-in for `DeviceLoginClient`, recording what the CLI asked of it."""
 
-    def __init__(self, *, session: bool = True, fail: BaseException | None = None, token: str = TOKEN) -> None:
-        """Script whether a session exists and what login does."""
+    def __init__(
+        self, *, session: bool = True, fail: BaseException | None = None, token: str = TOKEN, revoked: bool = True
+    ) -> None:
+        """Script whether a session exists, whether the server confirms its revocation, and what login does."""
         from webbpulse.device_login import StoredSession
 
         self.session = StoredSession("https://api.example.test/api/auth", "wp-tf", token, "wpdr_x.y", 9e9, 9e9, "")
@@ -342,6 +344,7 @@ class FakeDevice:
         self.fail = fail
         self.scopes: list[str] | None = None
         self.logged_out = False
+        self.revoked = revoked
 
     def login(self, scopes: list[str]) -> Any:
         """Record the scopes, then succeed or fail as scripted."""
@@ -354,10 +357,12 @@ class FakeDevice:
             self.session.issuer, "wp-tf", self.session.access_token, "wpdr_x.y", 9e9, 9e9, " ".join(scopes)
         )
 
-    def logout(self) -> bool:
+    def logout(self) -> Any:
         """Sign out when there is a session."""
+        from webbpulse.device_login import LogoutResult
+
         self.logged_out = self.has_session
-        return self.has_session
+        return LogoutResult(had_session=self.has_session, revoked=self.has_session and self.revoked)
 
     def stored(self) -> Any:
         """The scripted session."""
@@ -422,19 +427,49 @@ def test_logout_signs_out_or_says_there_was_nothing() -> None:
     assert "no wp-tf login session" in err
 
 
+def test_logout_warns_when_the_server_did_not_confirm() -> None:
+    """A failed server revoke still clears the local session, and says the server one may live on."""
+    device = FakeDevice(revoked=False)
+    code, _, err = _session(["logout"], device)
+    assert code == 0
+    assert device.logged_out
+    assert "signed out locally" in err
+    assert "may stay live" in err
+
+
 def test_the_device_client_targets_the_api_issuer_with_the_gate() -> None:
     """The issuer defaults to `<api>/api/auth`, `--issuer` overrides it, and the gate header rides along."""
     args = cli.build_parser().parse_args(["login"])
     client = cli._device_client(args, {}, API, GATE)
     assert client.issuer == f"{API}/api/auth"
     assert client._headers == {GATE_HEADER: GATE}
-    args = cli.build_parser().parse_args(["login", "--issuer", "https://id.example.test/api/auth"])
-    assert cli._device_client(args, {}, API, "").issuer == "https://id.example.test/api/auth"
+    args = cli.build_parser().parse_args(["login", "--issuer", "https://API.example.test:443/id"])
+    assert cli._device_client(args, {}, API, "").issuer == "https://API.example.test:443/id"
     args = cli.build_parser().parse_args(["logout"])
-    assert cli._device_client(args, {"WP_TF_ISSUER": "https://env.example.test/auth"}, API, "").issuer == (
-        "https://env.example.test/auth"
+    assert cli._device_client(args, {"WP_TF_ISSUER": "https://api.example.test/auth"}, API, "").issuer == (
+        "https://api.example.test/auth"
     )
     assert cli._device_client(args, {}, API, "")._headers == {}
+
+
+@pytest.mark.parametrize(
+    "issuer",
+    [
+        "https://id.example.test/api/auth",
+        "https://evil.test/auth",
+        "http://api.example.test/auth",
+        "https://api.example.test:8443/auth",
+        "https://test/auth",
+        "https://example.test/auth",
+        "https://user@api.example.test/auth",
+        "https://api.example.test.evil.test/auth",
+    ],
+)
+def test_an_issuer_off_the_api_origin_is_refused(issuer: str) -> None:
+    """The session and gate header only go to the API origin itself."""
+    args = cli.build_parser().parse_args(["login", "--issuer", issuer])
+    with pytest.raises(cli.UsageError, match="not on the API origin"):
+        cli._device_client(args, {}, API, GATE)
 
 
 def test_commands_use_the_login_session_when_no_key_is_set(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:

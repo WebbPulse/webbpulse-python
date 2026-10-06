@@ -24,3 +24,9 @@ os.environ["PYTHON_KEYRING_BACKEND"] = "keyring.backends.null.Keyring"
 def _primary_keys_only(primary_keys_only: list[CheckedKey]) -> list[CheckedKey]:
     """Refuse any key that is not exactly its table's primary key, as DynamoDB does."""
     return primary_keys_only
+
+
+@pytest.fixture(autouse=True, scope="session")
+def _cache_home(tmp_path_factory: pytest.TempPathFactory) -> None:
+    """Keep device login lock files out of the real user cache directory."""
+    os.environ["XDG_CACHE_HOME"] = str(tmp_path_factory.mktemp("cache"))

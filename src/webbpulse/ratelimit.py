@@ -53,6 +53,7 @@ __all__ = [
     "classify",
     "default_renderer",
     "identity_from_ip",
+    "identity_from_ip_prefix",
     "identity_from_principal",
     "principal_identity",
     "rate_limit",
@@ -217,6 +218,29 @@ def identity_from_ip(request: Request) -> str:
     from webbpulse.http import client_ip
 
     return client_ip(request)
+
+
+def identity_from_ip_prefix(request: Request) -> str:
+    """The source IP with IPv6 grouped by its /64, so one host cannot rotate addresses.
+
+    A single IPv6 host is normally handed a whole /64 and can pick a fresh address per
+    request, which would give it a fresh bucket each time under `identity_from_ip`. IPv4
+    and anything unparseable key on the address as read.
+    """
+    import ipaddress
+
+    from webbpulse.http import client_ip
+
+    address = client_ip(request)
+    try:
+        parsed = ipaddress.ip_address(address)
+    except ValueError:
+        return address
+    if isinstance(parsed, ipaddress.IPv6Address) and parsed.ipv4_mapped is None:
+        return str(ipaddress.ip_network(f"{parsed}/64", strict=False))
+    if isinstance(parsed, ipaddress.IPv6Address) and parsed.ipv4_mapped is not None:
+        return str(parsed.ipv4_mapped)
+    return str(parsed)
 
 
 def principal_identity(

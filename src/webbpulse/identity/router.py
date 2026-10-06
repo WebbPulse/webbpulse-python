@@ -197,6 +197,14 @@ def build_identity_router(
             "`device_grant_stores` or no hooks. The device grant needs both to issue tokens."
         )
     device_stores = device_grant_stores if settings.device_grant_enabled else None
+    if device_stores is not None and (resolved_stores.device_grants is None or resolved_stores.device_codes is None):
+        import dataclasses
+
+        resolved_stores = dataclasses.replace(
+            resolved_stores,
+            device_grants=resolved_stores.device_grants or device_stores.grants,
+            device_codes=resolved_stores.device_codes or device_stores.codes,
+        )
 
     prefix = identity_prefix(settings)
 
@@ -401,16 +409,23 @@ def _ip_limits(limiter_enabled: bool) -> Callable[..., list[Any]]:
     """A builder for per-IP rate limit dependencies, empty when the limiter is off."""
 
     def limits(*specs: tuple[str, tuple[int, int], str]) -> list[Any]:
-        """The rate limit dependencies for one route."""
+        """The rate limit dependencies for one route.
+
+        The third element of a spec names the key: `ip` is the source address, and
+        `ip64` groups IPv6 by its /64 so a host cannot rotate through its own prefix.
+        """
         if not limiter_enabled:
             return []
         from fastapi import Depends
 
-        from webbpulse.ratelimit import identity_from_ip, rate_limit
+        from webbpulse.ratelimit import identity_from_ip, identity_from_ip_prefix, rate_limit
 
+        keys = {"ip": identity_from_ip, "ip64": identity_from_ip_prefix}
         return [
-            Depends(rate_limit(identity_from_ip, limit=limit, window_seconds=window, namespace=namespace))
-            for namespace, (limit, window), _ in specs
+            Depends(
+                rate_limit(keys.get(kind, identity_from_ip), limit=limit, window_seconds=window, namespace=namespace)
+            )
+            for namespace, (limit, window), kind in specs
         ]
 
     return limits
@@ -458,9 +473,15 @@ def _authorization_subject_resolver(
         from an MCP client carries only the refresh cookie, so that is read next, strictly
         read-only: `SessionService.peek` rotates nothing and trips no reuse detection, and
         the user must still load and pass `may_authenticate`, as a refresh would require.
+        A request presenting a token that is not a browser session, such as a device or MCP
+        access token, resolves to no one, with no fallback to the cookie.
         """
+        from webbpulse.identity.claims import is_browser_session
         from webbpulse.identity.hooks import AuthenticationRefused
 
+        presented = _presented_claims(request, tokens)
+        if presented is not None and not is_browser_session(presented, settings.audience):
+            return None
         claims = _claims_from_request(request, tokens)
         user_id = claims.get("sub", "")
         if user_id:
@@ -1389,7 +1410,24 @@ def _claims_from_request(request: Request, tokens: TokenService) -> dict[str, st
     """Verified claims for a route the gateway's JWT authorizer sits in front of.
 
     Prefers the authorizer context header the gateway has already verified, and falls
-    back to verifying the bearer token locally. Empty mapping means not authenticated.
+    back to verifying the bearer token locally. Empty mapping means not authenticated,
+    which is also the answer for any token that is not a browser session: a client's grant
+    (`client_id` or `grant`) or a token for another audience, such as a device login's.
+    """
+    from webbpulse.identity.claims import is_browser_session
+
+    claims = _presented_claims(request, tokens)
+    if claims is None or not is_browser_session(claims, tokens.settings.audience):
+        return {}
+    return {str(k): str(v) for k, v in claims.items()}
+
+
+def _presented_claims(request: Request, tokens: TokenService) -> dict[str, Any] | None:
+    """The verified claims of whatever token the request presents, browser session or not.
+
+    The authorizer context first, then the bearer verified locally against the session
+    and device audiences, so a device token is recognised as one rather than read as no
+    token at all. `None` when nothing verifiable was presented.
     """
     import json
 
@@ -1401,17 +1439,17 @@ def _claims_from_request(request: Request, tokens: TokenService) -> dict[str, st
         except (KeyError, TypeError, ValueError):
             claims = None
         if isinstance(claims, dict):
-            return {str(k): str(v) for k, v in claims.items()}
+            return dict(claims)
 
     authorization = request.headers.get("authorization", "")
     scheme, _, token = authorization.partition(" ")
     if scheme.lower() != "bearer" or not token:
-        return {}
+        return None
+    settings = tokens.settings
     try:
-        verified = tokens.verify_access_token(token)
+        return dict(tokens.verify_access_token(token, audience=[settings.audience, settings.device_token_audience]))
     except Exception:
-        return {}
-    return {str(k): str(v) for k, v in verified.items()}
+        return None
 
 
 IDENTITY_ROUTE_RESPONSES: Final[dict[tuple[str, str], dict[int, str]]] = {

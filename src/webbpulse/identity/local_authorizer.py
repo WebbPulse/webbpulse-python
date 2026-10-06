@@ -83,12 +83,16 @@ class LocalAuthorizerMiddleware:
         app: Callable[..., Awaitable[None]],
         settings: IdentitySettings,
         environment: str | None = None,
+        *,
+        accept_device_tokens: bool = False,
     ) -> None:
         """Wrap `app`, refusing any environment but the local one.
 
         `environment` defaults to `settings.environment`, which is what a composition root
         holding one settings object should leave it as. Pass it only where the ASGI stack
         is built from an environment the identity settings do not describe.
+        `accept_device_tokens` mirrors adding the device audience to the gateway
+        authorizer, for a product whose CLI signs in with the device grant.
         """
         resolved = settings.environment if environment is None else environment
         if resolved.strip().lower() != LOCAL_ENVIRONMENT:
@@ -99,6 +103,7 @@ class LocalAuthorizerMiddleware:
             )
         self.app = app
         self._settings = settings
+        self._accept_device_tokens = accept_device_tokens
         self._verifier: Any = None
 
     def _build_verifier(self) -> Any:
@@ -112,7 +117,9 @@ class LocalAuthorizerMiddleware:
         from webbpulse.identity.verifier import JwksVerifier
 
         jwks = TokenService(self._settings, signing_client(self._settings)).jwks()
-        return JwksVerifier.from_settings(self._settings, client=InProcessKeyClient(jwks))
+        return JwksVerifier.from_settings(
+            self._settings, accept_device_tokens=self._accept_device_tokens, client=InProcessKeyClient(jwks)
+        )
 
     def _verify(self, token: str) -> dict[str, Any] | None:
         """This token's claims, or `None` when it is not one this issuer signed."""

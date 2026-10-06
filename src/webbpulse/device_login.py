@@ -10,16 +10,25 @@ in a browser. The access and refresh tokens go straight into the OS keyring and 
 refreshed there transparently when the access token is about to expire. Neither token is
 ever written to stdout, a log line, a command line or an exception message.
 
+A refresh runs under a file lock in the user cache directory, so two commands started
+together cannot both spend the same refresh token. A plaintext or failing keyring backend
+is refused rather than used, and an access token too large for the platform's credential
+store is left out of it and fetched again with the refresh token when next needed.
+
 Needs `webbpulse[device-login]` (httpx and keyring).
 """
 
 from __future__ import annotations
 
+import contextlib
+import hashlib
 import json
+import os
 import sys
 import time
-from collections.abc import Callable, Iterable, Mapping
+from collections.abc import Callable, Iterable, Iterator, Mapping
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import IO, TYPE_CHECKING, Any, Final, Protocol
 from urllib.parse import urlsplit
 
@@ -33,6 +42,7 @@ __all__ = [
     "DeviceLoginClient",
     "DeviceLoginError",
     "KeyringBackend",
+    "LogoutResult",
     "StoredSession",
 ]
 
@@ -41,6 +51,15 @@ DEVICE_CODE_GRANT_TYPE: Final = "urn:ietf:params:oauth:grant-type:device_code"
 REFRESH_MARGIN_SECONDS: Final = 60
 SLOW_DOWN_STEP: Final = 5
 _LOCAL_HOSTS: Final = frozenset({"localhost", "127.0.0.1", "::1"})
+KEYRING_ENTRY_BUDGET: Final = 1200
+"""The most characters one keyring entry may hold. Windows Credential Manager caps a secret
+at 2560 bytes and stores text as UTF-16, so this keeps well inside it on every platform."""
+_REFUSED_KEYRINGS: Final = frozenset(
+    {
+        "keyrings.alt.file.PlaintextKeyring",
+        "keyring.backends.fail.Keyring",
+    }
+)
 
 
 class DeviceLoginError(Exception):
@@ -75,13 +94,13 @@ class StoredSession:
     refresh_expires_at: float
     scope: str = ""
 
-    def to_json(self) -> str:
-        """The keyring form."""
+    def to_json(self, *, include_access_token: bool = True) -> str:
+        """The keyring form, optionally without the access token."""
         return json.dumps(
             {
                 "issuer": self.issuer,
                 "client_id": self.client_id,
-                "access_token": self.access_token,
+                "access_token": self.access_token if include_access_token else "",
                 "refresh_token": self.refresh_token,
                 "expires_at": self.expires_at,
                 "refresh_expires_at": self.refresh_expires_at,
@@ -120,12 +139,73 @@ def _check_issuer(issuer: str) -> str:
 
 
 def _default_keyring() -> KeyringBackend:
-    """The `keyring` module, or a `DeviceLoginError` naming the extra to install."""
+    """The `keyring` module, or a `DeviceLoginError` naming the extra to install or the backend refused.
+
+    A backend that writes secrets to disk in plaintext, or one that fails every call, is
+    refused by name rather than used, so tokens never land somewhere unprotected.
+    """
     try:
         import keyring
     except ImportError as exc:
         raise DeviceLoginError("device login needs keyring; install webbpulse[device-login]") from exc
+    backend = keyring.get_keyring()
+    name = f"{type(backend).__module__}.{type(backend).__qualname__}"
+    if name in _REFUSED_KEYRINGS:
+        raise DeviceLoginError(
+            f"the keyring backend {name} is not safe for tokens; configure a system keyring "
+            "(macOS Keychain, Windows Credential Manager, or Secret Service on Linux)"
+        )
     return keyring
+
+
+def _default_lock_dir() -> Path:
+    """Where refresh lock files live: the user cache directory, never anywhere shared."""
+    if sys.platform == "win32":
+        base = os.environ.get("LOCALAPPDATA") or str(Path.home() / "AppData" / "Local")
+        return Path(base) / "webbpulse" / "locks"
+    base = os.environ.get("XDG_CACHE_HOME") or str(Path.home() / ".cache")
+    return Path(base) / "webbpulse" / "locks"
+
+
+@contextlib.contextmanager
+def _file_lock(path: Path) -> Iterator[None]:
+    """Hold an exclusive lock on `path` for the block, across processes."""
+    path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    with path.open("a+b") as handle:
+        if sys.platform == "win32":
+            import msvcrt
+
+            handle.seek(0)
+            msvcrt.locking(handle.fileno(), msvcrt.LK_LOCK, 1)
+            try:
+                yield
+            finally:
+                handle.seek(0)
+                msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+        else:
+            import fcntl
+
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+            try:
+                yield
+            finally:
+                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+
+
+@dataclass(frozen=True, slots=True)
+class LogoutResult:
+    """What `logout` did. Truthy when there was a session to end.
+
+    `revoked` is whether the server confirmed the revocation. When it is false the local
+    copy is still gone, but the server session may live until it expires.
+    """
+
+    had_session: bool
+    revoked: bool = False
+
+    def __bool__(self) -> bool:
+        """Whether there was a session."""
+        return self.had_session
 
 
 class DeviceLoginClient:
@@ -147,6 +227,7 @@ class DeviceLoginClient:
         clock: Callable[[], float] = time.time,
         sleep: Callable[[float], None] = time.sleep,
         out: IO[str] | None = None,
+        lock_dir: Path | None = None,
     ) -> None:
         """Bind the client to an issuer, a client id and its seams. Makes no request."""
         if not client_id.strip():
@@ -160,6 +241,7 @@ class DeviceLoginClient:
         self._clock = clock
         self._sleep = sleep
         self._out = out
+        self._lock_dir = lock_dir
 
     @property
     def issuer(self) -> str:
@@ -187,10 +269,22 @@ class DeviceLoginClient:
             raise DeviceLoginError(f"could not read the keyring: {type(exc).__name__}") from None
         return StoredSession.from_json(text) if text else None
 
+    @contextlib.contextmanager
+    def _locked(self) -> Iterator[None]:
+        """Hold this issuer and client's refresh lock, so concurrent commands take turns."""
+        name = hashlib.sha256(self._username.encode("utf-8")).hexdigest()[:32]
+        with _file_lock((self._lock_dir or _default_lock_dir()) / f"{name}.lock"):
+            yield
+
     def _save(self, session: StoredSession) -> None:
-        """Write the session to the keyring."""
+        """Write the session to the keyring, leaving the access token out when it would not fit."""
+        text = session.to_json()
+        if len(text) > KEYRING_ENTRY_BUDGET:
+            text = session.to_json(include_access_token=False)
+        if len(text) > KEYRING_ENTRY_BUDGET:
+            raise DeviceLoginError("the device login is too large for the keyring")
         try:
-            self._backend().set_password(self._service, self._username, session.to_json())
+            self._backend().set_password(self._service, self._username, text)
         except Exception as exc:
             raise DeviceLoginError(f"could not write the keyring: {type(exc).__name__}") from None
 
@@ -275,8 +369,18 @@ class DeviceLoginClient:
         session = self.stored()
         if session is None:
             raise DeviceLoginError("not signed in; run login first")
+        if session.access_token and session.expires_at - REFRESH_MARGIN_SECONDS > self._clock():
+            return session.access_token
+        with self._locked():
+            return self._refresh_locked()
+
+    def _refresh_locked(self) -> str:
+        """Re-read the session under the lock and refresh it unless another command just did."""
+        session = self.stored()
+        if session is None:
+            raise DeviceLoginError("not signed in; run login first")
         now = self._clock()
-        if session.expires_at - REFRESH_MARGIN_SECONDS > now:
+        if session.access_token and session.expires_at - REFRESH_MARGIN_SECONDS > now:
             return session.access_token
         if session.refresh_expires_at <= now:
             self._forget()
@@ -294,16 +398,31 @@ class DeviceLoginClient:
         self._save(refreshed)
         return refreshed.access_token
 
-    def logout(self) -> bool:
-        """Revoke the session on the server and forget it locally. False when there was none."""
-        session = self.stored()
-        if session is None:
-            return False
-        try:
-            self._post("/device/revoke", {"token": session.refresh_token, "client_id": self._client_id})
-        finally:
-            self._forget()
-        return True
+    def logout(self) -> LogoutResult:
+        """Revoke the session on the server and forget it locally, whatever the server says.
+
+        When the revocation is not confirmed, by a non-200 answer or a network failure, the
+        local copy still goes and a warning says the server session may still be live.
+        """
+        with self._locked():
+            session = self.stored()
+            if session is None:
+                return LogoutResult(had_session=False)
+            revoked = False
+            try:
+                status, _ = self._post("/device/revoke", {"token": session.refresh_token, "client_id": self._client_id})
+                revoked = status == 200
+            except DeviceLoginError:
+                revoked = False
+            finally:
+                self._forget()
+        if not revoked:
+            self._print(
+                "Warning: the server did not confirm the sign-out. The local session is removed, but "
+                "the server session may stay live until it expires; revoke it from your account's "
+                "device logins to be sure."
+            )
+        return LogoutResult(had_session=True, revoked=revoked)
 
     def _session_from(self, body: Mapping[str, Any]) -> StoredSession:
         """A session from a token response."""

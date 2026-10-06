@@ -188,10 +188,12 @@ def register_ephemeral_routes(
         route key behind the staging access gate needs. A token that fails verification
         resolves to no subject, so it reads as not authenticated rather than as a fault.
         """
-        from webbpulse.identity.claims import identity_claims
+        from webbpulse.identity.claims import identity_claims, is_browser_session
 
         claims = identity_claims(request)
         if claims is not None:
+            if not is_browser_session(claims, tokens.settings.audience):
+                return "", []
             return str(claims.get("sub", "") or ""), caller_roles(claims)
 
         authorization = request.headers.get("authorization", "")
@@ -201,6 +203,8 @@ def register_ephemeral_routes(
         try:
             verified = tokens.verify_access_token(token.strip())
         except Exception:
+            return "", []
+        if not is_browser_session(verified, tokens.settings.audience):
             return "", []
         return str(verified.get("sub", "") or ""), caller_roles(verified)
 

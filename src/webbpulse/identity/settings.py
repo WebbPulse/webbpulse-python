@@ -356,6 +356,14 @@ class IdentitySettings(BaseSettings):
             "supported scope except these."
         ),
     )
+    device_audience: str = Field(
+        default="",
+        description=(
+            "The `aud` a device login's access token carries. Empty means `<issuer>/device`. "
+            "It must differ from `audience`, so browser session routes refuse device tokens "
+            "by construction; a resource server that serves the CLI accepts it explicitly."
+        ),
+    )
     device_access_token_ttl: timedelta = Field(
         default=timedelta(hours=1),
         description="How long a device login's access token lives. Capped at an hour.",
@@ -549,6 +557,23 @@ class IdentitySettings(BaseSettings):
                 "so there is no setting that turns the recent sign-in check off."
             )
         self._check_login_url("device_login_url", self.device_login_url, self.device_login_return_param)
+        if self.device_token_audience in {self.audience, self.mcp_resource_url, self.mfa_ticket_audience}:
+            raise ValueError(
+                "device_audience must differ from audience, mcp_resource_url and the MFA ticket "
+                "audience, or a device token would pass as another kind of token."
+            )
+        if self.totp_master_key:
+            from webbpulse.identity.crypto import MASTER_KEY_BYTES
+
+            try:
+                raw = base64.b64decode(self.totp_master_key.encode("ascii"), validate=True)
+            except Exception as exc:
+                raise ValueError(f"totp_master_key is not valid base64: {exc}") from exc
+            if len(raw) != MASTER_KEY_BYTES:
+                raise ValueError(
+                    f"totp_master_key decodes to {len(raw)} bytes, expected {MASTER_KEY_BYTES}. "
+                    "The device grant derives its approval and refresh keys from it."
+                )
         return self
 
     def _check_login_url(self, name: str, url: str, return_param: str) -> None:
@@ -699,6 +724,16 @@ class IdentitySettings(BaseSettings):
         if not self.totp_master_key:
             return b""
         return base64.b64decode(self.totp_master_key.encode("ascii"), validate=True)
+
+    @property
+    def device_token_audience(self) -> str:
+        """The `aud` of a device login's access token: `device_audience`, else `<issuer>/device`."""
+        return self.device_audience or f"{self.issuer.rstrip('/')}/device"
+
+    @property
+    def mfa_ticket_audience(self) -> str:
+        """The `aud` of an MFA ticket: `<issuer>/mfa`."""
+        return f"{self.issuer.rstrip('/')}/mfa"
 
     @property
     def local_signer_seed_value(self) -> str:

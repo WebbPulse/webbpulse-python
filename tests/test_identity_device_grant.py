@@ -39,7 +39,12 @@ from webbpulse.identity import (
     identity_prefix,
     normalize_user_code,
 )
-from webbpulse.identity.device_grant import USER_CODE_ALPHABET, DeviceApproval, new_user_code
+from webbpulse.identity.device_grant import (
+    DEVICE_REFRESH_GRACE_SECONDS,
+    USER_CODE_ALPHABET,
+    DeviceApproval,
+    new_user_code,
+)
 from webbpulse.identity.tokens import DISCOVERY_PATH
 
 KEY_A = "arn:aws:kms:us-west-2:111122223333:key/aaaaaaaa-1111-1111-1111-aaaaaaaaaaaa"
@@ -49,6 +54,8 @@ LOGIN = "https://app.staging.example.com/login"
 USER = "user-abc"
 OTHER = "user-xyz"
 CLIENT = "wp-tf"
+MASTER_KEY = "MDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWY="
+ORIGIN = "https://api.staging.example.com"
 
 
 class Hooks(BaseIdentityHooks):
@@ -86,6 +93,7 @@ def build_settings(**overrides: Any) -> IdentitySettings:
         "device_scopes_supported": ["runs:read", "runs:plan", "runs:apply", "admin"],
         "device_explicit_scopes": ["runs:apply", "admin"],
         "device_login_url": LOGIN,
+        "totp_master_key": MASTER_KEY,
     }
     values.update(overrides)
     return IdentitySettings(**values)
@@ -127,7 +135,7 @@ class Harness:
         """A signed-in browser's bearer, with a recent sign-in unless told otherwise."""
         moment = int(time.time()) if auth_time is None else auth_time
         token = self.tokens.mint_access_token(user_id, claims={"auth_time": moment, **claims})
-        return {"Authorization": f"Bearer {token}"}
+        return {"Authorization": f"Bearer {token}", "Origin": ORIGIN}
 
     def start(self, scope: str = "") -> dict[str, Any]:
         """Start a device login as the CLI would."""
@@ -192,6 +200,15 @@ class Harness:
     def grant(self, grant_id: str) -> Any:
         """The stored grant."""
         return self.stores.grants.get(grant_id)
+
+
+def _age_rotation(harness: Harness, grant_id: str) -> None:
+    """Move the last rotation outside the grace window."""
+    grants = harness.stores.grants
+    record = grants._items[grant_id]  # type: ignore[attr-defined]
+    grants._items[grant_id] = dataclasses.replace(  # type: ignore[attr-defined]
+        record, rotated_at=record.rotated_at - DEVICE_REFRESH_GRACE_SECONDS - 5
+    )
 
 
 @pytest.fixture
@@ -342,10 +359,10 @@ class TestPolling:
         )
         assert page.status_code == 404
 
-    def test_an_unknown_device_code_answers_expired_token(self, harness: Harness) -> None:
-        """An invented device code reads the same as an expired one."""
+    def test_an_unknown_device_code_answers_invalid_grant(self, harness: Harness) -> None:
+        """An invented device code is `invalid_grant`."""
         response = harness.poll("not-a-real-device-code")
-        assert response.json()["error"] == "expired_token"
+        assert response.json()["error"] == "invalid_grant"
 
     def test_another_client_cannot_collect_the_code(self, harness: Harness) -> None:
         """The device code is bound to the client that started it."""
@@ -362,7 +379,7 @@ class TestPolling:
         assert "Request denied" in page.text
         response = harness.poll(started["device_code"])
         assert response.json()["error"] == "access_denied"
-        assert harness.poll(started["device_code"]).json()["error"] == "expired_token"
+        assert harness.poll(started["device_code"]).json()["error"] == "invalid_grant"
         assert not harness.stores.grants._items  # type: ignore[attr-defined]
 
     def test_an_approved_code_is_collected_once(self, harness: Harness) -> None:
@@ -371,7 +388,7 @@ class TestPolling:
         harness.decide(started["user_code"])
         assert harness.poll(started["device_code"]).status_code == 200
         again = harness.poll(started["device_code"])
-        assert again.json()["error"] == "expired_token"
+        assert again.json()["error"] == "invalid_grant"
 
     def test_a_consume_race_is_invalid_grant(self, harness: Harness, fake_kms: Any) -> None:
         """When another poll consumed the code in between, the loser gets `invalid_grant`."""
@@ -381,7 +398,7 @@ class TestPolling:
         assert approval is not None
         assert service.decide(approval, user_id=USER, allow=True, auth_time=int(time.time()))
         original = harness.stores.codes.consume
-        harness.stores.codes.consume = lambda code_hash: (original(code_hash), None)[1]  # type: ignore[method-assign,assignment]
+        harness.stores.codes.consume = lambda code_hash, **kwargs: (original(code_hash, **kwargs), None)[1]  # type: ignore[method-assign]
         with pytest.raises(OAuthServerError) as caught:
             service.poll({"device_code": started["device_code"], "client_id": CLIENT})
         assert caught.value.error == "invalid_grant"
@@ -509,16 +526,19 @@ class TestApproval:
         response = harness.client.post(harness.url(DEVICE_APPROVE_PATH), data=form, headers=harness.browser(OTHER))
         assert response.status_code == 400
 
-    def test_a_cross_site_post_is_refused(self, harness: Harness) -> None:
-        """The approval must come from this server's own page."""
+    @pytest.mark.parametrize("origin", ["https://evil.example.com", "https://app.staging.example.com", ""])
+    def test_an_approval_from_another_origin_is_refused(self, harness: Harness, origin: str) -> None:
+        """The approval must carry this issuer's own `Origin`; a missing one is refused too."""
         started = harness.start()
         headers = harness.browser()
         form = harness.approval_form(started["user_code"], headers)
         form["decision"] = "allow"
-        response = harness.client.post(
-            harness.url(DEVICE_APPROVE_PATH), data=form, headers={**headers, "Sec-Fetch-Site": "cross-site"}
-        )
+        sent = {key: value for key, value in headers.items() if key != "Origin"}
+        if origin:
+            sent["Origin"] = origin
+        response = harness.client.post(harness.url(DEVICE_APPROVE_PATH), data=form, headers=sent)
         assert response.status_code == 403
+        assert harness.poll(started["device_code"]).json()["error"] == "authorization_pending"
 
     def test_a_device_token_cannot_approve_another_device(self, harness: Harness) -> None:
         """A CLI session is not a browser: its token is refused on the approval page."""
@@ -559,7 +579,7 @@ class TestScopeBinding:
     def test_the_access_token_is_bound_to_the_user_scopes_and_grant(self, harness: Harness) -> None:
         """The JWT names the user, the approved scopes, the client and the grant."""
         body = harness.login()
-        claims = harness.tokens.verify_access_token(body["access_token"])
+        claims = harness.tokens.verify_access_token(body["access_token"], audience=harness.tokens.device_audience)
         assert claims["sub"] == USER
         assert claims["scope"] == "runs:read runs:plan"
         assert claims["client_id"] == CLIENT
@@ -577,7 +597,10 @@ class TestScopeBinding:
         harness.hooks.held[USER] = "runs:read"
         body = harness.login("runs:read runs:apply")
         assert body["scope"] == "runs:read"
-        assert harness.tokens.verify_access_token(body["access_token"])["scope"] == "runs:read"
+        assert (
+            harness.tokens.verify_access_token(body["access_token"], audience=harness.tokens.device_audience)["scope"]
+            == "runs:read"
+        )
 
     def test_nothing_to_approve_when_the_person_holds_none(self, harness: Harness) -> None:
         """A request for only scopes the person lacks cannot be approved at all."""
@@ -635,11 +658,12 @@ class TestRefresh:
         """Presenting the replaced refresh token means two holders, so the whole grant ends."""
         body = harness.login()
         new = harness.refresh(body["refresh_token"]).json()
+        _age_rotation(harness, _grant_id(body))
         replay = harness.refresh(body["refresh_token"])
         assert replay.json()["error"] == "invalid_grant"
         assert harness.grant(_grant_id(body)).revoked
         assert harness.refresh(new["refresh_token"]).json()["error"] == "invalid_grant"
-        access = harness.tokens.verify_access_token(new["access_token"])
+        access = harness.tokens.verify_access_token(new["access_token"], audience=harness.tokens.device_audience)
         assert not device_grant_is_live(harness.stores.grants, access)
 
     def test_a_forged_secret_is_refused_without_revoking(self, harness: Harness) -> None:
@@ -677,12 +701,33 @@ class TestRefresh:
         harness.refresh(body["refresh_token"])
         assert harness.grant(_grant_id(body)).expires_at == grant.expires_at
 
-    def test_a_lost_rotation_race_revokes(self, harness: Harness) -> None:
-        """When the conditional rotate loses, the grant is ended rather than forked."""
+    def test_a_lost_rotation_race_hands_back_the_winners_pair(self, harness: Harness) -> None:
+        """When another request rotated first, the loser gets the same successor, not a fork."""
         body = harness.login()
-        harness.stores.grants.rotate = lambda *args, **kwargs: False  # type: ignore[method-assign]
-        assert harness.refresh(body["refresh_token"]).json()["error"] == "invalid_grant"
-        assert harness.grant(_grant_id(body)).revoked
+        grants = harness.stores.grants
+        original = grants.rotate
+
+        def rotate_then_lose(*args: Any, **kwargs: Any) -> bool:
+            """Let the rotation land, then report that another request won it."""
+            original(*args, **kwargs)
+            return False
+
+        grants.rotate = rotate_then_lose  # type: ignore[method-assign]
+        first = harness.refresh(body["refresh_token"]).json()
+        grants.rotate = original  # type: ignore[method-assign]
+        second = harness.refresh(body["refresh_token"]).json()
+        assert first["refresh_token"] == second["refresh_token"]
+        assert harness.grant(_grant_id(body)).live()
+
+    def test_a_retry_inside_the_grace_window_gets_the_same_pair(self, harness: Harness) -> None:
+        """A client that lost the response presents the old token again and is not revoked."""
+        body = harness.login()
+        first = harness.refresh(body["refresh_token"]).json()
+        again = harness.refresh(body["refresh_token"])
+        assert again.status_code == 200
+        assert again.json()["refresh_token"] == first["refresh_token"]
+        assert harness.grant(_grant_id(body)).live()
+        assert harness.refresh(first["refresh_token"]).status_code == 200
 
     def test_a_user_who_may_no_longer_sign_in_is_refused(self, harness: Harness) -> None:
         """A deleted account ends the grant at the next refresh."""
@@ -701,7 +746,7 @@ class TestRevocation:
         response = harness.client.post(harness.url(DEVICE_REVOKE_PATH), data={"token": body["refresh_token"]})
         assert response.status_code == 200
         assert harness.refresh(body["refresh_token"]).json()["error"] == "invalid_grant"
-        claims = harness.tokens.verify_access_token(body["access_token"])
+        claims = harness.tokens.verify_access_token(body["access_token"], audience=harness.tokens.device_audience)
         assert not device_grant_is_live(harness.stores.grants, claims)
 
     def test_revoke_answers_200_for_anything(self, harness: Harness) -> None:
@@ -742,21 +787,22 @@ class TestRevocation:
         """Anonymous callers and device tokens are both refused."""
         body = harness.login()
         assert harness.client.get(harness.url(DEVICE_GRANTS_PATH)).status_code == 401
-        device = {"Authorization": f"Bearer {body['access_token']}"}
+        device = {"Authorization": f"Bearer {body['access_token']}", "Origin": ORIGIN}
         assert harness.client.get(harness.url(DEVICE_GRANTS_PATH), headers=device).status_code == 401
         assert (
             harness.client.delete(harness.url(f"{DEVICE_GRANTS_PATH}/{_grant_id(body)}"), headers=device).status_code
             == 401
         )
 
-    def test_a_cross_site_delete_is_refused(self, harness: Harness) -> None:
+    def test_a_delete_from_another_origin_is_refused(self, harness: Harness) -> None:
         """The revoke button must be this site's own."""
         body = harness.login()
         response = harness.client.delete(
             harness.url(f"{DEVICE_GRANTS_PATH}/{_grant_id(body)}"),
-            headers={**harness.browser(), "Sec-Fetch-Site": "cross-site"},
+            headers={**harness.browser(), "Origin": "https://evil.example.com"},
         )
         assert response.status_code == 403
+        assert harness.grant(_grant_id(body)).live()
 
     def test_logout_everywhere_ends_device_logins(self, harness: Harness) -> None:
         """Signing out everywhere revokes every device grant as well."""
@@ -778,12 +824,15 @@ class TestLiveness:
     def test_a_device_token_is_live_while_its_grant_is(self, harness: Harness) -> None:
         """A fresh device login reads as live."""
         body = harness.login()
-        assert device_grant_is_live(harness.stores.grants, harness.tokens.verify_access_token(body["access_token"]))
+        assert device_grant_is_live(
+            harness.stores.grants,
+            harness.tokens.verify_access_token(body["access_token"], audience=harness.tokens.device_audience),
+        )
 
     def test_a_grant_for_another_user_is_not_live(self, harness: Harness) -> None:
         """The grant must belong to the token's subject."""
         body = harness.login()
-        claims = dict(harness.tokens.verify_access_token(body["access_token"]))
+        claims = dict(harness.tokens.verify_access_token(body["access_token"], audience=harness.tokens.device_audience))
         claims["sub"] = OTHER
         assert not device_grant_is_live(harness.stores.grants, claims)
 
@@ -914,12 +963,12 @@ def test_the_dynamo_stores_run_the_whole_flow(fake_kms: Any) -> None:
         body = service.poll(params, now=now + 60)
         with pytest.raises(OAuthServerError) as used:
             service.poll(params, now=now + 120)
-        assert used.value.error == "expired_token"
+        assert used.value.error == "invalid_grant"
 
         refresh = {"refresh_token": body["refresh_token"], "client_id": CLIENT}
         rotated = service.refresh(refresh, now=now + 180)
         with pytest.raises(OAuthServerError):
-            service.refresh(refresh, now=now + 200)
+            service.refresh(refresh, now=now + 180 + DEVICE_REFRESH_GRACE_SECONDS + 10)
         grant_id = _grant_id(body)
         record = stores.grants.get(grant_id)
         assert record is not None and record.revoked
@@ -956,7 +1005,9 @@ def test_the_device_tables_create_against_dynamodb(aws_credentials: None) -> Non
         assert grants["GlobalSecondaryIndexes"][0]["Projection"]["ProjectionType"] == "ALL"
 
 
-def test_the_cli_client_signs_in_against_the_server(harness: Harness, capsys: pytest.CaptureFixture[str]) -> None:
+def test_the_cli_client_signs_in_against_the_server(
+    harness: Harness, capsys: pytest.CaptureFixture[str], tmp_path: Any
+) -> None:
     """`DeviceLoginClient` end to end: print, approve in a browser, refresh, revoke, with no token printed."""
     import io
 
@@ -989,11 +1040,13 @@ def test_the_cli_client_signs_in_against_the_server(harness: Harness, capsys: py
 
     ring = Ring()
     http: Any = harness.client
-    client = DeviceLoginClient(ISSUER, CLIENT, http=http, keyring_backend=ring, sleep=approve_in_browser, out=out)
+    client = DeviceLoginClient(
+        ISSUER, CLIENT, http=http, keyring_backend=ring, sleep=approve_in_browser, out=out, lock_dir=tmp_path
+    )
     session = client.login(["runs:read", "runs:apply"])
     assert session.scope == "runs:read runs:apply"
     token = client.access_token()
-    claims = harness.tokens.verify_access_token(token)
+    claims = harness.tokens.verify_access_token(token, audience=harness.tokens.device_audience)
     assert claims["sub"] == USER
     assert claims["scope"] == "runs:read runs:apply"
 
@@ -1005,8 +1058,314 @@ def test_the_cli_client_signs_in_against_the_server(harness: Harness, capsys: py
     renewed = client.stored()
     assert renewed is not None and renewed.refresh_token != stored.refresh_token
 
-    assert client.logout()
+    result = client.logout()
+    assert result and result.revoked
     assert harness.grant(claims["sid"]).revoked
     captured = capsys.readouterr()
     for secret in (token, rotated, stored.refresh_token, renewed.refresh_token):
         assert secret not in out.getvalue() + captured.out + captured.err
+
+
+def _context_request(claims: dict[str, Any] | None = None, **headers: str) -> Any:
+    """A Starlette request carrying gateway claims in the request context and any extra headers."""
+    import json
+
+    from starlette.requests import Request
+
+    values = dict(headers)
+    if claims is not None:
+        values["x-amzn-request-context"] = json.dumps({"authorizer": {"jwt": {"claims": claims}}})
+    raw = [(key.lower().replace("_", "-").encode(), value.encode()) for key, value in values.items()]
+    return Request({"type": "http", "method": "GET", "path": "/", "headers": raw, "query_string": b""})
+
+
+class TestAudienceSeparation:
+    """A device token is for resource servers only: identity routes and default verifiers refuse it."""
+
+    def test_the_default_verifier_refuses_the_device_audience(self, harness: Harness) -> None:
+        """`verify_access_token` without an audience accepts only browser sessions."""
+        body = harness.login()
+        with pytest.raises(Exception):  # noqa: B017
+            harness.tokens.verify_access_token(body["access_token"])
+
+    def test_the_device_audience_must_differ(self) -> None:
+        """A device audience equal to the session audience would undo the separation."""
+        with pytest.raises(ValueError, match="device_audience"):
+            build_settings(device_audience=AUDIENCE)
+
+    def test_claims_from_request_refuses_a_device_bearer(self, harness: Harness) -> None:
+        """A device bearer reads as no session at all on an identity route."""
+        from webbpulse.identity.router import _claims_from_request
+
+        body = harness.login()
+        request = _context_request(authorization=f"Bearer {body['access_token']}")
+        assert _claims_from_request(request, harness.tokens) == {}
+        browser = _context_request(authorization=harness.browser()["Authorization"])
+        assert _claims_from_request(browser, harness.tokens)["sub"] == USER
+
+    def test_claims_from_request_refuses_device_gateway_claims(self, harness: Harness) -> None:
+        """Gateway claims carrying the device grant are refused, whatever the audience says."""
+        from webbpulse.identity.router import _claims_from_request
+
+        request = _context_request({"sub": USER, "aud": AUDIENCE, "grant": "device", "sid": "g"})
+        assert _claims_from_request(request, harness.tokens) == {}
+
+    def test_the_subject_resolver_does_not_fall_back_to_the_cookie(self, harness: Harness) -> None:
+        """A device bearer alongside a live refresh cookie still resolves to no one."""
+        from webbpulse.identity.router import _authorization_subject_resolver
+
+        peeked: list[str] = []
+
+        class Sessions:
+            def peek(self, value: str) -> Any:
+                """Record the read and answer a live session."""
+                peeked.append(value)
+                return type("Presented", (), {"user_id": USER, "family_id": "f"})()
+
+        class Flows:
+            sessions = Sessions()
+
+        resolve = _authorization_subject_resolver(harness.settings, harness.hooks, Flows(), harness.tokens)
+        body = harness.login()
+        cookie = f"{harness.settings.cookie_name}=refresh-cookie"
+        request = _context_request(authorization=f"Bearer {body['access_token']}", cookie=cookie)
+        assert resolve(request) is None
+        assert peeked == []
+
+    def test_the_subject_resolver_accepts_a_browser_bearer(self, harness: Harness) -> None:
+        """A browser session still resolves to its user."""
+        from webbpulse.identity.router import _authorization_subject_resolver
+
+        resolve = _authorization_subject_resolver(harness.settings, harness.hooks, None, harness.tokens)
+        found = resolve(_context_request(authorization=harness.browser()["Authorization"]))
+        assert found is not None and found.user_id == USER
+
+
+class TestResourceServerCheck:
+    """`claims_or_api_key` refuses device tokens unless their grant is checked and live."""
+
+    @staticmethod
+    def _client(device_grants: Any = None) -> TestClient:
+        """A one-route app behind `claims_or_api_key`."""
+        from fastapi import Depends
+
+        from webbpulse.identity.scopes import claims_or_api_key
+
+        app = FastAPI()
+        dependency = claims_or_api_key(device_grants=device_grants)
+
+        @app.get("/runs")
+        async def runs(claims: Any = Depends(dependency)) -> dict[str, str]:
+            """Echo the subject."""
+            return {"sub": str(claims.get("sub", ""))}
+
+        return TestClient(app)
+
+    @staticmethod
+    def _headers(claims: dict[str, Any]) -> dict[str, str]:
+        """The gateway request context for these claims."""
+        import json
+
+        return {"x-amzn-request-context": json.dumps({"authorizer": {"jwt": {"claims": claims}}})}
+
+    def test_device_claims_are_refused_without_the_check(self, harness: Harness) -> None:
+        """Left unwired, the dependency fails closed for device tokens and stays open for browsers."""
+        client = self._client()
+        body = harness.login()
+        claims = dict(harness.tokens.verify_access_token(body["access_token"], audience=harness.tokens.device_audience))
+        assert client.get("/runs", headers=self._headers(claims)).status_code == 401
+        assert client.get("/runs", headers=self._headers({"sub": USER})).status_code == 200
+
+    def test_a_live_grant_passes_and_a_revoked_one_does_not(self, harness: Harness) -> None:
+        """With the store wired, revocation takes effect on the next request once the cache is off."""
+        from webbpulse.identity import DeviceGrantLiveness
+
+        client = self._client(DeviceGrantLiveness(harness.stores.grants, ttl_seconds=0))
+        body = harness.login()
+        claims = dict(harness.tokens.verify_access_token(body["access_token"], audience=harness.tokens.device_audience))
+        assert client.get("/runs", headers=self._headers(claims)).status_code == 200
+        harness.stores.grants.revoke(_grant_id(body))
+        assert client.get("/runs", headers=self._headers(claims)).status_code == 401
+
+    def test_a_bare_store_is_wrapped(self, harness: Harness) -> None:
+        """Passing the store itself works the same as passing a liveness check."""
+        client = self._client(harness.stores.grants)
+        body = harness.login()
+        claims = dict(harness.tokens.verify_access_token(body["access_token"], audience=harness.tokens.device_audience))
+        assert client.get("/runs", headers=self._headers(claims)).status_code == 200
+
+
+class TestLivenessCache:
+    """The liveness cache is short and bounded."""
+
+    def test_the_cache_cannot_exceed_the_cap(self, harness: Harness) -> None:
+        """A longer cache is a configuration error."""
+        from webbpulse.identity import DeviceGrantLiveness
+        from webbpulse.identity.device_grant import DEVICE_LIVENESS_MAX_CACHE_SECONDS
+
+        with pytest.raises(ValueError, match="ttl_seconds"):
+            DeviceGrantLiveness(harness.stores.grants, ttl_seconds=DEVICE_LIVENESS_MAX_CACHE_SECONDS + 1)
+
+    def test_a_decision_is_reused_only_within_the_ttl(self, harness: Harness) -> None:
+        """A revocation is seen once the cached decision ages out."""
+        from webbpulse.identity import DeviceGrantLiveness
+
+        moment = [100.0]
+        live = DeviceGrantLiveness(harness.stores.grants, ttl_seconds=5, clock=lambda: moment[0])
+        body = harness.login()
+        claims = harness.tokens.verify_access_token(body["access_token"], audience=harness.tokens.device_audience)
+        assert live(claims)
+        harness.stores.grants.revoke(_grant_id(body))
+        assert live(claims)
+        moment[0] += 6
+        assert not live(claims)
+
+
+class TestMasterKey:
+    """The approval and refresh keys need a real master key."""
+
+    def test_the_router_refuses_to_build_without_one(self, fake_kms: Any) -> None:
+        """No master key, no device grant: the failure is at startup, not on the first login."""
+        from webbpulse.identity import DeviceGrantKeyMissing
+
+        settings = build_settings(totp_master_key="")
+        with pytest.raises(DeviceGrantKeyMissing):
+            build_identity_router(
+                settings,
+                Hooks(),
+                IdentityStores(credentials=InMemoryCredentialStore(), refresh_tokens=InMemoryRefreshTokenStore()),
+                tokens=TokenService(settings, fake_kms),
+                device_grant_stores=build_stores(),
+                limiter_enabled=False,
+            )
+
+
+class TestLookupCap:
+    """A signed-in person who keeps mistyping codes is stopped, whatever address they use."""
+
+    def test_too_many_wrong_codes_return_429(self, harness: Harness) -> None:
+        """After the cap, even a right code waits out the window."""
+        from webbpulse.identity.device_grant import DEVICE_USER_CODE_FAILURE_LIMIT
+
+        headers = harness.browser()
+        for _ in range(DEVICE_USER_CODE_FAILURE_LIMIT[0]):
+            response = harness.client.get(
+                harness.url(DEVICE_VERIFY_PATH), params={"user_code": "BCDF-GHJK"}, headers=headers
+            )
+            assert response.status_code == 404
+        started = harness.start()
+        response = harness.client.get(
+            harness.url(DEVICE_VERIFY_PATH), params={"user_code": started["user_code"]}, headers=headers
+        )
+        assert response.status_code == 429
+        other = harness.client.get(
+            harness.url(DEVICE_VERIFY_PATH), params={"user_code": started["user_code"]}, headers=harness.browser(OTHER)
+        )
+        assert other.status_code == 200
+
+
+class TestRevocationOnPasswordAndPurge:
+    """Password changes end device logins, and a purge deletes everything the device grant stored."""
+
+    @staticmethod
+    def _flows(harness: Harness) -> Any:
+        """Identity flows over the harness's device stores, with a password set for the user."""
+        from webbpulse.identity import PASSWORD_CREDENTIAL_TYPE, IdentityFlows
+        from webbpulse.identity.storage import CredentialRecord
+        from webbpulse.security import hash_password
+
+        credentials = InMemoryCredentialStore()
+        credentials.put(
+            CredentialRecord(
+                user_id=USER, credential_type=PASSWORD_CREDENTIAL_TYPE, secret=hash_password("old-pass-123!")
+            )
+        )
+        stores = IdentityStores(
+            credentials=credentials,
+            refresh_tokens=InMemoryRefreshTokenStore(),
+            device_grants=harness.stores.grants,
+            device_codes=harness.stores.codes,
+        )
+        return IdentityFlows(harness.settings, harness.hooks, stores, harness.tokens)
+
+    def test_a_password_change_revokes_every_device_grant(self, harness: Harness) -> None:
+        """Both CLI logins end with the password change."""
+        first, second = harness.login(), harness.login()
+        flows = self._flows(harness)
+        flows.change_password(
+            user_id=USER, current_password="old-pass-123!", new_password="a much better passphrase 42"
+        )
+        assert harness.grant(_grant_id(first)).revoked
+        assert harness.grant(_grant_id(second)).revoked
+
+    def test_a_purge_deletes_grants_codes_and_counters(self, harness: Harness) -> None:
+        """Nothing the device grant stored for the user survives a purge."""
+        body = harness.login()
+        started = harness.start()
+        harness.decide(started["user_code"])
+        harness.client.get(
+            harness.url(DEVICE_VERIFY_PATH), params={"user_code": "BCDF-GHJK"}, headers=harness.browser()
+        )
+        codes = harness.stores.codes
+        assert isinstance(codes, InMemoryDeviceCodeStore)
+        assert codes._failures
+        result = self._flows(harness).purge_user(USER)
+        assert result.device_grants == 1
+        assert result.device_codes == 1
+        assert harness.grant(_grant_id(body)) is None
+        assert not [record for record in codes._items.values() if record.user_id == USER]
+        assert not codes._failures
+
+
+@pytest.mark.usefixtures("aws_credentials")
+def test_the_dynamo_purge_reaches_decided_codes_without_a_scan(fake_kms: Any) -> None:
+    """The owner item lets a purge find the user's decided requests; counters and the item go too."""
+    import boto3
+    from moto import mock_aws
+
+    from webbpulse.identity import IdentityFlows
+
+    with mock_aws():
+        client = boto3.client("dynamodb", region_name="us-west-2")
+        for spec in DEVICE_GRANT_TABLES:
+            client.create_table(**spec.create_table_request("wp-test"))
+        stores = dynamo_device_grant_stores("wp-test", region_name="us-west-2")
+        settings = build_settings()
+        tokens = TokenService(settings, fake_kms)
+        service = DeviceGrantService(settings, Hooks(), stores, tokens)
+        now = int(time.time())
+
+        login = service.start({"client_id": CLIENT}, now=now)
+        approval = service.pending(login["user_code"], USER)
+        assert approval is not None
+        service.decide(approval, user_id=USER, allow=True, auth_time=now)
+        service.poll({"device_code": login["device_code"], "client_id": CLIENT}, now=now + 60)
+
+        waiting = service.start({"client_id": CLIENT}, now=now)
+        approval = service.pending(waiting["user_code"], USER)
+        assert approval is not None
+        service.decide(approval, user_id=USER, allow=False, auth_time=now)
+        service.note_failed_lookup(USER)
+
+        bystander = service.start({"client_id": CLIENT}, now=now)
+        approval = service.pending(bystander["user_code"], OTHER)
+        assert approval is not None
+        service.decide(approval, user_id=OTHER, allow=True, auth_time=now)
+
+        flows = IdentityFlows(
+            settings,
+            Hooks(),
+            IdentityStores(
+                refresh_tokens=InMemoryRefreshTokenStore(), device_grants=stores.grants, device_codes=stores.codes
+            ),
+            tokens,
+        )
+        result = flows.purge_user(USER)
+        assert result.device_grants == 1
+        assert result.device_codes >= 1
+
+        remaining = client.scan(TableName="wp-test-device-codes")["Items"]
+        keys = [item["device_code_hash"]["S"] for item in remaining]
+        assert not [key for key in keys if USER in key]
+        assert any(OTHER in key for key in keys)
+        assert service.list_grants(USER) == []

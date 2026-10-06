@@ -193,7 +193,12 @@ class TokenService:
     @property
     def mfa_audience(self) -> str:
         """The audience an MFA ticket carries: `<issuer>/mfa`, per section 3.2."""
-        return f"{self._settings.issuer.rstrip('/')}/mfa"
+        return self._settings.mfa_ticket_audience
+
+    @property
+    def device_audience(self) -> str:
+        """The audience a device login's access token carries, distinct from `settings.audience`."""
+        return self._settings.device_token_audience
 
     def verify_mfa_ticket(self, token: str, *, now: int | None = None) -> dict[str, Any]:
         """Verify an MFA ticket and return its claims, or raise `InvalidToken`.

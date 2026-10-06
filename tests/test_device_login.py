@@ -80,6 +80,7 @@ class Issuer:
         self.polls = list(polls or [])
         self.requests: list[httpx.Request] = []
         self.forms: list[dict[str, str]] = []
+        self.revoke_status = 200
         self.refresh_answer: tuple[int, dict[str, Any]] = (
             200,
             {
@@ -128,7 +129,7 @@ class Issuer:
             status, body = self.refresh_answer
             return httpx.Response(status, json=body)
         if path == "/api/auth/device/revoke":
-            return httpx.Response(200)
+            return httpx.Response(self.revoke_status)
         return httpx.Response(404, json={"error": "not_found"})
 
 
@@ -305,7 +306,8 @@ class TestLogout:
         issuer = Issuer()
         client, ring, _, _ = build(issuer)
         client.login()
-        assert client.logout() is True
+        result = client.logout()
+        assert result and result.revoked
         assert issuer.requests[-1].url.path == "/api/auth/device/revoke"
         assert issuer.forms[-1] == {"token": REFRESH, "client_id": CLIENT}
         assert ring.items == {}
@@ -313,7 +315,7 @@ class TestLogout:
     def test_logout_without_a_session_is_false(self) -> None:
         """Nothing to sign out of."""
         client, _, _, _ = build(Issuer())
-        assert client.logout() is False
+        assert not client.logout()
 
     def test_logout_forgets_even_when_the_server_is_down(self) -> None:
         """A failed revoke still clears the local session."""
@@ -324,13 +326,26 @@ class TestLogout:
         def down(request: httpx.Request) -> httpx.Response:
             raise httpx.ConnectError(f"refused {REFRESH}")
 
+        out = io.StringIO()
         offline = DeviceLoginClient(
-            ISSUER, CLIENT, http=httpx.Client(transport=httpx.MockTransport(down)), keyring_backend=ring
+            ISSUER, CLIENT, http=httpx.Client(transport=httpx.MockTransport(down)), keyring_backend=ring, out=out
         )
-        with pytest.raises(DeviceLoginError) as caught:
-            offline.logout()
+        result = offline.logout()
+        assert result and not result.revoked
         assert ring.items == {}
-        _assert_no_secret(str(caught.value))
+        assert "may stay live" in out.getvalue()
+        _assert_no_secret(out.getvalue())
+
+    def test_a_refused_revoke_warns_and_still_forgets(self) -> None:
+        """A non-200 answer to the revoke is reported, and the local session still goes."""
+        issuer = Issuer()
+        client, ring, _, out = build(issuer)
+        client.login()
+        issuer.revoke_status = 503
+        result = client.logout()
+        assert result and not result.revoked
+        assert ring.items == {}
+        assert "did not confirm" in out.getvalue()
 
 
 class TestSecrecy:
@@ -442,3 +457,56 @@ def test_a_missing_keyring_package_names_the_extra(monkeypatch: pytest.MonkeyPat
     monkeypatch.setattr(builtins, "__import__", fake_import)
     with pytest.raises(DeviceLoginError, match=r"webbpulse\[device-login\]"):
         DeviceLoginClient(ISSUER, CLIENT).stored()
+
+
+class TestKeyringSafety:
+    """The client refuses unsafe keyrings and keeps each entry within the smallest platform cap."""
+
+    def test_a_plaintext_backend_is_refused(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """A backend on the refused list raises instead of holding tokens."""
+        import webbpulse.device_login as device_login
+
+        monkeypatch.setattr(device_login, "_REFUSED_KEYRINGS", frozenset({"keyring.backends.null.Keyring"}))
+        with pytest.raises(DeviceLoginError, match="not safe for tokens"):
+            device_login._default_keyring()
+
+    def test_an_oversized_entry_drops_the_access_token(self) -> None:
+        """When the pair would not fit, only the refresh token is kept and the access token is minted again."""
+        from webbpulse.device_login import KEYRING_ENTRY_BUDGET
+
+        ring = FakeKeyring()
+        client = DeviceLoginClient(ISSUER, CLIENT, keyring_backend=ring)
+        client._save(
+            StoredSession(
+                issuer=ISSUER,
+                client_id=CLIENT,
+                access_token="a" * (KEYRING_ENTRY_BUDGET + 10),
+                refresh_token=REFRESH,
+                expires_at=1.0,
+                refresh_expires_at=2.0,
+            )
+        )
+        (text,) = ring.items.values()
+        assert len(text) <= KEYRING_ENTRY_BUDGET
+        stored = json.loads(text)
+        assert stored["access_token"] == ""
+        assert stored["refresh_token"] == REFRESH
+
+    def test_an_entry_too_large_even_without_the_access_token_is_refused(self) -> None:
+        """A refresh token that alone breaks the budget is an error, not a truncated write."""
+        from webbpulse.device_login import KEYRING_ENTRY_BUDGET
+
+        ring = FakeKeyring()
+        client = DeviceLoginClient(ISSUER, CLIENT, keyring_backend=ring)
+        with pytest.raises(DeviceLoginError, match="too large"):
+            client._save(
+                StoredSession(
+                    issuer=ISSUER,
+                    client_id=CLIENT,
+                    access_token=ACCESS,
+                    refresh_token="r" * KEYRING_ENTRY_BUDGET,
+                    expires_at=1.0,
+                    refresh_expires_at=2.0,
+                )
+            )
+        assert ring.items == {}

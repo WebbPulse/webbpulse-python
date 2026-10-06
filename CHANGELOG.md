@@ -36,6 +36,44 @@ This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   session when no `WP_TF_TOKEN` or `TF_TOKEN_<host>` is set, before the `terraform login`
   file. The session sends the staging access gate header like every other request. The
   `tf` extra now includes `keyring`.
+- `identity` device grant hardening: device access tokens carry their own audience,
+  `device_token_audience` (`<issuer>/device` unless `device_audience` is set), and every
+  browser-session route (`_claims_from_request`, the subject resolver, MCP authorize and
+  consent, step-up, password, TOTP, logout-all, device approval, e2e users) refuses any
+  token with a `grant` or `client_id` claim. A resource server opts in to device tokens by
+  adding that audience to its gateway JWT authorizer, or with
+  `JwksVerifier.from_settings(..., accept_device_tokens=True)` and
+  `LocalAuthorizerMiddleware(..., accept_device_tokens=True)`, and must then pass the
+  grant store as `claims_or_api_key(..., device_grants=stores.grants)`, which checks the
+  grant is live with a cache of at most five seconds (`DeviceGrantLiveness`). Without
+  `device_grants`, `claims_or_api_key` refuses any claims carrying `grant: "device"`, so
+  an unwired product fails closed. The OAuth subject resolver does not fall back to the
+  refresh cookie when the request presents a device or MCP token. Password change and
+  reset revoke device grants. `purge_user` deletes the user's grants when
+  `IdentityStores.device_grants` is set, and their decided device requests and failed
+  lookup counters when the new `IdentityStores.device_codes` is set, reported as
+  `PurgeResult.device_grants` and `PurgeResult.device_codes`; a decided request is found
+  through an `owner#<user>` item in `device-codes`, so the purge needs no scan. The
+  approval HMAC and refresh secrets use keys derived from the identity master key
+  (`totp_master_key`, `IDENTITY_TOTP_MASTER_KEY` or the app secret's `mfa_master_key`),
+  with no fallback, and `build_identity_router` raises `DeviceGrantKeyMissing` at startup
+  when the grant is on without one. `DeviceGrantKeyMissing`, `DeviceGrantLiveness` and
+  `claims.is_browser_session` are exported from `webbpulse.identity`. `POST /device/approve` needs an
+  `Origin` equal to the issuer's, and `DELETE /device/grants/{id}` one equal to the issuer
+  or `frontend_base_url`. Failed user code lookups are capped per user as well as per IP,
+  IP limits group IPv6 by /64 (`ratelimit.identity_from_ip_prefix`), and `/device/grants`
+  is rate limited. A refresh token presented again within 30 seconds of its rotation gets
+  the same successor instead of revoking the grant. An unknown or used device code answers
+  `invalid_grant`. User code collisions retry through a conditional put. No table schema
+  change: the per-user counter and user code reservations are items in `device-codes`, and
+  `rotated_at` is a plain attribute on `device-grants`. The service role needs
+  `TransactWriteItems`, `PutItem`, `UpdateItem`, `DeleteItem` and `GetItem` on both tables.
+- `device_login`: refreshes run under a file lock in the user cache directory, the
+  plaintext and fail keyring backends are refused, and an entry too large for the Windows
+  credential store drops the access token. `logout` returns `LogoutResult` and warns when
+  the server did not confirm the revocation. `wp-tf` refuses an `--issuer` whose origin
+  (scheme, host and port) differs from the API's, since the session and the gate header
+  are sent only there.
 
 ### Fixed
 
