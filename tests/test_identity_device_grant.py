@@ -4,7 +4,10 @@ from __future__ import annotations
 
 import dataclasses
 import re
+import socket
+import threading
 import time
+from collections.abc import Iterator
 from datetime import timedelta
 from typing import Any
 
@@ -12,6 +15,7 @@ import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
+from webbpulse.e2e.browser import browser_is_available
 from webbpulse.identity import (
     DEVICE_APPROVE_PATH,
     DEVICE_CODE_GRANT_TYPE,
@@ -467,6 +471,7 @@ class TestApproval:
         assert "form-action 'self'" in page.headers["content-security-policy"]
         assert page.headers["x-frame-options"] == "DENY"
         assert page.headers["cache-control"] == "no-store"
+        assert page.headers["referrer-policy"] == "same-origin"
 
     def test_a_wrong_code_is_refused(self, harness: Harness) -> None:
         """A code no request holds shows the entry form again with an error."""
@@ -526,9 +531,20 @@ class TestApproval:
         response = harness.client.post(harness.url(DEVICE_APPROVE_PATH), data=form, headers=harness.browser(OTHER))
         assert response.status_code == 400
 
-    @pytest.mark.parametrize("origin", ["https://evil.example.com", "https://app.staging.example.com", ""])
-    def test_an_approval_from_another_origin_is_refused(self, harness: Harness, origin: str) -> None:
-        """The approval must carry this issuer's own `Origin`; a missing one is refused too."""
+    @pytest.mark.parametrize(
+        ("origin", "fetch_site"),
+        [
+            ("https://evil.example.com", ""),
+            ("https://app.staging.example.com", ""),
+            ("", ""),
+            ("null", ""),
+            ("null", "cross-site"),
+            ("null", "same-site"),
+            ("https://evil.example.com", "same-origin"),
+        ],
+    )
+    def test_an_approval_from_another_origin_is_refused(self, harness: Harness, origin: str, fetch_site: str) -> None:
+        """The approval must carry this issuer's own `Origin`; a missing or unvouched null one is refused too."""
         started = harness.start()
         headers = harness.browser()
         form = harness.approval_form(started["user_code"], headers)
@@ -536,9 +552,22 @@ class TestApproval:
         sent = {key: value for key, value in headers.items() if key != "Origin"}
         if origin:
             sent["Origin"] = origin
+        if fetch_site:
+            sent["Sec-Fetch-Site"] = fetch_site
         response = harness.client.post(harness.url(DEVICE_APPROVE_PATH), data=form, headers=sent)
         assert response.status_code == 403
         assert harness.poll(started["device_code"]).json()["error"] == "authorization_pending"
+
+    def test_a_null_origin_the_browser_vouches_for_is_accepted(self, harness: Harness) -> None:
+        """A form posted under a strict referrer policy sends `Origin: null` with `Sec-Fetch-Site: same-origin`."""
+        started = harness.start()
+        headers = harness.browser()
+        form = harness.approval_form(started["user_code"], headers)
+        form["decision"] = "allow"
+        sent = {**headers, "Origin": "null", "Sec-Fetch-Site": "same-origin"}
+        response = harness.client.post(harness.url(DEVICE_APPROVE_PATH), data=form, headers=sent)
+        assert response.status_code == 200
+        assert harness.poll(started["device_code"]).status_code == 200
 
     def test_a_device_token_cannot_approve_another_device(self, harness: Harness) -> None:
         """A CLI session is not a browser: its token is refused on the approval page."""
@@ -1369,3 +1398,63 @@ def test_the_dynamo_purge_reaches_decided_codes_without_a_scan(fake_kms: Any) ->
         assert not [key for key in keys if USER in key]
         assert any(OTHER in key for key in keys)
         assert service.list_grants(USER) == []
+
+
+_CHROMIUM_MISSING = browser_is_available("chromium")
+
+
+def _free_port() -> int:
+    """A loopback port nothing is listening on."""
+    with socket.socket() as probe:
+        probe.bind(("127.0.0.1", 0))
+        return int(probe.getsockname()[1])
+
+
+@pytest.fixture
+def served(fake_kms: Any) -> Iterator[tuple[Harness, str]]:
+    """A harness whose app listens on loopback, with its issuer on that same origin."""
+    import uvicorn
+
+    port = _free_port()
+    origin = f"http://127.0.0.1:{port}"
+    harness = Harness(fake_kms, environment="local", issuer=f"{origin}/api/auth")
+    server = uvicorn.Server(uvicorn.Config(harness.client.app, host="127.0.0.1", port=port, log_level="warning"))
+    thread = threading.Thread(target=server.run, daemon=True)
+    thread.start()
+    deadline = time.monotonic() + 10
+    while not server.started:
+        assert time.monotonic() < deadline, "the test server did not start"
+        time.sleep(0.05)
+    try:
+        yield harness, origin
+    finally:
+        server.should_exit = True
+        thread.join(timeout=10)
+
+
+@pytest.mark.skipif(bool(_CHROMIUM_MISSING), reason=_CHROMIUM_MISSING or "chromium is available")
+def test_a_browser_approves_through_the_real_page(served: tuple[Harness, str]) -> None:
+    """Clicking "Allow access" in Chromium approves the code, and the CLI's next poll gets tokens."""
+    from playwright.sync_api import sync_playwright
+
+    harness, origin = served
+    started = harness.start()
+    bearer = {key: value for key, value in harness.browser().items() if key != "Origin"}
+    with sync_playwright() as playwright:
+        try:
+            browser = playwright.chromium.launch()
+        except Exception as error:
+            if "Executable doesn't exist" not in str(error):
+                raise
+            pytest.skip("this Playwright's chromium build is not installed where it looks")
+        try:
+            context = browser.new_context(extra_http_headers=bearer)
+            page = context.new_page()
+            page.goto(f"{origin}{harness.url(DEVICE_VERIFY_PATH)}?user_code={started['user_code']}")
+            with page.expect_response(lambda response: response.request.method == "POST") as posted:
+                page.get_by_role("button", name="Allow access").click()
+            assert posted.value.status == 200, posted.value.text()
+            assert "Device connected" in page.content()
+        finally:
+            browser.close()
+    assert harness.poll(started["device_code"]).status_code == 200
