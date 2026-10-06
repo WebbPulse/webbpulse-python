@@ -7,6 +7,8 @@ This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## Unreleased
 
+## 0.71.0
+
 ### Added
 
 - `identity`: the RFC 8628 OAuth device authorization grant, so a CLI signs a person in
