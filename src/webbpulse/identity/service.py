@@ -10,6 +10,7 @@ import logging
 import time
 import uuid
 from collections.abc import Mapping, Sequence
+from datetime import timedelta
 from typing import TYPE_CHECKING, Any, Final
 
 from webbpulse.identity.tokens import (
@@ -127,14 +128,22 @@ class TokenService:
         audience: str | Sequence[str] | None = None,
         session_id: str | None = None,
         now: int | None = None,
+        ttl: timedelta | None = None,
     ) -> str:
         """A signed RS256 access token for `subject`.
 
         `claims` are the product's own; any registered claim among them is dropped rather
         than honoured. No `nbf` is set, since `iat` and `exp` already bound the window.
+        `ttl` overrides `access_token_ttl` for one token and may not exceed
+        `MAX_ACCESS_TOKEN_TTL`.
         """
+        from webbpulse.identity.settings import MAX_ACCESS_TOKEN_TTL
+
         issued_at = int(time.time()) if now is None else now
-        ttl = int(self._settings.access_token_ttl.total_seconds())
+        lifetime = self._settings.access_token_ttl if ttl is None else ttl
+        if not timedelta(0) < lifetime <= MAX_ACCESS_TOKEN_TTL:
+            raise ValueError(f"An access token lifetime must be positive and at most {MAX_ACCESS_TOKEN_TTL}.")
+        ttl_seconds = int(lifetime.total_seconds())
 
         payload: dict[str, Any] = {}
         if claims:
@@ -145,7 +154,7 @@ class TokenService:
                 "sub": subject,
                 "aud": list(audience) if isinstance(audience, (list, tuple)) else (audience or self._settings.audience),
                 "iat": issued_at,
-                "exp": issued_at + ttl,
+                "exp": issued_at + ttl_seconds,
                 "jti": uuid.uuid4().hex,
                 "typ": ACCESS_TOKEN_TYPE,
             }
@@ -184,7 +193,12 @@ class TokenService:
     @property
     def mfa_audience(self) -> str:
         """The audience an MFA ticket carries: `<issuer>/mfa`, per section 3.2."""
-        return f"{self._settings.issuer.rstrip('/')}/mfa"
+        return self._settings.mfa_ticket_audience
+
+    @property
+    def device_audience(self) -> str:
+        """The audience a device login's access token carries, distinct from `settings.audience`."""
+        return self._settings.device_token_audience
 
     def verify_mfa_ticket(self, token: str, *, now: int | None = None) -> dict[str, Any]:
         """Verify an MFA ticket and return its claims, or raise `InvalidToken`.

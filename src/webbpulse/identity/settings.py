@@ -17,6 +17,8 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 __all__ = [
     "MAX_ACCESS_TOKEN_TTL",
     "MAX_AUTHORIZATION_CODE_TTL",
+    "MAX_DEVICE_CODE_TTL",
+    "MAX_DEVICE_SESSION_TTL",
     "MAX_SIGNING_KEYS",
     "IdentitySettings",
     "OAuthProvider",
@@ -37,6 +39,10 @@ MAX_ACCESS_TOKEN_TTL: Final = timedelta(hours=1)
 MAX_SIGNING_KEYS: Final = 4
 
 MAX_AUTHORIZATION_CODE_TTL: Final = timedelta(minutes=10)
+
+MAX_DEVICE_CODE_TTL: Final = timedelta(minutes=30)
+
+MAX_DEVICE_SESSION_TTL: Final = timedelta(hours=24)
 
 _PLAINTEXT_ISSUER_ENVIRONMENTS: Final[frozenset[str]] = frozenset({"local", "test"})
 
@@ -320,6 +326,82 @@ class IdentitySettings(BaseSettings):
         ),
     )
 
+    device_grant_enabled: bool = Field(
+        default=False,
+        description=(
+            "Mount the RFC 8628 device authorization grant, so a CLI can sign a person in "
+            "through the browser. Off by default: it opens a code endpoint and an approval "
+            "page, which a product with no CLI should never expose."
+        ),
+    )
+    device_clients: dict[str, str] = Field(
+        default_factory=dict,
+        description=(
+            "The clients allowed to start a device login, as client id to the name the "
+            "approval page shows. Required when `device_grant_enabled` is on."
+        ),
+    )
+    device_scopes_supported: list[str] = Field(
+        default_factory=list,
+        description=(
+            "The scopes a device login may be granted. A request naming anything outside "
+            "this list is refused. Required when `device_grant_enabled` is on."
+        ),
+    )
+    device_explicit_scopes: list[str] = Field(
+        default_factory=list,
+        description=(
+            "Supported scopes granted only when the client names them, never by default, "
+            "such as apply and admin scopes. A request that names no scope gets every "
+            "supported scope except these."
+        ),
+    )
+    device_audience: str = Field(
+        default="",
+        description=(
+            "The `aud` a device login's access token carries. Empty means `<issuer>/device`. "
+            "It must differ from `audience`, so browser session routes refuse device tokens "
+            "by construction; a resource server that serves the CLI accepts it explicitly."
+        ),
+    )
+    device_access_token_ttl: timedelta = Field(
+        default=timedelta(hours=1),
+        description="How long a device login's access token lives. Capped at an hour.",
+    )
+    device_session_ttl: timedelta = Field(
+        default=timedelta(hours=12),
+        description=(
+            "The hard cap on a device login: its refresh token rotates on every use and "
+            "stops working this long after approval, whatever the activity."
+        ),
+    )
+    device_code_ttl: timedelta = Field(
+        default=timedelta(minutes=10),
+        description="How long a device code and its user code wait for approval.",
+    )
+    device_poll_interval: int = Field(
+        default=5,
+        description="The seconds a client must wait between polls. Polling faster is `slow_down`.",
+    )
+    device_approval_max_age: timedelta = Field(
+        default=timedelta(minutes=10),
+        description=(
+            "The oldest sign-in that may approve a device login. Approval is a step-up, so "
+            "an older session is sent back through `device_login_url` with `prompt=login`."
+        ),
+    )
+    device_login_url: str = Field(
+        default="",
+        description=(
+            "The product's web sign-in page for the device approval page. Empty falls back "
+            "to `mcp_login_url`, and then to a 401 `login_required` answer."
+        ),
+    )
+    device_login_return_param: str = Field(
+        default="returnTo",
+        description="The query parameter on `device_login_url` that carries the approval URL back.",
+    )
+
     @field_validator("issuer", "frontend_base_url", mode="before")
     @classmethod
     def _strip_trailing_slash(cls, value: object) -> object:
@@ -446,6 +528,73 @@ class IdentitySettings(BaseSettings):
                 "that already holds the verifier, so a long-lived one is only an interception window."
             )
         return self
+
+    @model_validator(mode="after")
+    def _check_device_grant(self) -> IdentitySettings:
+        """Refuse a device grant that names no client or scope, or outlives its caps."""
+        if not self.device_grant_enabled:
+            return self
+        if not self.device_clients or any(not client_id.strip() for client_id in self.device_clients):
+            raise ValueError("device_grant_enabled is on and device_clients names no client, so no CLI could start.")
+        if not self.device_scopes_supported:
+            raise ValueError("device_grant_enabled is on and device_scopes_supported is empty.")
+        stray = sorted(set(self.device_explicit_scopes) - set(self.device_scopes_supported))
+        if stray:
+            raise ValueError(f"device_explicit_scopes names scopes device_scopes_supported does not: {stray}.")
+        if not timedelta(0) < self.device_access_token_ttl <= MAX_ACCESS_TOKEN_TTL:
+            raise ValueError(f"device_access_token_ttl must be positive and at most {MAX_ACCESS_TOKEN_TTL}.")
+        if not timedelta(0) < self.device_session_ttl <= MAX_DEVICE_SESSION_TTL:
+            raise ValueError(f"device_session_ttl must be positive and at most {MAX_DEVICE_SESSION_TTL}.")
+        if self.device_session_ttl < self.device_access_token_ttl:
+            raise ValueError("device_session_ttl is shorter than device_access_token_ttl.")
+        if not timedelta(0) < self.device_code_ttl <= MAX_DEVICE_CODE_TTL:
+            raise ValueError(f"device_code_ttl must be positive and at most {MAX_DEVICE_CODE_TTL}.")
+        if not 1 <= self.device_poll_interval <= 60:
+            raise ValueError("device_poll_interval must be between 1 and 60 seconds.")
+        if self.device_approval_max_age <= timedelta(0):
+            raise ValueError(
+                "device_approval_max_age must be positive. Approving a device login is a step-up, "
+                "so there is no setting that turns the recent sign-in check off."
+            )
+        self._check_login_url("device_login_url", self.device_login_url, self.device_login_return_param)
+        if self.device_token_audience in {self.audience, self.mcp_resource_url, self.mfa_ticket_audience}:
+            raise ValueError(
+                "device_audience must differ from audience, mcp_resource_url and the MFA ticket "
+                "audience, or a device token would pass as another kind of token."
+            )
+        if self.totp_master_key:
+            from webbpulse.identity.crypto import MASTER_KEY_BYTES
+
+            try:
+                raw = base64.b64decode(self.totp_master_key.encode("ascii"), validate=True)
+            except Exception as exc:
+                raise ValueError(f"totp_master_key is not valid base64: {exc}") from exc
+            if len(raw) != MASTER_KEY_BYTES:
+                raise ValueError(
+                    f"totp_master_key decodes to {len(raw)} bytes, expected {MASTER_KEY_BYTES}. "
+                    "The device grant derives its approval and refresh keys from it."
+                )
+        return self
+
+    def _check_login_url(self, name: str, url: str, return_param: str) -> None:
+        """Refuse a sign-in redirect target a browser could be sent somewhere unsafe by."""
+        if not return_param.strip():
+            raise ValueError(f"The return parameter for {name} must name the query parameter the sign-in page reads.")
+        if not url:
+            return
+        parsed = urlparse(url)
+        if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+            raise ValueError(f"{name} must be an absolute http(s) URL, got {url!r}.")
+        if parsed.fragment:
+            raise ValueError(f"{name} must have no fragment, got {url!r}.")
+        if parsed.scheme == "http" and self.environment.strip().lower() not in _PLAINTEXT_ISSUER_ENVIRONMENTS:
+            raise ValueError(
+                f"{name} {url!r} is plaintext http in environment {self.environment!r}. "
+                "The sign-in page it names collects credentials."
+            )
+        existing = {key for key, _ in parse_qsl(parsed.query, keep_blank_values=True)}
+        if return_param in existing or "prompt" in existing:
+            raise ValueError(f"{name} {url!r} already carries {return_param!r} or 'prompt', which the redirect writes.")
 
     def _check_mcp_login(self) -> None:
         """Refuse a sign-in redirect a browser could be sent somewhere unsafe by.
@@ -575,6 +724,16 @@ class IdentitySettings(BaseSettings):
         if not self.totp_master_key:
             return b""
         return base64.b64decode(self.totp_master_key.encode("ascii"), validate=True)
+
+    @property
+    def device_token_audience(self) -> str:
+        """The `aud` of a device login's access token: `device_audience`, else `<issuer>/device`."""
+        return self.device_audience or f"{self.issuer.rstrip('/')}/device"
+
+    @property
+    def mfa_ticket_audience(self) -> str:
+        """The `aud` of an MFA ticket: `<issuer>/mfa`."""
+        return f"{self.issuer.rstrip('/')}/mfa"
 
     @property
     def local_signer_seed_value(self) -> str:

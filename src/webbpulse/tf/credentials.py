@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import json
 import os
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from pathlib import Path
 
 TOKEN_ENV = "WP_TF_TOKEN"
@@ -52,8 +52,17 @@ def _file_token(path: Path, host: str) -> str | None:
     return token if isinstance(token, str) and token else None
 
 
-def resolve_token(host: str, environ: Mapping[str, str] | None = None, home: Path | None = None) -> str:
-    """The key for `host`: `WP_TF_TOKEN`, then `TF_TOKEN_<host>`, then `credentials.tfrc.json`.
+def resolve_token(
+    host: str,
+    environ: Mapping[str, str] | None = None,
+    home: Path | None = None,
+    *,
+    session_token: Callable[[], str | None] | None = None,
+) -> str:
+    """The key for `host`: `WP_TF_TOKEN`, `TF_TOKEN_<host>`, a `wp-tf login` session, `credentials.tfrc.json`.
+
+    `session_token` answers the stored device login's current access token, or `None` when
+    there is none; it is only called when no key is set in the environment.
 
     Raises:
         CredentialsError: None of them holds a token.
@@ -66,11 +75,15 @@ def resolve_token(host: str, environ: Mapping[str, str] | None = None, home: Pat
         value = env.get(name, "").strip()
         if value:
             return value
+    if session_token is not None:
+        session = session_token()
+        if session:
+            return session
     path = credentials_file(env, home)
     token = _file_token(path, host)
     if token:
         return token
-    raise CredentialsError(f"no token for {host}; run `terraform login {host}` or set {TOKEN_ENV}")
+    raise CredentialsError(f"no token for {host}; run `wp-tf login`, `terraform login {host}` or set {TOKEN_ENV}")
 
 
 __all__ = [

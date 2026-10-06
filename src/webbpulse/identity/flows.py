@@ -165,6 +165,8 @@ class PurgeResult:
     identity_tokens: int = 0
     webauthn_challenges: int = 0
     api_keys: int = 0
+    device_grants: int = 0
+    device_codes: int = 0
     unsupported: tuple[str, ...] = ()
 
     @property
@@ -180,6 +182,8 @@ class PurgeResult:
             + self.identity_tokens
             + self.webauthn_challenges
             + self.api_keys
+            + self.device_grants
+            + self.device_codes
         )
 
     def counts(self) -> dict[str, int]:
@@ -194,6 +198,8 @@ class PurgeResult:
             "identity_tokens": self.identity_tokens,
             "webauthn_challenges": self.webauthn_challenges,
             "api_keys": self.api_keys,
+            "device_grants": self.device_grants,
+            "device_codes": self.device_codes,
         }
 
 
@@ -734,6 +740,7 @@ class IdentityFlows:
         )
 
         revoked = self._revoke_families(user_id, keep_family_id=keep_family_id, family_ids=family_ids)
+        revoked += self._revoke_device_grants(user_id)
         _log.info(
             "Password changed.",
             extra={
@@ -867,6 +874,7 @@ class IdentityFlows:
         )
 
         revoked = self._revoke_families(record.user_id, family_ids=family_ids)
+        revoked += self._revoke_device_grants(record.user_id)
 
         try:
             self._hooks.mark_email_verified(record.user_id)
@@ -1182,6 +1190,17 @@ class IdentityFlows:
         )
         return {"deleted": deleted, "deleted_count": len(deleted), "cutoff": cutoff.isoformat()}
 
+    def _revoke_device_grants(self, user_id: str) -> int:
+        """Revoke every CLI login this user holds, when the device grant store is configured.
+
+        A password change or reset is the remedy for a compromise, and a device login is a
+        session like any other, so it ends with the rest.
+        """
+        grants = self._stores.device_grants
+        if grants is None:
+            return 0
+        return grants.revoke_all_for_user(user_id)
+
     def purge_user(self, user_id: str) -> PurgeResult:
         """Delete every identity row for a user the product has already deleted.
 
@@ -1199,7 +1218,9 @@ class IdentityFlows:
         The user's API keys go too when `IdentityStores.api_keys` is set. That table has no
         TTL, so a failed key delete raises and is retried rather than leaving keys behind
         forever. Only rows whose `user_id` is this user's are touched, so a key minted for a
-        non-user subject, such as a run or registry token, is never reached.
+        non-user subject, such as a run or registry token, is never reached. The user's device
+        logins go too when `IdentityStores.device_grants` is set, and the device requests they
+        decided and their failed lookup counters when `IdentityStores.device_codes` is.
         """
         cleaned = user_id.strip()
         if not cleaned:
@@ -1220,6 +1241,8 @@ class IdentityFlows:
                 return 0
 
         stores = self._stores
+        device_grants = stores.device_grants
+        device_codes = stores.device_codes
         result = PurgeResult(
             user_id=cleaned,
             refresh_tokens=counted(
@@ -1263,6 +1286,16 @@ class IdentityFlows:
             api_keys=(
                 counted("api_keys", lambda: stores.require_api_keys().delete_all_for_user(cleaned))
                 if stores.api_keys is not None
+                else 0
+            ),
+            device_grants=(
+                counted("device_grants", lambda: device_grants.delete_all_for_user(cleaned))
+                if device_grants is not None
+                else 0
+            ),
+            device_codes=(
+                counted("device_codes", lambda: _purge_device_codes(device_codes, cleaned))
+                if device_codes is not None
                 else 0
             ),
             unsupported=tuple(unsupported),
@@ -1840,3 +1873,10 @@ def _device_class(user_agent: str) -> str:
     if "mozilla" in lowered or "safari" in lowered or "chrome" in lowered:
         return "desktop"
     return "other"
+
+
+def _purge_device_codes(codes: Any, user_id: str) -> int:
+    """Delete a user's decided device requests and the failure counters of the current windows."""
+    from webbpulse.identity.device_grant import DEVICE_USER_CODE_FAILURE_LIMIT
+
+    return int(codes.delete_all_for_user(user_id, window=DEVICE_USER_CODE_FAILURE_LIMIT[1]))

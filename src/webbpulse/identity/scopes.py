@@ -180,6 +180,7 @@ def claims_or_api_key(
     | Callable[[ApiKeyRecord], Awaitable[Iterable[str]]]
     | None = None,
     tenant: Callable[[Request], str] | None = None,
+    device_grants: Any = None,
 ) -> Any:
     """Build the dependency returning verified claims from either credential.
 
@@ -205,11 +206,25 @@ def claims_or_api_key(
             learn which exist. `None` leaves the binding unchecked, which is right only for a
             single-tenant product; a multi-tenant one that leaves it `None` must make the
             check itself against `claims_tenant`.
+        device_grants: The `DeviceGrantStore`, or a `DeviceGrantLiveness` over it, for a
+            product whose authorizer accepts the device login audience. Claims carrying
+            `grant: "device"` are then refused with the same 401 once their grant is revoked
+            or past its cap, within the liveness cache's few seconds. Left `None`, any claims
+            carrying `grant: "device"` are refused outright, so a product that accepts the
+            device audience without wiring the check fails closed rather than honouring a
+            revoked CLI login until its access token expires.
 
     Returns:
         An `async def` dependency suitable for `Depends`.
     """
     _bind_fastapi_request()
+    liveness: Callable[[Mapping[str, Any]], bool] | None = None
+    if device_grants is not None:
+        from webbpulse.identity.device_grant import DeviceGrantLiveness
+
+        liveness = (
+            device_grants if isinstance(device_grants, DeviceGrantLiveness) else DeviceGrantLiveness(device_grants)
+        )
 
     async def dependency(request: Request) -> AuthorizerClaims:
         """Return the verified claims for this request, or raise a 401."""
@@ -219,6 +234,12 @@ def claims_or_api_key(
             _log.warning("Authorizer claims unreadable: %s", exc, exc_info=exc)
             raise _unauthenticated() from exc
         if claims is not None:
+            if liveness is None:
+                if str(claims.get("grant", "") or "") == "device":
+                    _log.warning("Refusing a device login token on a route with no device grant check.")
+                    raise _unauthenticated()
+            elif not liveness(claims):
+                raise _unauthenticated()
             return _tenant_checked(claims, request)
 
         if store is None:

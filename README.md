@@ -42,6 +42,7 @@ The base install carries only `pydantic` and `pydantic-settings`. Everything els
 | `security` | `PyJWT`, `bcrypt` | `webbpulse.security` |
 | `identity` | `PyJWT[crypto]`, `fastapi` | `webbpulse.identity` |
 | `oauth` | `httpx` | OAuth sign-in, on top of `identity` |
+| `device-login` | `httpx`, `keyring` | `webbpulse.device_login`, a CLI signing in through the identity device grant |
 | `github` | `httpx`, `PyJWT[crypto]` | `webbpulse.integrations.github` |
 | `stripe` | `stripe` | `webbpulse.integrations.stripe` |
 | `passkeys` | `webauthn` | `webbpulse.identity.passkeys`, only when `passkeys_enabled` |
@@ -284,10 +285,16 @@ wp-tf plan -w my-workspace --no-follow      # print the run id and return
 wp-tf logs run-... [--phase apply] [-f]
 wp-tf status run-...
 wp-tf workspaces
+wp-tf login [--scope runs:apply]            # sign in through the browser
+wp-tf logout
 ```
 
-- **Key.** It looks for `WP_TF_TOKEN`, then `TF_TOKEN_<host>`, then the key `terraform login`
-  wrote to `credentials.tfrc.json`. There is no separate login.
+- **Key.** It looks for `WP_TF_TOKEN`, then `TF_TOKEN_<host>`, then the `wp-tf login`
+  session in the OS keyring (refreshed as needed), then the key `terraform login` wrote to
+  `credentials.tfrc.json`.
+- **Login.** `wp-tf login` prints a URL and a code, you approve in the browser, and the
+  session lasts up to 12 hours. Apply and admin scopes are granted only when named with
+  `--scope`. `wp-tf logout` revokes the session on the server and forgets it.
 - **Scopes.** That key can read and plan. It cannot confirm, apply or read raw state, and
   `wp-tf` has no command that tries.
 - **Host.** `--host` or `WP_TF_HOST` sets the host, defaulting to

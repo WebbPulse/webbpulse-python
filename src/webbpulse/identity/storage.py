@@ -23,6 +23,7 @@ from webbpulse.identity.crypto import SCHEME_KMS_ENVELOPE
 if TYPE_CHECKING:  # pragma: no cover
     from webbpulse.dynamodb import Repository
     from webbpulse.identity.api_keys import ApiKeyStore
+    from webbpulse.identity.device_grant_storage import DeviceCodeStore, DeviceGrantStore
     from webbpulse.identity.oauth import OAuthLinkStore, OAuthStateStore
 
     TABLES: tuple[TableSpec, ...]
@@ -579,6 +580,14 @@ class IdentityStores:
     api_keys: ApiKeyStore | None = None
     """The `api-keys` table, set only by a product that has one, so `purge_user` deletes a
     deleted user's keys. Left `None`, the purge skips it, as it would any absent store."""
+    device_grants: DeviceGrantStore | None = None
+    """The `device-grants` table, for a product with the device grant on. Set, a password
+    change or reset revokes the user's CLI logins and `purge_user` deletes them.
+    `build_identity_router` fills it from `device_grant_stores`; a purge Lambda that builds
+    its own `IdentityFlows` must set it."""
+    device_codes: DeviceCodeStore | None = None
+    """The `device-codes` table, so `purge_user` deletes the requests a deleted user decided
+    and their failed lookup counters. Filled and required alongside `device_grants`."""
 
     def require_credentials(self) -> CredentialStore:
         """The credential store, or a `ValueError` if it was not configured."""

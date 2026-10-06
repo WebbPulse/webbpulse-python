@@ -18,6 +18,7 @@ if TYPE_CHECKING:  # pragma: no cover
 
     from fastapi import APIRouter
 
+    from webbpulse.identity.device_grant_storage import DeviceGrantStores
     from webbpulse.identity.email import EmailSender
     from webbpulse.identity.hooks import IdentityHooks
     from webbpulse.identity.lockout import LoginAttemptStore
@@ -31,6 +32,7 @@ if TYPE_CHECKING:  # pragma: no cover
 __all__ = [
     "build_dynamo_router",
     "create_identity_tables",
+    "dynamo_device_grant_stores",
     "dynamo_login_attempts",
     "dynamo_stores",
 ]
@@ -124,6 +126,31 @@ def dynamo_login_attempts(
     )
 
 
+def dynamo_device_grant_stores(
+    prefix: str | None = None,
+    *,
+    region_name: str | None = None,
+    endpoint_url: str | None = None,
+) -> DeviceGrantStores:
+    """The device grant's two stores, over the `device-codes` and `device-grants` tables under `prefix`."""
+    from webbpulse.identity.device_grant_storage import (
+        DEVICE_CODES_TABLE,
+        DEVICE_GRANTS_TABLE,
+        DeviceGrantStores,
+        DynamoDeviceCodeStore,
+        DynamoDeviceGrantStore,
+    )
+
+    def repository(logical_name: str) -> Any:
+        """A package repository for one device grant table under this prefix."""
+        return _repository(logical_name, prefix=prefix, region_name=region_name, endpoint_url=endpoint_url)
+
+    return DeviceGrantStores(
+        codes=DynamoDeviceCodeStore(repository(DEVICE_CODES_TABLE)),
+        grants=DynamoDeviceGrantStore(repository(DEVICE_GRANTS_TABLE)),
+    )
+
+
 def build_dynamo_router(
     settings: IdentitySettings,
     hooks: IdentityHooks | None = None,
@@ -144,6 +171,7 @@ def build_dynamo_router(
     consent_renderer: ConsentRenderer | None = None,
     tenant_resolver: TenantResolver | None = None,
     api_keys: bool = False,
+    device_grant_stores: DeviceGrantStores | None = None,
 ) -> APIRouter:
     """The identity router over the DynamoDB tables under `prefix`.
 
@@ -186,6 +214,7 @@ def build_dynamo_router(
         oauth_server_stores=oauth_server_stores,
         consent_renderer=consent_renderer,
         tenant_resolver=tenant_resolver,
+        device_grant_stores=device_grant_stores,
     )
 
 

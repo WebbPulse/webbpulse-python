@@ -121,12 +121,21 @@ class JwksVerifier:
         )
 
     @classmethod
-    def from_settings(cls, settings: IdentitySettings, **overrides: Any) -> JwksVerifier:
+    def from_settings(
+        cls, settings: IdentitySettings, *, accept_device_tokens: bool = False, **overrides: Any
+    ) -> JwksVerifier:
         """A verifier for the issuer and audience these settings name.
 
         Reads no signing key ARN, so it builds on a function that has none.
+        `accept_device_tokens` also accepts the device login audience
+        (`settings.device_token_audience`), which a resource server serving a CLI opts into;
+        such a server must also check `device_grant_is_live` for tokens carrying
+        `grant: "device"`. Identity's own session routes never accept them.
         """
-        return cls(issuer=settings.issuer, audience=settings.audience, **overrides)
+        audience: str | list[str] = settings.audience
+        if accept_device_tokens:
+            audience = [settings.audience, settings.device_token_audience]
+        return cls(issuer=settings.issuer, audience=audience, **overrides)
 
     @property
     def jwks_uri(self) -> str:
