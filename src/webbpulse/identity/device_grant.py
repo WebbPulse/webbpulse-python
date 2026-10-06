@@ -696,9 +696,17 @@ def build_device_grant_router(
         revoke_origins.add(_origin_of(settings.frontend_base_url))
 
     def origin_refused(request: Request, allowed: set[str]) -> JSONResponse | None:
-        """A 403 unless the request's `Origin` is one of `allowed`; a missing one is refused too."""
+        """A 403 unless the request's `Origin` is one of `allowed`; a missing one is refused too.
+
+        A browser posting a form under a strict referrer policy sends `Origin: null`, so that
+        value passes only when the browser itself vouches with `Sec-Fetch-Site: same-origin`,
+        a header no page can set.
+        """
         origin = request.headers.get("origin", "").strip().rstrip("/").lower()
         if origin and origin in allowed:
+            return None
+        fetch_site = request.headers.get("sec-fetch-site", "").strip().lower()
+        if origin == "null" and fetch_site == "same-origin":
             return None
         return error_response(
             OAuthServerError("invalid_request", "This request must come from this service's own pages.", status=403)
@@ -999,7 +1007,7 @@ def _render_page(
         headers={
             "Cache-Control": "no-store",
             "Content-Security-Policy": "; ".join(directives),
-            "Referrer-Policy": "no-referrer",
+            "Referrer-Policy": "same-origin",
             "X-Content-Type-Options": "nosniff",
             "X-Frame-Options": "DENY",
         },

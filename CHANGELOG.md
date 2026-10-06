@@ -7,6 +7,12 @@ This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## Unreleased
 
+## 0.71.2
+
+### Fixed
+
+- Device login approval works in a real browser (PLAT-17). The device pages sent `Referrer-Policy: no-referrer`, so Chrome posted the approval form with `Origin: null` and the origin check refused every approval with 403. The pages now send `Referrer-Policy: same-origin`, and the origin check also accepts `Origin: null` when the browser sends `Sec-Fetch-Site: same-origin`. Cross-site posts are still refused. A Chromium test now drives the real page; it skips where no Chromium is installed.
+
 ## 0.71.1
 
 ### Security
