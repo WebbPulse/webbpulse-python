@@ -34,6 +34,11 @@ class FakePlane:
         self.run_body: dict[str, Any] = {}
         self.log_pages = [["Terraform will perform the following actions:"], ["Plan: 1 to add."]]
         self.cancelled = False
+        self.confirm_bodies: list[bytes] = []
+        self.confirm_conflicts = 0
+        self.confirm_status = 200
+        self.discard_bodies: list[bytes] = []
+        self.phases: list[str] = []
 
     def handler(self, request: httpx.Request) -> httpx.Response:
         """Answer one request."""
@@ -61,7 +66,19 @@ class FakePlane:
         if path == "/api/v1/runs/run-1":
             status = self.statuses.pop(0) if len(self.statuses) > 1 else self.statuses[0]
             return httpx.Response(200, json={"run_id": "run-1", "status": status, "changes": self.changes})
+        if path == "/api/v1/runs/run-1/confirm":
+            self.confirm_bodies.append(request.content)
+            if self.confirm_conflicts:
+                self.confirm_conflicts -= 1
+                return httpx.Response(409, json={"detail": {"message": "not awaiting", "error_code": "CONFLICT"}})
+            if self.confirm_status != 200:
+                return httpx.Response(self.confirm_status, json={"message": "Forbidden"})
+            return httpx.Response(200, json={"run_id": "run-1", "status": "applying"})
+        if path == "/api/v1/runs/run-1/discard":
+            self.discard_bodies.append(request.content)
+            return httpx.Response(200, json={"run_id": "run-1", "status": "discarded"})
         if path == "/api/v1/runs/run-1/logs":
+            self.phases.append(request.url.params.get("phase", ""))
             after = request.url.params.get("after")
             index = int(after) if after else 0
             if index < len(self.log_pages):
@@ -74,7 +91,15 @@ class FakePlane:
         return httpx.Response(404, json={"detail": {"message": "not found", "error_code": "NOT_FOUND"}})
 
 
-def _run(plane: FakePlane, argv: list[str], gate: str = "") -> tuple[int, str, str]:
+class Terminal(io.StringIO):
+    """A stdin that claims to be a terminal, holding the typed answer."""
+
+    def isatty(self) -> bool:
+        """Always a terminal."""
+        return True
+
+
+def _run(plane: FakePlane, argv: list[str], gate: str = "", stdin: io.StringIO | None = None) -> tuple[int, str, str]:
     """Run the CLI against the fake plane and return the code, stdout and stderr."""
 
     def connect(args: argparse.Namespace, environ: Mapping[str, str], home: Path | None) -> tuple[str, ControlPlane]:
@@ -83,7 +108,9 @@ def _run(plane: FakePlane, argv: list[str], gate: str = "") -> tuple[int, str, s
         )
 
     out, err = io.StringIO(), io.StringIO()
-    code = cli.main(argv, stdout=out, stderr=err, environ={}, connect=connect, sleep=lambda _: None)
+    code = cli.main(
+        argv, stdout=out, stderr=err, stdin=stdin or io.StringIO(), environ={}, connect=connect, sleep=lambda _: None
+    )
     return code, out.getvalue(), err.getvalue()
 
 
@@ -392,6 +419,31 @@ def test_login_requests_the_named_scopes_and_prints_no_token() -> None:
     assert TOKEN not in out + err
 
 
+def test_add_scope_keeps_the_standard_set() -> None:
+    """`--add-scope` asks for the standard set plus the named scope, so the defaults are not dropped."""
+    device = FakeDevice()
+    assert _session(["login", "--add-scope", "state:download", "--add-scope", "runs:read"], device)[0] == 0
+    assert device.scopes == [*cli.STANDARD_SCOPES, "state:download"]
+    assert "runs:apply" in cli.STANDARD_SCOPES
+    assert "admin" not in cli.STANDARD_SCOPES
+
+
+def test_scope_and_add_scope_are_exclusive() -> None:
+    """Naming both an exact set and an addition is refused."""
+    code, _, err = _session(["login", "--scope", "runs:read", "--add-scope", "admin"], FakeDevice())
+    assert code == 1
+    assert "not allowed with" in err
+
+
+def test_login_help_explains_scopes(capsys: pytest.CaptureFixture[str]) -> None:
+    """`login --help` describes the three ways to choose scopes and the standard set."""
+    with pytest.raises(SystemExit):
+        cli.build_parser().parse_args(["login", "--help"])
+    help_text = capsys.readouterr().out
+    for phrase in ("--add-scope SCOPE", "--scope SCOPE", "no scope flag", "runs:apply", "state:download and admin"):
+        assert phrase in help_text
+
+
 def test_login_without_scopes_asks_for_the_default_set() -> None:
     """No `--scope` sends none, so the server grants its defaults and never apply or admin."""
     device = FakeDevice()
@@ -525,3 +577,140 @@ def test_an_unreadable_keyring_is_quiet(tmp_path: Path, monkeypatch: pytest.Monk
     monkeypatch.setattr("sys.stderr", stderr)
     assert cli._session_token(broken) is None  # type: ignore[arg-type]
     assert stderr.getvalue() == ""
+
+
+APPLY_STATUSES = ["planning", "awaiting_confirmation", "applying", "applied"]
+
+
+def test_apply_prompts_confirms_and_streams_the_apply(tmp_path: Path) -> None:
+    """`apply` starts an applying run, shows the plan, takes `yes`, confirms and streams the apply log."""
+    plane = FakePlane(list(APPLY_STATUSES))
+    code, out, err = _run(plane, ["apply", str(_config(tmp_path)), "-w", "demo"], stdin=Terminal("yes\n"))
+    assert code == 0, err
+    assert plane.run_body["plan_only"] is False
+    assert plane.run_body["is_destroy"] is False
+    assert "Plan: 1 to add, 0 to change, 0 to destroy." in err
+    assert 'Do you want to perform these actions in workspace "demo"?' in err
+    assert len(plane.confirm_bodies) == 1
+    assert plane.discard_bodies == []
+    assert "apply" in plane.phases
+    assert "Apply complete! Resources: 1 added, 0 changed, 0 destroyed." in err
+    assert "Terraform will perform the following actions:" in out
+
+
+def test_a_declined_apply_discards_the_run(tmp_path: Path) -> None:
+    """Anything but `yes` discards the run and exits 1 without confirming."""
+    plane = FakePlane(list(APPLY_STATUSES))
+    code, _, err = _run(plane, ["apply", str(_config(tmp_path)), "-w", "demo"], stdin=Terminal("no\n"))
+    assert code == 1
+    assert plane.confirm_bodies == []
+    assert len(plane.discard_bodies) == 1
+    assert "apply discarded" in err
+
+
+def test_end_of_input_at_the_prompt_discards(tmp_path: Path) -> None:
+    """A terminal closed at the prompt is a decline, not an approval."""
+    plane = FakePlane(list(APPLY_STATUSES))
+    code, _, _ = _run(plane, ["apply", str(_config(tmp_path)), "-w", "demo"], stdin=Terminal(""))
+    assert code == 1
+    assert plane.confirm_bodies == []
+    assert len(plane.discard_bodies) == 1
+
+
+def test_apply_refuses_a_non_interactive_stdin(tmp_path: Path) -> None:
+    """Without `--auto-approve`, a stdin that is not a terminal is refused before any request."""
+    plane = FakePlane(list(APPLY_STATUSES))
+    code, _, err = _run(plane, ["apply", str(_config(tmp_path)), "-w", "demo"], stdin=io.StringIO("yes\n"))
+    assert code == 1
+    assert "--auto-approve" in err
+    assert plane.requests == []
+
+
+def test_auto_approve_skips_the_prompt(tmp_path: Path) -> None:
+    """`--auto-approve` confirms without reading stdin, and `--destroy` asks for a destroy run."""
+    plane = FakePlane(list(APPLY_STATUSES))
+    argv = ["apply", str(_config(tmp_path)), "-w", "demo", "--auto-approve", "--destroy"]
+    code, _, err = _run(plane, argv, stdin=io.StringIO())
+    assert code == 0, err
+    assert plane.run_body["is_destroy"] is True
+    assert "Enter a value" not in err
+    assert len(plane.confirm_bodies) == 1
+
+
+def test_apply_with_no_changes_stops_after_the_plan(tmp_path: Path) -> None:
+    """A plan with no changes finishes the run, so nothing is asked or confirmed."""
+    plane = FakePlane(["planning", "planned_and_finished"], changes={"add": 0, "change": 0, "destroy": 0})
+    code, _, err = _run(plane, ["apply", str(_config(tmp_path)), "-w", "demo"], stdin=Terminal("yes\n"))
+    assert code == 0
+    assert "No changes." in err
+    assert plane.confirm_bodies == []
+
+
+def test_apply_reports_an_errored_plan(tmp_path: Path) -> None:
+    """A plan that errors exits 1 without a prompt."""
+    plane = FakePlane(["planning", "errored"])
+    code, _, err = _run(plane, ["apply", str(_config(tmp_path)), "-w", "demo"], stdin=Terminal("yes\n"))
+    assert code == 1
+    assert "errored" in err
+    assert "Enter a value" not in err
+
+
+def test_apply_reports_a_failed_apply(tmp_path: Path) -> None:
+    """An apply that errors exits 1."""
+    plane = FakePlane(["awaiting_confirmation", "applying", "errored"])
+    code, _, err = _run(plane, ["apply", str(_config(tmp_path)), "-w", "demo", "--auto-approve"])
+    assert code == 1
+    assert "ended errored" in err
+
+
+def test_confirm_retries_while_the_plane_readies_the_run(tmp_path: Path) -> None:
+    """A 409 while the run still awaits confirmation is retried; the second confirm lands."""
+    plane = FakePlane(["awaiting_confirmation", "awaiting_confirmation", "applying", "applied"])
+    plane.confirm_conflicts = 1
+    code, _, err = _run(plane, ["apply", str(_config(tmp_path)), "-w", "demo", "--auto-approve"])
+    assert code == 0, err
+    assert len(plane.confirm_bodies) == 2
+
+
+def test_a_forbidden_confirm_names_the_apply_scope() -> None:
+    """A 403 on confirm says to sign in with runs:apply."""
+    plane = FakePlane(["awaiting_confirmation"])
+    plane.confirm_status = 403
+    code, _, err = _run(plane, ["confirm", "run-1"])
+    assert code == 1
+    assert "wp-tf login --add-scope runs:apply" in err
+
+
+def test_confirm_and_discard_act_on_an_existing_run() -> None:
+    """`confirm` posts the comment and streams the apply; `discard` posts the comment."""
+    plane = FakePlane(["applying", "applied"])
+    code, _, err = _run(plane, ["confirm", "run-1", "--comment", "ship it"])
+    assert code == 0, err
+    assert json.loads(plane.confirm_bodies[0]) == {"comment": "ship it"}
+    assert "apply" in plane.phases
+    plane = FakePlane(["applying"])
+    code, _, _ = _run(plane, ["confirm", "run-1", "--no-follow"])
+    assert code == 0
+    assert plane.confirm_bodies == [b""]
+    assert plane.phases == []
+    plane = FakePlane(["awaiting_confirmation"])
+    code, _, err = _run(plane, ["discard", "run-1", "--comment", "not today"])
+    assert code == 0
+    assert json.loads(plane.discard_bodies[0]) == {"comment": "not today"}
+    assert "discarded run-1" in err
+
+
+def test_interrupting_the_apply_stream_leaves_the_apply_running(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Ctrl-C while following the apply stops following and does not cancel the run."""
+    plane = FakePlane(["applying"])
+
+    def interrupt(*_: Any, **__: Any) -> dict[str, Any]:
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(cli, "follow_run", interrupt)
+    code, _, err = _run(plane, ["confirm", "run-1"])
+    assert code == 130
+    assert not plane.cancelled
+    assert "the apply goes on" in err

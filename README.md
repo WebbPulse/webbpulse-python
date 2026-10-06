@@ -79,7 +79,7 @@ its dev dependencies.
 | `webbpulse.e2e` | A pytest plugin and generic post-deploy suite: route cut, coverage, reachability, identity, frontend and hygiene against a real stage | [e2e.md](docs/e2e.md) |
 | `webbpulse.ops.config` | The `webbpulse-config` console script: operators set keys in the `<prefix>/app` secret and the `/<prefix>/config` parameter | [Operator config CLI](#operator-config-cli) |
 | `webbpulse.ops.admin` | The `webbpulse-admin` console script: operators grant, revoke and list admins in a product's identity `users` table | [Operator admin CLI](#operator-admin-cli) |
-| `webbpulse.tf` | The `wp-tf` console script: plan-only runs on the WebbPulse Terraform control plane from a directory, with the log streamed | [Terraform plan CLI](#terraform-plan-cli-wp-tf) |
+| `webbpulse.tf` | The `wp-tf` console script: plan and apply runs on the WebbPulse Terraform control plane from a directory, with the log streamed | [Terraform CLI](#terraform-cli-wp-tf) |
 
 ## Wiring a FastAPI domain Lambda
 
@@ -270,10 +270,10 @@ when. There is no separate audit table. Addresses are only ever printed masked, 
 Data goes to stdout and diagnostics to stderr. Exit codes: `0` ok, `1` AWS or SDK error, `2`
 usage, `3` no such user, `4` the users table does not exist.
 
-## Terraform plan CLI (`wp-tf`)
+## Terraform CLI (`wp-tf`)
 
-`wp-tf` replaces a remote `terraform plan` against HCP Terraform. It tars a directory, starts
-a plan-only run on a control plane workspace and streams the log. Install it with the `tf`
+`wp-tf` replaces a remote `terraform plan` and `terraform apply` against HCP Terraform. It
+tars a directory, starts a run on a control plane workspace and streams the log. Install it with the `tf`
 extra (`uv tool install "webbpulse[tf]"` against the CodeArtifact index, or add the extra to a
 project).
 
@@ -282,10 +282,14 @@ terraform login terraform.webbpulse.com
 wp-tf plan -w my-workspace                  # plan the current directory
 wp-tf plan infra/prod -w ws-... --detailed-exitcode --destroy
 wp-tf plan -w my-workspace --no-follow      # print the run id and return
+wp-tf apply infra/prod -w my-workspace      # plan, ask, then stream the apply
+wp-tf apply -w my-workspace --auto-approve  # apply without asking
+wp-tf confirm run-... [--comment ...] [--no-follow]
+wp-tf discard run-... [--comment ...]
 wp-tf logs run-... [--phase apply] [-f]
 wp-tf status run-...
 wp-tf workspaces
-wp-tf login [--scope runs:apply]            # sign in through the browser
+wp-tf login [--add-scope state:download]    # sign in through the browser
 wp-tf logout
 ```
 
@@ -293,10 +297,19 @@ wp-tf logout
   session in the OS keyring (refreshed as needed), then the key `terraform login` wrote to
   `credentials.tfrc.json`.
 - **Login.** `wp-tf login` prints a URL and a code, you approve in the browser, and the
-  session lasts up to 12 hours. Apply and admin scopes are granted only when named with
-  `--scope`. `wp-tf logout` revokes the session on the server and forgets it.
-- **Scopes.** That key can read and plan. It cannot confirm, apply or read raw state, and
-  `wp-tf` has no command that tries.
+  session lasts up to 12 hours. `wp-tf logout` revokes the session on the server and forgets
+  it.
+- **Scopes.** With no flag, `wp-tf login` gets the control plane's default set.
+  `--add-scope SCOPE` asks for the standard set (every read and write scope plus
+  `runs:apply`) and the named scope, so adding one never drops the rest. `--scope SCOPE`
+  asks for exactly the named scopes, for a narrower session. `state:download` and `admin`
+  are granted only when named. `wp-tf login --help` lists the standard set.
+- **Apply.** `wp-tf apply` uploads and plans like `plan`, prints the change counts, then asks
+  `Only 'yes' will be accepted to approve.` on stderr and reads the answer from stdin. Any
+  other answer discards the run and exits `1`. Without `--auto-approve` it refuses a stdin
+  that is not a terminal instead of waiting. Confirming needs `runs:apply`; a 403 says to run
+  `wp-tf login --add-scope runs:apply`. `confirm` and `discard` act on an existing run.
+  Ctrl-C while the apply streams stops following and leaves the apply running.
 - **Host.** `--host` or `WP_TF_HOST` sets the host, defaulting to
   `terraform.webbpulse.com`. The API origin comes from the host's discovery document and must
   be https on the host or a subdomain. `--api-url` or `WP_TF_API_URL` can name it instead; it
@@ -315,8 +328,9 @@ wp-tf logout
   gitignore rules. `.git`, `.terraform` and local `*.tfstate` files are always skipped.
   `.tfvars` files are configuration, so they are uploaded. Uploads over 250 MB are refused.
 - **Output and exit codes.** Log lines go to stdout and progress to stderr. It exits `0` when
-  the plan succeeds and `1` on any failure. It exits `2` under `--detailed-exitcode` when the
-  plan has changes, and `130` after Ctrl-C, which also cancels the run. Tokens and the gate
+  the plan or apply succeeds and `1` on any failure or a declined apply. It exits `2` under
+  `--detailed-exitcode` when the plan has changes, and `130` after Ctrl-C, which cancels a
+  run that is still planning. Tokens and the gate
   value are never printed.
 
 ## GitHub App client
