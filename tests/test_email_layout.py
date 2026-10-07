@@ -30,7 +30,7 @@ BRAND = EmailBrand(
 )
 
 
-def _render(brand: EmailBrand = BRAND, **kwargs: object) -> tuple[str, str]:
+def _render(brand: EmailBrand = BRAND) -> tuple[str, str]:
     """Render a message with every block kind and return its HTML and text parts."""
     rendered = render_email(
         brand,
@@ -47,7 +47,6 @@ def _render(brand: EmailBrand = BRAND, **kwargs: object) -> tuple[str, str]:
         ],
         footer_note=Paragraph("You get this because you signed up."),
         footer_links=[EmailLink("Settings", "https://acme.example.com/settings")],
-        **kwargs,  # type: ignore[arg-type]
     )
     return rendered.html, rendered.text
 
