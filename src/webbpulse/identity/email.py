@@ -2,18 +2,28 @@
 
 An abstract sender with an SES v2 implementation and a recording one, plus
 `CappedEmailSender`, which puts any sender behind a `webbpulse.email_cap.EmailSendCap`.
-Bodies are rendered with `string.Template`, so escaping the HTML part is this module's own
-job.
+Bodies are built from `webbpulse.email_layout` blocks, which escape every value and render
+the HTML and plain-text parts from the same content.
 """
 
 from __future__ import annotations
 
-import html
 import logging
 from abc import ABC, abstractmethod
+from collections.abc import Sequence
 from dataclasses import dataclass, field
-from string import Template
 from typing import TYPE_CHECKING, Any, Final, Protocol
+
+from webbpulse.email_layout import (
+    DEFAULT_ACCENT,
+    Button,
+    EmailBlock,
+    EmailBrand,
+    EmailLink,
+    Heading,
+    Paragraph,
+    render_email,
+)
 
 if TYPE_CHECKING:  # pragma: no cover
     from webbpulse.email_cap import EmailCapDecision, EmailCategory, EmailSendCap
@@ -30,6 +40,8 @@ __all__ = [
     "RecordingEmailSender",
     "SesV2Client",
     "SesV2EmailSender",
+    "email_brand",
+    "render_branded",
     "render_password_changed",
     "render_password_reset",
     "render_registration_notice",
@@ -286,151 +298,110 @@ class RecordingEmailSender(EmailSender):
         self.sent.clear()
 
 
-_VERIFICATION_TEXT = Template(
-    """Confirm your email address
+def email_brand(settings: IdentitySettings) -> EmailBrand:
+    """The `EmailBrand` the identity emails render with, from the settings that already name it.
 
-Someone created a $product_name account with this address. Open the link below to
-confirm it:
+    A product that sets none of the branding fields still gets the shell, headed by its
+    product name in the default accent, with its support address in the footer.
+    """
+    links: tuple[EmailLink, ...] = ()
+    if settings.support_email:
+        links = (EmailLink("Contact support", f"mailto:{settings.support_email}"),)
+    home = settings.frontend_base_url
+    return EmailBrand(
+        product_name=settings.product_name,
+        logo_url=settings.logo_url or "",
+        accent_color=settings.email_accent_color or DEFAULT_ACCENT,
+        home_url=home if home.startswith(("http://", "https://")) else "",
+        footer_links=links,
+        legal_line=settings.email_legal_line,
+    )
 
-$link
 
-The link works once and expires in $expiry.
+def render_branded(
+    brand: EmailBrand,
+    *,
+    to: str,
+    subject: str,
+    blocks: Sequence[EmailBlock],
+    preheader: str = "",
+    footer_note: Paragraph | None = None,
+    footer_links: Sequence[EmailLink] = (),
+    tags: dict[str, str] | None = None,
+) -> EmailMessage:
+    """Render blocks through `webbpulse.email_layout` into an `EmailMessage` ready for any sender.
 
-If this was not you, you can ignore this message and no account will be activated.
+    The product-side entry point for every non-identity email, so a product's invites and
+    notifications share the identity emails' layout.
+    """
+    rendered = render_email(
+        brand,
+        subject=subject,
+        blocks=blocks,
+        preheader=preheader,
+        footer_note=footer_note,
+        footer_links=footer_links,
+    )
+    return EmailMessage(to=to, subject=subject, text=rendered.text, html=rendered.html, tags=dict(tags or {}))
 
-Questions? Reply to $support_email.
-"""
-)
 
-_VERIFICATION_HTML = Template(
-    """<p>Someone created a $product_name account with this address. Confirm it here:</p>
-<p><a href="$link">Confirm your email address</a></p>
-<p>The link works once and expires in $expiry.</p>
-<p>If this was not you, you can ignore this message and no account will be activated.</p>
-<p>Questions? Reply to <a href="mailto:$support_email">$support_email</a>.</p>
-"""
-)
+def _product(settings: IdentitySettings) -> str:
+    """The product name a sentence uses, with a neutral phrase when none is configured."""
+    return settings.product_name or "your account"
 
-_RESET_TEXT = Template(
-    """Reset your password
 
-Someone asked to reset the password on the $product_name account for this address.
-Open the link below to choose a new one:
-
-$link
-
-The link works once and expires in $expiry.
-
-If this was not you, you can ignore this message. Your password has not changed, and
-nobody can use this link without opening your mailbox.
-
-Questions? Reply to $support_email.
-"""
-)
-
-_RESET_HTML = Template(
-    """<p>Someone asked to reset the password on the $product_name account for this
-address. Choose a new one here:</p>
-<p><a href="$link">Reset your password</a></p>
-<p>The link works once and expires in $expiry.</p>
-<p>If this was not you, you can ignore this message. Your password has not changed, and
-nobody can use this link without opening your mailbox.</p>
-<p>Questions? Reply to <a href="mailto:$support_email">$support_email</a>.</p>
-"""
-)
-
-_REGISTRATION_NOTICE_TEXT = Template(
-    """Someone tried to create an account with your address
-
-Your address already has a $product_name account, so nothing was created and nothing
-has changed.
-
-If it was you, sign in as usual, or reset your password if you have forgotten it:
-
-$link
-
-If it was not you, no action is needed. Nobody can see that this address has an
-account, and no account was created.
-
-Questions? Reply to $support_email.
-"""
-)
-
-_REGISTRATION_NOTICE_HTML = Template(
-    """<p>Your address already has a $product_name account, so nothing was created and
-nothing has changed.</p>
-<p>If it was you, sign in as usual, or
-<a href="$link">reset your password</a> if you have forgotten it.</p>
-<p>If it was not you, no action is needed. Nobody can see that this address has an
-account, and no account was created.</p>
-<p>Questions? Reply to <a href="mailto:$support_email">$support_email</a>.</p>
-"""
-)
-
-_PASSWORD_CHANGED_TEXT = Template(
-    """Your password was changed
-
-The password on your $product_name account was just changed, and every other signed-in
-session was ended.
-
-If this was you, there is nothing to do.
-
-If it was not you, reset your password immediately and then contact us:
-
-$link
-
-Questions? Reply to $support_email.
-"""
-)
-
-_PASSWORD_CHANGED_HTML = Template(
-    """<p>The password on your $product_name account was just changed, and every other
-signed-in session was ended.</p>
-<p>If this was you, there is nothing to do.</p>
-<p>If it was not you, <a href="$link">reset your password</a> immediately and then
-contact us.</p>
-<p>Questions? Reply to <a href="mailto:$support_email">$support_email</a>.</p>
-"""
-)
-
-_HTML_DOCUMENT = Template(
-    """<!doctype html>
-<html lang="en">
-<head><meta charset="utf-8"><title>$subject</title></head>
-<body style="font-family: system-ui, -apple-system, Segoe UI, sans-serif; \
-font-size: 15px; line-height: 1.5; color: #1a1a1a;">
-$logo$body<p style="color: #666; font-size: 13px;">$product_name</p>
-</body>
-</html>
-"""
-)
+def _support(settings: IdentitySettings) -> list[EmailBlock]:
+    """The closing line naming the support address, or nothing when there is none."""
+    if not settings.support_email:
+        return []
+    address = settings.support_email
+    return [Paragraph("Questions? Write to ", EmailLink(address, f"mailto:{address}"), ".", muted=True)]
 
 
 def render_verification(settings: IdentitySettings, *, to: str, link: str, expiry: str) -> EmailMessage:
     """Render the email verification message."""
-    return _render(
-        settings,
+    product = _product(settings)
+    return render_branded(
+        email_brand(settings),
         to=to,
         subject=f"Confirm your email address for {settings.product_name}".strip(),
-        text_template=_VERIFICATION_TEXT,
-        html_template=_VERIFICATION_HTML,
-        link=link,
-        expiry=expiry,
-        purpose="verify_email",
+        preheader=f"Confirm your address to finish creating your {product} account.",
+        blocks=[
+            Heading("Confirm your email address"),
+            Paragraph(f"Someone created a {product} account with this address. Confirm it to activate the account."),
+            Button("Confirm your email address", link, show_url=True),
+            Paragraph(f"The link works once and expires in {expiry}."),
+            Paragraph("If this was not you, you can ignore this message and no account will be activated.", muted=True),
+            *_support(settings),
+        ],
+        tags={"purpose": "verify_email"},
     )
 
 
 def render_password_reset(settings: IdentitySettings, *, to: str, link: str, expiry: str) -> EmailMessage:
     """Render the password reset message."""
-    return _render(
-        settings,
+    product = _product(settings)
+    return render_branded(
+        email_brand(settings),
         to=to,
         subject=f"Reset your {settings.product_name} password".strip(),
-        text_template=_RESET_TEXT,
-        html_template=_RESET_HTML,
-        link=link,
-        expiry=expiry,
-        purpose="reset_password",
+        preheader=f"Choose a new password for your {product} account.",
+        blocks=[
+            Heading("Reset your password"),
+            Paragraph(
+                f"Someone asked to reset the password on the {product} account for this address. "
+                "Choose a new one with the link below."
+            ),
+            Button("Reset your password", link, show_url=True),
+            Paragraph(f"The link works once and expires in {expiry}."),
+            Paragraph(
+                "If this was not you, you can ignore this message. Your password has not changed, and "
+                "nobody can use this link without opening your mailbox.",
+                muted=True,
+            ),
+            *_support(settings),
+        ],
+        tags={"purpose": "reset_password"},
     )
 
 
@@ -439,15 +410,25 @@ def render_registration_notice(settings: IdentitySettings, *, to: str, link: str
 
     Carries a reset link rather than a verification link, because the account already exists.
     """
-    return _render(
-        settings,
+    product = _product(settings)
+    return render_branded(
+        email_brand(settings),
         to=to,
         subject=f"Someone tried to create a {settings.product_name} account".strip(),
-        text_template=_REGISTRATION_NOTICE_TEXT,
-        html_template=_REGISTRATION_NOTICE_HTML,
-        link=link,
-        expiry="",
-        purpose="registration_notice",
+        preheader="Nothing was created and nothing has changed.",
+        blocks=[
+            Heading("Someone tried to create an account with your address"),
+            Paragraph(f"Your address already has a {product} account, so nothing was created and nothing has changed."),
+            Paragraph("If it was you, sign in as usual, or reset your password if you have forgotten it."),
+            Button("Reset your password", link),
+            Paragraph(
+                "If it was not you, no action is needed. Nobody can see that this address has an account, "
+                "and no account was created.",
+                muted=True,
+            ),
+            *_support(settings),
+        ],
+        tags={"purpose": "registration_notice"},
     )
 
 
@@ -457,59 +438,21 @@ def render_password_changed(settings: IdentitySettings, *, to: str, link: str) -
     A change notification is the one signal a user has that a takeover happened, and the link
     is the reset link, which is the remedy.
     """
-    return _render(
-        settings,
+    product = _product(settings)
+    return render_branded(
+        email_brand(settings),
         to=to,
         subject=f"Your {settings.product_name} password was changed".strip(),
-        text_template=_PASSWORD_CHANGED_TEXT,
-        html_template=_PASSWORD_CHANGED_HTML,
-        link=link,
-        expiry="",
-        purpose="password_changed",
-    )
-
-
-def _render(
-    settings: IdentitySettings,
-    *,
-    to: str,
-    subject: str,
-    text_template: Template,
-    html_template: Template,
-    link: str,
-    expiry: str,
-    purpose: str,
-) -> EmailMessage:
-    """Render both parts of one message.
-
-    Both parts substitute the same values, the text part raw and the HTML part through
-    `html.escape`, in one place so a new template cannot forget the escape.
-    """
-    values = {
-        "product_name": settings.product_name or "your account",
-        "support_email": settings.support_email,
-        "link": link,
-        "expiry": expiry,
-        "subject": subject,
-    }
-    escaped = {key: html.escape(value, quote=True) for key, value in values.items()}
-
-    logo = ""
-    if settings.logo_url:
-        logo = (
-            f'<p><img src="{html.escape(settings.logo_url, quote=True)}" '
-            f'alt="{escaped["product_name"]}" height="40"></p>\n'
-        )
-
-    return EmailMessage(
-        to=to,
-        subject=subject,
-        text=text_template.substitute(values),
-        html=_HTML_DOCUMENT.substitute(
-            subject=escaped["subject"],
-            product_name=escaped["product_name"],
-            logo=logo,
-            body=html_template.substitute(escaped),
-        ),
-        tags={"purpose": purpose},
+        preheader="Every other signed-in session was ended.",
+        blocks=[
+            Heading("Your password was changed"),
+            Paragraph(
+                f"The password on your {product} account was just changed, and every other signed-in session was ended."
+            ),
+            Paragraph("If this was you, there is nothing to do."),
+            Paragraph("If it was not you, reset your password immediately and then contact us."),
+            Button("Reset your password", link),
+            *_support(settings),
+        ],
+        tags={"purpose": "password_changed"},
     )
