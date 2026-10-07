@@ -382,23 +382,22 @@ def test_no_message_uses_an_em_dash_or_the_word_developer(settings: IdentitySett
             assert "developer" not in part.lower()
 
 
-def test_a_template_with_a_missing_value_raises_rather_than_mailing_a_dollar_sign() -> None:
-    """`_render` raises `KeyError` on a missing placeholder rather than mailing the raw template."""
-    from string import Template
+def test_the_identity_emails_use_the_branded_shell_with_the_configured_accent() -> None:
+    """The shell carries the configured accent on the button, and the default accent when none is set."""
+    from webbpulse.email_layout import DEFAULT_ACCENT
 
-    from webbpulse.identity.email import _render
+    branded = make_settings(email_accent_color="#B8451A", logo_url="https://cdn.example.com/logo.png")
+    plain = make_settings()
 
-    with pytest.raises(KeyError):
-        _render(
-            make_settings(),
-            to=EMAIL,
-            subject="s",
-            text_template=Template("$nonexistent"),
-            html_template=Template("<p>x</p>"),
-            link="https://x",
-            expiry="1 hour",
-            purpose="verify_email",
-        )
+    assert branded.email_accent_color == "#b8451a"
+    assert 'bgcolor="#b8451a"' in render_verification(branded, to=EMAIL, link="https://x", expiry="1 hour").html
+    assert f'bgcolor="{DEFAULT_ACCENT}"' in render_verification(plain, to=EMAIL, link="https://x", expiry="1 hour").html
+
+
+def test_an_accent_that_is_not_a_colour_is_refused_at_startup() -> None:
+    """`email_accent_color` must be a hex colour, so a typo fails settings validation rather than a send."""
+    with pytest.raises(ValueError, match="email_accent_color"):
+        make_settings(email_accent_color="orange")
 
 
 def test_each_message_carries_a_distinct_purpose_tag(settings: IdentitySettings) -> None:

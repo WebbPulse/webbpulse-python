@@ -7,6 +7,25 @@ This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## Unreleased
 
+## 0.73.0
+
+### Added
+
+- `webbpulse.email_layout`, a branded email shell (STUP-79). `EmailBrand` names the product,
+  a PNG logo URL, an accent colour, a home URL, footer links and a legal line; `render_email`
+  renders `Heading`, `Paragraph`, `Button`, `Quote`, `Code` and `BulletList` blocks into a
+  table-based HTML part with inline styles and dark-mode rules, and a plain-text part from
+  the same blocks. Every value is escaped and links must be http, https or mailto.
+- `webbpulse.identity.render_branded` renders blocks into an `EmailMessage`, and
+  `email_brand(settings)` builds the identity brand. `IdentitySettings` gains
+  `email_accent_color` and `email_legal_line`.
+
+### Changed
+
+- The verification, password reset, registration notice and password changed emails render
+  through the shell. With no new settings they show the product name in the default accent,
+  so existing products need no change.
+
 ## 0.72.0
 
 ### Added

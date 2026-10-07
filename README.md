@@ -68,6 +68,7 @@ its dev dependencies.
 | `webbpulse.dynamodb` | `Repository` with `set_attributes`, `remove_attributes` and `get_many`, `Page`, `table_name`, `ttl_at`, `ttl_in`, `encode_numbers`, `new_ulid`, `IdempotencyStore`, and the `DynamoError` family, whose `ConditionFailed` every conditional write raises | [data-access.md](docs/data-access.md) |
 | `webbpulse.storage` | `presigned_put`, `PresignedUpload`: a presigned S3 PUT bounded by a signed content type and content length; `presigned_get`, `PresignedDownload`: a presigned S3 GET with optional signed response headers; `UPLOAD_CONTENT_TYPES`, `is_allowed_upload` and `disposition_for` for what an upload may declare and how it is served back | [data-access.md](docs/data-access.md) |
 | `webbpulse.ratelimit` | `rate_limit`, `rate_limit_middleware`, `LimitClass`, `classify`, `identity_from_principal`, a fixed window limiter on one DynamoDB table, failing open | [data-access.md](docs/data-access.md) |
+| `webbpulse.email_layout` | `EmailBrand`, `render_email` and the blocks (`Heading`, `Paragraph`, `Button`, `Quote`, `Code`, `BulletList`): one branded, table-based, dark-mode safe email shell with a plain-text alternative, stdlib only | [email-layout.md](docs/email-layout.md) |
 | `webbpulse.email_cap` | `EmailSendCap`, `EmailCapPolicy`, `EmailCapLimits`: outbound email caps per recipient, per tenant and per app day on the rate limits table, off by default, failing open | [email-caps.md](docs/email-caps.md) |
 | `webbpulse.security` | `hash_password`, `verify_password`, `needs_rehash`, `create_token`, `decode_token`, `bearer_claims` | [security.md](docs/security.md) |
 | `webbpulse.identity` | App-managed identity: password, session, email link, TOTP, OAuth and passkey flows, plus a KMS-backed `TokenService` and a JWKS | [identity.md](docs/identity.md), [the standard](docs/identity-standard.md) |
@@ -602,6 +603,7 @@ app.include_router(build_identity_router(settings, hooks, stores, tokens=tokens)
 | [docs/oauth-server.md](docs/oauth-server.md) | The OAuth 2.1 authorization server for a remote MCP server |
 | [docs/identity-passkeys.md](docs/identity-passkeys.md) | WebAuthn registration, passwordless sign-in and credential management |
 | [docs/http.md](docs/http.md) | `create_app`, the error envelope shapes, and conditional GET |
+| [docs/email-layout.md](docs/email-layout.md) | The branded email shell and `render_branded` |
 | [docs/email-caps.md](docs/email-caps.md) | Outbound email send caps and `CappedEmailSender` |
 | [docs/error-handlers.md](docs/error-handlers.md) | DynamoDB and custom exception handlers |
 | [docs/events.md](docs/events.md) | The stream and queue consumer route, and publishing an event |

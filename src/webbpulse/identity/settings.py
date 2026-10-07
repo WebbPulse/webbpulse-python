@@ -214,7 +214,21 @@ class IdentitySettings(BaseSettings):
     frontend_base_url: str = Field(default="")
     product_name: str = Field(default="")
     support_email: str = Field(default="")
-    logo_url: str | None = Field(default=None)
+    logo_url: str | None = Field(
+        default=None,
+        description="Absolute URL of a PNG or JPEG logo shown in the email header. Email clients drop SVG.",
+    )
+    email_accent_color: str = Field(
+        default="",
+        description=(
+            "The `#rrggbb` accent for email buttons and links. Empty uses "
+            "`webbpulse.email_layout.DEFAULT_ACCENT`; a value that is not a colour is refused."
+        ),
+    )
+    email_legal_line: str = Field(
+        default="",
+        description="A postal or legal line closing every email footer. Empty shows the product name alone.",
+    )
 
     google_client_id: str = Field(default="")
     github_client_id: str = Field(default="")
@@ -407,6 +421,19 @@ class IdentitySettings(BaseSettings):
     def _strip_trailing_slash(cls, value: object) -> object:
         """Strip trailing slashes so `iss`, discovery and the authorizer agree."""
         return value.rstrip("/") if isinstance(value, str) else value
+
+    @field_validator("email_accent_color")
+    @classmethod
+    def _check_email_accent(cls, value: str) -> str:
+        """Normalise the accent to `#rrggbb`, refusing a value that is not a colour at startup."""
+        from webbpulse.email_layout import normalise_hex
+
+        if not value.strip():
+            return ""
+        normalised = normalise_hex(value)
+        if normalised is None:
+            raise ValueError(f"email_accent_color must be a #rrggbb colour, got {value!r}.")
+        return normalised
 
     @model_validator(mode="after")
     def _check_issuer_scheme(self) -> IdentitySettings:

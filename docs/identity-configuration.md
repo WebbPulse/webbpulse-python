@@ -51,7 +51,8 @@ permanently.
 | `email_from` | `""` | |
 | `ses_configuration_set` | `None` | |
 | `frontend_base_url` | `""` | Where emailed links point |
-| `product_name`, `support_email`, `logo_url` | `""`, `""`, `None` | Branding |
+| `product_name`, `support_email`, `logo_url` | `""`, `""`, `None` | Branding. `logo_url` is an absolute PNG or JPEG URL for the email header |
+| `email_accent_color`, `email_legal_line` | `""`, `""` | Email button and link accent (`#rrggbb`, empty is the default accent) and the footer legal line |
 | `google_client_id`, `github_client_id` | `""` | Client **ids** only; secrets never live here |
 | `oauth_redirect_uris` | `[]` | Exact-match allow-list; empty means `<issuer>/oauth/callback` |
 
