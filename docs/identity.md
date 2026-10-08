@@ -193,6 +193,14 @@ doubles from one second to a fifteen minute cap, and any success clears it. Ther
 hard lock, because a hard lock on a known address is a denial of service anybody can
 trigger.
 
+**Second-factor codes have their own lockout with the same rules.** Every route that checks
+a TOTP or recovery code (`/login/totp`, `/step-up` with a `code`, `/totp/disable` and
+`/recovery-codes`) counts refused codes per user under `mfa#<user_id>` in `login-attempts`,
+whichever address sent them, and answers `429 TOO_MANY_ATTEMPTS` with `Retry-After` once the
+delay is in force. Only a correct code clears it. It is kept apart from the password count
+because the attacker it stops already has the password, and each correct password would
+otherwise reset the count and let them guess codes from rotating addresses indefinitely.
+
 **The emailed links point at the frontend, and both confirmations are `POST`.** A reset link
 carries no password, so a page has to collect one, and a `GET` that consumes state is spent
 by the first mail scanner that follows it. `frontend_base_url` plus `VERIFY_LINK_PATH` and

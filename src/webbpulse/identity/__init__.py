@@ -195,6 +195,7 @@ from webbpulse.identity.lockout import (
     email_key,
     ip_key,
     lockout_state,
+    mfa_key,
     new_attempt,
 )
 from webbpulse.identity.mfa import (
@@ -885,6 +886,7 @@ __all__ = [
     "is_expired",
     "kid_for_der",
     "lockout_state",
+    "mfa_key",
     "mint_api_key",
     "mint_test_token",
     "missing_scopes",

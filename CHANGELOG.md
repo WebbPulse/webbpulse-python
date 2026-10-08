@@ -7,6 +7,33 @@ This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## Unreleased
 
+## 0.78.0
+
+### Security
+
+- Refused TOTP and recovery codes now count toward a per-user progressive lockout (PLAT-29).
+  Before, they were rate limited only per IP, so an attacker holding the password could keep
+  guessing codes from rotating addresses. `complete_mfa`, `step_up`, `disable_totp` and
+  `regenerate_recovery_codes` check and record attempts under the new `mfa_key(user_id)`
+  (`mfa#<user_id>`) in the existing `login-attempts` table, with the same threshold, doubling
+  delay and fifteen minute cap as password lockout. A correct code clears the count; a correct
+  password does not. A locked step raises `RateLimited` and the routes answer
+  `429 TOO_MANY_ATTEMPTS` with `Retry-After`.
+
+### Added
+
+- `webbpulse.identity.mfa_key`.
+- `ip`, `user_agent` and `now` keyword arguments on `IdentityFlows.step_up`, `disable_totp` and
+  `regenerate_recovery_codes`, and `now` on `complete_mfa`.
+
+### Changed
+
+- `POST /totp/disable`, `POST /recovery-codes` and a code `POST /step-up` can now answer 429
+  for a locked account, not only for a busy address.
+- The lockout refusal log line reads "Attempt refused by progressive lockout." and second
+  factor routes log `<purpose>.locked` and `<purpose>.failure` events (`mfa`, `mfa_step_up`,
+  `totp_disable`, `recovery_regenerate`).
+
 ## 0.77.0
 
 ### Security

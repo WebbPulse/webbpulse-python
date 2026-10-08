@@ -1124,10 +1124,13 @@ def _mount_mfa(
         except LoginRejected as exc:
             return rejected(request, exc)
         code = _required_code(payload)
+        ip, user_agent = context(request)
         try:
-            await run_sync(lambda: flows.disable_totp(user_id=subject, code=code))
+            await run_sync(lambda: flows.disable_totp(user_id=subject, code=code, ip=ip, user_agent=user_agent))
         except MfaRejected as exc:
             return _mfa_refused(request, exc)
+        except LoginRejected as exc:
+            return rejected(request, exc)
         return JSONResponse({"disabled": True})
 
     @router.post(
@@ -1141,10 +1144,15 @@ def _mount_mfa(
         except LoginRejected as exc:
             return rejected(request, exc)
         code = _required_code(payload)
+        ip, user_agent = context(request)
         try:
-            codes = await run_sync(lambda: flows.regenerate_recovery_codes(user_id=subject, code=code))
+            codes = await run_sync(
+                lambda: flows.regenerate_recovery_codes(user_id=subject, code=code, ip=ip, user_agent=user_agent)
+            )
         except MfaRejected as exc:
             return _mfa_refused(request, exc)
+        except LoginRejected as exc:
+            return rejected(request, exc)
         return JSONResponse({"recovery_codes": codes.codes})
 
 
@@ -1206,10 +1214,21 @@ def _mount_step_up(
         credential = _step_up_credential(payload)
         if credential is None:
             code = _required_code(payload)
+            ip, user_agent = context(request)
             try:
-                result = await run_sync(lambda: flows.step_up(user_id=subject, session_id=session_id, code=code))
+                result = await run_sync(
+                    lambda: flows.step_up(
+                        user_id=subject,
+                        session_id=session_id,
+                        code=code,
+                        ip=ip,
+                        user_agent=user_agent,
+                    )
+                )
             except MfaRejected as exc:
                 return _mfa_refused(request, exc)
+            except LoginRejected as exc:
+                return rejected(request, exc)
             return JSONResponse(success_body(result))
 
         from webbpulse.identity.passkeys import PasskeyRejected
@@ -1480,7 +1499,7 @@ IDENTITY_ROUTE_RESPONSES: Final[dict[tuple[str, str], dict[int, str]]] = {
     ("POST", LOGIN_TOTP_PATH): {
         401: "The code was refused",
         403: "The challenge is no longer open",
-        429: "Too many attempts from this address",
+        429: "Too many attempts from this address, or the account is locked",
     },
     ("POST", TOTP_ENROL_PATH): {401: "No bearer token was presented", 429: "Too many enrolment attempts"},
     ("POST", TOTP_ACTIVATE_PATH): {
@@ -1489,11 +1508,11 @@ IDENTITY_ROUTE_RESPONSES: Final[dict[tuple[str, str], dict[int, str]]] = {
     },
     ("POST", TOTP_DISABLE_PATH): {
         401: "No bearer token was presented, or the code was refused",
-        429: "Too many attempts from this address",
+        429: "Too many attempts from this address, or the account is locked",
     },
     ("POST", RECOVERY_CODES_PATH): {
         401: "No bearer token was presented, or the code was refused",
-        429: "Too many attempts from this address",
+        429: "Too many attempts from this address, or the account is locked",
     },
     ("POST", STEP_UP_PATH): {
         401: "No bearer token was presented, or the password or factor was refused",
