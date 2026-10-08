@@ -83,8 +83,8 @@ gateway builds the discovery URL as `issuer + "/.well-known/openid-configuration
 | `POST /api/auth/recovery-codes` | Replaces the set on a `code`, invalidating every previous code |
 | `POST /api/auth/step-up` | Re-authenticates inside the session for a fresher `auth_time`, on a code or a passkey assertion |
 | `GET /api/auth/oauth/providers` | The providers this deployment can sign a user in with, anonymous |
-| `GET /api/auth/oauth/{provider}/start` | Mints a state and redirects the browser to the provider |
-| `GET /api/auth/oauth/callback` | Spends the state, verifies the provider's answer, issues the token pair |
+| `GET /api/auth/oauth/{provider}/start` | Mints a state, sets the browser binding cookie and redirects the browser to the provider |
+| `GET /api/auth/oauth/callback` | Spends the state, checks the binding cookie, verifies the provider's answer, issues the token pair |
 | `POST /api/auth/oauth/{provider}/link` | Starts a link for a recently signed-in account, returning the URL and setting the browser binding cookie |
 | `GET /api/auth/oauth/links` | The providers attached to this account (`provider`, `login`, `email`, `linked_at`), for a settings page |
 | `DELETE /api/auth/oauth/{provider}/link` | Detaches a provider for a recently signed-in account, unless it is the last way in |

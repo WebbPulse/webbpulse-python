@@ -7,6 +7,23 @@ This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## Unreleased
 
+## 0.77.0
+
+### Security
+
+- An OAuth login is now bound to the browser that started it, as a link already was (PLAT-30).
+  `GET /oauth/{provider}/start` sets the `wp_oauth_link` binding cookie in login mode too, the
+  state row keeps its digest, and the callback refuses with `OAUTH_STATE_INVALID` unless the
+  cookie matches. This closes login CSRF, where a victim finishing an attacker's authorization
+  URL was signed into the attacker's account. Every callback outcome now clears the cookie,
+  including the MFA ticket and `LoginRejected` redirects.
+
+### Changed
+
+- The callback refuses a state row with no binding, so OAuth logins and links already in flight
+  when this version deploys fail once with `OAUTH_STATE_INVALID` and must be started again.
+- `OAuthService.start` keeps `binding` on a login row as well as a link row.
+
 ## 0.76.0
 
 ### Added

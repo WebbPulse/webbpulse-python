@@ -1321,15 +1321,15 @@ def test_a_callback_with_a_bad_state_redirects_rather_than_rendering_json(client
     assert "oauth_error=OAUTH_STATE_INVALID" in response.headers["location"]
 
 
-def test_a_cancelled_consent_screen_redirects_without_an_error_page(client: Any) -> None:
+def test_a_cancelled_consent_screen_redirects_without_an_error_page(link_client: Any) -> None:
     """A callback carrying `error=access_denied` redirects with `oauth_error=OAUTH_CANCELLED`."""
     prefix = identity_prefix(make_settings())
-    start = client.get(f"{prefix}/oauth/google/start")
+    start = link_client.get(f"{prefix}/oauth/google/start")
     from urllib.parse import parse_qs, urlsplit
 
     state = parse_qs(urlsplit(start.headers["location"]).query)["state"][0]
 
-    response = client.get(f"{prefix}/oauth/callback?state={state}&error=access_denied")
+    response = link_client.get(f"{prefix}/oauth/callback?state={state}&error=access_denied")
     assert response.status_code == 303
     assert "oauth_error=OAUTH_CANCELLED" in response.headers["location"]
 
@@ -1889,11 +1889,94 @@ def test_a_link_start_sets_an_httponly_binding_cookie_and_stores_only_its_digest
     assert record.binding != secret
 
 
-def test_a_login_start_sets_no_binding_cookie(link_client: Any) -> None:
-    """Only a link binds its state to a browser."""
+def test_a_login_start_sets_a_binding_cookie_and_stores_only_its_digest(
+    link_client: Any, stores: IdentityStores
+) -> None:
+    """A login binds its state to the starting browser just as a link does."""
+    from webbpulse.identity.oauth import OAUTH_LINK_BINDING_COOKIE
+
     response = link_client.get(f"{identity_prefix(make_settings())}/oauth/github/start")
     assert response.status_code == 302
-    assert "set-cookie" not in response.headers
+    cookie = response.headers["set-cookie"]
+    assert cookie.startswith(f"{OAUTH_LINK_BINDING_COOKIE}=")
+    assert "HttpOnly" in cookie
+    assert "samesite=lax" in cookie.lower()
+    secret = link_client.cookies.get(OAUTH_LINK_BINDING_COOKIE)
+    record = stores.require_oauth_states().consume(_state_of(response.headers["location"]))
+    assert record is not None
+    assert record.mode == "login"
+    assert record.binding
+    assert record.binding != secret
+
+
+def _link_github_then_start_login(link_client: Any, hooks: FakeHooks) -> str:
+    """Link GitHub to a fresh user, then start a GitHub login and return its state."""
+    user = hooks.add(EMAIL, email_verified=True)
+    prefix = identity_prefix(make_settings())
+    linked = _state_of(_start_github_link(link_client, str(user["id"])).json()["authorization_url"])
+    link_client.get(f"{prefix}/oauth/callback?state={linked}&code=abc")
+    return _state_of(link_client.get(f"{prefix}/oauth/github/start").headers["location"])
+
+
+def test_a_login_completes_in_the_browser_that_started_it(link_client: Any, hooks: FakeHooks) -> None:
+    """The matching cookie signs the user in and is cleared alongside the refresh cookie."""
+    from webbpulse.identity.oauth import OAUTH_LINK_BINDING_COOKIE
+
+    settings = make_settings()
+    state = _link_github_then_start_login(link_client, hooks)
+
+    response = link_client.get(f"{identity_prefix(settings)}/oauth/callback?state={state}&code=abc")
+    assert response.status_code == 303
+    assert "oauth=1" in response.headers["location"]
+    cookies = response.headers.get_list("set-cookie")
+    assert any(c.startswith(f"{settings.cookie_name}=") for c in cookies)
+    assert any(c.startswith(f'{OAUTH_LINK_BINDING_COOKIE}=""') for c in cookies)
+
+
+def test_a_login_completed_in_another_browser_is_refused(link_client: Any, hooks: FakeHooks) -> None:
+    """Login CSRF: a victim finishing an attacker's authorization URL is signed in to nothing."""
+    settings = make_settings()
+    state = _link_github_then_start_login(link_client, hooks)
+    link_client.cookies.clear()
+
+    response = link_client.get(f"{identity_prefix(settings)}/oauth/callback?state={state}&code=abc")
+    assert response.status_code == 303
+    assert "oauth_error=OAUTH_STATE_INVALID" in response.headers["location"]
+    cookies = response.headers.get_list("set-cookie")
+    assert not any(c.startswith(f"{settings.cookie_name}=") for c in cookies)
+
+
+def test_a_login_with_a_forged_binding_cookie_is_refused(link_client: Any, hooks: FakeHooks) -> None:
+    """A cookie that does not hash to the stored digest signs nobody in."""
+    from webbpulse.identity.oauth import OAUTH_LINK_BINDING_COOKIE
+
+    settings = make_settings()
+    prefix = identity_prefix(settings)
+    state = _link_github_then_start_login(link_client, hooks)
+    link_client.cookies.clear()
+    link_client.cookies.set(OAUTH_LINK_BINDING_COOKIE, "forged", path=prefix)
+
+    response = link_client.get(f"{prefix}/oauth/callback?state={state}&code=abc")
+    assert "oauth_error=OAUTH_STATE_INVALID" in response.headers["location"]
+    cookies = response.headers.get_list("set-cookie")
+    assert not any(c.startswith(f"{settings.cookie_name}=") for c in cookies)
+
+
+def test_a_login_state_with_no_binding_is_refused(link_client: Any, stores: IdentityStores) -> None:
+    """A row written before logins were bound fails once rather than skipping the check."""
+    stores.require_oauth_states().put(
+        OAuthStateRecord(
+            state="unbound-login",
+            provider=GITHUB_PROVIDER,
+            mode="login",
+            created_at="",
+            expires_at=int(time.time()) + 600,
+        )
+    )
+
+    response = link_client.get(f"{identity_prefix(make_settings())}/oauth/callback?state=unbound-login&code=abc")
+    assert response.status_code == 303
+    assert "oauth_error=OAUTH_STATE_INVALID" in response.headers["location"]
 
 
 def test_a_link_completes_in_the_browser_that_started_it(

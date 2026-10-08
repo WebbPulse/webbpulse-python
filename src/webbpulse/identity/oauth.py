@@ -579,7 +579,7 @@ def _link_from_item(item: Mapping[str, Any]) -> OAuthLinkRecord:
 
 
 def new_link_binding() -> tuple[str, str]:
-    """A fresh browser secret for a `link` start and the digest the state row keeps.
+    """A fresh browser secret for a login or link start and the digest the state row keeps.
 
     The secret goes to the browser in `OAUTH_LINK_BINDING_COOKIE`; only its SHA-256 is
     stored, so a leaked state row cannot be replayed from another browser.
@@ -591,8 +591,8 @@ def new_link_binding() -> tuple[str, str]:
 def link_binding_matches(record: OAuthStateRecord, presented: str) -> bool:
     """Whether the callback came from the browser that started this state.
 
-    A row with no binding, such as a login or one written by an older version, always
-    matches, so the check only ever tightens a `link`.
+    A row with no binding, such as one written by an older version, always matches here;
+    the callback route refuses an unbound row itself.
     """
     if not record.binding:
         return True
@@ -728,7 +728,7 @@ class OAuthService:
 
         The row is written first and `redirect_uri` is checked against the allow-list here,
         so the callback can trust the stored value. A missing client secret refuses up front.
-        `binding` is the digest from `new_link_binding`, kept only on a `link` row.
+        `binding` is the digest from `new_link_binding`, kept on the row in either mode.
         """
         config = self._provider(provider)
         self._client_secret(provider)
@@ -754,7 +754,7 @@ class OAuthService:
                 return_to=resolved_return,
                 user_id=user_id if mode == "link" else "",
                 redirect_uri=resolved_redirect,
-                binding=binding if mode == "link" else "",
+                binding=binding,
             )
         )
 
