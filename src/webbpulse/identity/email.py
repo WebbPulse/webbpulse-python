@@ -16,6 +16,7 @@ from typing import TYPE_CHECKING, Any, Final, Protocol
 
 from webbpulse.email_layout import (
     DEFAULT_ACCENT,
+    DEFAULT_THEME,
     Button,
     EmailBlock,
     EmailBrand,
@@ -302,7 +303,7 @@ def email_brand(settings: IdentitySettings) -> EmailBrand:
     """The `EmailBrand` the identity emails render with, from the settings that already name it.
 
     A product that sets none of the branding fields still gets the shell, headed by its
-    product name in the default accent, with its support address in the footer.
+    product name in the default accent and theme, with its support address in the footer.
     """
     links: tuple[EmailLink, ...] = ()
     if settings.support_email:
@@ -315,6 +316,8 @@ def email_brand(settings: IdentitySettings) -> EmailBrand:
         home_url=home if home.startswith(("http://", "https://")) else "",
         footer_links=links,
         legal_line=settings.email_legal_line,
+        dark_accent_color=settings.email_dark_accent_color,
+        theme=settings.email_theme or DEFAULT_THEME,
     )
 
 

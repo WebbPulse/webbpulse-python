@@ -27,6 +27,37 @@ message = render_branded(
 )
 ```
 
+## Themes
+
+`EmailBrand.theme` takes an `EmailTheme` built from the product's own design tokens, so its
+emails read like its app. Every value is a hex colour or a plain number, never a CSS variable,
+because email clients do not resolve them.
+
+```python
+from webbpulse.email_layout import EmailPalette, EmailTheme
+
+theme = EmailTheme(
+    light=EmailPalette(page="#f7f7f8", card="#ffffff", line="#e5e5ea", text="#1b1c20",
+                       muted="#62646f", quote="#efeff2", quote_text="#1b1c20"),
+    dark=EmailPalette(page="#141518", card="#1b1c20", line="#2a2b31", text="#e7e7eb",
+                      muted="#9b9da7", quote="#232429", quote_text="#e7e7eb"),
+    font_stack="Inter, ui-sans-serif, system-ui, -apple-system, 'Segoe UI', Roboto, sans-serif",
+    on_accent_dark="#17120f",
+    card_radius=8,
+    button_radius=6,
+)
+brand = EmailBrand(accent_color="#b8451a", dark_accent_color="#f2703a", theme=theme)
+```
+
+- `light` is inline on every element. `dark` is applied by clients that read
+  `prefers-color-scheme` or Outlook's `data-ogsc`.
+- `dark_accent_color` repaints the button, its text and the quote rule in dark mode. Empty uses
+  the accent. `with_accent(color, dark=None)` replaces both, so a workspace colour shows in each
+  scheme.
+- Text on the accent is `on_accent_light` or `on_accent_dark`, whichever contrasts more.
+- A font stack may not carry quotes, braces, angle brackets or semicolons, and radii are 0 to
+  32 pixels. `DEFAULT_THEME` is what a brand gets when it names none.
+
 ## Rules the shell enforces
 
 - Every value is escaped. Callers pass plain strings, never markup.
@@ -51,5 +82,6 @@ message = render_branded(
 
 The four identity messages use `email_brand(settings)`: `product_name`, `logo_url`,
 `email_accent_color`, `frontend_base_url` as the home link, `support_email` as a footer
-link and `email_legal_line`. A product that sets none of them gets its name in the default
-accent.
+link, `email_legal_line`, `email_dark_accent_color` and `email_theme` (an `EmailTheme`
+passed in code). A product that sets none of them gets its name in the default accent and
+theme.
