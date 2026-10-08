@@ -7,6 +7,19 @@ This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## Unreleased
 
+## 0.75.0
+
+### Added
+
+- `webbpulse.dynamodb.encode_start_key` and `decode_start_key` carry a `LastEvaluatedKey`
+  across the wire as an opaque, URL-safe cursor (PLAT-39). Values keep their DynamoDB types,
+  so a `Decimal` or binary key round-trips exactly, and an optional `scope` binds a cursor to
+  the read it came from. A malformed, oversized, tampered or foreign-scoped token raises
+  `InvalidStartKey`, which is both a `DynamoError` and a `ValueError`.
+- `webbpulse.dynamodb.iter_all_pages` and `read_all_pages` follow `LastEvaluatedKey` over a
+  raw boto3 `Table.query` or `Table.scan`, with an optional `max_items` cap. An empty
+  filtered page with a cursor still set does not end the walk.
+
 ## 0.74.0
 
 ### Added
