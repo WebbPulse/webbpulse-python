@@ -6,11 +6,14 @@ and callers keep passing DynamoDB's own vocabulary. Nothing opens a connection a
 
 from __future__ import annotations
 
+import base64
+import binascii
+import json
 import os
-from collections.abc import Iterator, Mapping, Sequence
+from collections.abc import Callable, Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from datetime import UTC, datetime, timedelta
-from decimal import Decimal
+from decimal import Decimal, InvalidOperation
 from functools import lru_cache, wraps
 from typing import TYPE_CHECKING, Any, Final
 
@@ -19,6 +22,7 @@ if TYPE_CHECKING:  # pragma: no cover
 
 __all__ = [
     "BATCH_GET_LIMIT",
+    "MAX_START_KEY_LENGTH",
     "TABLE_PREFIX_ENV",
     "TRANSACT_WRITE_LIMIT",
     "ULID_LENGTH",
@@ -28,15 +32,21 @@ __all__ = [
     "ConditionFailed",
     "DynamoError",
     "IdempotencyStore",
+    "InvalidStartKey",
     "ItemNotFound",
     "Page",
+    "PageCall",
     "ReadOnlyTable",
     "Repository",
     "TransactionCanceled",
     "UnprocessedItems",
+    "decode_start_key",
     "encode_numbers",
+    "encode_start_key",
+    "iter_all_pages",
     "new_ulid",
     "now_iso",
+    "read_all_pages",
     "reset_resource_cache",
     "table_name",
     "transact_write",
@@ -96,6 +106,19 @@ class ConditionFailed(DynamoError):
         self.condition = condition
         self.key = dict(key) if key is not None else None
         super().__init__(f"{table}: condition failed ({condition}) for key {self.key}")
+
+
+class InvalidStartKey(DynamoError, ValueError):
+    """A start-key token was malformed, tampered with, or minted under another scope.
+
+    Also a `ValueError`, so a handler that already maps bad input to a 400 covers it. One
+    error and one message for every cause, since a client learns nothing useful from which
+    check refused its token, and none of the token is echoed back.
+    """
+
+    def __init__(self) -> None:
+        """Carry the one fixed message every refusal uses."""
+        super().__init__("The pagination cursor is not valid.")
 
 
 class TransactionCanceled(DynamoError):
@@ -158,6 +181,14 @@ _CONDITIONAL_CHECK_FAILED: Final = "ConditionalCheckFailed"
 _CONDITIONAL_CHECK_FAILED_EXCEPTION: Final = "ConditionalCheckFailedException"
 
 _TRANSACTION_CANCELED: Final = "TransactionCanceledException"
+
+MAX_START_KEY_LENGTH: Final = 4096
+"""The longest token `decode_start_key` reads, so a hostile cursor costs bounded work."""
+
+_START_KEY_VERSION: Final = 1
+
+_START_KEY_MAX_ATTRIBUTES: Final = 4
+"""A `LastEvaluatedKey` holds the table's key and, on an index, the index's key too."""
 
 type Item = dict[str, Any]
 type Key = Mapping[str, Any]
@@ -297,6 +328,153 @@ class Page:
             f"Page(items={len(self.items)}, has_more={self.has_more}, "
             f"count={self.count}, scanned_count={self.scanned_count})"
         )
+
+
+def _encode_key_value(value: Any) -> dict[str, str]:
+    """One key attribute value in DynamoDB's typed form, the only types a key can hold."""
+    if isinstance(value, str):
+        return {"S": value}
+    if isinstance(value, bool):
+        raise TypeError("A start key cannot hold a boolean; key attributes are S, N or B.")
+    if isinstance(value, (int, Decimal)):
+        return {"N": str(value)}
+    if isinstance(value, (bytes, bytearray)):
+        return {"B": base64.b64encode(bytes(value)).decode("ascii")}
+
+    from boto3.dynamodb.types import Binary
+
+    if isinstance(value, Binary):
+        return {"B": base64.b64encode(bytes(value.value)).decode("ascii")}
+    raise TypeError(f"A start key cannot hold {type(value).__name__}; key attributes are S, N or B.")
+
+
+def _decode_key_value(typed: Any) -> Any:
+    """One typed key attribute value back as what the boto3 resource layer returns."""
+    if not isinstance(typed, dict) or len(typed) != 1:
+        raise InvalidStartKey
+    ((tag, raw),) = typed.items()
+    if not isinstance(raw, str):
+        raise InvalidStartKey
+    if tag == "S":
+        return raw
+    if tag == "N":
+        try:
+            number = Decimal(raw)
+        except InvalidOperation as exc:
+            raise InvalidStartKey from exc
+        if not number.is_finite():
+            raise InvalidStartKey
+        return number
+    if tag == "B":
+        try:
+            return base64.b64decode(raw.encode("ascii"), validate=True)
+        except (ValueError, binascii.Error) as exc:
+            raise InvalidStartKey from exc
+    raise InvalidStartKey
+
+
+def encode_start_key(key: Mapping[str, Any] | None, *, scope: str | None = None) -> str | None:
+    """A `LastEvaluatedKey` as an opaque, URL-safe cursor, or `None` when there is no next page.
+
+    Each value is stored in DynamoDB's typed form, so a `Decimal` keeps its precision and a
+    binary key stays binary through the round trip. `scope` stamps the read the key came
+    from, a workspace or a feed, and `decode_start_key` refuses the token under any other
+    scope, so a client cannot resume one tenant's cursor against another's partition.
+
+    The token is encoded, not signed: a client can read the key in it, so it carries nothing
+    the caller may not already see. Reach for `webbpulse.http.encode_cursor` when the cursor
+    must be tamper-evident under an application key.
+
+    Raises:
+        TypeError: When a value is not a type a DynamoDB key can hold.
+    """
+    if not key:
+        return None
+    payload: dict[str, Any] = {
+        "v": _START_KEY_VERSION,
+        "k": {str(name): _encode_key_value(value) for name, value in key.items()},
+    }
+    if scope is not None:
+        payload["s"] = scope
+    raw = json.dumps(payload, separators=(",", ":"), sort_keys=True).encode("utf-8")
+    return base64.urlsafe_b64encode(raw).decode("ascii").rstrip("=")
+
+
+def decode_start_key(token: str | None, *, scope: str | None = None) -> Item | None:
+    """A cursor from `encode_start_key` back as an `ExclusiveStartKey`, `None` when absent.
+
+    `None` and the empty string mean the first page. Anything else is held to the exact
+    shape the encoder writes: urlsafe base64 of a JSON object with a known version, one to
+    four attributes each holding one S, N or B value, and the same `scope` it was minted
+    under. Numbers come back as `Decimal` and binaries as `bytes`, which is what the boto3
+    resource layer accepts.
+
+    Raises:
+        InvalidStartKey: When the token is too long, not base64, not JSON, not that shape, or
+            minted under a different scope.
+    """
+    if not token:
+        return None
+    if len(token) > MAX_START_KEY_LENGTH:
+        raise InvalidStartKey
+    try:
+        raw = base64.urlsafe_b64decode((token + "=" * (-len(token) % 4)).encode("ascii"))
+        payload = json.loads(raw.decode("utf-8"))
+    except (ValueError, binascii.Error, UnicodeError) as exc:
+        raise InvalidStartKey from exc
+    if not isinstance(payload, dict) or payload.get("v") != _START_KEY_VERSION:
+        raise InvalidStartKey
+    if set(payload) - {"v", "k", "s"} or payload.get("s") != scope:
+        raise InvalidStartKey
+    attributes = payload.get("k")
+    if not isinstance(attributes, dict) or not 0 < len(attributes) <= _START_KEY_MAX_ATTRIBUTES:
+        raise InvalidStartKey
+    if not all(isinstance(name, str) and name for name in attributes):
+        raise InvalidStartKey
+    return {name: _decode_key_value(typed) for name, typed in attributes.items()}
+
+
+type PageCall = Callable[..., Mapping[str, Any]]
+"""A raw paged read, such as `table.query` or `table.scan`, taking DynamoDB's own arguments."""
+
+
+def iter_all_pages(call: PageCall, *, max_items: int | None = None, **kwargs: Any) -> Iterator[Item]:
+    """Yield every item a paged read returns, following `LastEvaluatedKey` across pages.
+
+    `call` is the raw operation, a boto3 `Table.query` or `Table.scan` or anything with that
+    shape, and `kwargs` are its arguments verbatim, `ExclusiveStartKey` included to resume.
+    An empty page that still carries a cursor is normal after a `FilterExpression`, so only a
+    missing `LastEvaluatedKey` ends the walk. `max_items` stops it once that many items have
+    been yielded, without reading another page; `Limit` in `kwargs` stays the page size.
+
+    `Repository.iter_query` and `iter_scan` are the same walk over a repository; this is the
+    one for a caller that holds a table or builds its own request.
+
+    Raises:
+        ValueError: When `max_items` is negative.
+    """
+    if max_items is not None and max_items < 0:
+        raise ValueError(f"max_items cannot be negative, got {max_items}.")
+    if max_items == 0:
+        return
+    yielded = 0
+    request = dict(kwargs)
+    while True:
+        response = call(**request)
+        for item in response.get("Items", []):
+            yield dict(item)
+            yielded += 1
+            if max_items is not None and yielded >= max_items:
+                return
+        last_key = response.get("LastEvaluatedKey")
+        if not last_key:
+            return
+        request["ExclusiveStartKey"] = last_key
+
+
+def read_all_pages(call: PageCall, *, max_items: int | None = None, **kwargs: Any) -> list[Item]:
+    """Every item `iter_all_pages` yields, as a list."""
+    return list(iter_all_pages(call, max_items=max_items, **kwargs))
 
 
 def _chunks(values: Sequence[Any], size: int) -> Iterator[list[Any]]:

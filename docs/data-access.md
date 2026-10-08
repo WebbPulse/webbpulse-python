@@ -217,6 +217,27 @@ for item in repo.iter_scan(FilterExpression=Attr("state").eq("open"), max_items=
 unbounded scan safe to expose. A parallel scan passes `segment` and `total_segments`; giving
 one without the other is a `ValueError` rather than a silently partial result.
 
+### Cursors and raw paged reads
+
+`encode_start_key(page.last_evaluated_key)` turns a `LastEvaluatedKey` into an opaque,
+URL-safe cursor, or `None` when there is no next page, and `decode_start_key(cursor)` turns it
+back into an `ExclusiveStartKey`, or `None` for a missing or empty cursor:
+
+```python
+page = repo.query(Key("workspace_id").eq(workspace_id), start_key=decode_start_key(cursor, scope=workspace_id))
+next_cursor = encode_start_key(page.last_evaluated_key, scope=workspace_id)
+```
+
+Values keep their DynamoDB types, so a `Decimal` or binary key survives the round trip. Any
+token that is not exactly what the encoder writes, or that was minted under another `scope`,
+raises `InvalidStartKey`, a `DynamoError` and a `ValueError`, with one fixed message. The
+token is encoded, not signed; use `webbpulse.http.encode_cursor` when a cursor must be
+tamper-evident.
+
+`iter_all_pages(table.query, **request)` and `read_all_pages` follow `LastEvaluatedKey` over a
+raw boto3 call with DynamoDB's own arguments, for a caller that holds a table rather than a
+`Repository`. Both take `max_items`, and an empty filtered page does not end the walk.
+
 ### Batch reads
 
 `batch_get(keys)` reads up to `BATCH_GET_LIMIT` (100) keys per request and chunks anything
