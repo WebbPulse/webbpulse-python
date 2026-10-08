@@ -1145,7 +1145,8 @@ def pytest_sessionfinish(session: pytest.Session, exitstatus: int) -> None:
     if worker:
         records = config.stash.get(SUITE_REQUESTS_KEY, None) or []
         runwide.write_worker_records(directory, worker, records)
-        runwide.write_worker_warnings(directory, worker, config.stash.get(DURABLE_FALLBACK_KEY, None) or [])
+        fallback_notes: list[str] = config.stash.get(DURABLE_FALLBACK_KEY, [])
+        runwide.write_worker_warnings(directory, worker, fallback_notes)
         return
     if not runwide.xdist_is_active(config):
         return
