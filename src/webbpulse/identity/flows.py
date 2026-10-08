@@ -20,6 +20,7 @@ from webbpulse.identity.lockout import (
     email_key,
     ip_key,
     lockout_state,
+    mfa_key,
     new_attempt,
 )
 from webbpulse.identity.mfa import (
@@ -456,11 +457,13 @@ class IdentityFlows:
         code: str,
         ip: str = "",
         user_agent: str = "",
+        now: datetime | None = None,
     ) -> AuthResult:
         """The second leg of login: spend a ticket, satisfy a factor, issue the session.
 
         The ticket is consumed before the code is checked, so a stolen ticket cannot be used
-        to grind codes.
+        to grind codes, and the code is checked under the account's MFA lockout, so neither
+        can fresh tickets from a known password spread across addresses.
         """
         service = self._require_mfa()
         user_id = service.consume_ticket(ticket)
@@ -472,7 +475,7 @@ class IdentityFlows:
                 error_code="MFA_TICKET_INVALID",
             )
 
-        method = service.verify_challenge(user_id, code)
+        method = self._verify_factor(service, user_id, code, ip=ip, user_agent=user_agent, now=now, purpose="mfa")
         _log.info(
             "MFA login completed.",
             extra={"event": "mfa.success", "user_id": user_id, "method": method},
@@ -485,19 +488,25 @@ class IdentityFlows:
         user_id: str,
         session_id: str,
         code: str,
+        ip: str = "",
+        user_agent: str = "",
+        now: datetime | None = None,
     ) -> AuthResult:
         """Re-authenticate inside an existing session with a TOTP or recovery code.
 
         No new refresh family and no cookie change: what changes is `auth_time` and `amr`.
         The result carries an empty `refresh_token` and the caller's existing `family_id`.
         `step_up_with_passkey` is the same step taken with a WebAuthn assertion instead.
+        The code counts toward the same MFA lockout as the second leg of login.
         """
         service = self._require_mfa()
         user = self._hooks.load_user_by_id(user_id)
         if user is None:
             raise MfaRejected()
 
-        method = service.verify_challenge(user_id, code)
+        method = self._verify_factor(
+            service, user_id, code, ip=ip, user_agent=user_agent, now=now, purpose="mfa_step_up"
+        )
         auth_time = int(time.time())
         self._sessions.record_reauthentication(session_id, auth_time)
         access = self._mint_access(
@@ -646,36 +655,57 @@ class IdentityFlows:
         passkeys = self.passkeys
         return passkeys is not None and bool(passkeys.list_passkeys(user_id))
 
-    def disable_totp(self, *, user_id: str, code: str) -> None:
+    def disable_totp(
+        self,
+        *,
+        user_id: str,
+        code: str,
+        ip: str = "",
+        user_agent: str = "",
+        now: datetime | None = None,
+    ) -> None:
         """Remove the factor and every recovery code, after proving possession of the factor.
 
-        The code is checked before anything is deleted, so a stolen access token alone cannot
-        turn off the control that bounds its value. A recovery code presented here is spent.
+        The code is checked before anything is deleted, and under the MFA lockout, so a stolen
+        access token alone cannot turn off the control that bounds its value. A recovery code
+        presented here is spent.
         """
         service = self._require_mfa()
         user = self._hooks.load_user_by_id(user_id)
         if user is None:
             raise MfaRejected()
 
-        method = service.verify_challenge(user_id, code)
+        method = self._verify_factor(
+            service, user_id, code, ip=ip, user_agent=user_agent, now=now, purpose="totp_disable"
+        )
         service.disable_totp(user_id)
         _log.info(
             "TOTP disabled after re-authentication.",
             extra={"event": "totp.disabled", "user_id": user_id, "method": method},
         )
 
-    def regenerate_recovery_codes(self, *, user_id: str, code: str) -> RecoveryCodeSet:
+    def regenerate_recovery_codes(
+        self,
+        *,
+        user_id: str,
+        code: str,
+        ip: str = "",
+        user_agent: str = "",
+        now: datetime | None = None,
+    ) -> RecoveryCodeSet:
         """Replace every recovery code, after proving possession of the factor.
 
-        Verification happens before the old set is deleted, so a refused attempt leaves the
-        user's existing codes intact.
+        Verification happens before the old set is deleted, and under the MFA lockout, so a
+        refused attempt leaves the user's existing codes intact.
         """
         service = self._require_mfa()
         user = self._hooks.load_user_by_id(user_id)
         if user is None:
             raise MfaRejected()
 
-        method = service.verify_challenge(user_id, code)
+        method = self._verify_factor(
+            service, user_id, code, ip=ip, user_agent=user_agent, now=now, purpose="recovery_regenerate"
+        )
         codes = service.regenerate_recovery_codes(user_id)
         _log.info(
             "Recovery codes regenerated after re-authentication.",
@@ -1711,10 +1741,46 @@ class IdentityFlows:
         if state.locked:
             self._record(identity, "locked", ip=ip, user_agent=user_agent)
             _log.warning(
-                "Password attempt refused by progressive lockout.",
+                "Attempt refused by progressive lockout.",
                 extra={"event": f"{purpose}.locked", "ip": ip, "failures": state.failures},
             )
             raise RateLimited(state.retry_after_seconds(now=now))
+
+    def _verify_factor(
+        self,
+        service: MfaService,
+        user_id: str,
+        code: str,
+        *,
+        ip: str,
+        user_agent: str,
+        now: datetime | None,
+        purpose: str,
+    ) -> str:
+        """Satisfy a factor under the user's MFA lockout, returning the `amr` value.
+
+        Refuses with `RateLimited` while the lockout is in force, records every refused code as
+        a failure under `mfa_key(user_id)` whichever address sent it, and records a success,
+        which clears the count as a correct password clears the password count.
+        """
+        identity = mfa_key(user_id)
+        self._refuse_when_locked(identity, ip=ip, user_agent=user_agent, now=now or datetime.now(UTC), purpose=purpose)
+        try:
+            method = service.verify_challenge(user_id, code)
+        except MfaRejected:
+            self._record(identity, "failure", user_id=user_id, ip=ip, user_agent=user_agent)
+            _log.info(
+                "Second factor attempt failed.",
+                extra={
+                    "event": f"{purpose}.failure",
+                    "user_id": user_id,
+                    "ip": ip,
+                    "user_agent": _device_class(user_agent),
+                },
+            )
+            raise
+        self._record(identity, "success", user_id=user_id, ip=ip, user_agent=user_agent)
+        return method
 
     def _check_password(
         self,

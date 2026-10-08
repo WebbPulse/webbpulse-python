@@ -1,7 +1,7 @@
 """Progressive lockout and the `login-attempts` record it is computed from.
 
 Lockout protects one account by delaying the next attempt after consecutive password
-failures; rate limiting, which protects the service, lives in `webbpulse.ratelimit`.
+failures, and separately after consecutive second-factor failures; rate limiting, which protects the service, lives in `webbpulse.ratelimit`.
 """
 
 from __future__ import annotations
@@ -32,6 +32,7 @@ __all__ = [
     "email_key",
     "ip_key",
     "lockout_state",
+    "mfa_key",
     "new_attempt",
 ]
 
@@ -58,6 +59,15 @@ def email_key(email: str) -> str:
 def ip_key(address: str) -> str:
     """The `identity_key` for a source address."""
     return f"ip#{address}"
+
+
+def mfa_key(user_id: str) -> str:
+    """The `identity_key` that counts one user's second-factor attempts.
+
+    Separate from the email key so a correct password, which is exactly what an attacker
+    guessing codes already holds, cannot clear the count.
+    """
+    return f"mfa#{user_id}"
 
 
 @dataclass(frozen=True, slots=True)

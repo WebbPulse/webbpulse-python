@@ -2253,3 +2253,122 @@ def test_password_step_up_without_a_bearer_is_a_401(
 
     assert response.status_code == 401
     assert response.json()["error_code"] == "NOT_AUTHENTICATED"
+
+
+def test_wrong_codes_from_many_addresses_lock_the_mfa_step(
+    flows: IdentityFlows, mfa: MfaService, hooks: FakeHooks, stores: IdentityStores
+) -> None:
+    """Five wrong codes, each from a different address and ticket, lock the second leg of login.
+
+    The attacker holds the password, so each fresh login succeeds and must not clear the count.
+    """
+    from webbpulse.identity.flows import RateLimited
+
+    seed_account(hooks, stores)
+    seed, _ = enrol(mfa)
+    for index in range(5):
+        address = f"198.51.100.{index + 1}"
+        with pytest.raises(MfaChallengeRequired) as challenged:
+            flows.login(email=EMAIL, password=PASSWORD, ip=address)
+        with pytest.raises(MfaRejected):
+            flows.complete_mfa(ticket=challenged.value.challenge.ticket, code=code_now(seed, offset=-5), ip=address)
+
+    with pytest.raises(MfaChallengeRequired) as challenged:
+        flows.login(email=EMAIL, password=PASSWORD, ip="203.0.113.50")
+    with pytest.raises(RateLimited) as caught:
+        flows.complete_mfa(ticket=challenged.value.challenge.ticket, code=code_now(seed, offset=1), ip="203.0.113.50")
+
+    assert caught.value.status_code == 429
+    assert caught.value.error_code == "TOO_MANY_ATTEMPTS"
+    assert caught.value.retry_after >= 1
+
+
+def test_the_mfa_lockout_lifts_after_its_delay_and_a_correct_code_clears_it(
+    flows: IdentityFlows,
+    mfa: MfaService,
+    hooks: FakeHooks,
+    stores: IdentityStores,
+    attempts: InMemoryLoginAttemptStore,
+) -> None:
+    """Step-up, disable and regenerate share one count; the delay decays and a success resets it."""
+    from datetime import UTC, datetime, timedelta
+
+    from webbpulse.identity.flows import RateLimited
+    from webbpulse.identity.lockout import lockout_state, mfa_key
+
+    seed_account(hooks, stores)
+    seed, _ = enrol(mfa)
+    wrong = code_now(seed, offset=-5)
+    for index in range(5):
+        address = f"198.51.100.{index + 1}"
+        with pytest.raises(MfaRejected):
+            if index % 3 == 0:
+                flows.step_up(user_id=USER_ID, session_id="session-1", code=wrong, ip=address)
+            elif index % 3 == 1:
+                flows.disable_totp(user_id=USER_ID, code=wrong, ip=address)
+            else:
+                flows.regenerate_recovery_codes(user_id=USER_ID, code=wrong, ip=address)
+
+    with pytest.raises(RateLimited):
+        flows.step_up(user_id=USER_ID, session_id="session-1", code=code_now(seed, offset=1), ip="203.0.113.50")
+    with pytest.raises(RateLimited):
+        flows.disable_totp(user_id=USER_ID, code=code_now(seed, offset=1), ip="203.0.113.51")
+
+    later = datetime.now(UTC) + timedelta(minutes=20)
+    stepped = flows.step_up(user_id=USER_ID, session_id="session-1", code=code_now(seed, offset=1), now=later)
+
+    assert AMR_OTP in claims_of(stepped.access_token)["amr"]
+    assert lockout_state(attempts.recent(mfa_key(USER_ID))).failures == 0
+    with pytest.raises(MfaRejected):
+        flows.step_up(user_id=USER_ID, session_id="session-1", code=wrong)
+
+
+def test_a_password_failure_and_an_mfa_failure_are_counted_apart(
+    flows: IdentityFlows,
+    mfa: MfaService,
+    hooks: FakeHooks,
+    stores: IdentityStores,
+    attempts: InMemoryLoginAttemptStore,
+) -> None:
+    """A wrong code is recorded under the user's MFA key and never under the email key."""
+    from webbpulse.identity.lockout import email_key, mfa_key
+
+    seed_account(hooks, stores)
+    seed, _ = enrol(mfa)
+    with pytest.raises(MfaRejected):
+        flows.step_up(user_id=USER_ID, session_id="session-1", code=code_now(seed, offset=-5))
+
+    assert [row.outcome for row in attempts.recent(mfa_key(USER_ID))] == ["failure"]
+    assert attempts.recent(email_key(EMAIL)) == []
+
+
+def test_a_locked_mfa_step_over_http_is_a_429_with_retry_after(
+    client: TestClient,
+    hooks: FakeHooks,
+    stores: IdentityStores,
+    kms: FakeKms,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The step-up, disable and recovery routes all answer the MFA lockout with a 429."""
+    seed_account(hooks, stores)
+    settings = make_settings()
+    service = MfaService(settings, stores, TokenService(settings, kms), kms_client=kms)
+    seed, _ = enrol(service)
+    auth = _signed_in(client, seed)
+    wrong = code_now(seed, offset=-5)
+    for _ in range(5):
+        refused = client.post(f"{prefix()}{STEP_UP_PATH}", headers=auth, json={"code": wrong})
+        assert refused.status_code == 401
+
+    with clock_advanced(monkeypatch, 2):
+        responses = [
+            client.post(f"{prefix()}{path}", headers=auth, json={"code": code_now(seed)})
+            for path in (STEP_UP_PATH, TOTP_DISABLE_PATH, RECOVERY_CODES_PATH)
+        ]
+
+    for response in responses:
+        assert response.status_code == 429
+        assert response.json()["error_code"] == "TOO_MANY_ATTEMPTS"
+        assert int(response.headers["retry-after"]) >= 1
+    factor = stores.require_totp_factors().get(USER_ID)
+    assert factor is not None and factor.is_active
