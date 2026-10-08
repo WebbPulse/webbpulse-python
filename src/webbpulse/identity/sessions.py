@@ -22,6 +22,8 @@ from webbpulse.identity.storage import (
 )
 
 if TYPE_CHECKING:  # pragma: no cover
+    from collections.abc import Sequence
+
     from webbpulse.identity.settings import IdentitySettings
 
 __all__ = [
@@ -46,7 +48,8 @@ class IssuedRefresh:
     `token` is the plaintext and exists only long enough to reach `set_cookie`; the stored
     record carries only its hash. `device` is the label the family was started under, which every generation carries.
     `auth_time` is the family's last authentication in epoch seconds, for the access token
-    minted alongside this generation.
+    minted alongside this generation. `amr` is the sign-in's `amr`, empty for a family
+    started before it was recorded.
     """
 
     token: str
@@ -56,6 +59,7 @@ class IssuedRefresh:
     expires_at: int
     device: str = ""
     auth_time: int = 0
+    amr: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -107,12 +111,14 @@ class SessionService:
         ip: str = "",
         now: datetime | None = None,
         auth_time: int | None = None,
+        amr: Sequence[str] = (),
     ) -> IssuedRefresh:
         """Begin a new family for one login, at generation 1.
 
         `device` and `ip` are recorded for the audit trail only: nothing in the rotation path
         compares them, since binding a session to either breaks legitimate users. `auth_time`
-        defaults to the moment the family starts, which is the login.
+        defaults to the moment the family starts, which is the login. `amr` is how the login
+        was made, and every generation carries it unchanged.
         """
         moment = now or datetime.now(UTC)
         return self._mint(
@@ -124,6 +130,7 @@ class SessionService:
             family_started_at=moment,
             now=moment,
             auth_time=int(moment.timestamp()) if auth_time is None else auth_time,
+            amr=tuple(dict.fromkeys(amr)),
         )
 
     def record_reauthentication(self, family_id: str, auth_time: int) -> int:
@@ -161,6 +168,7 @@ class SessionService:
         family_started_at: datetime,
         now: datetime,
         auth_time: int,
+        amr: tuple[str, ...] = (),
     ) -> IssuedRefresh:
         """Write one generation of a family and return its plaintext token.
 
@@ -183,6 +191,7 @@ class SessionService:
                 ip_first_seen=ip,
                 family_started_at=_iso(family_started_at),
                 auth_time=auth_time,
+                amr=amr,
             )
         )
         return IssuedRefresh(
@@ -193,6 +202,7 @@ class SessionService:
             expires_at=expires_at,
             device=device,
             auth_time=auth_time,
+            amr=amr,
         )
 
     def rotate(
@@ -236,6 +246,7 @@ class SessionService:
             family_started_at=self._family_started_at(record),
             now=moment,
             auth_time=self._auth_time(record),
+            amr=record.amr,
         )
 
         previous = self._store.consume(
@@ -313,6 +324,7 @@ class SessionService:
             family_started_at=self._family_started_at(current),
             now=moment,
             auth_time=max(self._auth_time(current), self._auth_time(successor_record)),
+            amr=current.amr,
         )
         _log.info(
             "Concurrent refresh inside the grace window; replaying rather than revoking.",

@@ -40,12 +40,14 @@ __all__ = [
     "AMR_OTP",
     "AMR_PASSWORD",
     "AMR_RECOVERY",
+    "PASSKEY_FACTOR",
     "RECOVERY_CODE_COUNT",
     "TOTP_FACTOR",
     "Enrolment",
     "MfaChallenge",
     "MfaRejected",
     "MfaService",
+    "MfaTicket",
     "RecoveryCodeSet",
     "hash_recovery_code",
     "normalise_recovery_code",
@@ -60,6 +62,8 @@ AMR_MFA: Final = "mfa"
 AMR_RECOVERY: Final = "recovery"
 
 TOTP_FACTOR: Final = "totp"
+
+PASSKEY_FACTOR: Final = "passkey"
 
 RECOVERY_CODE_COUNT: Final = 10
 
@@ -125,6 +129,18 @@ class MfaChallenge:
     def as_body(self) -> dict[str, Any]:
         """Render the JSON body in the shape `AuthClient.runTokenCall` branches on."""
         return {"mfa_required": True, "mfa_ticket": self.ticket, "factors": list(self.factors)}
+
+
+@dataclass(frozen=True, slots=True)
+class MfaTicket:
+    """A spent MFA ticket: whose login it was, and the `amr` of the first factor.
+
+    `amr` is what the first leg proved, such as `pwd` or an OAuth provider, so the second
+    leg can issue a session that reports how it really began.
+    """
+
+    user_id: str
+    amr: list[str]
 
 
 @dataclass(frozen=True, slots=True)
@@ -232,14 +248,21 @@ class MfaService:
         user_id = str(user.get("id", ""))
         return bool(user_id) and bool(self.factors_for(user_id))
 
-    def issue_challenge(self, user_id: str, *, factors: Sequence[str]) -> MfaChallenge:
-        """Mint a ticket for a login that got past the password and record it for single use.
+    def issue_challenge(
+        self,
+        user_id: str,
+        *,
+        factors: Sequence[str],
+        amr: Sequence[str] = (AMR_PASSWORD,),
+    ) -> MfaChallenge:
+        """Mint a ticket for a login that got past its first factor and record it for single use.
 
         The row is written before the ticket is returned, so a failed write leaves a ticket
-        that cannot be spent rather than one that works more than once.
+        that cannot be spent rather than one that works more than once. `amr` is the first
+        factor's, carried in the signed ticket for `redeem_ticket` to hand back.
         """
         jti = secrets.token_urlsafe(24)
-        ticket = self._tokens.mint_mfa_ticket(user_id, factors=[AMR_PASSWORD], jti=jti)
+        ticket = self._tokens.mint_mfa_ticket(user_id, factors=list(amr) or [AMR_PASSWORD], jti=jti)
         ttl_seconds = int(self._settings.mfa_ticket_ttl.total_seconds())
         self._stores.require_identity_tokens().put(
             IdentityTokenRecord(
@@ -254,22 +277,25 @@ class MfaService:
         return MfaChallenge(ticket=ticket, factors=list(factors))
 
     def consume_ticket(self, ticket: str) -> str:
-        """Verify a ticket, spend it, and return the user id it was issued for.
+        """Verify a ticket, spend it, and return the user id it was issued for."""
+        return self.redeem_ticket(ticket).user_id
+
+    def ticket_subject(self, ticket: str) -> str:
+        """The user id a ticket was issued for, checking its signature and spending nothing.
+
+        For a step that must know whose login this is before the factor is presented, such
+        as minting a WebAuthn challenge. Refuses exactly as `redeem_ticket` does.
+        """
+        return str(self._verified_ticket(ticket)["sub"])
+
+    def redeem_ticket(self, ticket: str) -> MfaTicket:
+        """Verify a ticket, spend it, and return its user id and first-factor `amr`.
 
         The signature proves the issuer and the atomic consume proves it has not been spent;
-        a ticket that verifies over a consumed row is a replay and is refused.
+        a ticket that verifies over a consumed row is a replay and is refused. A ticket with
+        no readable `amr` reports `pwd`, which is what every ticket carried before.
         """
-        from webbpulse.identity.service import InvalidToken
-
-        try:
-            claims = self._tokens.verify_mfa_ticket(ticket)
-        except InvalidToken as exc:
-            _log.info("mfa ticket rejected: %s", exc.reason)
-            raise MfaRejected(
-                "That sign-in attempt has expired. Start again.",
-                error_code="MFA_TICKET_INVALID",
-            ) from exc
-
+        claims = self._verified_ticket(ticket)
         record = self._stores.require_identity_tokens().consume(hash_token(str(claims["jti"])))
         if record is None or record.purpose != "mfa_ticket":
             _log.warning("mfa ticket replay refused for %s", claims.get("sub"))
@@ -277,7 +303,22 @@ class MfaService:
                 "That sign-in attempt has expired. Start again.",
                 error_code="MFA_TICKET_INVALID",
             )
-        return str(claims["sub"])
+        raw = claims.get("amr")
+        amr = [str(method) for method in raw if str(method)] if isinstance(raw, list) else []
+        return MfaTicket(user_id=str(claims["sub"]), amr=amr or [AMR_PASSWORD])
+
+    def _verified_ticket(self, ticket: str) -> dict[str, Any]:
+        """The claims of a ticket whose signature, audience and type check, or `MfaRejected`."""
+        from webbpulse.identity.service import InvalidToken
+
+        try:
+            return self._tokens.verify_mfa_ticket(ticket)
+        except InvalidToken as exc:
+            _log.info("mfa ticket rejected: %s", exc.reason)
+            raise MfaRejected(
+                "That sign-in attempt has expired. Start again.",
+                error_code="MFA_TICKET_INVALID",
+            ) from exc
 
     def begin_enrolment(self, user_id: str, *, account_name: str) -> Enrolment:
         """Generate and seal a seed, returning it in plaintext exactly once.

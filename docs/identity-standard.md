@@ -89,6 +89,7 @@ Paths are relative to the issuer prefix (normally `/api/auth`).
 |---|---|
 | `POST /register`, `POST /login` | none |
 | `POST /login/totp` (holds an MFA ticket, not an access token) | none |
+| `POST /login/mfa/passkey/options`, `/login/mfa/passkey/verify` (hold an MFA ticket) | none |
 | `POST /login/passkey/options`, `/login/passkey/verify` | none |
 | `POST /refresh` (the cookie authenticates it) | none |
 | `POST /logout`, `POST /logout-all` (MUST work with an expired access token) | none |

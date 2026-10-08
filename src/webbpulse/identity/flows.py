@@ -26,6 +26,7 @@ from webbpulse.identity.lockout import (
 from webbpulse.identity.mfa import (
     AMR_MFA,
     AMR_PASSWORD,
+    PASSKEY_FACTOR,
     MfaChallenge,
     MfaRejected,
     MfaService,
@@ -256,6 +257,14 @@ class IdentityFlows:
             self.passkeys = PasskeyService(settings, stores)
 
     @property
+    def passkey_second_factor_enabled(self) -> bool:
+        """Whether a passkey can answer the login MFA challenge.
+
+        Needs `passkeys_second_factor`, the MFA service for the ticket, and the passkey service.
+        """
+        return self._settings.passkeys_second_factor and self.mfa is not None and self.passkeys is not None
+
+    @property
     def sessions(self) -> SessionService:
         """The session service, for a caller that needs the family lifecycle directly."""
         return self._sessions
@@ -402,7 +411,7 @@ class IdentityFlows:
             },
         )
 
-        challenge = self._challenge_for(user)
+        challenge = self._challenge_for(user, amr=[AMR_PASSWORD])
         if challenge is not None:
             raise MfaChallengeRequired(challenge)
 
@@ -425,30 +434,40 @@ class IdentityFlows:
 
         self._hooks.may_authenticate(user)
 
-        challenge = self._challenge_for(user)
+        amr = [AMR_OAUTH, provider]
+        challenge = self._challenge_for(user, amr=amr)
         if challenge is not None:
             raise MfaChallengeRequired(challenge)
 
-        return self._issue(
-            user,
-            ip=ip,
-            user_agent=user_agent,
-            amr=[AMR_OAUTH, provider],
-        )
+        return self._issue(user, ip=ip, user_agent=user_agent, amr=amr)
 
-    def _challenge_for(self, user: Mapping[str, Any]) -> MfaChallenge | None:
+    def _challenge_for(
+        self,
+        user: Mapping[str, Any],
+        *,
+        amr: Sequence[str],
+        passkey_factor: bool = True,
+    ) -> MfaChallenge | None:
         """The challenge this user must answer, or `None` to issue tokens directly.
 
         Returns `None` when MFA is not configured at all, so a product that never wired the
-        stores keeps its previous behaviour.
+        stores keeps its previous behaviour. `amr` is the first factor's and rides in the
+        ticket. With `passkeys_second_factor` on, a registered passkey is offered as the
+        `passkey` factor unless `passkey_factor` is false, as when a passkey was the first.
         """
         if self.mfa is None:
             return None
         user_id = _user_id(user)
         factors = self.mfa.factors_for(user_id)
+        if passkey_factor and self.passkey_second_factor_enabled and self._has_passkey(user_id):
+            factors = [*factors, PASSKEY_FACTOR]
         if not factors:
             return None
-        return self.mfa.issue_challenge(user_id, factors=factors)
+        return self.mfa.issue_challenge(user_id, factors=factors, amr=amr)
+
+    def _has_passkey(self, user_id: str) -> bool:
+        """Whether the user has at least one registered passkey."""
+        return self.passkeys is not None and bool(self.passkeys.list_passkeys(user_id))
 
     def complete_mfa(
         self,
@@ -466,7 +485,8 @@ class IdentityFlows:
         can fresh tickets from a known password spread across addresses.
         """
         service = self._require_mfa()
-        user_id = service.consume_ticket(ticket)
+        spent = service.redeem_ticket(ticket)
+        user_id = spent.user_id
 
         user = self._hooks.load_user_by_id(user_id)
         if user is None:
@@ -480,7 +500,59 @@ class IdentityFlows:
             "MFA login completed.",
             extra={"event": "mfa.success", "user_id": user_id, "method": method},
         )
-        return self._issue(user, ip=ip, user_agent=user_agent, amr=[AMR_PASSWORD, method])
+        return self._issue(user, ip=ip, user_agent=user_agent, amr=[*spent.amr, method])
+
+    def begin_mfa_passkey(self, *, ticket: str) -> RegistrationChallenge:
+        """Options for answering a login MFA challenge with a passkey.
+
+        The ticket's signature names the user and is not spent here, so the challenge is
+        scoped to that user and demands user verification, as a step-up does. Refused with
+        403 `PASSKEY_FACTOR_DISABLED` unless `passkey_second_factor_enabled`.
+        """
+        service, passkeys = self._require_passkey_factor()
+        return passkeys.begin_step_up(service.ticket_subject(ticket))
+
+    def complete_mfa_with_passkey(
+        self,
+        *,
+        ticket: str,
+        challenge_id: str,
+        credential: Mapping[str, Any],
+        ip: str = "",
+        user_agent: str = "",
+    ) -> AuthResult:
+        """The second leg of login answered with a passkey assertion instead of a code.
+
+        The ticket is spent before the assertion is checked, as in `complete_mfa`, and the
+        session's `amr` is the first factor's plus `swk`, which adds `mfa`.
+        """
+        from webbpulse.identity.passkeys import AMR_PASSKEY
+
+        service, passkeys = self._require_passkey_factor()
+        spent = service.redeem_ticket(ticket)
+        user = self._hooks.load_user_by_id(spent.user_id)
+        if user is None:
+            raise MfaRejected(
+                "That sign-in attempt has expired. Start again.",
+                error_code="MFA_TICKET_INVALID",
+            )
+        self._hooks.may_authenticate(user)
+        passkeys.finish_step_up(spent.user_id, challenge_id=challenge_id, credential=credential)
+        _log.info(
+            "MFA login completed.",
+            extra={"event": "mfa.success", "user_id": spent.user_id, "method": AMR_PASSKEY},
+        )
+        return self._issue(user, ip=ip, user_agent=user_agent, amr=[*spent.amr, AMR_PASSKEY])
+
+    def _require_passkey_factor(self) -> tuple[MfaService, PasskeyService]:
+        """The MFA and passkey services, or 403 `PASSKEY_FACTOR_DISABLED`."""
+        if not self.passkey_second_factor_enabled or self.mfa is None or self.passkeys is None:
+            raise MfaRejected(
+                "Passkeys cannot complete this sign-in.",
+                error_code="PASSKEY_FACTOR_DISABLED",
+                status_code=403,
+            )
+        return self.mfa, self.passkeys
 
     def step_up(
         self,
@@ -978,6 +1050,7 @@ class IdentityFlows:
         access = self._mint_access(
             user,
             session_id=result.issued.family_id,
+            amr=result.issued.amr or (AMR_PASSWORD,),
             auth_time=result.issued.auth_time or None,
         )
         _log.info(
@@ -1584,7 +1657,7 @@ class IdentityFlows:
         self._hooks.may_authenticate(user)
 
         if not result.user_verified and self.mfa is not None:
-            challenge = self._challenge_for(user)
+            challenge = self._challenge_for(user, amr=result.amr, passkey_factor=False)
             if challenge is not None:
                 raise MfaChallengeRequired(challenge)
 
@@ -1633,9 +1706,9 @@ class IdentityFlows:
         extra: Mapping[str, Any] | None = None,
         amr: Sequence[str] = (AMR_PASSWORD,),
     ) -> AuthResult:
-        """Start a family and mint the first access token for it."""
+        """Start a family that records `amr`, and mint the first access token for it."""
         user_id = _user_id(user)
-        issued = self._sessions.start_family(user_id, device=_device_class(user_agent), ip=ip)
+        issued = self._sessions.start_family(user_id, device=_device_class(user_agent), ip=ip, amr=amr)
         access = self._mint_access(user, session_id=issued.family_id, amr=amr, auth_time=issued.auth_time)
         return AuthResult(
             access_token=access,

@@ -29,6 +29,7 @@ permanently.
 | `totp_enabled` | `True` | |
 | `passkeys_enabled` | `True` | |
 | `passkeys_passwordless` | `True` | |
+| `passkeys_second_factor` | `False` | A registered passkey answers the login MFA challenge as the `passkey` factor; needs the TOTP stores for the ticket |
 | `oauth_providers` | `["google","github"]` | `OAuthProvider` literals |
 | `password_breach_check` | `False` | Opt in to the breach corpus check (5.2) |
 | `mfa_required_for_roles` | `[]` | |

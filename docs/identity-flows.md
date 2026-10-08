@@ -27,6 +27,21 @@ Leg one returns **no access token**, but an MFA ticket: `typ` `mfa_ticket`, `aud
    the TOTP code in window.
 3. `200 {access_token, ...}` plus `Set-Cookie` refresh.
 
+The ticket carries the first factor's `amr` (`pwd`, or `oauth` and the provider), so the
+session the second leg issues reports how the sign-in really began.
+
+With `passkeys_second_factor` on, a user with a registered passkey gets `passkey` in
+`factors`, even with no TOTP enrolled. The SPA then calls `POST /login/mfa/passkey/options
+{mfa_ticket}`, which mints a user-scoped, UV-required challenge without spending the ticket,
+and `POST /login/mfa/passkey/verify {mfa_ticket, challenge_id, credential}`, which spends it
+and issues `amr` `["pwd", "swk", "mfa"]`. A passkey that was itself the first factor is never
+offered again as the second.
+
+Every refresh family records the sign-in `amr`, and every access token minted by `/refresh`
+carries it. A family written before the attribute existed refreshes with `["pwd"]`, as it
+always did. A step-up raises `amr` on that one access token and moves `auth_time`; it does not
+change the `amr` later refreshes report.
+
 The ticket MUST be rejected by every other audience, and is single use: its `jti` is recorded
 and a replay refused. `POST /step-up` raises `amr` inside a session; sensitive routes MUST
 assert on `amr`, not a boolean.
