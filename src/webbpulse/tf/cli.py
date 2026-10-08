@@ -11,6 +11,9 @@
     wp-tf logs run-01M3... --phase plan --follow
     wp-tf status run-01M3...
     wp-tf workspaces
+    wp-tf var list -w platform-staging
+    wp-tf var set region us-west-2 -w platform-staging
+    printf %s "$SECRET" | wp-tf var set api_key --value-stdin --sensitive -w platform-staging
     wp-tf login --add-scope state:download
     wp-tf logout
 
@@ -26,7 +29,7 @@ The access gate value comes from `WP_TF_GATE`, else from the gate's SSM paramete
 `/<prefix>/access-gate/origin-verify` when AWS credentials can read it, with the prefix
 from `--gate-prefix`, `WP_TF_GATE_PREFIX` or the known host. Only `apply` and `confirm`
 apply, and `apply` asks first unless `--auto-approve` is given. No command reads state, and
-no token or gate value is ever printed.
+no token, gate value or sensitive variable value is ever printed.
 
 Log lines go to stdout, progress and the confirmation prompt to stderr. Exit codes: 0 when
 the plan or apply succeeded, 1 on any failure or a declined apply, 2 under
@@ -52,7 +55,7 @@ from .gate import GateError, resolve_gate
 if TYPE_CHECKING:
     from webbpulse.device_login import DeviceLoginClient
 
-    from .client import ControlPlane
+    from .client import ApiError, ControlPlane
 
 PROG = "wp-tf"
 
@@ -110,6 +113,15 @@ The standard set is:
 
 state:download and admin are never granted unless named. Applying needs runs:apply, so
 when the plane's default set lacks it, sign in with `wp-tf login --add-scope runs:apply`."""
+
+VARIABLE_SCOPES_HINT = (
+    "run `wp-tf login --add-scope variables:write` to sign in with a keyring session that has it; "
+    "a `terraform login` key is used only when no session, WP_TF_TOKEN or TF_TOKEN_<host> is present"
+)
+"""How to get a credential that can write variables, said when the plane refuses one."""
+
+SENSITIVE_PLACEHOLDER = "<sensitive>"
+"""What `var list` shows in place of a sensitive value, which the plane never returns."""
 
 DRAIN_EMPTY_PAGES = 2
 """Empty log pages read after a run ends before the stream counts as complete, since the
@@ -178,6 +190,39 @@ def build_parser() -> argparse.ArgumentParser:
     status.add_argument("run_id")
 
     commands.add_parser("workspaces", help="list workspaces: id, name, working directory")
+
+    var = commands.add_parser("var", help="list, read, set and delete workspace variables")
+    var_commands = var.add_subparsers(dest="var_command", required=True)
+    workspace = _Parser(add_help=False)
+    workspace.add_argument("-w", "--workspace", required=True, help="workspace name or ws- id")
+    var_commands.add_parser(
+        "list", parents=[workspace], help="list variables: key, category, flags, value (sensitive ones redacted)"
+    )
+    var_get = var_commands.add_parser(
+        "get", parents=[workspace], help="print one variable's value; a sensitive value is refused"
+    )
+    var_get.add_argument("key")
+    var_get.add_argument("--json", action="store_true", help="print the whole variable as JSON")
+    var_set = var_commands.add_parser(
+        "set",
+        parents=[workspace],
+        help="create or update a variable, keeping its category, hcl, description and sensitivity unless given",
+    )
+    var_set.add_argument("key")
+    var_set.add_argument("value", nargs="?", help="the value; prefer --value-stdin for anything secret")
+    var_set.add_argument(
+        "--value-stdin", action="store_true", help="read the value from stdin, dropping one trailing newline"
+    )
+    var_set.add_argument("--category", choices=("terraform", "env"), help="terraform or env (default terraform)")
+    var_set.add_argument(
+        "--hcl", action=argparse.BooleanOptionalAction, default=None, help="parse the value as an HCL expression"
+    )
+    var_set.add_argument("--description", help="the variable's description")
+    var_set.add_argument(
+        "--sensitive", action="store_true", help="store the value write-only; a sensitive variable stays sensitive"
+    )
+    var_unset = var_commands.add_parser("unset", parents=[workspace], help="delete a variable")
+    var_unset.add_argument("key")
 
     login = commands.add_parser(
         "login",
@@ -492,6 +537,118 @@ def _confirm_command(
     return _follow_apply(plane, args.run_id, stdout, stderr, sleep)
 
 
+def _variable_flags(variable: Mapping[str, Any]) -> str:
+    """The `hcl` and `sensitive` markers of a variable, or `-` when it has neither."""
+    flags = [name for name in ("hcl", "sensitive") if variable.get(name)]
+    return ",".join(flags) or "-"
+
+
+def _redacted(variable: Mapping[str, Any]) -> dict[str, Any]:
+    """The variable with its value replaced by the placeholder when it is sensitive."""
+    shown = dict(variable)
+    if shown.get("sensitive"):
+        shown["value"] = SENSITIVE_PLACEHOLDER
+    return shown
+
+
+def _variable_refusal(exc: ApiError, scope: str) -> ApiError | None:
+    """A plane refusal of a variable call reworded to name the scope or sign-in it needs, or None."""
+    from .client import ApiError
+
+    if exc.status == 403:
+        hint = VARIABLE_SCOPES_HINT if scope == "variables:write" else f"run `wp-tf login --add-scope {scope}`"
+        return ApiError(exc.status, f"the credential lacks the {scope} scope; {hint}", exc.error_code)
+    if exc.status == 401 and exc.error_code == "STEP_UP_REQUIRED":
+        return ApiError(
+            exc.status,
+            "changing a sensitive variable needs a sign-in within the last 15 minutes; run `wp-tf login` again",
+            exc.error_code,
+        )
+    return None
+
+
+def _set_value(args: argparse.Namespace, stdin: IO[str]) -> str:
+    """The value `var set` writes, from the argument or from stdin, never both."""
+    if args.value_stdin == (args.value is not None):
+        raise UsageError("var set takes a value or --value-stdin, exactly one")
+    if args.value is not None:
+        return str(args.value)
+    value = stdin.read()
+    if value.endswith("\r\n"):
+        return value[:-2]
+    return value[:-1] if value.endswith("\n") else value
+
+
+def _existing_variable(plane: ControlPlane, workspace_id: str, key: str) -> dict[str, Any] | None:
+    """The stored variable, or None when the workspace has no variable by that key."""
+    from .client import ApiError
+
+    try:
+        return plane.get_variable(workspace_id, key)
+    except ApiError as exc:
+        if exc.status == 404:
+            return None
+        raise
+
+
+def _var_command(
+    args: argparse.Namespace, plane: ControlPlane, stdin: IO[str], stdout: IO[str], stderr: IO[str]
+) -> int:
+    """Run `var list`, `get`, `set` or `unset`. No sensitive value is ever printed."""
+    from .client import ApiError
+
+    value = _set_value(args, stdin) if args.var_command == "set" else ""
+    workspace = plane.resolve_workspace(args.workspace)
+    workspace_id = str(workspace["workspace_id"])
+    name = str(workspace.get("name") or workspace_id)
+    scope = "variables:read"
+    try:
+        if args.var_command == "list":
+            for item in plane.list_variables(workspace_id):
+                shown = _redacted(item)
+                row = (shown.get("key"), shown.get("category"), _variable_flags(shown), shown.get("value"))
+                print("\t".join("" if part is None else str(part) for part in row), file=stdout)
+            return EXIT_OK
+        if args.var_command == "get":
+            variable = plane.get_variable(workspace_id, args.key)
+            if args.json:
+                print(json.dumps(_redacted(variable), indent=2, sort_keys=True), file=stdout)
+                return EXIT_OK
+            if variable.get("sensitive"):
+                print(f"{PROG}: {args.key} is sensitive; its value is never read back", file=stderr)
+                return EXIT_ERROR
+            print(variable.get("value") or "", file=stdout)
+            return EXIT_OK
+        if args.var_command == "unset":
+            scope = "variables:write"
+            plane.delete_variable(workspace_id, args.key)
+            print(f"{PROG}: deleted {args.key} from {name}", file=stderr, flush=True)
+            return EXIT_OK
+        existing = _existing_variable(plane, workspace_id, args.key) or {}
+        scope = "variables:write"
+        stored = plane.put_variable(
+            workspace_id,
+            args.key,
+            value=value,
+            category=args.category or str(existing.get("category") or "terraform"),
+            hcl=bool(existing.get("hcl")) if args.hcl is None else args.hcl,
+            sensitive=args.sensitive or bool(existing.get("sensitive")),
+            description=str(existing.get("description") or "") if args.description is None else args.description,
+        )
+    except ApiError as exc:
+        refusal = _variable_refusal(exc, scope)
+        if refusal is None:
+            raise
+        raise refusal from exc
+    verb = "updated" if existing else "created"
+    print(
+        f"{PROG}: {verb} {args.key} on {name} ({stored.get('category', '')}, {_variable_flags(stored)})",
+        file=stderr,
+        flush=True,
+    )
+    return EXIT_OK
+
+
 def _requested_scopes(args: argparse.Namespace) -> list[str]:
     """The scopes `login` asks for: exactly `--scope`, the standard set plus `--add-scope`, or none
     so the plane grants its default set."""
@@ -719,6 +876,8 @@ def main(
                 else:
                     _print_all_logs(plane, args.run_id, args.phase, out)
                 return EXIT_OK
+            if args.command == "var":
+                return _var_command(args, plane, inp, out, err)
             if args.command == "status":
                 print(json.dumps(plane.get_run(args.run_id), indent=2, sort_keys=True), file=out)
                 return EXIT_OK
