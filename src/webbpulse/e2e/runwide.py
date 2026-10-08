@@ -36,6 +36,7 @@ from .unavailable import UNAVAILABLE_STATUS, ExpectedUnavailable, normalise_expe
 __all__ = [
     "RUN_DIRECTORY_PREFIX",
     "WORKER_SKIP_REASON",
+    "WORKER_WARNINGS_SUFFIX",
     "RecordedRequest",
     "RunWideVerdicts",
     "controller_verdicts",
@@ -46,6 +47,7 @@ __all__ = [
     "no_integration_reported_an_error",
     "no_request_was_answered_with_a_server_error",
     "read_worker_records",
+    "read_worker_warnings",
     "remove_run_directory",
     "run_directory",
     "the_access_log_carries_this_runs_requests",
@@ -53,9 +55,13 @@ __all__ = [
     "the_allowlist_is_not_stale",
     "the_run_recorded_requests_to_correlate",
     "write_worker_records",
+    "write_worker_warnings",
 ]
 
 RUN_DIRECTORY_PREFIX: Final = "webbpulse-e2e-run-"
+
+WORKER_WARNINGS_SUFFIX: Final = ".warnings"
+"""The suffix of a worker's warnings file, kept apart from the `*.json` request records."""
 
 WORKER_SKIP_REASON: Final = (
     "the run-wide checks are made on the controller once every worker has finished. Under "
@@ -165,6 +171,43 @@ def _records_in(path: Path) -> Iterator[RecordedRequest]:
             path=str(item.get("path", "")),
             request_id=str(item.get("request_id", "")),
         )
+
+
+def write_worker_warnings(directory: Path, worker: str, warnings: Iterable[str]) -> Path | None:
+    """Write the warnings one worker wants the controller to print, returning the path written.
+
+    Nothing is written for an empty list, so a clean worker leaves no file. Written to a
+    temporary name and renamed, the way the request records are.
+    """
+    messages = [str(message) for message in warnings if message]
+    if not messages:
+        return None
+    directory.mkdir(parents=True, exist_ok=True)
+    target = directory / f"{worker}{WORKER_WARNINGS_SUFFIX}"
+    staging = directory / f".{worker}{WORKER_WARNINGS_SUFFIX}.tmp"
+    staging.write_text(json.dumps(messages), encoding="utf-8")
+    staging.replace(target)
+    return target
+
+
+def read_worker_warnings(directory: Path) -> tuple[str, ...]:
+    """Every warning every worker of this run wrote, in worker order.
+
+    A file that is unreadable or not a list of strings is skipped rather than raising, for
+    the same reason `read_worker_records` skips one.
+    """
+    if not directory.is_dir():
+        return ()
+    messages: list[str] = []
+    for path in sorted(directory.glob(f"*{WORKER_WARNINGS_SUFFIX}")):
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            continue
+        if not isinstance(payload, list):
+            continue
+        messages.extend(str(item) for item in payload if isinstance(item, str) and item)
+    return tuple(messages)
 
 
 def remove_run_directory(directory: Path) -> None:

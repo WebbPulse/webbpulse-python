@@ -7,7 +7,10 @@ user needs no such group.
 
 Falls back to the durable user whenever the route is not there, which covers a product that
 has not adopted the flag yet and any environment where the flag is off. A read-only run
-signs in as nobody and asks for neither.
+signs in as nobody and asks for neither. Only the route's own refusal counts as "not here":
+a 403 from the HTTP API authorizer in front of it, which a cold start produces, is retried
+and then raised, because reading it as a refusal silently ran a whole worker as the shared
+durable user.
 
 A run whose teardown delete failed leaves its user behind, so the first worker of every run
 asks the sweep route to delete ephemeral users older than `SWEEP_OLDER_THAN_SECONDS`. A
@@ -23,20 +26,25 @@ from __future__ import annotations
 
 import secrets
 import string
+import time
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import Any, Final, Protocol
 
 __all__ = [
     "BODY_EXCERPT_LIMIT",
     "CREATE_PATH",
+    "GATEWAY_RETRY_DELAYS",
     "PASSWORD_LENGTH",
     "RESERVED_EMAIL_DOMAIN",
+    "ROUTE_REFUSAL_CODES",
     "SWEEP_OLDER_THAN_SECONDS",
     "SWEEP_PATH",
     "SWEEP_UNOFFERED_STATUSES",
     "Credentials",
     "EphemeralUser",
     "TokenClient",
+    "attempt_ephemeral_user",
     "create_ephemeral_user",
     "delete_ephemeral_user",
     "describe_delete_failure",
@@ -44,6 +52,7 @@ __all__ = [
     "email_validation_hint",
     "ephemeral_email",
     "generate_password",
+    "is_route_refusal",
     "item_path",
     "sweep_ephemeral_users",
 ]
@@ -63,6 +72,14 @@ SWEEP_OLDER_THAN_SECONDS: Final = 3 * 60 * 60
 
 SWEEP_UNOFFERED_STATUSES: Final = frozenset({403, 404, 405, 501})
 """The answers that mean this deployment offers no sweep, rather than that one failed."""
+
+ROUTE_REFUSAL_CODES: Final = frozenset({"ADMIN_REQUIRED", "EPHEMERAL_USERS_DISABLED"})
+"""The `error_code` values the create route's own 403 carries, which mean "not offered here"."""
+
+UNMOUNTED_STATUSES: Final = frozenset({404, 405})
+
+GATEWAY_RETRY_DELAYS: Final[tuple[float, ...]] = (1.0, 2.0, 4.0)
+"""Seconds slept before each retry of a 403 that is not the route's own refusal."""
 
 DETAIL_LIMIT: Final = 10
 
@@ -242,6 +259,27 @@ class EphemeralUser:
     create_path: str = CREATE_PATH
 
 
+def is_route_refusal(response: Any) -> bool:
+    """Whether this 403 is the create route's own refusal rather than the gateway's.
+
+    The route answers in the shared error envelope with a top-level `error_code` from
+    `ROUTE_REFUSAL_CODES`. A `detail` object carrying the code is read too, for a product
+    that renders the refusal through a bare `HTTPException`. Anything else, such as the
+    authorizer's `{"message": "Forbidden"}`, is not the route speaking.
+    """
+    try:
+        payload = response.json()
+    except Exception:
+        return False
+    if not isinstance(payload, dict):
+        return False
+    detail = payload.get("detail")
+    codes = {payload.get("error_code")}
+    if isinstance(detail, dict):
+        codes.add(detail.get("error_code"))
+    return any(code in ROUTE_REFUSAL_CODES for code in codes)
+
+
 def create_ephemeral_user(
     client: TokenClient,
     *,
@@ -250,31 +288,74 @@ def create_ephemeral_user(
     create_path: str = CREATE_PATH,
     password: str | None = None,
     attributes: dict[str, Any] | None = None,
+    sleep: Callable[[float], None] = time.sleep,
 ) -> EphemeralUser | None:
     """Create this run's login user, or None when the route is not offered here.
 
-    A 404 or a 403 is read as "this deployment does not offer ephemeral users" and answered
-    with None so the caller falls back to the durable user. Every other failure raises,
-    because a route that exists and is erroring is a finding rather than a reason to quietly
-    mutate the shared account.
+    `attempt_ephemeral_user` with the reason for a missing route dropped, for a caller that
+    only needs to know whether it got a user.
+    """
+    result = attempt_ephemeral_user(
+        client,
+        run_id=run_id,
+        admin_token=admin_token,
+        create_path=create_path,
+        password=password,
+        attributes=attributes,
+        sleep=sleep,
+    )
+    return result if isinstance(result, EphemeralUser) else None
+
+
+def attempt_ephemeral_user(
+    client: TokenClient,
+    *,
+    run_id: str,
+    admin_token: str,
+    create_path: str = CREATE_PATH,
+    password: str | None = None,
+    attributes: dict[str, Any] | None = None,
+    sleep: Callable[[float], None] = time.sleep,
+) -> EphemeralUser | str:
+    """Create this run's login user, or say why this deployment does not offer the route.
+
+    A 404 or 405 means the route is not mounted, and a 403 carrying one of
+    `ROUTE_REFUSAL_CODES` is the route refusing; both return the reason so the caller can
+    fall back to the durable user and say why. Any other 403 is the gateway in front of the
+    route, such as an authorizer timing out on a cold start, and is retried after each delay
+    in `GATEWAY_RETRY_DELAYS` before it raises. Every other failure raises at once, because a
+    route that exists and is erroring is a finding rather than a reason to quietly mutate the
+    shared account.
 
     Neither the generated password nor the admin token reaches the raised message.
     """
     secret = password if password is not None else generate_password()
     email = ephemeral_email(run_id)
-    response = client.with_token(admin_token).post(
-        create_path,
-        json={"email": email, "password": secret, "attributes": dict(attributes or {})},
-    )
-    if response.status_code in (403, 404, 405):
-        return None
+    body = {"email": email, "password": secret, "attributes": dict(attributes or {})}
+    response = client.with_token(admin_token).post(create_path, json=body)
+    for delay in GATEWAY_RETRY_DELAYS:
+        if response.status_code != 403 or is_route_refusal(response):
+            break
+        sleep(delay)
+        response = client.with_token(admin_token).post(create_path, json=body)
+    if response.status_code in UNMOUNTED_STATUSES:
+        return f"POST {create_path} answered {response.status_code}, so this deployment does not mount the route."
+    if response.status_code == 403 and is_route_refusal(response):
+        return f"POST {create_path} refused the run. It said: {describe_error_body(response)}"
+    if response.status_code == 403:
+        raise RuntimeError(
+            f"POST {create_path} answered 403 on {len(GATEWAY_RETRY_DELAYS) + 1} attempts with a body "
+            "that is not the route's own refusal, so the gateway in front of it, most likely the "
+            "HTTP API authorizer, kept refusing the minted admin token. Falling back would run "
+            f"this worker as the shared durable user. It said: {describe_error_body(response)}"
+        )
     if response.status_code != 201:
-        body = describe_error_body(response)
-        hint = email_validation_hint(response.status_code, body, email)
+        described = describe_error_body(response)
+        hint = email_validation_hint(response.status_code, described, email)
         message = (
             f"POST {create_path} answered {response.status_code} rather than creating this "
             "run's ephemeral e2e user. The route is mounted, so this is a real failure "
-            f"rather than a deployment that does not offer it. It said: {body}"
+            f"rather than a deployment that does not offer it. It said: {described}"
         )
         raise RuntimeError(f"{message} {hint}" if hint else message)
     try:

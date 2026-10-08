@@ -7,6 +7,27 @@ This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## Unreleased
 
+## 0.74.0
+
+### Added
+
+- `webbpulse.e2e.ephemeral.attempt_ephemeral_user` returns the created user or the reason the
+  deployment does not offer the route, and `is_route_refusal` tells the route's own 403 from
+  the gateway's (PLAT-20).
+- `webbpulse.e2e.runwide.write_worker_warnings` and `read_worker_warnings` hand worker
+  warnings to the controller through the run directory.
+
+### Changed
+
+- `create_ephemeral_user` no longer reads every 403 as "not offered". Only a 403 whose
+  `error_code` is `ADMIN_REQUIRED` or `EPHEMERAL_USERS_DISABLED`, the route's own refusal,
+  falls back with 404 and 405. Any other 403, such as an HTTP API authorizer's
+  `{"message": "Forbidden"}` on a cold start, is retried after 1, 2 and 4 seconds and then
+  raises rather than running the worker as the shared durable user.
+- A run that could mint and still falls back to the durable user warns, and the warning is
+  printed under `webbpulse e2e durable user fallback` in the terminal summary, from every
+  worker under xdist.
+
 ## 0.73.0
 
 ### Added

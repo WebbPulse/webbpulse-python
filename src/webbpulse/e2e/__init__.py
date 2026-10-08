@@ -34,7 +34,7 @@ from .ephemeral import (
     CREATE_PATH,
     Credentials,
     EphemeralUser,
-    create_ephemeral_user,
+    attempt_ephemeral_user,
     describe_delete_failure,
     sweep_ephemeral_users,
 )
@@ -66,6 +66,8 @@ from .xdist import SHARED_STATE_GROUP, GroupingPlugin, worker_id
 
 __all__ = [
     "CREATE_PATH",
+    "DURABLE_FALLBACK_HEADER",
+    "DURABLE_FALLBACK_KEY",
     "E2E_PREFIX",
     "GATE_HEADER",
     "LOCAL_ACCESS_LOG_REASON",
@@ -144,6 +146,10 @@ DEFAULT_BROWSER_TIMEOUT_MS = 15000
 RUN_WIDE_GROUPS: tuple[str, ...] = ("TestAccessLogHealth", "TestRouteCoverage")
 
 SUITE_REQUESTS_KEY: pytest.StashKey[list[RequestRecord]] = pytest.StashKey()
+
+DURABLE_FALLBACK_KEY: pytest.StashKey[list[str]] = pytest.StashKey()
+
+DURABLE_FALLBACK_HEADER = "webbpulse e2e durable user fallback"
 
 GATE_HEADER = "x-origin-verify"
 E2E_PREFIX = "e2e-"
@@ -658,7 +664,7 @@ def ephemeral_user_attributes() -> Mapping[str, Any]:
 
     A product that grants write scopes only to an admin or a verified row needs this, since
     a user created with no attributes holds read scopes alone and every write case would be
-    refused. The mapping reaches `create_ephemeral_user` as `attributes=` and nothing else
+    refused. The mapping reaches `attempt_ephemeral_user` as `attributes=` and nothing else
     reads it, so a product may put anything its own create route accepts in it.
     """
     return {}
@@ -691,17 +697,28 @@ def ephemeral_user(
 
     The user is created with whatever `ephemeral_user_attributes` yields, so a product that
     needs an admin or verified row overrides that one fixture rather than this whole one.
+
+    A run that could mint and still ends up on the durable user warns, through
+    `_note_durable_fallback`, so the fallback reaches the terminal summary even under xdist.
     """
-    if e2e_env.read_only or not admin_mint_token:
+    if e2e_env.read_only:
+        yield None
+        return
+    if not admin_mint_token:
+        if e2e_env.mint_enabled:
+            _note_durable_fallback(request.config, "minting the admin token failed, see the mint warning.")
         yield None
         return
     run_id = f"{e2e_env.run_id}-{worker_id(request.config)}"
-    user = create_ephemeral_user(
+    attempt = attempt_ephemeral_user(
         anon,
         run_id=run_id,
         admin_token=admin_mint_token,
         attributes=dict(ephemeral_user_attributes),
     )
+    user = attempt if isinstance(attempt, EphemeralUser) else None
+    if isinstance(attempt, str):
+        _note_durable_fallback(request.config, attempt)
     try:
         yield user
     finally:
@@ -715,6 +732,21 @@ def ephemeral_user(
                 ),
                 stacklevel=2,
             )
+
+
+def _note_durable_fallback(config: pytest.Config, reason: str) -> None:
+    """Warn that this worker runs as the shared durable user, and keep the warning for the summary.
+
+    The warning is issued at once for a serial run's own warnings summary, and stashed so
+    `pytest_sessionfinish` can hand it to the controller of a distributed run through the
+    run directory, where the controller prints every worker's in the terminal summary.
+    """
+    message = (
+        f"Worker {worker_id(config)} could mint but runs as the shared durable e2e user rather "
+        f"than its own ephemeral user, so it may race other runs against that account: {reason}"
+    )
+    config.issue_config_time_warning(UserWarning(message), stacklevel=2)
+    config.stash.setdefault(DURABLE_FALLBACK_KEY, []).append(message)
 
 
 @pytest.fixture(scope="session")
@@ -1113,9 +1145,13 @@ def pytest_sessionfinish(session: pytest.Session, exitstatus: int) -> None:
     if worker:
         records = config.stash.get(SUITE_REQUESTS_KEY, None) or []
         runwide.write_worker_records(directory, worker, records)
+        runwide.write_worker_warnings(directory, worker, config.stash.get(DURABLE_FALLBACK_KEY, None) or [])
         return
     if not runwide.xdist_is_active(config):
         return
+    fallbacks = runwide.read_worker_warnings(directory)
+    if fallbacks:
+        config.stash.setdefault(DURABLE_FALLBACK_KEY, []).extend(fallbacks)
     verdicts = _controller_verdicts(config, directory)
     if verdicts is None:
         return
@@ -1202,10 +1238,18 @@ def _controller_access_log(
 def pytest_terminal_summary(terminalreporter: Any) -> None:
     """Print the controller's run-wide verdicts, in the same words the tests use.
 
-    Only a distributed run prints anything here: a serial run ran the groups as tests and
+    Only a distributed run prints the verdicts: a serial run ran the groups as tests and
     the report already carries them. The messages are the ones the shared check functions
     return, so a failure reads the same whichever mode found it.
+
+    Every durable user fallback is printed first, in either mode, since under xdist the
+    controller is the only place a worker's fallback is guaranteed to be seen.
     """
+    fallbacks = terminalreporter.config.stash.get(DURABLE_FALLBACK_KEY, None) or []
+    if fallbacks:
+        terminalreporter.write_sep("=", DURABLE_FALLBACK_HEADER)
+        for message in fallbacks:
+            terminalreporter.write_line(f"WARNING {message}")
     verdicts = terminalreporter.config.stash.get(CONTROLLER_VERDICTS_KEY, None)
     if verdicts is None:
         return

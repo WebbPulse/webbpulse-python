@@ -139,6 +139,7 @@ class FakeConfig:
     ) -> None:
         """Hold the parsed options, and `workerinput` only when this stands for a worker."""
         self.option = FakeOption(numprocesses)
+        self.stash = pytest.Stash()
         if workerid is not None:
             self.workerinput = {"workerid": workerid}
 
@@ -216,6 +217,103 @@ class TestTheWorkerFile:
     def test_cleaning_up_twice_is_harmless(self, tmp_path: Path) -> None:
         """Cleanup never raises, because a tidy-up failure must not fail a run."""
         runwide.remove_run_directory(runwide.run_directory("gone", base=str(tmp_path)))
+
+
+class FakeSession:
+    """A `pytest.Session` stand-in carrying the config and the exit status the hook sets."""
+
+    def __init__(self, config: FakeConfig) -> None:
+        """Hold the config and start with a passing exit status."""
+        self.config = config
+        self.exitstatus = 0
+
+
+class FakeReporter:
+    """A terminal reporter stand-in recording every line the summary writes."""
+
+    def __init__(self, config: FakeConfig) -> None:
+        """Hold the config the summary reads and the lines written."""
+        self.config = config
+        self.lines: list[str] = []
+
+    def write_sep(self, sep: str, title: str) -> None:
+        """Record a section header."""
+        self.lines.append(title)
+
+    def write_line(self, line: str) -> None:
+        """Record one line."""
+        self.lines.append(line)
+
+
+class TestTheWorkerWarnings:
+    """A worker's durable user fallback reaches the controller's summary under xdist."""
+
+    def test_a_worker_writes_and_the_controller_reads_its_warnings(self, tmp_path: Path) -> None:
+        """Every worker's warnings come back, in worker order."""
+        directory = runwide.run_directory("run-1", base=str(tmp_path))
+        runwide.write_worker_warnings(directory, "gw1", ["second"])
+        runwide.write_worker_warnings(directory, "gw0", ["first"])
+        assert runwide.read_worker_warnings(directory) == ("first", "second")
+
+    def test_a_clean_worker_writes_nothing(self, tmp_path: Path) -> None:
+        """No warnings leaves no file, so the controller prints no empty section."""
+        directory = runwide.run_directory("run-1", base=str(tmp_path))
+        assert runwide.write_worker_warnings(directory, "gw0", []) is None
+        assert runwide.read_worker_warnings(directory) == ()
+
+    def test_warnings_are_not_read_as_request_records(self, tmp_path: Path) -> None:
+        """The two files share a directory, so neither reader may pick up the other's."""
+        directory = runwide.run_directory("run-1", base=str(tmp_path))
+        runwide.write_worker_records(directory, "gw0", [record(path="/api/a")])
+        runwide.write_worker_warnings(directory, "gw0", ["fell back"])
+        assert [request.path for request in runwide.read_worker_records(directory)] == ["/api/a"]
+        assert runwide.read_worker_warnings(directory) == ("fell back",)
+
+    def test_an_unreadable_warnings_file_is_skipped(self, tmp_path: Path) -> None:
+        """One worker's lost file costs only its own warnings."""
+        directory = runwide.run_directory("run-1", base=str(tmp_path))
+        runwide.write_worker_warnings(directory, "gw0", ["kept"])
+        (directory / f"gw1{runwide.WORKER_WARNINGS_SUFFIX}").write_text("{not json", encoding="utf-8")
+        assert runwide.read_worker_warnings(directory) == ("kept",)
+
+    def test_the_run_directory_cleanup_removes_warnings_too(self, tmp_path: Path) -> None:
+        """The controller's cleanup leaves nothing of the run behind."""
+        directory = runwide.run_directory("run-1", base=str(tmp_path))
+        runwide.write_worker_warnings(directory, "gw0", ["fell back"])
+        runwide.remove_run_directory(directory)
+        assert not directory.exists()
+
+    def test_a_worker_fallback_reaches_the_controller_summary(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The worker's session finish hands it over, and the controller prints it."""
+        import tempfile
+
+        import webbpulse.e2e as plugin
+
+        monkeypatch.setattr(tempfile, "tempdir", str(tmp_path))
+        monkeypatch.setenv("E2E_RUN_ID", "run-77")
+        monkeypatch.delenv("E2E_ENVIRONMENT", raising=False)
+
+        worker = FakeConfig(numprocesses=2, workerid="gw3")
+        worker.stash[plugin.DURABLE_FALLBACK_KEY] = ["Worker gw3 could mint but runs as the durable user"]
+        plugin.pytest_sessionfinish(FakeSession(worker), 0)  # type: ignore[arg-type]
+
+        controller = FakeConfig(numprocesses=2)
+        plugin.pytest_sessionfinish(FakeSession(controller), 0)  # type: ignore[arg-type]
+        reporter = FakeReporter(controller)
+        plugin.pytest_terminal_summary(reporter)
+
+        assert reporter.lines[0] == plugin.DURABLE_FALLBACK_HEADER
+        assert reporter.lines[1] == "WARNING Worker gw3 could mint but runs as the durable user"
+
+    def test_a_run_without_fallbacks_prints_no_section(self) -> None:
+        """A clean run's summary is unchanged."""
+        import webbpulse.e2e as plugin
+
+        reporter = FakeReporter(FakeConfig())
+        plugin.pytest_terminal_summary(reporter)
+        assert reporter.lines == []
 
 
 class TestControllerAggregation:

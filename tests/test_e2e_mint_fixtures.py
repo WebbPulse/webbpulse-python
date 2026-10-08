@@ -17,6 +17,7 @@ import pytest
 from _pytest.outcomes import Skipped
 
 from webbpulse.e2e import (
+    DURABLE_FALLBACK_KEY,
     E2EEnvironment,
     admin_mint_token,
     ephemeral_user,
@@ -97,8 +98,9 @@ class RecordingConfig:
     """A `pytest.Config` stand-in collecting the warnings a fixture issues."""
 
     def __init__(self) -> None:
-        """Hold the warnings issued."""
+        """Hold the warnings issued and the stash the fallback note is kept in."""
         self.warnings: list[Warning] = []
+        self.stash = pytest.Stash()
 
     def issue_config_time_warning(self, warning: Warning, stacklevel: int = 1) -> None:
         """Record one warning instead of emitting it."""
@@ -400,6 +402,85 @@ class TestEphemeralUserDeleteWarning:
         message = str(request.config.warnings[0])
         assert "usr-1" in message
         assert "start sweep" in message
+
+
+class UnmountedResponse:
+    """The 404 a deployment without the create route answers with."""
+
+    status_code = 404
+    text = ""
+
+    def json(self) -> Any:
+        """The shared envelope for a missing route."""
+        return {"error_code": "NOT_FOUND", "message": "Not Found"}
+
+
+class UnmountedClient(FakeAnonClient):
+    """A client for a deployment that does not mount the create route."""
+
+    def post(self, path: str, *, json: Any = None) -> Any:
+        """Answer the create as a missing route."""
+        return UnmountedResponse()
+
+
+class TestDurableFallbackWarning:
+    """A run that could mint and ends up on the durable user says so, and keeps it for the summary."""
+
+    def run(self, env: E2EEnvironment, client: FakeAnonClient, admin_token: str) -> RecordingRequest:
+        """Drive the fixture through setup and teardown, returning the request it warned on."""
+        request = RecordingRequest()
+        generator = ephemeral_user.__wrapped__(  # type: ignore[attr-defined]
+            request,
+            env,
+            client,
+            admin_token,
+            {},
+        )
+        assert next(generator) is None
+        generator.close()
+        return request
+
+    def test_an_unmounted_route_warns_and_is_kept_for_the_summary(self) -> None:
+        """The silent fallback is what PLAT-20 removes."""
+        request = self.run(environment(), UnmountedClient(), "minted.admin.token")
+        assert len(request.config.warnings) == 1
+        message = str(request.config.warnings[0])
+        assert "durable e2e user" in message
+        assert "404" in message
+        assert "master" in message
+        assert request.config.stash[DURABLE_FALLBACK_KEY] == [message]
+
+    def test_a_failed_mint_warns_about_the_fallback(self) -> None:
+        """Minting was on and gave no token, so the run lost its user and must say so."""
+        request = self.run(environment(), FakeAnonClient(), "")
+        assert len(request.config.stash[DURABLE_FALLBACK_KEY]) == 1
+        assert "minting the admin token failed" in request.config.stash[DURABLE_FALLBACK_KEY][0]
+
+    def test_a_run_that_cannot_mint_says_nothing(self) -> None:
+        """A local stack never could have had a user, so its durable run is the plan."""
+        request = self.run(environment(mint_enabled=False), FakeAnonClient(), "")
+        assert request.config.warnings == []
+        assert DURABLE_FALLBACK_KEY not in request.config.stash
+
+    def test_a_read_only_run_says_nothing(self) -> None:
+        """A read-only run signs in as nobody, so there is no fallback to report."""
+        request = self.run(environment(read_only=True), FakeAnonClient(), "minted.admin.token")
+        assert request.config.warnings == []
+        assert DURABLE_FALLBACK_KEY not in request.config.stash
+
+    def test_a_created_user_says_nothing(self) -> None:
+        """The ordinary path carries no fallback note."""
+        request = RecordingRequest()
+        generator = ephemeral_user.__wrapped__(  # type: ignore[attr-defined]
+            request,
+            environment(),
+            FakeAnonClient(),
+            "minted.admin.token",
+            {},
+        )
+        assert next(generator) is not None
+        generator.close()
+        assert DURABLE_FALLBACK_KEY not in request.config.stash
 
 
 class FailedDeleteResponse:
