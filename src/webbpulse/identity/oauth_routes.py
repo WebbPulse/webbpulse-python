@@ -142,7 +142,7 @@ def register_oauth_routes(
     binding_samesite = "none" if settings.cookie_samesite == "none" else "lax"
 
     def binding_cookie_kwargs() -> dict[str, Any]:
-        """Where the link binding cookie lives: the refresh cookie's path and domain, `Lax`.
+        """Where the binding cookie lives: the refresh cookie's path and domain, `Lax`.
 
         `Lax` rather than the refresh cookie's own setting, because the callback is a
         top-level navigation back from the provider's site and `Strict` would withhold it.
@@ -153,7 +153,7 @@ def register_oauth_routes(
         return kwargs
 
     def set_binding_cookie(response: Any, secret: str) -> Any:
-        """Hand the browser the secret that proves it started this link."""
+        """Hand the browser the secret that proves it started this flow."""
         response.set_cookie(
             OAUTH_LINK_BINDING_COOKIE,
             secret,
@@ -166,7 +166,7 @@ def register_oauth_routes(
         return response
 
     def clear_binding_cookie(response: Any) -> Any:
-        """Drop the link binding cookie once its state is spent."""
+        """Drop the binding cookie once its state is spent."""
         response.delete_cookie(
             OAUTH_LINK_BINDING_COOKIE,
             secure=settings.cookie_secure,
@@ -244,7 +244,7 @@ def register_oauth_routes(
         """Begin an authorization, and redirect the browser to the provider.
 
         `mode` defaults to `login`; a `link` start requires a bearer token and records the
-        verified user id on the state row.
+        verified user id on the state row. Either mode binds the state to this browser.
         """
         from webbpulse.identity.router import run_sync
 
@@ -255,7 +255,7 @@ def register_oauth_routes(
             refusal = step_up_refusal(request)
             if refusal is not None:
                 return refusal
-        secret, digest = new_link_binding() if mode == "link" else ("", "")
+        secret, digest = new_link_binding()
 
         try:
             authorization = await run_sync(
@@ -272,14 +272,15 @@ def register_oauth_routes(
             return oauth_refused(request, exc)
 
         redirect = RedirectResponse(authorization.authorization_url, status_code=302)
-        return set_binding_cookie(redirect, secret) if secret else redirect
+        return set_binding_cookie(redirect, secret)
 
     @router.get(f"{prefix}{OAUTH_CALLBACK_PATH}")
     async def oauth_callback(request: _FastAPIRequest) -> Any:
         """Finish an authorization: spend the state, verify the identity, act on the mode.
 
         The state is spent first so a replay dies before any provider call, and the mode
-        comes from the state row rather than the URL.
+        comes from the state row rather than the URL. Both modes must come back to the
+        browser that started them, and every outcome clears the binding cookie.
         """
         from webbpulse.identity.router import run_sync
 
@@ -293,9 +294,7 @@ def register_oauth_routes(
         except OAuthRejected as exc:
             return error_redirect(exc)
 
-        if record.mode == "link" and not link_binding_matches(
-            record, request.cookies.get(OAUTH_LINK_BINDING_COOKIE, "")
-        ):
+        if not record.binding or not link_binding_matches(record, request.cookies.get(OAUTH_LINK_BINDING_COOKIE, "")):
             return clear_binding_cookie(
                 error_redirect(
                     OAuthRejected(
@@ -311,7 +310,7 @@ def register_oauth_routes(
                 OAuthRejected("Sign-in was cancelled.", error_code="OAUTH_CANCELLED"),
                 record.return_to,
             )
-            return clear_binding_cookie(cancelled) if record.mode == "link" else cancelled
+            return clear_binding_cookie(cancelled)
 
         ip, user_agent = context(request)
         try:
@@ -334,21 +333,25 @@ def register_oauth_routes(
             )
         except MfaChallengeRequired as challenge:
             body = challenge.challenge.as_body()
-            return RedirectResponse(
-                _with_flag(
-                    record.return_to or settings.frontend_base_url,
-                    "mfa_ticket",
-                    str(body.get("mfa_ticket", "")),
-                ),
-                status_code=303,
+            return clear_binding_cookie(
+                RedirectResponse(
+                    _with_flag(
+                        record.return_to or settings.frontend_base_url,
+                        "mfa_ticket",
+                        str(body.get("mfa_ticket", "")),
+                    ),
+                    status_code=303,
+                )
             )
         except OAuthRejected as exc:
             refused = error_redirect(exc, record.return_to)
-            return clear_binding_cookie(refused) if record.mode == "link" else refused
+            return clear_binding_cookie(refused)
         except LoginRejected as exc:
-            return error_redirect(
-                OAuthRejected(exc.message, error_code=exc.error_code, status_code=exc.status_code),
-                record.return_to,
+            return clear_binding_cookie(
+                error_redirect(
+                    OAuthRejected(exc.message, error_code=exc.error_code, status_code=exc.status_code),
+                    record.return_to,
+                )
             )
 
         redirect = RedirectResponse(
@@ -356,7 +359,7 @@ def register_oauth_routes(
             status_code=303,
         )
         redirect.set_cookie(settings.cookie_name, result.refresh_token, **settings.cookie_kwargs())
-        return redirect
+        return clear_binding_cookie(redirect)
 
     @router.post(f"{prefix}{OAUTH_LINK_PATH}")
     async def oauth_link(
