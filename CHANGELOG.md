@@ -7,6 +7,20 @@ This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## Unreleased
 
+## 0.76.0
+
+### Added
+
+- `webbpulse.email_layout.EmailPalette` and `EmailTheme` let a product hand the email shell its
+  own design tokens: light and dark palettes, font and mono stacks, the two on-accent text
+  colours and the card, button and inline radii (PLAT-40). `DEFAULT_THEME`, `DEFAULT_LIGHT` and
+  `DEFAULT_DARK` are the previous values, so a brand that names no theme renders as before.
+- `EmailBrand.theme` and `EmailBrand.dark_accent_color`. Dark-mode clients now repaint the
+  button, its text and the quote rule in the dark accent, and dark links are clamped from it.
+  `with_accent` takes an optional dark accent and otherwise uses the new accent in both schemes.
+- `IdentitySettings.email_dark_accent_color` and `email_theme`, so the identity emails can share
+  the product's theme.
+
 ## 0.75.0
 
 ### Added

@@ -11,8 +11,10 @@ from datetime import timedelta
 from typing import Any, Final, Literal
 from urllib.parse import parse_qsl, urlparse
 
-from pydantic import Field, field_validator, model_validator
+from pydantic import Field, InstanceOf, ValidationInfo, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
+
+from webbpulse.email_layout import EmailTheme
 
 __all__ = [
     "MAX_ACCESS_TOKEN_TTL",
@@ -229,6 +231,18 @@ class IdentitySettings(BaseSettings):
         default="",
         description="A postal or legal line closing every email footer. Empty shows the product name alone.",
     )
+    email_dark_accent_color: str = Field(
+        default="",
+        description="The `#rrggbb` accent dark-mode email clients show. Empty uses `email_accent_color`.",
+    )
+    email_theme: InstanceOf[EmailTheme] | None = Field(
+        default=None,
+        exclude=True,
+        description=(
+            "The product's email palette, fonts and radii, passed in code rather than the environment. "
+            "None uses `webbpulse.email_layout.DEFAULT_THEME`."
+        ),
+    )
 
     google_client_id: str = Field(default="")
     github_client_id: str = Field(default="")
@@ -422,17 +436,17 @@ class IdentitySettings(BaseSettings):
         """Strip trailing slashes so `iss`, discovery and the authorizer agree."""
         return value.rstrip("/") if isinstance(value, str) else value
 
-    @field_validator("email_accent_color")
+    @field_validator("email_accent_color", "email_dark_accent_color")
     @classmethod
-    def _check_email_accent(cls, value: str) -> str:
-        """Normalise the accent to `#rrggbb`, refusing a value that is not a colour at startup."""
+    def _check_email_accent(cls, value: str, info: ValidationInfo) -> str:
+        """Normalise an accent to `#rrggbb`, refusing a value that is not a colour at startup."""
         from webbpulse.email_layout import normalise_hex
 
         if not value.strip():
             return ""
         normalised = normalise_hex(value)
         if normalised is None:
-            raise ValueError(f"email_accent_color must be a #rrggbb colour, got {value!r}.")
+            raise ValueError(f"{info.field_name} must be a #rrggbb colour, got {value!r}.")
         return normalised
 
     @model_validator(mode="after")

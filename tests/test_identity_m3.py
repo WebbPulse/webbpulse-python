@@ -394,6 +394,30 @@ def test_the_identity_emails_use_the_branded_shell_with_the_configured_accent() 
     assert f'bgcolor="{DEFAULT_ACCENT}"' in render_verification(plain, to=EMAIL, link="https://x", expiry="1 hour").html
 
 
+def test_the_identity_emails_use_the_configured_theme_and_dark_accent() -> None:
+    """A product's theme and dark accent reach the identity emails, so they match its own messages."""
+    from webbpulse.email_layout import EmailPalette, EmailTheme
+
+    light = EmailPalette(
+        page="#f7f7f8",
+        card="#ffffff",
+        line="#e5e5ea",
+        text="#1b1c20",
+        muted="#62646f",
+        quote="#efeff2",
+        quote_text="#1b1c20",
+    )
+    theme = EmailTheme(light=light, font_stack="Inter, sans-serif", card_radius=8)
+    settings = make_settings(email_accent_color="#b8451a", email_dark_accent_color="#F2703A", email_theme=theme)
+
+    html = render_verification(settings, to=EMAIL, link="https://x", expiry="1 hour").html
+
+    assert settings.email_dark_accent_color == "#f2703a"
+    assert "font-family:Inter, sans-serif;" in html
+    assert "border:1px solid #e5e5ea;border-radius:8px;" in html
+    assert ".wp-button{background-color:#f2703a !important;}" in html
+
+
 def test_an_accent_that_is_not_a_colour_is_refused_at_startup() -> None:
     """`email_accent_color` must be a hex colour, so a typo fails settings validation rather than a send."""
     with pytest.raises(ValueError, match="email_accent_color"):
