@@ -110,8 +110,12 @@ class BaseServiceSettings(BaseSettings):
     )
 
     environment: Environment = Field(
-        default="local",
-        description="Which deployment this is. Drives defaults elsewhere, never behaviour here.",
+        default="production",
+        description=(
+            "Which deployment this is. Drives defaults elsewhere, never behaviour here. Unset "
+            "reads as `production`, so a deployment that forgets it keeps its rate limits and "
+            "production checks; a local stack or test suite sets `local` or `test` explicitly."
+        ),
     )
     service_name: str = Field(
         default="webbpulse",

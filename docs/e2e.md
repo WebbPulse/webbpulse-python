@@ -685,6 +685,11 @@ production deployment has no route to reach rather than a route that answers 403
 must present a token carrying `admin` in its `roles` claim, which in staging means a
 KMS-minted token the e2e workflow alone can produce.
 
+Both routes hold to the address convention. Create answers 400 `EPHEMERAL_EMAIL_REQUIRED`
+for any address that is not `e2e-<run>@e2e.invalid`, and delete answers 403
+`NOT_EPHEMERAL_USER` for a user whose address is not one, leaving that account in place, so
+an admin token cannot turn either route against a real account.
+
 Delete removes only the product's users row. The identity rows are the users-table stream
 purge's to remove, so every run exercises the same deletion path production uses. A product
 enabling the flag implements the `delete_user` hook.

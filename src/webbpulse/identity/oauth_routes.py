@@ -335,7 +335,7 @@ def register_oauth_routes(
             body = challenge.challenge.as_body()
             return clear_binding_cookie(
                 RedirectResponse(
-                    _with_flag(
+                    _with_fragment(
                         record.return_to or settings.frontend_base_url,
                         "mfa_ticket",
                         str(body.get("mfa_ticket", "")),
@@ -475,6 +475,21 @@ def _with_flag(target: str, key: str, value: str = "1") -> str:
     base = target or "/"
     separator = "&" if "?" in base else "?"
     return f"{base}{separator}{key}={quote(value)}"
+
+
+def _with_fragment(target: str, key: str, value: str) -> str:
+    """Append a parameter to a frontend URL's fragment, which browsers never send to a server.
+
+    Used for the MFA ticket so it stays out of server logs, proxies and the Referer header.
+    The frontend reads it from `location.hash`.
+    """
+    from urllib.parse import quote
+
+    base, hash_mark, fragment = (target or "/").partition("#")
+    pair = f"{key}={quote(value, safe='')}"
+    if hash_mark and fragment:
+        return f"{base}#{fragment}&{pair}"
+    return f"{base}#{pair}"
 
 
 OAUTH_ROUTE_RESPONSES: Final[dict[tuple[str, str], dict[int, str]]] = {

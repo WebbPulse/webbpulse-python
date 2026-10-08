@@ -1933,6 +1933,47 @@ def test_a_login_completes_in_the_browser_that_started_it(link_client: Any, hook
     assert any(c.startswith(f'{OAUTH_LINK_BINDING_COOKIE}=""') for c in cookies)
 
 
+def test_an_mfa_ticket_travels_in_the_fragment_not_the_query(
+    link_client: Any, hooks: FakeHooks, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The ticket never reaches a server log, a proxy or a Referer header."""
+    from urllib.parse import parse_qs, urlsplit
+
+    from webbpulse.identity.mfa import MfaChallenge
+
+    def challenge(self: IdentityFlows, *args: Any, **kwargs: Any) -> Any:
+        """Answer the login with a second-factor challenge."""
+        raise MfaChallengeRequired(MfaChallenge(ticket="tkt.with/odd+chars", factors=["totp"]))
+
+    monkeypatch.setattr(IdentityFlows, "issue_for_oauth", challenge)
+    settings = make_settings()
+    state = _link_github_then_start_login(link_client, hooks)
+
+    response = link_client.get(f"{identity_prefix(settings)}/oauth/callback?state={state}&code=abc")
+    assert response.status_code == 303
+    location = urlsplit(response.headers["location"])
+    assert "mfa_ticket" not in parse_qs(location.query)
+    assert parse_qs(location.fragment) == {"mfa_ticket": ["tkt.with/odd+chars"]}
+    assert not any(c.startswith(f"{settings.cookie_name}=") for c in response.headers.get_list("set-cookie"))
+
+
+@pytest.mark.parametrize(
+    ("target", "expected"),
+    [
+        ("https://app.example.com/login", "https://app.example.com/login#mfa_ticket=a%2Fb"),
+        ("https://app.example.com/login?next=x", "https://app.example.com/login?next=x#mfa_ticket=a%2Fb"),
+        ("https://app.example.com/login#tab=1", "https://app.example.com/login#tab=1&mfa_ticket=a%2Fb"),
+        ("https://app.example.com/login#", "https://app.example.com/login#mfa_ticket=a%2Fb"),
+        ("", "/#mfa_ticket=a%2Fb"),
+    ],
+)
+def test_with_fragment_appends_to_the_fragment(target: str, expected: str) -> None:
+    """The query is left alone and any existing fragment is kept."""
+    from webbpulse.identity.oauth_routes import _with_fragment
+
+    assert _with_fragment(target, "mfa_ticket", "a/b") == expected
+
+
 def test_a_login_completed_in_another_browser_is_refused(link_client: Any, hooks: FakeHooks) -> None:
     """Login CSRF: a victim finishing an attacker's authorization URL is signed in to nothing."""
     settings = make_settings()
