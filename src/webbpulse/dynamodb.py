@@ -344,7 +344,8 @@ def _encode_key_value(value: Any) -> dict[str, str]:
     from boto3.dynamodb.types import Binary
 
     if isinstance(value, Binary):
-        return {"B": base64.b64encode(bytes(value)).decode("ascii")}
+        raw: Any = value.__bytes__()
+        return {"B": base64.b64encode(raw).decode("ascii")}
     raise TypeError(f"A start key cannot hold {type(value).__name__}; key attributes are S, N or B.")
 
 
