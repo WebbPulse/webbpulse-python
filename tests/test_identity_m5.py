@@ -2248,7 +2248,7 @@ class TestPasskeySecondFactor:
         challenge = _password_challenge(flows)
         assert challenge.factors == ["totp", "passkey"]
         result = flows.complete_mfa(ticket=challenge.ticket, code=_next_code(secret))
-        assert _claims_of(result.access_token)["amr"] == ["pwd", "totp", "mfa"]
+        assert _claims_of(result.access_token)["amr"] == ["pwd", "otp", "mfa"]
 
     def test_a_passkey_completes_the_login_with_mfa(
         self, hooks: FakeHooks, stores: IdentityStores, kms: FakeKms
@@ -2347,7 +2347,7 @@ class TestPasskeySecondFactor:
             flows.login_with_passkey(challenge_id=login.challenge_id, credential=credential)
         assert caught.value.challenge.factors == ["totp"]
         result = flows.complete_mfa(ticket=caught.value.challenge.ticket, code=_next_code(secret))
-        assert _claims_of(result.access_token)["amr"] == ["swk", "totp", "mfa"]
+        assert _claims_of(result.access_token)["amr"] == ["swk", "otp", "mfa"]
 
 
 class TestFirstFactorAmr:
@@ -2363,11 +2363,11 @@ class TestFirstFactorAmr:
         with pytest.raises(MfaChallengeRequired) as caught:
             flows.issue_for_oauth(user, provider="github")
         result = flows.complete_mfa(ticket=caught.value.challenge.ticket, code=_next_code(secret))
-        assert _claims_of(result.access_token)["amr"] == ["oauth", "github", "totp", "mfa"]
+        assert _claims_of(result.access_token)["amr"] == ["oauth", "github", "otp", "mfa"]
         assert _claims_of(flows.refresh(result.refresh_token).access_token)["amr"] == [
             "oauth",
             "github",
-            "totp",
+            "otp",
             "mfa",
         ]
 

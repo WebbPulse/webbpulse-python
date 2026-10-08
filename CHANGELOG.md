@@ -34,9 +34,9 @@ This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 ### Fixed
 
 - A session completed through `/login/totp` after an OAuth sign-in, or after a passkey login
-  without user verification, reported `amr` `["pwd", "totp", "mfa"]`. The MFA ticket now
-  carries the first factor, so it reports `["oauth", "<provider>", "totp", "mfa"]` or
-  `["swk", "totp", "mfa"]`.
+  without user verification, reported `amr` `["pwd", "otp", "mfa"]`. The MFA ticket now
+  carries the first factor, so it reports `["oauth", "<provider>", "otp", "mfa"]` or
+  `["swk", "otp", "mfa"]`.
 
 ## 0.79.0
 
