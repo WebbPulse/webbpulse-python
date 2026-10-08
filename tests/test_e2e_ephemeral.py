@@ -16,11 +16,13 @@ import pytest
 from webbpulse.e2e.ephemeral import (
     BODY_EXCERPT_LIMIT,
     CREATE_PATH,
+    GATEWAY_RETRY_DELAYS,
     RESERVED_EMAIL_DOMAIN,
     SWEEP_OLDER_THAN_SECONDS,
     SWEEP_PATH,
     Credentials,
     EphemeralUser,
+    attempt_ephemeral_user,
     create_ephemeral_user,
     delete_ephemeral_user,
     describe_delete_failure,
@@ -28,6 +30,7 @@ from webbpulse.e2e.ephemeral import (
     email_validation_hint,
     ephemeral_email,
     generate_password,
+    is_route_refusal,
     item_path,
     sweep_ephemeral_users,
 )
@@ -257,7 +260,7 @@ class TestCreateEphemeralUser:
         create_ephemeral_user(client, run_id=RUN_ID, admin_token=ADMIN_TOKEN)
         assert client.calls[0]["path"] == CREATE_PATH
 
-    @pytest.mark.parametrize("status", [403, 404, 405])
+    @pytest.mark.parametrize("status", [404, 405])
     def test_a_deployment_without_the_route_falls_back(self, status: int) -> None:
         """None sends the caller to the durable user, which is the supported fallback.
 
@@ -323,6 +326,109 @@ class TestCreateEphemeralUser:
         assert "Request validation failed." in message
         assert "req-abc123" in message
         assert "request: Field required (missing)" in message
+
+
+def route_refusal(code: str) -> FakeResponse:
+    """The 403 the create route itself answers, in the shared error envelope."""
+    return FakeResponse(
+        403,
+        {"success": False, "status": 403, "error_code": code, "message": "refused", "request_id": "req-r"},
+    )
+
+
+GATEWAY_FORBIDDEN: Any = {"message": "Forbidden"}
+
+
+class TestGatewayRefusals:
+    """A 403 from the authorizer in front of the route is retried, never read as "not offered".
+
+    A Standupless staging worker's create met a cold-start authorizer 403 and silently ran
+    its whole session as the shared durable user; the next create seconds later answered 201.
+    """
+
+    @pytest.mark.parametrize("code", ["ADMIN_REQUIRED", "EPHEMERAL_USERS_DISABLED"])
+    def test_the_routes_own_refusal_falls_back_without_retrying(self, code: str) -> None:
+        """The route speaking for itself still means "not offered here"."""
+        client = FakeClient([route_refusal(code)])
+        sleeps: list[float] = []
+        result = attempt_ephemeral_user(client, run_id=RUN_ID, admin_token=ADMIN_TOKEN, sleep=sleeps.append)
+        assert isinstance(result, str)
+        assert code in result
+        assert len(client.calls) == 1
+        assert sleeps == []
+
+    def test_a_refusal_rendered_through_detail_is_recognised(self) -> None:
+        """A product raising a bare `HTTPException` nests the code under `detail`."""
+        response = FakeResponse(403, {"detail": {"error_code": "EPHEMERAL_USERS_DISABLED", "message": "off"}})
+        assert is_route_refusal(response) is True
+
+    @pytest.mark.parametrize(
+        "payload",
+        [GATEWAY_FORBIDDEN, None, ValueError("not json"), {"error_code": "FORBIDDEN"}, ["Forbidden"]],
+    )
+    def test_anything_else_is_not_the_routes_refusal(self, payload: Any) -> None:
+        """The authorizer's body, an empty one and another code are all the gateway or a bug."""
+        assert is_route_refusal(FakeResponse(403, payload)) is False
+
+    def test_a_gateway_403_is_retried_until_it_creates(self) -> None:
+        """The cold start passes, and the run gets its own user after one short wait."""
+        client = FakeClient([FakeResponse(403, GATEWAY_FORBIDDEN), FakeResponse(201, {"user_id": "user-1"})])
+        sleeps: list[float] = []
+        user = create_ephemeral_user(client, run_id=RUN_ID, admin_token=ADMIN_TOKEN, sleep=sleeps.append)
+        assert user is not None
+        assert user.user_id == "user-1"
+        assert sleeps == [GATEWAY_RETRY_DELAYS[0]]
+        assert len(client.calls) == 2
+
+    def test_every_retry_resends_the_same_user(self) -> None:
+        """A retry must ask for the same address and password, or the user would not match."""
+        client = FakeClient([FakeResponse(403, GATEWAY_FORBIDDEN), FakeResponse(201, {"user_id": "user-1"})])
+        create_ephemeral_user(client, run_id=RUN_ID, admin_token=ADMIN_TOKEN, sleep=lambda _: None)
+        assert client.calls[0]["json"] == client.calls[1]["json"]
+        assert client.tokens == [ADMIN_TOKEN, ADMIN_TOKEN]
+
+    def test_a_gateway_403_that_persists_raises_rather_than_falling_back(self) -> None:
+        """Every attempt refused by the gateway is a failure, never a durable user run."""
+        attempts = len(GATEWAY_RETRY_DELAYS) + 1
+        client = FakeClient([FakeResponse(403, GATEWAY_FORBIDDEN) for _ in range(attempts)])
+        sleeps: list[float] = []
+        with pytest.raises(RuntimeError) as caught:
+            create_ephemeral_user(
+                client,
+                run_id=RUN_ID,
+                admin_token=ADMIN_TOKEN,
+                password="the-generated-password",
+                sleep=sleeps.append,
+            )
+        message = str(caught.value)
+        assert len(client.calls) == attempts
+        assert sleeps == list(GATEWAY_RETRY_DELAYS)
+        assert "authorizer" in message
+        assert "Forbidden" in message
+        assert "the-generated-password" not in message
+        assert ADMIN_TOKEN not in message
+
+    def test_a_gateway_403_followed_by_the_routes_refusal_falls_back(self) -> None:
+        """Once the route answers for itself, its answer decides."""
+        client = FakeClient([FakeResponse(403, GATEWAY_FORBIDDEN), route_refusal("EPHEMERAL_USERS_DISABLED")])
+        result = attempt_ephemeral_user(client, run_id=RUN_ID, admin_token=ADMIN_TOKEN, sleep=lambda _: None)
+        assert isinstance(result, str)
+        assert "EPHEMERAL_USERS_DISABLED" in result
+
+    def test_a_gateway_403_followed_by_another_failure_raises_that_failure(self) -> None:
+        """A retry that reaches a mounted, erroring route reports what the route said."""
+        client = FakeClient([FakeResponse(403, GATEWAY_FORBIDDEN), FakeResponse(422, VALIDATION_ENVELOPE)])
+        with pytest.raises(RuntimeError) as caught:
+            create_ephemeral_user(client, run_id=RUN_ID, admin_token=ADMIN_TOKEN, sleep=lambda _: None)
+        assert "VALIDATION_ERROR" in str(caught.value)
+
+    @pytest.mark.parametrize("status", [404, 405])
+    def test_an_unmounted_route_names_its_status(self, status: int) -> None:
+        """The reason a caller warns with says which answer meant "not here"."""
+        client = FakeClient([FakeResponse(status)])
+        result = attempt_ephemeral_user(client, run_id=RUN_ID, admin_token=ADMIN_TOKEN)
+        assert isinstance(result, str)
+        assert str(status) in result
 
 
 class TestDescribeErrorBody:
