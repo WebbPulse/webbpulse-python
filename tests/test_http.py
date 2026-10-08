@@ -22,15 +22,15 @@ from starlette.requests import Request
 
 from webbpulse.http import (
     DOMAIN_HEADER,
+    DYNAMODB_RETRY_AFTER_SECONDS,
     MANGUM_EVENT_SCOPE_KEY,
     MONOLITH_DOMAIN,
-    DomainHeaderMiddleware,
-    TrailingSlashMiddleware,
-    DYNAMODB_RETRY_AFTER_SECONDS,
     REQUEST_CONTEXT_HEADER,
     REQUEST_ID_HEADER,
     ROUTE_KEY_HEADER,
+    DomainHeaderMiddleware,
     ErrorSpec,
+    TrailingSlashMiddleware,
     bind_user_id,
     client_ip,
     create_app,
