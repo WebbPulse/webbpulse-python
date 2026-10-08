@@ -9,8 +9,28 @@ permissions:
   contents: read
 
 jobs:
+  verify:
+    name: Verify the tagged commit is on main
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out the repository
+        uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Fail unless the commit is an ancestor of main
+        run: |
+          set -euo pipefail
+          git fetch origin main
+          if ! git merge-base --is-ancestor "$GITHUB_SHA" origin/main; then
+            echo "::error title=Not on main::$GITHUB_SHA is not an ancestor of origin/main, refusing to publish."
+            exit 1
+          fi
+
   publish:
     name: Publish the package to CodeArtifact
+    needs: verify
     uses: WebbPulse/.github/.github/workflows/codeartifact-publish-python.yml@v3
     permissions:
       contents: read
