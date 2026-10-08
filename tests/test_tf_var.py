@@ -52,6 +52,8 @@ class FakeVariablePlane:
         path = request.url.path
         if path == "/api/v1/workspaces":
             return httpx.Response(200, json={"items": [{"workspace_id": WS_ID, "name": "demo"}]})
+        if path == f"/api/v1/workspaces/{WS_ID}":
+            return httpx.Response(200, json={"workspace_id": WS_ID, "name": "demo"})
         if path == VARIABLES_PATH:
             return httpx.Response(200, json={"items": [self._render(item) for item in self.variables.values()]})
         if path.startswith(f"{VARIABLES_PATH}/"):
