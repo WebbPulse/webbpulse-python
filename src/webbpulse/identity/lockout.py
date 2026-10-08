@@ -1,7 +1,8 @@
 """Progressive lockout and the `login-attempts` record it is computed from.
 
 Lockout protects one account by delaying the next attempt after consecutive password
-failures, and separately after consecutive second-factor failures; rate limiting, which protects the service, lives in `webbpulse.ratelimit`.
+failures, and separately after consecutive second-factor failures; rate limiting, which
+protects the service, lives in `webbpulse.ratelimit`.
 """
 
 from __future__ import annotations
