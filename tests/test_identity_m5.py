@@ -50,6 +50,8 @@ from webbpulse.identity.flows import (
 from webbpulse.identity.mfa import AMR_PASSWORD, MfaRejected
 from webbpulse.identity.oauth_routes import OAUTH_PROVIDERS_CACHE_CONTROL
 from webbpulse.identity.passkey_routes import (
+    LOGIN_MFA_PASSKEY_OPTIONS_PATH,
+    LOGIN_MFA_PASSKEY_VERIFY_PATH,
     LOGIN_PASSKEY_OPTIONS_PATH,
     LOGIN_PASSKEY_VERIFY_PATH,
     PASSKEY_AVAILABILITY_CACHE_CONTROL,
@@ -2134,3 +2136,337 @@ def _enrol_authenticator_over_http(client: TestClient, token: str) -> SoftAuthen
     )
     assert registered.status_code == 201, registered.text
     return authenticator
+
+
+def _second_factor_flows(
+    hooks: FakeHooks,
+    stores: IdentityStores,
+    kms: FakeKms,
+    **overrides: Any,
+) -> IdentityFlows:
+    """Identity flows with `passkeys_second_factor` on, unless an override says otherwise."""
+    settings = make_settings(**{"passkeys_second_factor": True, **overrides})
+    return IdentityFlows(
+        settings,
+        hooks,
+        stores,
+        TokenService(settings, kms),
+        attempts=InMemoryLoginAttemptStore(),
+        kms_client=kms,
+    )
+
+
+def _next_code(secret: str) -> str:
+    """A TOTP code for the next step, which no enrolment has spent yet."""
+    return totp_module.generate_code(secret, step=totp_module.current_step() + 1)
+
+
+def _password_challenge(flows: IdentityFlows) -> Any:
+    """Sign in with the seeded password and return the MFA challenge it raises."""
+    with pytest.raises(MfaChallengeRequired) as caught:
+        flows.login(email=EMAIL, password=PASSWORD)
+    return caught.value.challenge
+
+
+def _answer_with_passkey(flows: IdentityFlows, ticket: str, authenticator: SoftAuthenticator) -> Any:
+    """Mint the ticket's passkey challenge, answer it, and complete the login."""
+    challenge = flows.begin_mfa_passkey(ticket=ticket)
+    credential = authenticator.assertion(_challenge_of(challenge.options))
+    return flows.complete_mfa_with_passkey(ticket=ticket, challenge_id=challenge.challenge_id, credential=credential)
+
+
+class TestPasskeySecondFactor:
+    """`passkeys_second_factor`: a passkey answers the login MFA challenge."""
+
+    def test_off_by_default(
+        self,
+        flows: IdentityFlows,
+        hooks: FakeHooks,
+        stores: IdentityStores,
+        passkeys: PasskeyService,
+    ) -> None:
+        """Without the setting a passkey holder's password login issues tokens, as before."""
+        seed_account(hooks, stores)
+        enrol_passkey(passkeys)
+
+        assert flows.passkey_second_factor_enabled is False
+        result = flows.login(email=EMAIL, password=PASSWORD)
+        assert _claims_of(result.access_token)["amr"] == [AMR_PASSWORD]
+
+    def test_off_refuses_both_legs(
+        self,
+        flows: IdentityFlows,
+        hooks: FakeHooks,
+        stores: IdentityStores,
+    ) -> None:
+        """The flows refuse a passkey answer with 403 when the setting is off."""
+        seed_account(hooks, stores)
+        _enrol_totp(flows)
+        ticket = _password_challenge(flows).ticket
+
+        with pytest.raises(MfaRejected) as options:
+            flows.begin_mfa_passkey(ticket=ticket)
+        with pytest.raises(MfaRejected) as verify:
+            flows.complete_mfa_with_passkey(ticket=ticket, challenge_id="x", credential={})
+        assert options.value.status_code == verify.value.status_code == 403
+        assert options.value.error_code == "PASSKEY_FACTOR_DISABLED"
+
+    def test_needs_the_mfa_wiring(self, hooks: FakeHooks, stores: IdentityStores, kms: FakeKms) -> None:
+        """With TOTP off there is no ticket to carry, so the setting has no effect."""
+        flows = _second_factor_flows(hooks, stores, kms, totp_enabled=False)
+        assert flows.passkey_second_factor_enabled is False
+
+    def test_a_passkey_holder_is_challenged_without_totp(
+        self, hooks: FakeHooks, stores: IdentityStores, kms: FakeKms
+    ) -> None:
+        """A password login of a user with only a passkey asks for the passkey."""
+        flows = _second_factor_flows(hooks, stores, kms)
+        seed_account(hooks, stores)
+        assert flows.passkeys is not None
+        enrol_passkey(flows.passkeys)
+
+        challenge = _password_challenge(flows)
+        assert challenge.factors == ["passkey"]
+        assert challenge.as_body()["factors"] == ["passkey"]
+
+    def test_a_user_without_a_passkey_is_not_challenged(
+        self, hooks: FakeHooks, stores: IdentityStores, kms: FakeKms
+    ) -> None:
+        """The setting adds a factor only for users who have one."""
+        flows = _second_factor_flows(hooks, stores, kms)
+        seed_account(hooks, stores)
+        assert flows.login(email=EMAIL, password=PASSWORD).access_token
+
+    def test_totp_and_passkey_are_both_offered(self, hooks: FakeHooks, stores: IdentityStores, kms: FakeKms) -> None:
+        """A user with both factors may answer with either."""
+        flows = _second_factor_flows(hooks, stores, kms)
+        seed_account(hooks, stores)
+        secret = _enrol_totp(flows)
+        assert flows.passkeys is not None
+        enrol_passkey(flows.passkeys)
+
+        challenge = _password_challenge(flows)
+        assert challenge.factors == ["totp", "passkey"]
+        result = flows.complete_mfa(ticket=challenge.ticket, code=_next_code(secret))
+        assert _claims_of(result.access_token)["amr"] == ["pwd", "otp", "mfa"]
+
+    def test_a_passkey_completes_the_login_with_mfa(
+        self, hooks: FakeHooks, stores: IdentityStores, kms: FakeKms
+    ) -> None:
+        """The session reports the password and the passkey, and refresh keeps saying so."""
+        flows = _second_factor_flows(hooks, stores, kms)
+        seed_account(hooks, stores)
+        assert flows.passkeys is not None
+        authenticator, _ = enrol_passkey(flows.passkeys)
+
+        result = _answer_with_passkey(flows, _password_challenge(flows).ticket, authenticator)
+        assert _claims_of(result.access_token)["amr"] == ["pwd", "swk", "mfa"]
+        refreshed = flows.refresh(result.refresh_token)
+        assert _claims_of(refreshed.access_token)["amr"] == ["pwd", "swk", "mfa"]
+
+    def test_options_do_not_spend_the_ticket(self, hooks: FakeHooks, stores: IdentityStores, kms: FakeKms) -> None:
+        """Asking for options twice leaves the ticket good for the verify leg."""
+        flows = _second_factor_flows(hooks, stores, kms)
+        seed_account(hooks, stores)
+        assert flows.passkeys is not None
+        authenticator, _ = enrol_passkey(flows.passkeys)
+        ticket = _password_challenge(flows).ticket
+
+        flows.begin_mfa_passkey(ticket=ticket)
+        assert _answer_with_passkey(flows, ticket, authenticator).access_token
+
+    def test_the_ticket_is_single_use(self, hooks: FakeHooks, stores: IdentityStores, kms: FakeKms) -> None:
+        """A ticket that completed a login cannot complete another."""
+        flows = _second_factor_flows(hooks, stores, kms)
+        seed_account(hooks, stores)
+        assert flows.passkeys is not None
+        authenticator, _ = enrol_passkey(flows.passkeys)
+        ticket = _password_challenge(flows).ticket
+        _answer_with_passkey(flows, ticket, authenticator)
+
+        with pytest.raises(MfaRejected) as caught:
+            _answer_with_passkey(flows, ticket, authenticator)
+        assert caught.value.error_code == "MFA_TICKET_INVALID"
+
+    def test_a_forged_ticket_is_refused_before_any_challenge(
+        self, hooks: FakeHooks, stores: IdentityStores, kms: FakeKms
+    ) -> None:
+        """Options for a ticket that does not verify are the expired-attempt refusal."""
+        flows = _second_factor_flows(hooks, stores, kms)
+        with pytest.raises(MfaRejected) as caught:
+            flows.begin_mfa_passkey(ticket="not.a.ticket")
+        assert caught.value.error_code == "MFA_TICKET_INVALID"
+
+    def test_another_users_passkey_is_refused(self, hooks: FakeHooks, stores: IdentityStores, kms: FakeKms) -> None:
+        """The challenge is scoped to the ticket's user, so a stranger's credential fails."""
+        flows = _second_factor_flows(hooks, stores, kms)
+        seed_account(hooks, stores)
+        seed_account(hooks, stores, email="other@example.com", user_id="user-0002")
+        assert flows.passkeys is not None
+        enrol_passkey(flows.passkeys)
+        stranger, _ = enrol_passkey(flows.passkeys, user_id="user-0002")
+
+        with pytest.raises(PasskeyRejected):
+            _answer_with_passkey(flows, _password_challenge(flows).ticket, stranger)
+
+    def test_an_unverified_passkey_cannot_answer(self, hooks: FakeHooks, stores: IdentityStores, kms: FakeKms) -> None:
+        """The second factor demands user verification, as a step-up does."""
+        flows = _second_factor_flows(hooks, stores, kms)
+        seed_account(hooks, stores)
+        assert flows.passkeys is not None
+        authenticator, _ = enrol_passkey(flows.passkeys, user_verified=False)
+
+        with pytest.raises(PasskeyRejected):
+            _answer_with_passkey(flows, _password_challenge(flows).ticket, authenticator)
+
+    def test_a_disabled_account_cannot_finish(self, hooks: FakeHooks, stores: IdentityStores, kms: FakeKms) -> None:
+        """`may_authenticate` is asked again on the second leg."""
+        flows = _second_factor_flows(hooks, stores, kms)
+        seed_account(hooks, stores)
+        assert flows.passkeys is not None
+        authenticator, _ = enrol_passkey(flows.passkeys)
+        ticket = _password_challenge(flows).ticket
+        hooks.refuse = "Disabled."
+
+        with pytest.raises(AuthenticationRefused):
+            _answer_with_passkey(flows, ticket, authenticator)
+
+    def test_a_passkey_first_factor_is_not_offered_again(
+        self, hooks: FakeHooks, stores: IdentityStores, kms: FakeKms
+    ) -> None:
+        """An unverified passkey login is challenged for TOTP only, and the session says `swk`."""
+        flows = _second_factor_flows(hooks, stores, kms)
+        seed_account(hooks, stores)
+        secret = _enrol_totp(flows)
+        assert flows.passkeys is not None
+        authenticator, _ = enrol_passkey(flows.passkeys, user_verified=False)
+        login = flows.begin_passkey_login()
+        credential = authenticator.assertion(_challenge_of(login.options))
+
+        with pytest.raises(MfaChallengeRequired) as caught:
+            flows.login_with_passkey(challenge_id=login.challenge_id, credential=credential)
+        assert caught.value.challenge.factors == ["totp"]
+        result = flows.complete_mfa(ticket=caught.value.challenge.ticket, code=_next_code(secret))
+        assert _claims_of(result.access_token)["amr"] == ["swk", "otp", "mfa"]
+
+
+class TestFirstFactorAmr:
+    """The MFA ticket carries the first factor, so the second leg reports it."""
+
+    def test_oauth_then_totp_reports_the_provider(
+        self, flows: IdentityFlows, hooks: FakeHooks, stores: IdentityStores
+    ) -> None:
+        """An OAuth sign-in completed with TOTP reports `oauth` and the provider, not `pwd`."""
+        user = seed_account(hooks, stores)
+        secret = _enrol_totp(flows)
+
+        with pytest.raises(MfaChallengeRequired) as caught:
+            flows.issue_for_oauth(user, provider="github")
+        result = flows.complete_mfa(ticket=caught.value.challenge.ticket, code=_next_code(secret))
+        assert _claims_of(result.access_token)["amr"] == ["oauth", "github", "otp", "mfa"]
+        assert _claims_of(flows.refresh(result.refresh_token).access_token)["amr"] == [
+            "oauth",
+            "github",
+            "otp",
+            "mfa",
+        ]
+
+    def test_a_ticket_without_amr_reports_a_password(self, flows: IdentityFlows) -> None:
+        """A ticket minted with no first factor redeems as `pwd`, what every ticket said before."""
+        service = flows.mfa
+        assert service is not None
+        challenge = service.issue_challenge(USER_ID, factors=["totp"], amr=[])
+        spent = service.redeem_ticket(challenge.ticket)
+        assert spent.user_id == USER_ID
+        assert spent.amr == [AMR_PASSWORD]
+
+    def test_ticket_subject_spends_nothing(self, flows: IdentityFlows) -> None:
+        """Reading a ticket's subject leaves it redeemable once."""
+        service = flows.mfa
+        assert service is not None
+        challenge = service.issue_challenge(USER_ID, factors=["totp"], amr=["oauth", "google"])
+        assert service.ticket_subject(challenge.ticket) == USER_ID
+        assert service.redeem_ticket(challenge.ticket).amr == ["oauth", "google"]
+        with pytest.raises(MfaRejected):
+            service.consume_ticket(challenge.ticket)
+
+
+def _second_factor_client(hooks: FakeHooks, stores: IdentityStores, kms: FakeKms, *, enabled: bool) -> TestClient:
+    """A `TestClient` over the full identity router with `passkeys_second_factor` as given."""
+    from webbpulse.http import register_error_handlers
+
+    app = FastAPI()
+    register_error_handlers(app, error_codes=True)
+    app.include_router(
+        build_identity_router(
+            make_settings(passkeys_second_factor=enabled),
+            hooks,
+            stores,
+            kms_client=kms,
+            attempts=InMemoryLoginAttemptStore(),
+            limiter_enabled=False,
+        )
+    )
+    return TestClient(app, base_url="https://api.example.com")
+
+
+class TestPasskeySecondFactorRoutes:
+    """`/login/mfa/passkey/options` and `/verify` over HTTP."""
+
+    def test_routes_are_absent_by_default(self, hooks: FakeHooks, stores: IdentityStores, kms: FakeKms) -> None:
+        """A deployment that has not opted in does not declare the routes."""
+        paths = _router_paths(
+            build_identity_router(make_settings(), hooks, stores, kms_client=kms, limiter_enabled=False)
+        )
+        assert f"{prefix()}{LOGIN_MFA_PASSKEY_OPTIONS_PATH}" not in paths
+        assert f"{prefix()}{LOGIN_MFA_PASSKEY_VERIFY_PATH}" not in paths
+
+    def test_routes_mount_and_declare_their_statuses(
+        self, hooks: FakeHooks, stores: IdentityStores, kms: FakeKms
+    ) -> None:
+        """With the setting on both routes mount with their declared refusals."""
+        from fastapi.routing import APIRoute
+
+        built = build_identity_router(
+            make_settings(passkeys_second_factor=True), hooks, stores, kms_client=kms, limiter_enabled=False
+        )
+        declared = {route.path: set(route.responses) for route in built.routes if isinstance(route, APIRoute)}
+        assert {401, 403, 404, 429} <= declared[f"{prefix()}{LOGIN_MFA_PASSKEY_OPTIONS_PATH}"]
+        assert {401, 403, 429} <= declared[f"{prefix()}{LOGIN_MFA_PASSKEY_VERIFY_PATH}"]
+
+    def test_full_ceremony_over_http(self, hooks: FakeHooks, stores: IdentityStores, kms: FakeKms) -> None:
+        """Password, then the passkey, then a session cookie and an `mfa` access token."""
+        seed_account(hooks, stores)
+        flows = _second_factor_flows(hooks, stores, kms)
+        assert flows.passkeys is not None
+        authenticator, _ = enrol_passkey(flows.passkeys)
+
+        with _second_factor_client(hooks, stores, kms, enabled=True) as client:
+            login = client.post(f"{prefix()}{LOGIN_PATH}", json={"email": EMAIL, "password": PASSWORD})
+            assert login.status_code == 200, login.text
+            assert login.json()["factors"] == ["passkey"]
+            ticket = login.json()["mfa_ticket"]
+
+            options = client.post(f"{prefix()}{LOGIN_MFA_PASSKEY_OPTIONS_PATH}", json={"mfa_ticket": ticket})
+            assert options.status_code == 200, options.text
+            assertion = authenticator.assertion(options.json()["publicKey"]["challenge"])
+            verified = client.post(
+                f"{prefix()}{LOGIN_MFA_PASSKEY_VERIFY_PATH}",
+                json={"mfa_ticket": ticket, "challenge_id": options.json()["challenge_id"], "credential": assertion},
+            )
+            assert verified.status_code == 200, verified.text
+            assert _claims_of(verified.json()["access_token"])["amr"] == ["pwd", "swk", "mfa"]
+            assert "set-cookie" in verified.headers
+
+    def test_a_bad_ticket_is_a_401(self, hooks: FakeHooks, stores: IdentityStores, kms: FakeKms) -> None:
+        """Options for an invalid ticket answer the MFA ticket refusal."""
+        with _second_factor_client(hooks, stores, kms, enabled=True) as client:
+            response = client.post(f"{prefix()}{LOGIN_MFA_PASSKEY_OPTIONS_PATH}", json={"mfa_ticket": "nope"})
+        assert response.status_code == 401
+        assert response.json()["error_code"] == "MFA_TICKET_INVALID"
+
+    def test_verify_without_a_credential_is_a_422(self, hooks: FakeHooks, stores: IdentityStores, kms: FakeKms) -> None:
+        """A verify body with no credential is refused before the ticket is spent."""
+        with _second_factor_client(hooks, stores, kms, enabled=True) as client:
+            response = client.post(f"{prefix()}{LOGIN_MFA_PASSKEY_VERIFY_PATH}", json={"mfa_ticket": "x"})
+        assert response.status_code == 422

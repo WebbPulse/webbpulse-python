@@ -716,6 +716,102 @@ def test_a_reauthentication_never_moves_auth_time_backwards(sessions: SessionSer
     assert rotated.auth_time == first.auth_time
 
 
+def test_a_family_keeps_its_sign_in_amr_across_rotations(sessions: SessionService) -> None:
+    """Every generation carries the `amr` the family started with, deduplicated."""
+    first = sessions.start_family(USER_ID, amr=["pwd", "totp", "pwd"])
+    assert first.amr == ("pwd", "totp")
+
+    second = sessions.rotate(first.token).issued
+    assert second is not None
+    third = sessions.rotate(second.token).issued
+    assert third is not None
+    assert second.amr == third.amr == ("pwd", "totp")
+
+
+def test_the_grace_replay_carries_the_sign_in_amr(sessions: SessionService) -> None:
+    """A concurrent refresh replayed inside the grace window reports the same `amr`."""
+    first = sessions.start_family(USER_ID, amr=["swk", "pin"])
+    winner = sessions.rotate(first.token)
+    loser = sessions.rotate(first.token)
+
+    assert loser.outcome == "replayed"
+    assert winner.issued is not None
+    assert loser.issued is not None
+    assert winner.issued.amr == loser.issued.amr == ("swk", "pin")
+
+
+def test_a_reauthentication_leaves_the_family_amr_alone(sessions: SessionService) -> None:
+    """A step-up moves `auth_time` but not the `amr` later refreshes report."""
+    first = sessions.start_family(USER_ID, amr=["pwd"])
+    sessions.record_reauthentication(first.family_id, first.auth_time + 60)
+    rotated = sessions.rotate(first.token).issued
+    assert rotated is not None
+    assert rotated.amr == ("pwd",)
+
+
+def test_a_family_started_without_amr_rotates_with_none(sessions: SessionService) -> None:
+    """A family from before `amr` was recorded rotates with an empty one for the caller to default."""
+    first = sessions.start_family(USER_ID)
+    rotated = sessions.rotate(first.token).issued
+    assert rotated is not None
+    assert first.amr == rotated.amr == ()
+
+
+def test_refresh_keeps_the_sign_in_amr(flows: IdentityFlows, hooks: FakeHooks, stores: IdentityStores) -> None:
+    """A refreshed access token reports the `amr` its family was started with."""
+    import jwt
+
+    user = seed_account(hooks, stores)
+    issued = flows.sessions.start_family(USER_ID, amr=["oauth", "github"])
+    refreshed = flows.refresh(issued.token)
+
+    assert refreshed.user == user
+    claims = jwt.decode(refreshed.access_token, options={"verify_signature": False})
+    assert claims["amr"] == ["oauth", "github", "mfa"]
+
+
+def test_refresh_of_a_family_without_amr_reports_a_password(
+    flows: IdentityFlows, hooks: FakeHooks, stores: IdentityStores
+) -> None:
+    """A family row written before `amr` existed refreshes with `["pwd"]`, as it always did."""
+    import jwt
+
+    from webbpulse.identity.storage import RefreshTokenRecord, hash_token
+
+    seed_account(hooks, stores)
+    stores.require_refresh_tokens().put(
+        RefreshTokenRecord(
+            token_hash=hash_token("legacy-token"),
+            family_id="legacy-family",
+            user_id=USER_ID,
+            generation=1,
+            created_at=datetime.now(UTC).isoformat(),
+            expires_at=int((datetime.now(UTC) + timedelta(days=7)).timestamp()),
+            family_started_at=datetime.now(UTC).isoformat(),
+        )
+    )
+    refreshed = flows.refresh("legacy-token")
+
+    claims = jwt.decode(refreshed.access_token, options={"verify_signature": False})
+    assert claims["amr"] == ["pwd"]
+    rotated = stores.require_refresh_tokens().get(hash_token(refreshed.refresh_token))
+    assert rotated is not None
+    assert rotated.amr == ()
+
+
+def test_password_login_records_pwd_on_the_family(
+    flows: IdentityFlows, hooks: FakeHooks, stores: IdentityStores
+) -> None:
+    """The family a password login starts records `pwd`."""
+    from webbpulse.identity.storage import hash_token
+
+    seed_account(hooks, stores)
+    login = flows.login(email=EMAIL, password=PASSWORD)
+    record = stores.require_refresh_tokens().get(hash_token(login.refresh_token))
+    assert record is not None
+    assert record.amr == ("pwd",)
+
+
 def test_a_store_without_family_updates_leaves_refresh_working(stores: IdentityStores) -> None:
     """A store that cannot record a step-up is skipped, and rotation carries the login time."""
     from webbpulse.identity.storage import InMemoryRefreshTokenStore
@@ -1717,6 +1813,34 @@ def test_the_dynamo_store_round_trips_auth_time(dynamo_refresh_store: Any) -> No
     )
 
     assert dynamo_refresh_store.get("t").auth_time == 1_790_000_000
+
+
+def test_the_dynamo_store_round_trips_amr(dynamo_refresh_store: Any) -> None:
+    """A row written with an `amr` reads back with it, in order."""
+    from webbpulse.identity.storage import RefreshTokenRecord
+
+    dynamo_refresh_store.put(
+        RefreshTokenRecord(
+            token_hash="t",
+            family_id="fam",
+            user_id=USER_ID,
+            generation=0,
+            created_at="2026-09-13T00:00:00Z",
+            expires_at=4_102_444_800,
+            amr=("pwd", "swk"),
+        )
+    )
+
+    assert dynamo_refresh_store.get("t").amr == ("pwd", "swk")
+
+
+def test_the_dynamo_store_reads_a_row_without_amr_as_empty(dynamo_refresh_store: Any, dynamodb_resource: Any) -> None:
+    """A row from before `amr` existed, or written with none, has no attribute and reads as empty."""
+    _seed_family(dynamo_refresh_store, user_id=USER_ID, family_id="old")
+
+    assert dynamo_refresh_store.get("old-gen0").amr == ()
+    item = dynamodb_resource.Table("refresh-tokens").get_item(Key={"token_hash": "old-gen0"})["Item"]
+    assert "amr" not in item
 
 
 def test_revoke_all_for_user_revokes_every_family_through_the_user_index(dynamo_refresh_store: Any) -> None:

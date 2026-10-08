@@ -7,6 +7,37 @@ This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## Unreleased
 
+## 0.80.0
+
+### Added
+
+- Refresh families record the sign-in `amr`, and every access token `/refresh` mints carries
+  it (PLAT-43). Before, a refreshed token always said `["pwd"]`, so a session that signed in
+  with a second factor, a passkey or OAuth lost that after its first access token expired.
+  `RefreshTokenRecord.amr`, `IssuedRefresh.amr` and `SessionService.start_family(amr=...)`;
+  `DynamoRefreshTokenStore` writes the `amr` attribute only when non-empty. Rows written
+  before this release have no attribute and keep refreshing with `["pwd"]`. A step-up still
+  raises `amr` on its own access token only.
+- `IDENTITY_PASSKEYS_SECOND_FACTOR` (`passkeys_second_factor`, off by default): a registered
+  passkey answers the login MFA challenge. Password and OAuth sign-ins of a passkey holder
+  return `passkey` in `factors`, even with no TOTP enrolled, and
+  `POST /login/mfa/passkey/options {mfa_ticket}` plus
+  `POST /login/mfa/passkey/verify {mfa_ticket, challenge_id, credential}` complete it with
+  `amr` `["pwd", "swk", "mfa"]`. Needs the TOTP stores, which hold the ticket.
+  `IdentityFlows.passkey_second_factor_enabled`, `begin_mfa_passkey`,
+  `complete_mfa_with_passkey`, `PASSKEY_FACTOR`, `LOGIN_MFA_PASSKEY_OPTIONS_PATH`,
+  `LOGIN_MFA_PASSKEY_VERIFY_PATH`.
+- `MfaService.redeem_ticket` returns an `MfaTicket` of user id and first-factor `amr`;
+  `MfaService.ticket_subject` reads a ticket without spending it; `issue_challenge` takes
+  `amr`.
+
+### Fixed
+
+- A session completed through `/login/totp` after an OAuth sign-in, or after a passkey login
+  without user verification, reported `amr` `["pwd", "otp", "mfa"]`. The MFA ticket now
+  carries the first factor, so it reports `["oauth", "<provider>", "otp", "mfa"]` or
+  `["swk", "otp", "mfa"]`.
+
 ## 0.79.0
 
 ### Added

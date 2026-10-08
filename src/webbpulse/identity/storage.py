@@ -161,7 +161,9 @@ class RefreshTokenRecord:
     recording `successor_hash` so a replay inside the grace window gets that successor.
     `auth_time` is when the person last proved who they are in this family, in epoch
     seconds: the login, or a later step-up. Rotation copies it rather than bumping it, and
-    `0` means a record written before the field existed.
+    `0` means a record written before the field existed. `amr` is the sign-in's `amr`,
+    copied by rotation so every refreshed access token reports how the session began; empty
+    means a record written before the field existed.
     """
 
     token_hash: str
@@ -177,6 +179,7 @@ class RefreshTokenRecord:
     ip_first_seen: str = ""
     family_started_at: str = ""
     auth_time: int = 0
+    amr: tuple[str, ...] = ()
 
     @property
     def is_consumed(self) -> bool:
@@ -1035,24 +1038,25 @@ class DynamoRefreshTokenStore(RefreshTokenStore):
         return _refresh_record_from_item(item) if item is not None else None
 
     def put(self, record: RefreshTokenRecord) -> None:
-        """Write a new generation."""
-        self._repo.put(
-            {
-                "token_hash": record.token_hash,
-                "family_id": record.family_id,
-                "user_id": record.user_id,
-                "generation": record.generation,
-                "created_at": record.created_at,
-                "expires_at": record.expires_at,
-                "consumed_at": record.consumed_at,
-                "successor_hash": record.successor_hash,
-                "revoked": record.revoked,
-                "device": record.device,
-                "ip_first_seen": record.ip_first_seen,
-                "family_started_at": record.family_started_at,
-                "auth_time": record.auth_time,
-            }
-        )
+        """Write a new generation, leaving `amr` off a row that has none."""
+        item: dict[str, Any] = {
+            "token_hash": record.token_hash,
+            "family_id": record.family_id,
+            "user_id": record.user_id,
+            "generation": record.generation,
+            "created_at": record.created_at,
+            "expires_at": record.expires_at,
+            "consumed_at": record.consumed_at,
+            "successor_hash": record.successor_hash,
+            "revoked": record.revoked,
+            "device": record.device,
+            "ip_first_seen": record.ip_first_seen,
+            "family_started_at": record.family_started_at,
+            "auth_time": record.auth_time,
+        }
+        if record.amr:
+            item["amr"] = list(record.amr)
+        self._repo.put(item)
 
     def consume(
         self, token_hash: str, *, successor_hash: str, consumed_at: str | None = None
@@ -1613,6 +1617,7 @@ def _refresh_record_from_item(item: Mapping[str, Any]) -> RefreshTokenRecord:
         ip_first_seen=str(item.get("ip_first_seen", "")),
         family_started_at=str(item.get("family_started_at", "")),
         auth_time=int(item.get("auth_time", 0) or 0),
+        amr=tuple(str(method) for method in item.get("amr") or ()),
     )
 
 

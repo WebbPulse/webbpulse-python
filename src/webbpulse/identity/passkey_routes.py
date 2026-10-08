@@ -1,7 +1,9 @@
 """The eight passkey HTTP routes, plus the unconditional availability route.
 
 The eight mount onto the identity router when both passkey tables exist;
-`GET /passkeys/availability` mounts in every deployment through its own function.
+`GET /passkeys/availability` mounts in every deployment through its own function. The two
+`/login/mfa/passkey` routes, which answer a login MFA challenge with a passkey, mount
+alongside them only when `passkeys_second_factor` is on.
 """
 
 from __future__ import annotations
@@ -52,6 +54,8 @@ def _bind_fastapi_request() -> None:
 
 
 __all__ = [
+    "LOGIN_MFA_PASSKEY_OPTIONS_PATH",
+    "LOGIN_MFA_PASSKEY_VERIFY_PATH",
     "LOGIN_PASSKEY_OPTIONS_PATH",
     "LOGIN_PASSKEY_VERIFY_PATH",
     "PASSKEYS_PATH",
@@ -74,6 +78,9 @@ PASSKEY_REGISTER_VERIFY_PATH = "/passkeys/register/verify"
 
 LOGIN_PASSKEY_OPTIONS_PATH = "/login/passkey/options"
 LOGIN_PASSKEY_VERIFY_PATH = "/login/passkey/verify"
+
+LOGIN_MFA_PASSKEY_OPTIONS_PATH = "/login/mfa/passkey/options"
+LOGIN_MFA_PASSKEY_VERIFY_PATH = "/login/mfa/passkey/verify"
 
 PASSKEYS_PATH = "/passkeys"
 PASSKEY_ITEM_PATH = "/passkeys/{credential_id}"
@@ -140,7 +147,8 @@ def register_passkey_routes(
     """Add the eight passkey routes. Call only when `flows.passkeys` is not `None`.
 
     The caller gates the mount so the OpenAPI document describes only what the deployment
-    can actually do.
+    can actually do; the two MFA passkey routes are gated here on
+    `flows.passkey_second_factor_enabled` for the same reason.
     """
     from fastapi import Body
     from fastapi.responses import JSONResponse
@@ -273,6 +281,19 @@ def register_passkey_routes(
             return rejected(request, exc)
         return set_refresh_cookie(JSONResponse(success_body(result)), result.refresh_token)
 
+    if bool(getattr(flows, "passkey_second_factor_enabled", False)):
+        _mount_mfa_passkey(
+            router,
+            prefix=prefix,
+            flows=flows,
+            limits=limits,
+            context=context,
+            rejected=rejected,
+            success_body=success_body,
+            set_refresh_cookie=set_refresh_cookie,
+            passkey_refused=passkey_refused,
+        )
+
     @router.post(
         f"{prefix}{STEP_UP_PASSKEY_OPTIONS_PATH}",
         dependencies=limits(("passkey-options", PASSKEY_OPTIONS_LIMIT, "ip")),
@@ -352,6 +373,85 @@ def register_passkey_routes(
         return JSONResponse({"deleted": True})
 
 
+def _mount_mfa_passkey(
+    router: APIRouter,
+    *,
+    prefix: str,
+    flows: Any,
+    limits: Callable[..., list[Any]],
+    context: Callable[[Request], tuple[str, str]],
+    rejected: Callable[[Request, Any], JSONResponse],
+    success_body: Callable[[Any], dict[str, Any]],
+    set_refresh_cookie: Callable[[JSONResponse, str], JSONResponse],
+    passkey_refused: Callable[[Request, Any], JSONResponse],
+) -> None:
+    """Add the two routes that answer a login MFA challenge with a passkey.
+
+    Both carry the `mfa_ticket` from the challenge body and sit outside the gateway
+    authorizer, like `login/totp`. Options does not spend the ticket; verify does.
+    """
+    from fastapi import Body
+    from fastapi.responses import JSONResponse
+
+    from webbpulse.identity.flows import LoginRejected
+    from webbpulse.identity.mfa import MfaRejected
+    from webbpulse.identity.passkeys import PasskeyRejected
+    from webbpulse.identity.router import _mfa_refused
+
+    @router.post(
+        f"{prefix}{LOGIN_MFA_PASSKEY_OPTIONS_PATH}",
+        dependencies=limits(("passkey-options", PASSKEY_OPTIONS_LIMIT, "ip")),
+    )
+    async def mfa_passkey_options(request: _FastAPIRequest, payload: dict[str, Any] = Body(...)) -> JSONResponse:
+        """Issue an assertion challenge scoped to the user an MFA ticket names."""
+        try:
+            challenge = await run_sync(lambda: flows.begin_mfa_passkey(ticket=str(payload.get("mfa_ticket", ""))))
+        except MfaRejected as exc:
+            return _mfa_refused(request, exc)
+        except PasskeyRejected as exc:
+            return passkey_refused(request, exc)
+        except LoginRejected as exc:
+            return rejected(request, exc)
+        return JSONResponse({"challenge_id": challenge.challenge_id, "publicKey": challenge.options})
+
+    @router.post(
+        f"{prefix}{LOGIN_MFA_PASSKEY_VERIFY_PATH}",
+        dependencies=limits(("passkey-login", PASSKEY_LOGIN_LIMIT, "ip")),
+    )
+    async def mfa_passkey_verify(request: _FastAPIRequest, payload: dict[str, Any] = Body(...)) -> JSONResponse:
+        """Spend an MFA ticket against a passkey assertion and issue the session."""
+        ip, user_agent = context(request)
+        credential = payload.get("credential")
+        if not isinstance(credential, dict):
+            return passkey_refused(
+                request,
+                PasskeyRejected(
+                    "A credential is required.",
+                    error_code="CREDENTIAL_REQUIRED",
+                    status_code=422,
+                ),
+            )
+        try:
+            result = await run_sync(
+                lambda: flows.complete_mfa_with_passkey(
+                    ticket=str(payload.get("mfa_ticket", "")),
+                    challenge_id=str(payload.get("challenge_id", "")),
+                    credential=credential,
+                    ip=ip,
+                    user_agent=user_agent,
+                )
+            )
+        except MfaRejected as exc:
+            return _mfa_refused(request, exc)
+        except PasskeyRejected as exc:
+            return passkey_refused(request, exc)
+        except LoginRejected as exc:
+            return rejected(request, exc)
+        return set_refresh_cookie(JSONResponse(success_body(result)), result.refresh_token)
+
+    _ = (mfa_passkey_options, mfa_passkey_verify)
+
+
 PASSKEY_ROUTE_RESPONSES: Final[dict[tuple[str, str], dict[int, str]]] = {
     ("POST", PASSKEY_REGISTER_OPTIONS_PATH): {
         401: "No bearer token was presented",
@@ -372,6 +472,17 @@ PASSKEY_ROUTE_RESPONSES: Final[dict[tuple[str, str], dict[int, str]]] = {
     ("POST", LOGIN_PASSKEY_VERIFY_PATH): {
         401: "The assertion was refused",
         403: "Passwordless sign in is closed on this deployment",
+        429: "Too many attempts from this address",
+    },
+    ("POST", LOGIN_MFA_PASSKEY_OPTIONS_PATH): {
+        401: "The MFA ticket is invalid or expired",
+        403: "Passkeys cannot complete sign in on this deployment",
+        404: "No passkey is registered on this account",
+        429: "Too many attempts from this address",
+    },
+    ("POST", LOGIN_MFA_PASSKEY_VERIFY_PATH): {
+        401: "The MFA ticket or the assertion was refused",
+        403: "Passkeys cannot complete sign in on this deployment",
         429: "Too many attempts from this address",
     },
     ("POST", STEP_UP_PASSKEY_OPTIONS_PATH): {

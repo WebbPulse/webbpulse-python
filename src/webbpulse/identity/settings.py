@@ -135,6 +135,14 @@ class IdentitySettings(BaseSettings):
     totp_enabled: bool = True
     passkeys_enabled: bool = True
     passkeys_passwordless: bool = True
+    passkeys_second_factor: bool = Field(
+        default=False,
+        description=(
+            "Count a registered passkey as a second factor on a password or OAuth sign-in: "
+            "the MFA challenge then lists `passkey`, and a WebAuthn assertion completes it. "
+            "Needs the MFA wiring (TOTP stores) for the ticket. Off by default."
+        ),
+    )
     oauth_providers: list[OAuthProvider] = Field(default_factory=lambda: _DEFAULT_OAUTH_PROVIDERS.copy())
     password_breach_check: bool = Field(
         default=False,
