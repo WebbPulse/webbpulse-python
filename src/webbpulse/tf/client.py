@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import re
 from typing import Any
-from urllib.parse import urlsplit
+from urllib.parse import quote, urlsplit
 
 import httpx
 
@@ -291,6 +291,45 @@ class ControlPlane:
     def discard_run(self, run_id: str, comment: str = "") -> dict[str, Any]:
         """Discard a run's plan without applying it; the comment is kept on the run."""
         return dict(self._request("POST", f"/runs/{run_id}/discard", json={"comment": comment} if comment else None))
+
+    def list_variables(self, workspace_id: str) -> list[dict[str, Any]]:
+        """Every variable on a workspace; a sensitive one comes back with no value."""
+        body = self._request("GET", f"/workspaces/{workspace_id}/variables")
+        return [dict(item) for item in body.get("items", [])]
+
+    def get_variable(self, workspace_id: str, key: str) -> dict[str, Any]:
+        """One variable by key; a sensitive one comes back with no value."""
+        return dict(self._request("GET", f"/workspaces/{workspace_id}/variables/{quote(key, safe='')}"))
+
+    def put_variable(
+        self,
+        workspace_id: str,
+        key: str,
+        *,
+        value: str,
+        category: str,
+        hcl: bool,
+        sensitive: bool,
+        description: str,
+    ) -> dict[str, Any]:
+        """Create or replace one variable with every attribute given."""
+        return dict(
+            self._request(
+                "PUT",
+                f"/workspaces/{workspace_id}/variables/{quote(key, safe='')}",
+                json={
+                    "value": value,
+                    "category": category,
+                    "hcl": hcl,
+                    "sensitive": sensitive,
+                    "description": description,
+                },
+            )
+        )
+
+    def delete_variable(self, workspace_id: str, key: str) -> None:
+        """Delete one variable."""
+        self._request("DELETE", f"/workspaces/{workspace_id}/variables/{quote(key, safe='')}")
 
     def logs(self, run_id: str, phase: str, after: str | None) -> tuple[list[str], str | None]:
         """One page of a phase's log lines and the token that continues after them."""

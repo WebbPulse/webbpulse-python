@@ -7,6 +7,19 @@ This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## Unreleased
 
+## 0.79.0
+
+### Added
+
+- `wp-tf var list|get|set|unset -w <workspace>` reads and writes control plane workspace
+  variables (PLAT-41). `set` keeps the stored category, `hcl` flag, description and
+  sensitivity unless `--category`, `--hcl`/`--no-hcl`, `--description` or `--sensitive` says
+  otherwise, and takes the value from `--value-stdin` so a secret stays off the command line.
+  Sensitive values are never printed: `list` and `get --json` redact them and `get` refuses
+  them. A 403 names the missing `variables:read` or `variables:write` scope and the
+  `wp-tf login --add-scope` that grants it; a 401 `STEP_UP_REQUIRED` says to sign in again.
+- `ControlPlane.list_variables`, `get_variable`, `put_variable` and `delete_variable`.
+
 ## 0.78.0
 
 ### Security

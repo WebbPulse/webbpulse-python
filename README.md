@@ -290,6 +290,11 @@ wp-tf discard run-... [--comment ...]
 wp-tf logs run-... [--phase apply] [-f]
 wp-tf status run-...
 wp-tf workspaces
+wp-tf var list -w my-workspace              # key, category, flags, value; sensitive ones redacted
+wp-tf var get region -w my-workspace [--json]
+wp-tf var set region us-west-2 -w my-workspace [--category env] [--hcl] [--description ...]
+printf %s "$SECRET" | wp-tf var set api_key --value-stdin --sensitive -w my-workspace
+wp-tf var unset region -w my-workspace
 wp-tf login [--add-scope state:download]    # sign in through the browser
 wp-tf logout
 ```
@@ -311,6 +316,21 @@ wp-tf logout
   that is not a terminal instead of waiting. Confirming needs `runs:apply`; a 403 says to run
   `wp-tf login --add-scope runs:apply`. `confirm` and `discard` act on an existing run.
   Ctrl-C while the apply streams stops following and leaves the apply running.
+- **Variables.** `wp-tf var` reads and writes a workspace's variables. `set` keeps the stored
+  category, `hcl` flag and description unless `--category`, `--hcl`/`--no-hcl` or
+  `--description` is given, and a sensitive variable stays sensitive. Pass a secret with
+  `--value-stdin` (one trailing newline is dropped) so it never lands on a command line or in
+  shell history; a value starting with `-` goes after `--`. The plane never returns a
+  sensitive value, so `list` and `get --json` show `<sensitive>` and `get` refuses it. Reads
+  need `variables:read`, writes `variables:write`; a refusal names the missing scope.
+  Changing a sensitive variable as a person also needs a sign-in within 15 minutes.
+- **Agent credentials for variables.** Agents write variables through a `wp-tf login`
+  session, not a stored key: `wp-tf login --add-scope variables:write` (the standard set
+  already includes it) is approved by a person in the browser, held in the OS keyring and
+  lasts up to 12 hours. The session is used ahead of the `terraform login` key, which
+  usually has only `variables:read`, so the two can sit side by side. No long-lived
+  `variables:write` key goes in an app secret or environment variable; `WP_TF_TOKEN` and
+  `TF_TOKEN_<host>` override the session, so leave them unset when writing variables.
 - **Host.** `--host` or `WP_TF_HOST` sets the host, defaulting to
   `terraform.webbpulse.com`. The API origin comes from the host's discovery document and must
   be https on the host or a subdomain. `--api-url` or `WP_TF_API_URL` can name it instead; it
