@@ -10,19 +10,25 @@ resolve a bearer token in process.
 The key set is cached across invocations. An unknown `kid` triggers at most one refetch
 per `cooldown`, which is what lets a signing key rotation be picked up without turning an
 unknown `kid` into an unbounded fetch loop.
+
+`cached_verifier` hands out one verifier per issuer, audience and JWKS URI for the life of
+the process, and `verified_bearer_subject` is the optional-auth read on top of it: the
+`sub` of a verified Bearer token, or `""` for anything else.
 """
 
 from __future__ import annotations
 
 import logging
 import threading
-from collections.abc import Sequence
+from collections.abc import Callable, Mapping, Sequence
 from typing import TYPE_CHECKING, Any, Final
 
 from webbpulse.identity.service import ACCESS_TOKEN_TYPE, InvalidToken
 from webbpulse.identity.tokens import DISCOVERY_PATH, JWKS_PATH, JWS_ALGORITHM
 
 if TYPE_CHECKING:  # pragma: no cover
+    from fastapi import Request
+
     from webbpulse.identity.settings import IdentitySettings
 
 __all__ = [
@@ -30,7 +36,10 @@ __all__ = [
     "DEFAULT_COOLDOWN",
     "DEFAULT_TIMEOUT",
     "JwksVerifier",
+    "cached_verifier",
+    "clear_verifier_cache",
     "discovery_jwks_uri",
+    "verified_bearer_subject",
 ]
 
 DEFAULT_CACHE_LIFESPAN: Final = 600.0
@@ -195,3 +204,90 @@ class JwksVerifier:
             except Exception as exc:
                 _log.debug("No JWKS signing key matched the token's kid.", exc_info=True)
                 raise InvalidToken(f"no signing key for the token's kid: {exc}") from exc
+
+
+_VERIFIERS: dict[tuple[str, tuple[str, ...], str], JwksVerifier] = {}
+
+_VERIFIERS_LOCK = threading.Lock()
+
+
+def _audiences(audience: str | Sequence[str]) -> tuple[str, ...]:
+    """The non-blank audiences, stripped and de-duplicated in order."""
+    values = [audience] if isinstance(audience, str) else list(audience)
+    cleaned: list[str] = []
+    for value in values:
+        stripped = value.strip()
+        if stripped and stripped not in cleaned:
+            cleaned.append(stripped)
+    return tuple(cleaned)
+
+
+def cached_verifier(
+    issuer: str,
+    audience: str | Sequence[str],
+    *,
+    jwks_uri: str | None = None,
+) -> JwksVerifier | None:
+    """The process-wide `JwksVerifier` for this issuer, audience and JWKS URI, or None.
+
+    None when the issuer or every audience is blank, which is how a function without the
+    identity environment reads, and when the verifier cannot be built. Blank `jwks_uri`
+    means the issuer's default. One instance per key, so its key set cache is shared by
+    every caller in the execution environment.
+    """
+    normalised = issuer.strip().rstrip("/")
+    audiences = _audiences(audience)
+    if not normalised or not audiences:
+        return None
+    uri = (jwks_uri or "").strip()
+    key = (normalised, audiences, uri)
+    with _VERIFIERS_LOCK:
+        verifier = _VERIFIERS.get(key)
+        if verifier is not None:
+            return verifier
+        try:
+            verifier = JwksVerifier(
+                issuer=normalised,
+                audience=audiences[0] if len(audiences) == 1 else list(audiences),
+                jwks_uri=uri or None,
+            )
+        except Exception:
+            _log.debug("Could not build a JWKS verifier for %s.", normalised, exc_info=True)
+            return None
+        _VERIFIERS[key] = verifier
+        return verifier
+
+
+def clear_verifier_cache() -> None:
+    """Drop every verifier `cached_verifier` built. For tests that change the environment."""
+    with _VERIFIERS_LOCK:
+        _VERIFIERS.clear()
+
+
+def verified_bearer_subject(
+    request: Request,
+    verifier: JwksVerifier | Callable[[str], Mapping[str, Any]] | None,
+) -> str:
+    """The `sub` of the request's Bearer token verified in process, or `""`.
+
+    `verifier` is a `JwksVerifier` or any callable returning claims, such as
+    `TokenService.verify_access_token`. No Bearer header, no verifier, or a token that does
+    not verify all answer `""` rather than raise, so a bad or expired token on an optional
+    auth route reads as an anonymous caller.
+    """
+    if verifier is None:
+        return ""
+
+    from webbpulse.identity.scopes import bearer_credential
+
+    presented = bearer_credential(request)
+    if not presented:
+        return ""
+    verify = verifier.verify if isinstance(verifier, JwksVerifier) else verifier
+    try:
+        claims = verify(presented)
+    except Exception:
+        _log.debug("A Bearer token did not verify.", exc_info=True)
+        return ""
+    subject = claims.get("sub")
+    return subject if isinstance(subject, str) else ""

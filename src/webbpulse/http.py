@@ -11,6 +11,9 @@ builds the same page under an API's own plural key.
 
 `conditional_response` answers a polled GET with a weak `ETag`, a 304 with an empty body
 when `If-None-Match` already holds it, and `Cache-Control: private, no-cache`.
+
+`TrailingSlashMiddleware` serves a path whose trailing slash no route declares, and
+`DomainHeaderMiddleware` names the application that answered on every response.
 """
 
 from __future__ import annotations
@@ -38,26 +41,33 @@ from pydantic import BaseModel, ConfigDict, Field, create_model
 from starlette.exceptions import HTTPException as StarletteHTTPException
 from starlette.middleware.base import BaseHTTPMiddleware, RequestResponseEndpoint
 from starlette.responses import Response
+from starlette.routing import Match
 
 from webbpulse.log_context import current_context, request_id_var, set_request_id, set_user_id
 from webbpulse.messages import DEFAULT_MESSAGE, STATUS_MESSAGES
 
 if TYPE_CHECKING:  # pragma: no cover
+    from starlette.routing import Router
+
     from webbpulse.config import BaseServiceSettings
 
 __all__ = [
     "CONDITIONAL_CACHE_CONTROL",
     "DEFAULT_CORS_ALLOW_HEADERS",
     "DEFAULT_ERROR_STATUSES",
+    "DOMAIN_HEADER",
     "DYNAMODB_ERROR_MESSAGES",
     "DYNAMODB_RETRY_AFTER_SECONDS",
     "LAMBDA_CONTEXT_HEADER",
+    "MANGUM_EVENT_SCOPE_KEY",
+    "MONOLITH_DOMAIN",
     "REQUEST_CONTEXT_HEADER",
     "REQUEST_ID_HEADER",
     "RETRY_ATTEMPT_HEADER",
     "ROUTE_KEY_HEADER",
     "SIGNATURE_ALGORITHMS",
     "CursorPage",
+    "DomainHeaderMiddleware",
     "DynamoDBErrorHandlerOptions",
     "DynamoDBErrors",
     "ErrorContext",
@@ -71,6 +81,7 @@ __all__ = [
     "RequestIdMiddleware",
     "RequestLoggingMiddleware",
     "SignatureMismatch",
+    "TrailingSlashMiddleware",
     "ValidationErrorDetail",
     "bind_user_id",
     "client_ip",
@@ -105,11 +116,20 @@ REQUEST_CONTEXT_HEADER: Final = "x-amzn-request-context"
 
 LAMBDA_CONTEXT_HEADER: Final = "x-amzn-lambda-context"
 
+MANGUM_EVENT_SCOPE_KEY: Final = "aws.event"
+"""The ASGI scope key Mangum stores the raw Lambda event under."""
+
 REQUEST_ID_HEADER: Final = "X-Request-ID"
 
 RETRY_ATTEMPT_HEADER: Final = "X-Retry-Attempt"
 
 ROUTE_KEY_HEADER: Final = "X-WebbPulse-Route-Key"
+
+DOMAIN_HEADER: Final = "x-webbpulse-domain"
+"""Names the application that served a request, so which function answered is readable from the response."""
+
+MONOLITH_DOMAIN: Final = "monolith"
+"""What a whole-surface composition root reports, since no single domain name is true of it."""
 
 CONDITIONAL_CACHE_CONTROL: Final = "private, no-cache"
 """The `Cache-Control` every conditional response carries: cache per user, revalidate each time."""
@@ -185,20 +205,39 @@ def route_key(request: Request) -> str:
     return value if isinstance(value, str) and value else ""
 
 
-def client_ip(request: Request, *, local_fallback: bool = True) -> str:
-    """The caller's IP address, read from the API Gateway request context header.
+def _source_ip(context: Any) -> str:
+    """The `sourceIp` in one API Gateway request context, v2 `http` before v1 `identity`."""
+    if not isinstance(context, Mapping):
+        return ""
+    for section in ("http", "identity"):
+        values = context.get(section)
+        if isinstance(values, Mapping):
+            source_ip = values.get("sourceIp")
+            if isinstance(source_ip, str) and source_ip:
+                return source_ip
+    return ""
 
+
+def client_ip(request: Request, *, local_fallback: bool = True) -> str:
+    """The caller's IP address, as API Gateway observed it.
+
+    Read in order from the request context header, the same header's context nested under
+    `requestContext`, and the `requestContext` of the `aws.event` scope key Mangum sets.
+    Each reads the HTTP API v2 `http.sourceIp` before the REST v1 `identity.sourceIp`.
     `X-Forwarded-For` is never read, because a client can forge it. Falls back to the peer
     address when `local_fallback` is set, and returns `"unknown"` otherwise.
     """
     context = request_context(request)
     if context is not None:
-        for section in ("http", "identity"):
-            values = context.get(section)
-            if isinstance(values, Mapping):
-                source_ip = values.get("sourceIp")
-                if isinstance(source_ip, str) and source_ip:
-                    return source_ip
+        source_ip = _source_ip(context) or _source_ip(context.get("requestContext"))
+        if source_ip:
+            return source_ip
+
+    event = request.scope.get(MANGUM_EVENT_SCOPE_KEY)
+    if isinstance(event, Mapping):
+        source_ip = _source_ip(event.get("requestContext"))
+        if source_ip:
+            return source_ip
 
     if local_fallback and request.client is not None and request.client.host:
         return request.client.host
@@ -350,6 +389,68 @@ class RequestLoggingMiddleware:
         if subject is not None:
             extra["user_id"] = subject
         self._logger.info("request", extra=extra)
+
+
+class TrailingSlashMiddleware:
+    """Serve a path whose trailing slash does not match any declared route.
+
+    A request for `/items/` that only `/items` matches, or the reverse, is rewritten to the
+    path that does match rather than redirected, so a preflight or a POST body survives.
+    A path either spelling already matches, or neither does, passes through unchanged.
+    """
+
+    def __init__(self, app: Any, router: Router) -> None:
+        """Wrap `app`, matching candidate paths against `router`."""
+        self.app = app
+        self.router = router
+
+    def _matches(self, scope: Mapping[str, Any]) -> bool:
+        """Whether any route in the router matches this scope's path."""
+        for route in self.router.routes:
+            match, _ = route.matches(dict(scope))
+            if match != Match.NONE:
+                return True
+        return False
+
+    async def __call__(self, scope: Any, receive: Any, send: Any) -> None:
+        """Rewrite the scope's path to its matching alternate, then pass it on."""
+        if scope.get("type") == "http" and not self._matches(scope):
+            path = str(scope["path"])
+            alternate = path[:-1] if path.endswith("/") and path != "/" else path + "/"
+            if self._matches({**scope, "path": alternate}):
+                scope["path"] = alternate
+                scope["raw_path"] = alternate.encode("utf-8")
+        await self.app(scope, receive, send)
+
+
+class DomainHeaderMiddleware:
+    """Stamp every response with the name of the application that produced it.
+
+    Written on `http.response.start`, so it lands on the error envelopes too. `header`
+    defaults to `DOMAIN_HEADER`.
+    """
+
+    def __init__(self, app: Any, domain: str, *, header: str = DOMAIN_HEADER) -> None:
+        """Wrap `app`, stamping responses with `domain` under `header`."""
+        self.app = app
+        self.header = header.lower().encode("latin-1")
+        self.value = domain.encode("latin-1")
+
+    async def __call__(self, scope: Any, receive: Any, send: Any) -> None:
+        """Add the domain header to the outgoing response."""
+        if scope.get("type") != "http":
+            await self.app(scope, receive, send)
+            return
+
+        async def send_wrapper(message: Any) -> None:
+            """Append the domain header as the response starts."""
+            if message.get("type") == "http.response.start":
+                headers = list(message.get("headers") or [])
+                headers.append((self.header, self.value))
+                message["headers"] = headers
+            await send(message)
+
+        await self.app(scope, receive, send_wrapper)
 
 
 def _route_path(scope: Mapping[str, Any]) -> str | None:
