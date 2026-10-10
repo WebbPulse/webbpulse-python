@@ -7,6 +7,25 @@ This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## Unreleased
 
+## 0.86.0
+
+### Changed
+
+- An OAuth-only sign-in no longer carries `mfa` in its `amr` (PLAT-52). `access_token_amr`
+  used to add `mfa` whenever the `amr` held more than one distinct value, so the
+  `["oauth", "<provider>"]` an OAuth sign-in records read as two factors and minted
+  `["oauth", "<provider>", "mfa"]` on sign-in, refresh, step-up and the consent subject.
+  `mfa` is now added only when the `amr` holds two or more distinct methods from the new
+  `webbpulse.identity.mfa.AMR_FACTOR_METHODS` (`pwd`, `otp`, `recovery`, `swk`, `hwk`,
+  `pin`, `oauth`); the provider name is not a factor. OAuth plus TOTP, OAuth plus a
+  passkey, password plus TOTP and a user-verified passkey still carry `mfa`.
+- Adopters whose policies read `mfa`, including `session_tenant_resolver` policies and
+  route checks on the `amr` claim, will now see OAuth-only sessions without it, which is
+  the correct reading: such a session must step up with TOTP or a passkey to satisfy an
+  MFA policy. Access tokens minted before the upgrade keep their old `amr` until they
+  expire; the next refresh mints the corrected claim. A policy that wanted any federated
+  sign-in should test for `oauth`, not `mfa`.
+
 ## 0.85.0
 
 ### Changed

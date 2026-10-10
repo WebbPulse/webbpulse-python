@@ -189,10 +189,16 @@ is `RS256`, `KMS_KEY_SPEC` is `RSA_2048`, `KMS_SIGNING_ALGORITHM` is
 | `jti` | random | audit correlation, not revocation |
 | `sid` | the refresh family id | ties a token to its session |
 | `typ` | `access` | **mandatory**, asserted positively by every verifier |
-| `amr` | e.g. `["pwd","otp"]` | `pwd`, `otp`, `mfa`, `recovery`, `swk`, `pin`, `oauth` |
+| `amr` | e.g. `["pwd","otp","mfa"]` | `pwd`, `otp`, `mfa`, `recovery`, `swk`, `hwk`, `pin`, `oauth`, plus the OAuth provider name |
 | `roles` | e.g. `["admin"]` | from the product's hooks, never invented here |
 | `scope` | space-delimited | so a route can use `authorizationScopes` |
 | `email`, `email_verified` | convenience | |
+
+**`mfa` means two distinct factors.** `access_token_amr` adds it when the `amr` holds two
+or more of `AMR_FACTOR_METHODS` (`pwd`, `otp`, `recovery`, `swk`, `hwk`, `pin`, `oauth`).
+The provider name an OAuth sign-in records beside `oauth` is not a factor, so
+`["oauth","google"]` carries no `mfa`, while `["oauth","google","otp","mfa"]` and
+`["swk","pin","mfa"]` do.
 
 **Every token MUST carry `typ`, and every verifier MUST assert the value it expects.** A
 missing `typ` is a rejection, never a default: one signing key covers several purposes

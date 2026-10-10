@@ -1186,6 +1186,7 @@ def test_the_access_token_records_the_provider_in_amr(flows: IdentityFlows, hook
     assert AMR_OAUTH in claims["amr"]
     assert GOOGLE_PROVIDER in claims["amr"]
     assert "forged" not in claims["amr"], "a hook must not be able to set amr"
+    assert "mfa" not in claims["amr"], "one OAuth factor is not two"
 
 
 def test_an_oauth_login_honours_mfa(hooks: FakeHooks, stores: IdentityStores, kms: FakeKms) -> None:
