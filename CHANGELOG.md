@@ -7,6 +7,8 @@ This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## Unreleased
 
+## 0.89.0
+
 ### Added
 
 - Browser to desktop session handoff (PLAT-55). With `IDENTITY_DESKTOP_HANDOFF_SCHEMES` set,
