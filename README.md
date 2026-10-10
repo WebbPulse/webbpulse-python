@@ -75,9 +75,9 @@ its dev dependencies.
 | `webbpulse.identity` | App-managed identity: password, session, email link, TOTP, OAuth and passkey flows, plus a KMS-backed `TokenService` and a JWKS | [identity.md](docs/identity.md), [the standard](docs/identity-standard.md) |
 | `webbpulse.identity.oauth_server` | An OAuth 2.1 authorization server for hosting a remote MCP server: discovery, PKCE code grant, dynamic registration, consent | [oauth-server.md](docs/oauth-server.md) |
 | `webbpulse.integrations.github` | `GitHubAppClient`: the App JWT, cached installation tokens, check runs, commit statuses, issue comments and installation reads; `load_github_app_settings` for the standard `GITHUB_*` keys; `convert_manifest_code` for the App manifest flow | [GitHub App client](#github-app-client) |
-| `webbpulse.integrations.stripe` | `load_stripe_settings` for the standard `STRIPE_*` keys; `stripe_client` for a `stripe.StripeClient`; `verify_webhook_event` and `claim_webhook_event` for a verified, exactly-once webhook receiver | [Stripe](#stripe) |
+| `webbpulse.integrations.stripe` | `load_stripe_settings` for the standard `STRIPE_*` keys; `stripe_client` for a `stripe.StripeClient`; `verify_webhook_event` and `claim_webhook_event` for a verified, exactly-once webhook receiver; `StripeGateway` for checkout, portal, one customer per owner, seats and cancel on delete | [Stripe](#stripe), [stripe.md](docs/stripe.md) |
 | `webbpulse.lambda_entry` | `run_uvicorn`, `is_lambda`, `resolve_port`: the AWS Lambda Web Adapter entrypoint, with no Mangum and no handler | [packaging.md](docs/packaging.md) |
-| `webbpulse.testing` | Pytest fixtures: `test_client`, `create_table`, `rate_limit_table`, `make_request_context_headers`, `FakeKms`, `FakeIdempotencyStore`, `FakePresigner`, `FakeQueue`, `FakeWebhookSender`, `sign_stripe_payload`; `assert_entrypoint_isolation` for the per-domain image check; `assert_audit_log_contract` for any `AuditLogStore`; `primary_keys_only` (or `enforce_primary_keys`) makes moto refuse a key that is not exactly the table's primary key, as DynamoDB does | [packaging.md](docs/packaging.md) |
+| `webbpulse.testing` | Pytest fixtures: `test_client`, `create_table`, `rate_limit_table`, `make_request_context_headers`, `FakeKms`, `FakeIdempotencyStore`, `FakePresigner`, `FakeQueue`, `FakeWebhookSender`, `FakeStripeGateway`, `sign_stripe_payload`; `assert_entrypoint_isolation` for the per-domain image check; `assert_audit_log_contract` for any `AuditLogStore`; `primary_keys_only` (or `enforce_primary_keys`) makes moto refuse a key that is not exactly the table's primary key, as DynamoDB does | [packaging.md](docs/packaging.md) |
 | `webbpulse.e2e` | A pytest plugin and generic post-deploy suite: route cut, coverage, reachability, identity, frontend and hygiene against a real stage | [e2e.md](docs/e2e.md) |
 | `webbpulse.ops.config` | The `webbpulse-config` console script: operators set keys in the `<prefix>/app` secret and the `/<prefix>/config` parameter | [Operator config CLI](#operator-config-cli) |
 | `webbpulse.ops.admin` | The `webbpulse-admin` console script: operators grant, revoke and list admins in a product's identity `users` table | [Operator admin CLI](#operator-admin-cli) |
@@ -470,6 +470,10 @@ raises `StripeNotConfigured`; a missing, wrong, malformed or stale signature rai
 `claim`, and answers False for a redelivery; release `event_claim_key(event.id)` when the
 work fails so Stripe's retry can win. In tests, `webbpulse.testing.sign_stripe_payload`
 signs a body the way Stripe does, and `FakeIdempotencyStore` stands in for the table.
+
+`StripeGateway` wraps the billing calls on top: Checkout and portal sessions, one customer
+per owner however many checkouts race, seat changes, cancel on account delete, and a
+`verify_webhook` that answers a parsed `StripeEvent`. See [stripe.md](docs/stripe.md).
 
 ## Step-up gate
 

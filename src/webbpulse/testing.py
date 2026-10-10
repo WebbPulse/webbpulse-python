@@ -4,9 +4,9 @@ Enable them with `pytest_plugins = ["webbpulse.testing"]`. They cover a moto-bac
 DynamoDB table, a `TestClient` whose requests carry a realistic API Gateway request
 context, and a locally signing KMS stand-in. `primary_keys_only` holds moto to DynamoDB's
 rule that a key names exactly the table's primary key. `FakeIdempotencyStore`, `FakePresigner`,
-`FakeQueue` and `FakeWebhookSender` are the doubles for the seams a handler reaches the
-outside world through, so a test needs neither moto nor a socket, and `sign_stripe_payload`
-signs a Stripe webhook body the way Stripe does. `assert_entrypoint_isolation`
+`FakeQueue`, `FakeStripeGateway` and `FakeWebhookSender` are the doubles for the seams a
+handler reaches the outside world through, so a test needs neither moto nor a socket, and
+`sign_stripe_payload` signs a Stripe webhook body the way Stripe does. `assert_entrypoint_isolation`
 is the composition-layer check: it builds every domain's entrypoint in its own interpreter
 and holds that each one imports its own domain package and no other. Import only from tests;
 it needs the `testing` extra, and `FakeKms` additionally needs `cryptography`, which the
@@ -21,6 +21,7 @@ already imported and does nothing when FastAPI is absent.
 
 from __future__ import annotations
 
+import copy
 import json
 import os
 import sys
@@ -36,6 +37,8 @@ if TYPE_CHECKING:  # pragma: no cover
     from fastapi.testclient import TestClient
     from mypy_boto3_dynamodb.service_resource import Table
 
+    from webbpulse.integrations.stripe import StripeEvent
+
 __all__ = [
     "CheckedKey",
     "EntrypointImports",
@@ -43,6 +46,7 @@ __all__ = [
     "FakeKms",
     "FakePresigner",
     "FakeQueue",
+    "FakeStripeGateway",
     "FakeWebhookSender",
     "assert_api_key_store_contract",
     "assert_audit_log_contract",
@@ -1068,6 +1072,246 @@ def sign_stripe_payload(payload: bytes, secret: str, *, timestamp: int | None = 
     moment = int(time.time()) if timestamp is None else int(timestamp)
     digest = hmac.new(secret.encode("utf-8"), f"{moment}.".encode() + bytes(payload), hashlib.sha256).hexdigest()
     return f"t={moment},v1={digest}"
+
+
+class FakeStripeGateway:
+    """An in-memory `webbpulse.integrations.stripe.BillingGateway`, without the network or the `stripe` package.
+
+    It keeps customers, subscriptions and the sessions it was asked for in dicts and lists a
+    test reads back, and holds the same guarantees as `StripeGateway`: `ensure_customer`
+    answers one customer per owner however many threads race it, `cancel_subscriptions`
+    skips ended subscriptions so a replay cancels nothing, and `verify_webhook` checks a
+    `sign_stripe_payload` header against `webhook_secret` with Stripe's five minute
+    tolerance. `customer_creates` counts the customers actually created. Seed prices with
+    `prices`, a lookup key to price id map, and subscriptions with `add_subscription`.
+    """
+
+    def __init__(self, *, prices: Mapping[str, str] | None = None, webhook_secret: str | None = None) -> None:
+        """Start with the given prices and nothing else."""
+        import threading
+
+        self.prices = dict(prices or {})
+        self.webhook_secret = webhook_secret
+        self.customers: dict[str, dict[str, Any]] = {}
+        self.subscriptions: dict[str, dict[str, Any]] = {}
+        self.checkout_sessions: list[dict[str, Any]] = []
+        self.portal_sessions: list[dict[str, Any]] = []
+        self.customer_creates = 0
+        self._lock = threading.Lock()
+        self._sequence = 0
+
+    def __repr__(self) -> str:
+        """Name the class only, since `webhook_secret` may be set."""
+        return "FakeStripeGateway()"
+
+    def _next(self, prefix: str) -> str:
+        """A fresh id under `prefix`, such as `cus_fake_1`."""
+        self._sequence += 1
+        return f"{prefix}_fake_{self._sequence}"
+
+    def find_price_id(self, lookup_key: str) -> str | None:
+        """The price seeded under `lookup_key`, or None."""
+        return self.prices.get(lookup_key)
+
+    def find_customer_ids(self, owner_key: str, owner_id: str) -> list[str]:
+        """The ids of every customer whose metadata names the owner, oldest first."""
+        from webbpulse.integrations.stripe import customer_search_query
+
+        customer_search_query(owner_key, owner_id)
+        with self._lock:
+            return [
+                customer["id"]
+                for customer in self.customers.values()
+                if customer["metadata"].get(owner_key) == owner_id
+            ]
+
+    def ensure_customer(
+        self,
+        *,
+        owner_key: str,
+        owner_id: str,
+        email: str | None = None,
+        name: str | None = None,
+        metadata: Mapping[str, str] | None = None,
+        customer_id: str | None = None,
+    ) -> str:
+        """The owner's one customer id, created at most once."""
+        if customer_id:
+            return customer_id
+        existing = self.find_customer_ids(owner_key, owner_id)
+        if existing:
+            return existing[0]
+        with self._lock:
+            for customer in self.customers.values():
+                if customer["metadata"].get(owner_key) == owner_id:
+                    return str(customer["id"])
+            new_id = self._next("cus")
+            self.customers[new_id] = {
+                "id": new_id,
+                "object": "customer",
+                "created": self._sequence,
+                "email": email,
+                "name": name,
+                "metadata": {**(metadata or {}), owner_key: owner_id},
+            }
+            self.customer_creates += 1
+            return new_id
+
+    def create_checkout_session(
+        self,
+        *,
+        customer_id: str,
+        price_id: str,
+        reference_id: str,
+        success_url: str,
+        cancel_url: str,
+        quantity: int = 1,
+        metadata: Mapping[str, str] | None = None,
+    ) -> str:
+        """Record the session and answer a fake Checkout URL."""
+        if quantity < 1:
+            raise ValueError("quantity must be at least 1")
+        with self._lock:
+            session_id = self._next("cs")
+            self.checkout_sessions.append(
+                {
+                    "id": session_id,
+                    "customer": customer_id,
+                    "price": price_id,
+                    "quantity": quantity,
+                    "client_reference_id": reference_id,
+                    "success_url": success_url,
+                    "cancel_url": cancel_url,
+                    "metadata": dict(metadata or {}),
+                }
+            )
+        return f"https://checkout.stripe.test/{session_id}"
+
+    def create_portal_session(self, *, customer_id: str, return_url: str) -> str:
+        """Record the session and answer a fake portal URL."""
+        with self._lock:
+            session_id = self._next("bps")
+            self.portal_sessions.append({"id": session_id, "customer": customer_id, "return_url": return_url})
+        return f"https://billing.stripe.test/{session_id}"
+
+    def add_subscription(
+        self,
+        customer_id: str,
+        *,
+        status: str = "active",
+        quantity: int = 1,
+        lookup_key: str | None = None,
+        metadata: Mapping[str, str] | None = None,
+        current_period_end: int | None = None,
+    ) -> dict[str, Any]:
+        """Seed a one-item subscription for `customer_id` and answer it."""
+        with self._lock:
+            subscription_id = self._next("sub")
+            item_id = self._next("si")
+            subscription: dict[str, Any] = {
+                "id": subscription_id,
+                "object": "subscription",
+                "customer": customer_id,
+                "status": status,
+                "cancel_at_period_end": False,
+                "metadata": dict(metadata or {}),
+                "items": {
+                    "object": "list",
+                    "data": [
+                        {
+                            "id": item_id,
+                            "quantity": quantity,
+                            "current_period_end": current_period_end,
+                            "price": {"id": self.prices.get(lookup_key or ""), "lookup_key": lookup_key},
+                        }
+                    ],
+                },
+            }
+            self.subscriptions[subscription_id] = subscription
+        return copy.deepcopy(subscription)
+
+    def retrieve_subscription(self, subscription_id: str) -> dict[str, Any]:
+        """A copy of the subscription, raising `KeyError` for an unknown id."""
+        with self._lock:
+            return copy.deepcopy(self.subscriptions[subscription_id])
+
+    def set_quantity(self, subscription_id: str, item_id: str, quantity: int) -> dict[str, Any]:
+        """Set the item's quantity and answer the subscription."""
+        if quantity < 1:
+            raise ValueError("quantity must be at least 1")
+        with self._lock:
+            subscription = self.subscriptions[subscription_id]
+            for item in subscription["items"]["data"]:
+                if item["id"] == item_id:
+                    item["quantity"] = quantity
+        return self.retrieve_subscription(subscription_id)
+
+    def cancel_subscriptions(self, customer_id: str) -> list[str]:
+        """Cancel the customer's live subscriptions, answering the ids cancelled."""
+        from webbpulse.integrations.stripe import ENDED_SUBSCRIPTION_STATUSES
+
+        cancelled: list[str] = []
+        with self._lock:
+            for subscription in self.subscriptions.values():
+                if subscription["customer"] != customer_id:
+                    continue
+                if subscription["status"] in ENDED_SUBSCRIPTION_STATUSES:
+                    continue
+                subscription["status"] = "canceled"
+                cancelled.append(subscription["id"])
+        return cancelled
+
+    def cancel_owner_subscriptions(self, owner_key: str, owner_id: str) -> list[str]:
+        """Cancel the live subscriptions of every customer the owner holds."""
+        cancelled: list[str] = []
+        for customer_id in self.find_customer_ids(owner_key, owner_id):
+            cancelled.extend(self.cancel_subscriptions(customer_id))
+        return cancelled
+
+    def verify_webhook(self, payload: bytes, signature_header: str | None) -> StripeEvent:
+        """Check a `sign_stripe_payload` header and parse the body into a `StripeEvent`.
+
+        Raises `StripeNotConfigured` without a `webhook_secret` and `StripeSignatureError`
+        for a missing, wrong or stale signature or a body that is not an event, as
+        `StripeGateway.verify_webhook` does.
+        """
+        import hashlib
+        import hmac
+        import time
+
+        from webbpulse.integrations.stripe import (
+            DEFAULT_WEBHOOK_TOLERANCE_SECONDS,
+            StripeEvent,
+            StripeNotConfigured,
+            StripeSignatureError,
+        )
+
+        if not isinstance(payload, bytes | bytearray):
+            raise TypeError("payload must be the raw request body as bytes")
+        if not self.webhook_secret:
+            raise StripeNotConfigured("the Stripe configuration is missing STRIPE_WEBHOOK_SECRET")
+        if not signature_header:
+            raise StripeSignatureError("the webhook delivery carries no Stripe-Signature header")
+        parts = [part.split("=", 1) for part in signature_header.split(",") if "=" in part]
+        stamps = [value for name, value in parts if name == "t"]
+        signatures = [value for name, value in parts if name == "v1"]
+        if len(stamps) != 1 or not stamps[0].isdigit() or not signatures:
+            raise StripeSignatureError("the webhook signature did not verify")
+        moment = int(stamps[0])
+        expected = hmac.new(
+            self.webhook_secret.encode("utf-8"), f"{moment}.".encode() + bytes(payload), hashlib.sha256
+        ).hexdigest()
+        if not any(hmac.compare_digest(expected, candidate) for candidate in signatures):
+            raise StripeSignatureError("the webhook signature did not verify")
+        if moment < time.time() - DEFAULT_WEBHOOK_TOLERANCE_SECONDS:
+            raise StripeSignatureError("the webhook signature did not verify")
+        try:
+            body = json.loads(bytes(payload))
+        except ValueError:
+            raise StripeSignatureError("the webhook body is not a Stripe event") from None
+        if not isinstance(body, Mapping):
+            raise StripeSignatureError("the webhook body is not a Stripe event")
+        return StripeEvent.from_payload(body)
 
 
 class FakePresigner:

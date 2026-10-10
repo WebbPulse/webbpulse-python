@@ -7,6 +7,36 @@ This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## Unreleased
 
+## 0.88.0
+
+### Added
+
+- `webbpulse.integrations.stripe.StripeGateway`, the subscription billing calls
+  CarModPicker and Standupless share (PLAT-36): `find_price_id`, `ensure_customer`,
+  `create_checkout_session`, `create_portal_session`, `retrieve_subscription`,
+  `set_quantity`, `cancel_subscriptions`, `cancel_owner_subscriptions` and
+  `verify_webhook`, behind the `BillingGateway` Protocol. See `docs/stripe.md`.
+- `ensure_customer` creates at most one customer per owner: a metadata search answers an
+  existing one (the oldest of legacy duplicates), and the create carries the deterministic
+  idempotency key `webbpulse-customer-v1-<owner_key>-<owner_id>`, so concurrent checkouts
+  get the same customer. This closes the duplicate-customer race in CAR-11.
+  `StripeCustomerConflict` is raised only when Stripe refuses the key and no customer is
+  found.
+- `cancel_owner_subscriptions(owner_key, owner_id)` cancels every live subscription of the
+  owner's customers at once, idempotently and without the owner's row, for account delete
+  (CAR-10).
+- `StripeEvent`, a frozen parsed event with `subscription_id`, `customer_id` and
+  `reference_id`; `customer_idempotency_key`, `customer_search_query`,
+  `CUSTOMER_IDEMPOTENCY_PREFIX` and `ENDED_SUBSCRIPTION_STATUSES`.
+- `webbpulse.testing.FakeStripeGateway`, an in-memory `BillingGateway` whose
+  `verify_webhook` checks `sign_stripe_payload` headers.
+
+### Changed
+
+- `webbpulse.integrations.stripe` imports `stripe` only when a client or gateway is built,
+  so the settings and errors load without the extra installed.
+- `claim_webhook_event` accepts any event with an `id`, including a `StripeEvent`.
+
 ## 0.87.0
 
 ### Fixed
