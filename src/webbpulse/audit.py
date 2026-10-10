@@ -10,7 +10,8 @@ purge.
 Every payload, `before` and `after` passes through `Redaction` when an `AuditEvent` is
 built, so no store, recorder or caller path can persist a value under a secret-looking key
 or a value shaped like a credential. A product narrows that further per action with an
-allowlist in its `AuditCatalogue`.
+allowlist in its `AuditCatalogue`. A store reads its rows back with `AuditEvent.restore`,
+which keeps what was written rather than scrubbing it again.
 
 `AuditLogStore` is the storage Protocol, with `DynamoAuditLogStore` over a
 `webbpulse.dynamodb.Repository` and `InMemoryAuditLogStore` for tests. `AuditRecorder` is the
@@ -41,6 +42,7 @@ from webbpulse.dynamodb import (
     encode_start_key,
     new_ulid,
 )
+from webbpulse.identity.api_keys import API_KEY_PREFIX, PREFIX_DISPLAY_LENGTH
 from webbpulse.identity.storage import TableAttribute, TableIndex, TableSpec
 
 if TYPE_CHECKING:  # pragma: no cover
@@ -142,8 +144,11 @@ DEFAULT_SECRET_KEYS: Final[frozenset[str]] = frozenset(
 `secret_name` are not, because they end in an identifier rather than the secret itself.
 """
 
+_DISPLAYED_SECRET_LENGTH: Final = PREFIX_DISPLAY_LENGTH - len(API_KEY_PREFIX)
+
 DEFAULT_SECRET_VALUE_PATTERNS: Final[tuple[re.Pattern[str], ...]] = (
-    re.compile(r"\b(?:wpk|wps|sk|rk|whsec)_[A-Za-z0-9_\-]{8,}"),
+    re.compile(rf"\b(?:wpk|wps)_[A-Za-z0-9_\-]{{{_DISPLAYED_SECRET_LENGTH + 1},}}"),
+    re.compile(r"\b(?:sk|rk|whsec)_[A-Za-z0-9_\-]{8,}"),
     re.compile(r"\b(?:ghp|gho|ghu|ghs|ghr)_[A-Za-z0-9]{20,}"),
     re.compile(r"\bgithub_pat_[A-Za-z0-9_]{20,}"),
     re.compile(r"\bxox[abprs]-[A-Za-z0-9\-]{10,}"),
@@ -152,7 +157,12 @@ DEFAULT_SECRET_VALUE_PATTERNS: Final[tuple[re.Pattern[str], ...]] = (
     re.compile(r"\beyJ[A-Za-z0-9_\-]{8,}\.[A-Za-z0-9_\-]{8,}\.[A-Za-z0-9_\-]*"),
     re.compile(r"(?i)\bbearer\s+[A-Za-z0-9._~+/\-]{16,}"),
 )
-"""Values shaped like a credential, scrubbed wherever they appear, whatever key holds them."""
+"""Values shaped like a credential, scrubbed wherever they appear, whatever key holds them.
+
+A `wpk_` or `wps_` value must run past the `PREFIX_DISPLAY_LENGTH` characters an API key
+shows in the clear, so `webbpulse.identity.api_keys.display_prefix` is kept and a full key is
+scrubbed.
+"""
 
 
 def _now() -> datetime:
@@ -294,7 +304,8 @@ class AuditEvent:
     `event_id` defaults to a ULID minted at `occurred_at`, which is what makes a time range a
     key condition; one given explicitly must be a ULID. `payload` is the event's JSON detail,
     and `before` and `after` the changed fields of an update. All three pass through the
-    default `Redaction`, so none can hold a secret-looking key or value. `expires_at` is the
+    default `Redaction`, so none can hold a secret-looking key or value; only `restore`, the
+    read path of a store, skips it. `expires_at` is the
     epoch second the TTL removes the row, or `None` to keep it.
     """
 
@@ -332,6 +343,41 @@ class AuditEvent:
             object.__setattr__(self, "before", _DEFAULT_REDACTION.apply(self.before))
         if self.after is not None:
             object.__setattr__(self, "after", _DEFAULT_REDACTION.apply(self.after))
+
+    @classmethod
+    def restore(
+        cls,
+        *,
+        tenant_id: str,
+        action: str,
+        actor: AuditActor,
+        event_id: str,
+        occurred_at: datetime,
+        target: AuditTarget = _NO_TARGET,
+        payload: Mapping[str, Any] | None = None,
+        before: Mapping[str, Any] | None = None,
+        after: Mapping[str, Any] | None = None,
+        expires_at: int | None = None,
+    ) -> AuditEvent:
+        """An event read back from a store exactly as it was written, without scrubbing it again.
+
+        The read path of a store. The shape is still checked, but `payload`, `before` and
+        `after` are kept as given, so a value the write path let through, or a row written
+        before a product adopted this module, reads back unchanged.
+        """
+        event = cls(
+            tenant_id=tenant_id,
+            action=action,
+            actor=actor,
+            target=target,
+            occurred_at=occurred_at,
+            event_id=event_id,
+            expires_at=expires_at,
+        )
+        object.__setattr__(event, "payload", dict(payload or {}))
+        object.__setattr__(event, "before", dict(before) if before is not None else None)
+        object.__setattr__(event, "after", dict(after) if after is not None else None)
+        return event
 
     @property
     def target_key(self) -> str:
@@ -571,7 +617,7 @@ class DynamoAuditLogStore:
         raw_before = item.get("before")
         raw_after = item.get("after")
         raw_expiry = item.get(names.expires_at)
-        return AuditEvent(
+        return AuditEvent.restore(
             tenant_id=str(item[names.tenant_id]),
             event_id=str(item[names.event_id]),
             action=str(item.get(names.action, "")),
@@ -882,6 +928,9 @@ class AuditRecorder:
     ) -> AuditEvent:
         """The event `record` would store, scrubbed by the action's redaction, without storing it.
 
+        `target` is kept as given, so a target with only a label keeps it; the event joins the
+        target index only when the target has both a type and an id.
+
         Raises:
             ValueError: When `action` is not in the catalogue.
         """
@@ -894,7 +943,7 @@ class AuditRecorder:
             tenant_id=tenant_id,
             action=action,
             actor=actor,
-            target=target or _NO_TARGET,
+            target=target if target is not None else _NO_TARGET,
             payload=redaction.apply(payload),
             before=redaction.apply(before) if before is not None else None,
             after=redaction.apply(after) if after is not None else None,
