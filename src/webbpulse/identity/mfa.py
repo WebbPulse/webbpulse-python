@@ -21,14 +21,14 @@ from webbpulse.identity.crypto import (
     SecretMasterKeyCipher,
     TotpCipher,
 )
+from webbpulse.identity.oauth import AMR_OAUTH
+from webbpulse.identity.passkeys import AMR_PASSKEY, AMR_PIN
 from webbpulse.identity.storage import (
     IdentityTokenRecord,
     RecoveryCodeRecord,
     TotpFactorRecord,
     hash_token,
 )
-from webbpulse.identity.oauth import AMR_OAUTH
-from webbpulse.identity.passkeys import AMR_PASSKEY, AMR_PIN
 
 if TYPE_CHECKING:  # pragma: no cover
     from collections.abc import Mapping, Sequence
