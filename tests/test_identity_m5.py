@@ -2470,3 +2470,135 @@ class TestPasskeySecondFactorRoutes:
         with _second_factor_client(hooks, stores, kms, enabled=True) as client:
             response = client.post(f"{prefix()}{LOGIN_MFA_PASSKEY_VERIFY_PATH}", json={"mfa_ticket": "x"})
         assert response.status_code == 422
+
+
+OAUTH_GOOGLE = ["oauth", "google"]
+PASSKEY_SIGN_IN = [AMR_PASSKEY, AMR_PIN]
+
+
+class TestStepUpKeepsTheSignInAmr:
+    """A step-up mints the family's sign-in `amr` plus the step-up factor, not a literal `pwd`."""
+
+    @staticmethod
+    def _session(flows: IdentityFlows, amr: list[str]) -> str:
+        """Start a refresh family that signed in with `amr`, returning its id."""
+        return flows.sessions.start_family(USER_ID, amr=amr).family_id
+
+    @staticmethod
+    def _totp_seed(flows: IdentityFlows) -> str:
+        """Enrol and activate TOTP for the user, returning the seed."""
+        service = flows.mfa
+        assert service is not None
+        enrolment = service.begin_enrolment(USER_ID, account_name=EMAIL)
+        service.confirm_enrolment(USER_ID, totp_module.generate_code(enrolment.secret, step=totp_module.current_step()))
+        return enrolment.secret
+
+    def _totp_step_up(self, flows: IdentityFlows, session_id: str) -> list[str]:
+        """Step up with a TOTP code and return the minted `amr`."""
+        seed = self._totp_seed(flows)
+        code = totp_module.generate_code(seed, step=totp_module.current_step() + 1)
+        result = flows.step_up(user_id=USER_ID, session_id=session_id, code=code)
+        return list(_claims_of(result.access_token)["amr"])
+
+    @staticmethod
+    def _passkey_step_up(flows: IdentityFlows, passkeys: PasskeyService, session_id: str) -> list[str]:
+        """Step up with a passkey assertion and return the minted `amr`."""
+        authenticator, _ = enrol_passkey(passkeys)
+        challenge = flows.begin_passkey_step_up(user_id=USER_ID)
+        result = flows.step_up_with_passkey(
+            user_id=USER_ID,
+            session_id=session_id,
+            challenge_id=challenge.challenge_id,
+            credential=authenticator.assertion(_challenge_of(challenge.options)),
+        )
+        return list(_claims_of(result.access_token)["amr"])
+
+    @staticmethod
+    def _password_step_up(flows: IdentityFlows, session_id: str) -> list[str]:
+        """Step up with the password and return the minted `amr`."""
+        result = flows.step_up_with_password(user_id=USER_ID, session_id=session_id, password=PASSWORD)
+        return list(_claims_of(result.access_token)["amr"])
+
+    def test_totp_from_an_oauth_session(self, flows: IdentityFlows, hooks: FakeHooks, stores: IdentityStores) -> None:
+        """An OAuth session stepping up with TOTP still leads with `oauth`."""
+        seed_account(hooks, stores)
+        amr = self._totp_step_up(flows, self._session(flows, OAUTH_GOOGLE))
+        assert amr == ["oauth", "google", "otp", "mfa"]
+
+    def test_passkey_from_an_oauth_session(
+        self, flows: IdentityFlows, passkeys: PasskeyService, hooks: FakeHooks, stores: IdentityStores
+    ) -> None:
+        """An OAuth session stepping up with a passkey still leads with `oauth`."""
+        seed_account(hooks, stores)
+        amr = self._passkey_step_up(flows, passkeys, self._session(flows, OAUTH_GOOGLE))
+        assert amr == ["oauth", "google", AMR_PASSKEY, "mfa"]
+
+    def test_password_from_an_oauth_session(
+        self, flows: IdentityFlows, hooks: FakeHooks, stores: IdentityStores
+    ) -> None:
+        """An OAuth session stepping up with its password still leads with `oauth`."""
+        seed_account(hooks, stores)
+        amr = self._password_step_up(flows, self._session(flows, OAUTH_GOOGLE))
+        assert amr == ["oauth", "google", AMR_PASSWORD, "mfa"]
+
+    def test_totp_from_a_passkey_session(self, flows: IdentityFlows, hooks: FakeHooks, stores: IdentityStores) -> None:
+        """A passkey session stepping up with TOTP still leads with `swk`."""
+        seed_account(hooks, stores)
+        amr = self._totp_step_up(flows, self._session(flows, PASSKEY_SIGN_IN))
+        assert amr == [AMR_PASSKEY, AMR_PIN, "otp", "mfa"]
+
+    def test_passkey_from_a_passkey_session(
+        self, flows: IdentityFlows, passkeys: PasskeyService, hooks: FakeHooks, stores: IdentityStores
+    ) -> None:
+        """A passkey session stepping up with a passkey keeps its own `amr`, deduplicated."""
+        seed_account(hooks, stores)
+        amr = self._passkey_step_up(flows, passkeys, self._session(flows, PASSKEY_SIGN_IN))
+        assert amr == [AMR_PASSKEY, AMR_PIN, "mfa"]
+
+    def test_password_from_a_passkey_session(
+        self, flows: IdentityFlows, hooks: FakeHooks, stores: IdentityStores
+    ) -> None:
+        """A passkey session stepping up with the password still leads with `swk`."""
+        seed_account(hooks, stores)
+        amr = self._password_step_up(flows, self._session(flows, PASSKEY_SIGN_IN))
+        assert amr == [AMR_PASSKEY, AMR_PIN, AMR_PASSWORD, "mfa"]
+
+    def test_a_real_passkey_login_keeps_swk_through_a_password_step_up(
+        self, flows: IdentityFlows, passkeys: PasskeyService, hooks: FakeHooks, stores: IdentityStores
+    ) -> None:
+        """The family a passwordless login starts is what the step-up builds on."""
+        seed_account(hooks, stores)
+        authenticator, _ = enrol_passkey(passkeys)
+        challenge = flows.begin_passkey_login()
+        login = flows.login_with_passkey(
+            challenge_id=challenge.challenge_id,
+            credential=authenticator.assertion(_challenge_of(challenge.options)),
+        )
+        amr = self._password_step_up(flows, str(_claims_of(login.access_token)["sid"]))
+        assert amr == [AMR_PASSKEY, AMR_PIN, AMR_PASSWORD, "mfa"]
+
+    def test_a_family_without_amr_falls_back_to_a_password(
+        self, flows: IdentityFlows, hooks: FakeHooks, stores: IdentityStores
+    ) -> None:
+        """A family that recorded no `amr`, or no family at all, reads as `pwd` as before."""
+        seed_account(hooks, stores)
+        legacy = flows.sessions.start_family(USER_ID).family_id
+        assert self._totp_step_up(flows, legacy) == [AMR_PASSWORD, "otp", "mfa"]
+        assert self._password_step_up(flows, "no-such-family") == [AMR_PASSWORD]
+
+    def test_a_store_that_cannot_read_a_family_falls_back_to_a_password(self, hooks: FakeHooks, kms: FakeKms) -> None:
+        """A custom store without `family_amr` keeps the old step-up `amr`."""
+
+        class Legacy(InMemoryRefreshTokenStore):
+            """A store predating `family_amr`."""
+
+            def family_amr(self, family_id: str) -> tuple[str, ...]:
+                """Refuse, as the base class does."""
+                raise NotImplementedError
+
+        settings = make_settings()
+        stores = IdentityStores(credentials=InMemoryCredentialStore(), refresh_tokens=Legacy())
+        flows = IdentityFlows(settings, hooks, stores, TokenService(settings, kms), kms_client=kms)
+        seed_account(hooks, stores)
+        session_id = flows.sessions.start_family(USER_ID, amr=OAUTH_GOOGLE).family_id
+        assert self._password_step_up(flows, session_id) == [AMR_PASSWORD]

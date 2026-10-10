@@ -153,6 +153,11 @@ the tenant is re-checked against that resolver when the form posts rather than t
 the form. It is written into the code record, not accepted again at `/token`, where the
 client could change it.
 
+A product whose tenants carry their own auth policy passes `session_tenant_resolver`
+instead. It receives the consenting `AuthorizationSubject`, whose `amr` says how the session
+signed in, and wins over `tenant_resolver` for both the list and the re-check, so a tenant
+the session may not enter is never offered and cannot be posted.
+
 The form carries the authorization parameters through the user's browser, so they are
 covered by an HMAC that also binds the signed-in user id, which is never sent. A scope or
 redirect URI edited in the browser, a form minted in another account's session, or a form

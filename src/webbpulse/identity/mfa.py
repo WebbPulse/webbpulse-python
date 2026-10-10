@@ -49,6 +49,7 @@ __all__ = [
     "MfaService",
     "MfaTicket",
     "RecoveryCodeSet",
+    "access_token_amr",
     "hash_recovery_code",
     "normalise_recovery_code",
 ]
@@ -70,6 +71,14 @@ RECOVERY_CODE_COUNT: Final = 10
 RECOVERY_CODE_BYTES: Final = 12
 
 _RECOVERY_GROUP: Final = 5
+
+
+def access_token_amr(amr: Sequence[str]) -> tuple[str, ...]:
+    """The `amr` an access token carries for these methods: deduplicated, with `mfa` added when more than one."""
+    methods = list(dict.fromkeys(amr))
+    if len(methods) > 1 and AMR_MFA not in methods:
+        methods.append(AMR_MFA)
+    return tuple(methods)
 
 
 def normalise_recovery_code(code: str) -> str:

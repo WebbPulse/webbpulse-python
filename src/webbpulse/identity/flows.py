@@ -24,13 +24,13 @@ from webbpulse.identity.lockout import (
     new_attempt,
 )
 from webbpulse.identity.mfa import (
-    AMR_MFA,
     AMR_PASSWORD,
     PASSKEY_FACTOR,
     MfaChallenge,
     MfaRejected,
     MfaService,
     RecoveryCodeSet,
+    access_token_amr,
 )
 from webbpulse.identity.passwords import (
     check_password,
@@ -568,6 +568,8 @@ class IdentityFlows:
 
         No new refresh family and no cookie change: what changes is `auth_time` and `amr`.
         The result carries an empty `refresh_token` and the caller's existing `family_id`.
+        `amr` is the family's sign-in `amr` plus the step-up factor, or `pwd` plus the factor
+        for a family that recorded none.
         `step_up_with_passkey` is the same step taken with a WebAuthn assertion instead.
         The code counts toward the same MFA lockout as the second leg of login.
         """
@@ -584,7 +586,7 @@ class IdentityFlows:
         access = self._mint_access(
             user,
             session_id=session_id,
-            amr=[AMR_PASSWORD, method],
+            amr=[*self._sign_in_amr(session_id), method],
             auth_time=auth_time,
         )
         _log.info(
@@ -644,7 +646,7 @@ class IdentityFlows:
         access = self._mint_access(
             user,
             session_id=session_id,
-            amr=[AMR_PASSWORD, AMR_PASSKEY],
+            amr=[*self._sign_in_amr(session_id), AMR_PASSKEY],
             auth_time=auth_time,
         )
         _log.info(
@@ -671,7 +673,7 @@ class IdentityFlows:
     ) -> AuthResult:
         """Re-authenticate inside an existing session with the account password.
 
-        The same result as `step_up`, with `amr` of `pwd`. The password goes through the check
+        The same result as `step_up`, with `pwd` as the step-up factor. The password goes through the check
         login uses, under the same lockout key, so a wrong password here gives login's
         refusal and counts toward the account's lockout. A password alone is enough even
         when the user has MFA, as in GitHub sudo mode. A user with neither a password nor a
@@ -702,7 +704,9 @@ class IdentityFlows:
 
         auth_time = int(time.time())
         self._sessions.record_reauthentication(session_id, auth_time)
-        access = self._mint_access(user, session_id=session_id, amr=[AMR_PASSWORD], auth_time=auth_time)
+        access = self._mint_access(
+            user, session_id=session_id, amr=[*self._sign_in_amr(session_id), AMR_PASSWORD], auth_time=auth_time
+        )
         _log.info(
             "Step-up authentication succeeded.",
             extra={"event": "mfa.step_up", "user_id": user_id, "method": AMR_PASSWORD},
@@ -1740,6 +1744,14 @@ class IdentityFlows:
             extra=dict(extra or {}),
         )
 
+    def _sign_in_amr(self, session_id: str) -> tuple[str, ...]:
+        """The `amr` the session signed in with, or `pwd` for a family that recorded none.
+
+        What a step-up builds on, so the token keeps saying how the session began, as a
+        refresh of the same family does.
+        """
+        return self._sessions.family_amr(session_id) or (AMR_PASSWORD,)
+
     def _mint_access(
         self,
         user: Mapping[str, Any],
@@ -1753,11 +1765,8 @@ class IdentityFlows:
         `amr` and `auth_time` are applied after `claims_for`, so a product hook cannot
         overwrite them. `mfa` is added alongside the specific factor when more than one was used.
         """
-        methods = list(dict.fromkeys(amr))
-        if len(methods) > 1 and AMR_MFA not in methods:
-            methods.append(AMR_MFA)
         claims = dict(self._hooks.claims_for(user))
-        claims["amr"] = methods
+        claims["amr"] = list(access_token_amr(amr))
         claims["auth_time"] = int(time.time()) if auth_time is None else auth_time
         return self._tokens.mint_access_token(
             _user_id(user),

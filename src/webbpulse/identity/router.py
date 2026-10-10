@@ -24,7 +24,12 @@ if TYPE_CHECKING:  # pragma: no cover
     from webbpulse.identity.hooks import IdentityHooks
     from webbpulse.identity.lockout import LoginAttemptStore
     from webbpulse.identity.mfa import MfaRejected
-    from webbpulse.identity.oauth_server import AuthorizationSubject, ConsentRenderer, TenantResolver
+    from webbpulse.identity.oauth_server import (
+        AuthorizationSubject,
+        ConsentRenderer,
+        SessionTenantResolver,
+        TenantResolver,
+    )
     from webbpulse.identity.oauth_server_storage import OAuthServerStores
     from webbpulse.identity.passkeys import PasskeyRejected
     from webbpulse.identity.service import TokenService
@@ -162,6 +167,7 @@ def build_identity_router(
     consent_theme: ConsentTheme | None = None,
     tenant_resolver: TenantResolver | None = None,
     device_grant_stores: DeviceGrantStores | None = None,
+    session_tenant_resolver: SessionTenantResolver | None = None,
 ) -> APIRouter:
     """The identity router for a product, mounted with no prefix.
 
@@ -171,6 +177,7 @@ def build_identity_router(
     per-route rate limits and every other environment keeps them. `consent_theme` brands
     the built-in OAuth consent screen; `consent_renderer` replaces it. `device_grant_stores`
     backs the device authorization grant and is required when `device_grant_enabled` is on.
+    `session_tenant_resolver` wins over `tenant_resolver` and sees the consenting session.
     """
     from fastapi import APIRouter
     from fastapi.responses import JSONResponse
@@ -291,6 +298,7 @@ def build_identity_router(
             consent_renderer=consent_renderer,
             consent_theme=consent_theme,
             tenant_resolver=tenant_resolver,
+            session_tenant_resolver=session_tenant_resolver,
         )
 
     if device_stores is not None and hooks is not None:
@@ -329,6 +337,7 @@ def _mount_oauth_server(
     consent_renderer: ConsentRenderer | None,
     consent_theme: ConsentTheme | None,
     tenant_resolver: TenantResolver | None,
+    session_tenant_resolver: SessionTenantResolver | None = None,
 ) -> None:
     """Mount the OAuth 2.1 authorization server, behind `mcp_oauth_enabled`.
 
@@ -364,6 +373,7 @@ def _mount_oauth_server(
             consent_renderer=consent_renderer,
             consent_theme=consent_theme,
             tenant_resolver=tenant_resolver,
+            session_tenant_resolver=session_tenant_resolver,
             limits=limits,
             authorization_subject_resolver=subject_resolver,
         )
@@ -478,6 +488,7 @@ def _authorization_subject_resolver(
         """
         from webbpulse.identity.claims import is_browser_session
         from webbpulse.identity.hooks import AuthenticationRefused
+        from webbpulse.identity.mfa import AMR_PASSWORD, access_token_amr
 
         presented = _presented_claims(request, tokens)
         if presented is not None and not is_browser_session(presented, settings.audience):
@@ -494,6 +505,7 @@ def _authorization_subject_resolver(
                 session_id=claims.get("sid", ""),
                 email=email,
                 name=name,
+                amr=_amr_claim(presented or {}),
             )
         if flows is None or hooks is None:
             return None
@@ -514,6 +526,7 @@ def _authorization_subject_resolver(
             session_id=presented.family_id,
             email=email,
             name=name,
+            amr=access_token_amr(presented.amr or (AMR_PASSWORD,)),
         )
 
     return subject_resolver
@@ -1413,6 +1426,16 @@ def _int_claim(value: str) -> int:
         return int(float(value))
     except (TypeError, ValueError, OverflowError):
         return 0
+
+
+def _amr_claim(claims: Mapping[str, Any]) -> tuple[str, ...]:
+    """The `amr` of verified claims as a tuple, whether it arrived as a list or the gateway's string."""
+    from webbpulse.identity.claims import coerce_claims
+
+    value = coerce_claims(claims).get("amr")
+    if isinstance(value, list):
+        return tuple(str(method) for method in value)
+    return ()
 
 
 def _subject_from_request(request: Request, tokens: TokenService) -> str:
