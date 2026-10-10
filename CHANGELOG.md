@@ -7,6 +7,40 @@ This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## Unreleased
 
+## 0.85.0
+
+### Changed
+
+- A step-up keeps the session's sign-in `amr` (PLAT-45). `step_up`, `step_up_with_passkey`
+  and `step_up_with_password` used to mint `amr` with a literal `pwd` first factor, so an
+  OAuth or passkey session read as a password session after a step-up until its next
+  refresh. They now mint the refresh family's stored sign-in `amr` plus the step-up factor,
+  with `mfa` added when more than one method is present, exactly as a refresh of the same
+  family does. A family that recorded no `amr` falls back to `pwd` as before. A password
+  session stepping up with its password still reads `["pwd"]`.
+- `RefreshTokenStore.family_amr(family_id)` reads a family's sign-in `amr`, implemented by
+  the in-memory and DynamoDB stores; the base raises `NotImplementedError`, which
+  `SessionService.family_amr` reports as empty. `PresentedSession` carries `amr`, and
+  `webbpulse.identity.mfa.access_token_amr` is the deduplicate-and-add-`mfa` rule the token
+  minting uses.
+
+### Added
+
+- The OAuth server's consent step can see how the session signed in (PLAT-46).
+  `AuthorizationSubject` carries `amr`, read from the presented token or, for a cookie-only
+  browser, from the refresh family. A new `session_tenant_resolver` keyword on
+  `build_identity_router`, `build_dynamo_router` and `build_oauth_server_router`
+  takes a `SessionTenantResolver`, `Callable[[AuthorizationSubject], Sequence[TenantChoice]]`,
+  and wins over `tenant_resolver` for both the consent list and the re-check of the chosen
+  tenant, so a product can leave out a tenant whose sign-in method policy the session does
+  not meet. Existing one-argument `tenant_resolver` callables are unchanged.
+
+### Adopter impact
+
+- None required. A product that enforces a sign-in method policy on tenants passes
+  `session_tenant_resolver=` and reads `subject.amr`. A custom `RefreshTokenStore` that
+  does not implement `family_amr` keeps today's `pwd` step-up `amr`.
+
 ## 0.84.0
 
 ### Fixed

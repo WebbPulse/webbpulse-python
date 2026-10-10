@@ -372,6 +372,14 @@ class RefreshTokenStore(ABC):
         """
         raise NotImplementedError("This store cannot update a refresh family's auth_time.")
 
+    def family_amr(self, family_id: str) -> tuple[str, ...]:
+        """The sign-in `amr` a family was started with, empty when none was recorded.
+
+        Every generation carries the same `amr`, so any row of the family answers. The base
+        raises `NotImplementedError`, which `SessionService.family_amr` reports as empty.
+        """
+        raise NotImplementedError("This store cannot read a refresh family by its id.")
+
     @abstractmethod
     def delete_all_for_user(self, user_id: str) -> int:
         """Delete every refresh row a user holds, returning how many rows went.
@@ -730,6 +738,13 @@ class InMemoryRefreshTokenStore(RefreshTokenStore):
                 self._items[token_hash] = dataclasses.replace(record, auth_time=auth_time)
                 count += 1
         return count
+
+    def family_amr(self, family_id: str) -> tuple[str, ...]:
+        """The sign-in `amr` a family was started with, empty when none was recorded."""
+        for record in self._items.values():
+            if record.family_id == family_id and record.amr:
+                return record.amr
+        return ()
 
     def revoke_all_for_user(self, user_id: str, *, except_family_id: str = "") -> int:
         """Revoke every family for a user. What a password reset and "sign out everywhere" call."""
@@ -1118,6 +1133,24 @@ class DynamoRefreshTokenStore(RefreshTokenStore):
                 continue
             count += 1
         return count
+
+    def family_amr(self, family_id: str) -> tuple[str, ...]:
+        """The sign-in `amr` a family was started with, empty when none was recorded.
+
+        Reads the family index, falling back to a consistent read of the first row's key
+        when the index does not project `amr`.
+        """
+        from boto3.dynamodb.conditions import Key
+
+        first_hash = ""
+        for item in self._repo.iter_query(Key("family_id").eq(family_id), index_name=REFRESH_FAMILY_INDEX):
+            if item.get("amr"):
+                return tuple(str(method) for method in item["amr"])
+            first_hash = first_hash or str(item.get("token_hash", ""))
+        if not first_hash:
+            return ()
+        record = self.get(first_hash)
+        return record.amr if record is not None else ()
 
     def revoke_all_for_user(self, user_id: str, *, except_family_id: str = "") -> int:
         """Revoke every family for a user. What a password reset and "sign out everywhere" call.

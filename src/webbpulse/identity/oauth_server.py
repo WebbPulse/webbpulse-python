@@ -60,6 +60,7 @@ __all__ = [
     "ConsentRenderer",
     "OAuthServerError",
     "OAuthServerService",
+    "SessionTenantResolver",
     "TenantChoice",
     "build_authorization_server_metadata",
     "build_oauth_server_router",
@@ -194,6 +195,7 @@ class AuthorizationSubject:
     `session_id` is the refresh family the request rode on, when there is one. Resolved from
     a bearer or authorizer claims first, then from the refresh cookie, read-only. `email`
     and `name` are what the consent screen shows as the signed-in account, when known.
+    `amr` is how the session signed in, as its access token reports it, or empty when unknown.
     """
 
     user_id: str
@@ -201,6 +203,7 @@ class AuthorizationSubject:
     session_id: str = ""
     email: str = ""
     name: str = ""
+    amr: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -251,6 +254,13 @@ type TenantResolver = Callable[[str], Sequence[TenantChoice]]
 
 A product's own membership model. Returning one tenant still shows the consent screen: the
 user is approving a client's access, not only choosing where it applies.
+"""
+
+type SessionTenantResolver = Callable[[AuthorizationSubject], Sequence[TenantChoice]]
+"""Maps the consenting session to the tenants it may bind a token to.
+
+`TenantResolver` given the whole `AuthorizationSubject`, so a product can leave out a tenant
+whose auth policy the session does not meet, such as a sign-in method policy read from `amr`.
 """
 
 
@@ -913,6 +923,7 @@ def build_oauth_server_router(
     consent_renderer: ConsentRenderer | None = None,
     consent_theme: ConsentTheme | None = None,
     tenant_resolver: TenantResolver | None = None,
+    session_tenant_resolver: SessionTenantResolver | None = None,
     limits: Callable[..., list[Any]] | None = None,
     subject_resolver: Callable[[Request], str] | None = None,
     authorization_subject_resolver: Callable[[Request], AuthorizationSubject | None] | None = None,
@@ -926,6 +937,7 @@ def build_oauth_server_router(
     `authorization_subject_resolver` wins over the older `subject_resolver`, which carries
     no `auth_time` and so always counts as stale when `mcp_consent_max_age` is set.
     `consent_renderer` wins over `consent_theme`, which brands the built-in screen.
+    `session_tenant_resolver` wins over `tenant_resolver`, which sees only the user id.
     """
     from fastapi import APIRouter
     from fastapi.responses import JSONResponse, RedirectResponse
@@ -956,6 +968,16 @@ def build_oauth_server_router(
             return found if found is not None and found.user_id else None
         user_id = subject_resolver(request) if subject_resolver is not None else ""
         return AuthorizationSubject(user_id=user_id) if user_id else None
+
+    tenant_required = session_tenant_resolver is not None or tenant_resolver is not None
+
+    def tenants_for(subject: AuthorizationSubject) -> tuple[TenantChoice, ...]:
+        """The tenants this session may grant, from whichever resolver the product mounted."""
+        if session_tenant_resolver is not None:
+            return tuple(session_tenant_resolver(subject))
+        if tenant_resolver is not None:
+            return tuple(tenant_resolver(subject.user_id))
+        return ()
 
     def is_stale(subject: AuthorizationSubject) -> bool:
         """Whether the user's last authentication is older than `mcp_consent_max_age` allows."""
@@ -1041,7 +1063,7 @@ def build_oauth_server_router(
             return sign_in_response(query, stale=subject is not None, status=302)
         user_id = subject.user_id
 
-        tenants = tuple(tenant_resolver(user_id)) if tenant_resolver is not None else ()
+        tenants = tenants_for(subject)
         fields = {
             "response_type": "code",
             "client_id": parsed.client.client_id,
@@ -1060,7 +1082,7 @@ def build_oauth_server_router(
                 tenants=tenants,
                 form_action=f"{prefix}{CONSENT_PATH}",
                 form_fields=fields,
-                tenant_required=tenant_resolver is not None,
+                tenant_required=tenant_required,
                 product_name=settings.product_name,
                 account_email=subject.email,
                 account_name=subject.name,
@@ -1114,8 +1136,8 @@ def build_oauth_server_router(
                 status_code=303,
             )
 
-        if tenant_resolver is not None:
-            allowed = {tenant.id for tenant in tenant_resolver(user_id)}
+        if tenant_required:
+            allowed = {tenant.id for tenant in tenants_for(subject)}
             if tenant_id not in allowed:
                 return error_response(
                     OAuthServerError("invalid_request", "That workspace is not one this account may grant access to.")

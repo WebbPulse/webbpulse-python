@@ -1718,3 +1718,153 @@ class TestRefreshScopes:
 
         assert exc.value.error == "invalid_scope"
         assert _refresh(service, body["refresh_token"])["scope"] == "mcp:read"
+
+
+GOOGLE_ONLY = "google-only"
+
+
+class SessionAwareApp:
+    """An app whose consent step lists a Google-only workspace to Google sessions alone."""
+
+    def __init__(self, fake_kms: Any, *, legacy_resolver: bool = False) -> None:
+        """Mount the router with a `session_tenant_resolver` and a renderer that records each context."""
+        from fastapi.responses import HTMLResponse
+
+        from webbpulse.identity import AuthorizationSubject, SessionService
+
+        self.settings = build_settings()
+        self.store = InMemoryRefreshTokenStore()
+        self.sessions = SessionService(self.settings, self.store)
+        self.tokens = TokenService(self.settings, fake_kms)
+        self.prefix = identity_prefix(self.settings)
+        self.subjects: list[AuthorizationSubject] = []
+        self.contexts: list[ConsentContext] = []
+
+        def resolve(subject: AuthorizationSubject) -> Sequence[TenantChoice]:
+            """Offer the Google-only workspace only to a session that signed in with Google."""
+            self.subjects.append(subject)
+            choices = [TenantChoice(id=TENANT, name="Workspace One")]
+            if subject.amr[:2] == ("oauth", "google"):
+                choices.append(TenantChoice(id=GOOGLE_ONLY, name="Google Only"))
+            return choices
+
+        def render(context: ConsentContext) -> HTMLResponse:
+            """Record the context instead of rendering the built-in screen."""
+            self.contexts.append(context)
+            return HTMLResponse("consent")
+
+        app = FastAPI()
+        app.include_router(
+            build_identity_router(
+                self.settings,
+                CookieHooks(),
+                IdentityStores(credentials=InMemoryCredentialStore(), refresh_tokens=self.store),
+                tokens=self.tokens,
+                oauth_server_stores=build_stores(),
+                consent_renderer=render,
+                tenant_resolver=tenants_for if legacy_resolver else None,
+                session_tenant_resolver=resolve,
+                limiter_enabled=False,
+            )
+        )
+        self.client = TestClient(app, base_url="https://api.staging.example.com")
+
+    def bearer(self, amr: list[str]) -> dict[str, str]:
+        """An `Authorization` header for `USER` whose token reports `amr`."""
+        return {"Authorization": f"Bearer {self.tokens.mint_access_token(USER, claims={'amr': amr})}"}
+
+    def authorize(self, headers: dict[str, str] | None = None) -> ConsentContext:
+        """GET `/authorize` and return the context the renderer saw."""
+        response = self.client.get(
+            f"{self.prefix}{AUTHORIZE_PATH}",
+            params=authorize_params(new_pkce_verifier()),
+            headers=headers or {},
+            follow_redirects=False,
+        )
+        assert response.status_code == 200
+        return self.contexts[-1]
+
+    def consent(self, context: ConsentContext, tenant_id: str, headers: dict[str, str] | None = None) -> Any:
+        """POST the consent form the context carries, allowing `tenant_id`."""
+        fields = dict(context.form_fields)
+        fields.update(decision="allow", tenant_id=tenant_id)
+        return self.client.post(
+            f"{self.prefix}{CONSENT_PATH}", data=fields, headers=headers or {}, follow_redirects=False
+        )
+
+
+class TestSessionTenantResolver:
+    """`session_tenant_resolver` sees how the consenting session signed in."""
+
+    def test_a_google_session_is_offered_and_may_grant_the_google_only_workspace(self, fake_kms: Any) -> None:
+        """The list and the re-check both see the bearer's `amr`."""
+        app = SessionAwareApp(fake_kms)
+        headers = app.bearer(["oauth", "google", "mfa"])
+
+        context = app.authorize(headers)
+        response = app.consent(context, GOOGLE_ONLY, headers)
+
+        assert [tenant.id for tenant in context.tenants] == [TENANT, GOOGLE_ONLY]
+        assert context.tenant_required is True
+        assert response.status_code == 303
+        assert "code=" in response.headers["location"]
+        assert [subject.amr for subject in app.subjects] == [("oauth", "google", "mfa")] * 2
+        assert {subject.user_id for subject in app.subjects} == {USER}
+
+    def test_a_password_session_is_not_offered_the_google_only_workspace(self, fake_kms: Any) -> None:
+        """The workspace is left out of the list, and posting it anyway is refused."""
+        app = SessionAwareApp(fake_kms)
+        headers = app.bearer(["pwd"])
+
+        context = app.authorize(headers)
+        refused = app.consent(context, GOOGLE_ONLY, headers)
+        allowed = app.consent(context, TENANT, headers)
+
+        assert [tenant.id for tenant in context.tenants] == [TENANT]
+        assert refused.status_code == 400
+        assert refused.json()["error"] == "invalid_request"
+        assert allowed.status_code == 303
+
+    def test_the_session_resolver_wins_over_the_user_id_resolver(self, fake_kms: Any) -> None:
+        """With both mounted, only the session-aware resolver is consulted."""
+        app = SessionAwareApp(fake_kms, legacy_resolver=True)
+
+        context = app.authorize(app.bearer(["oauth", "google", "mfa"]))
+
+        assert [tenant.id for tenant in context.tenants] == [TENANT, GOOGLE_ONLY]
+        assert len(app.subjects) == 1
+
+    def test_a_cookie_session_reports_its_family_amr(self, fake_kms: Any) -> None:
+        """A cookie-only browser reports the family's sign-in `amr` as its access token would."""
+        app = SessionAwareApp(fake_kms)
+        issued = app.sessions.start_family(USER, device="browser", amr=["oauth", "google"])
+        app.client.cookies.set(app.settings.cookie_name, issued.token)
+
+        context = app.authorize()
+
+        assert app.subjects[-1].amr == ("oauth", "google", "mfa")
+        assert app.subjects[-1].session_id == issued.family_id
+        assert GOOGLE_ONLY in [tenant.id for tenant in context.tenants]
+
+    def test_a_cookie_family_without_amr_reports_a_password(self, fake_kms: Any) -> None:
+        """A family started before `amr` was recorded reads as `pwd`, as its refresh does."""
+        app = SessionAwareApp(fake_kms)
+        issued = app.sessions.start_family(USER, device="browser")
+        app.client.cookies.set(app.settings.cookie_name, issued.token)
+
+        context = app.authorize()
+
+        assert app.subjects[-1].amr == ("pwd",)
+        assert [tenant.id for tenant in context.tenants] == [TENANT]
+
+    def test_peek_carries_the_family_amr(self) -> None:
+        """`SessionService.peek` reports the sign-in `amr` the family recorded."""
+        from webbpulse.identity import SessionService
+
+        sessions = SessionService(build_settings(), InMemoryRefreshTokenStore())
+        issued = sessions.start_family(USER, amr=["swk", "pin"])
+
+        found = sessions.peek(issued.token)
+
+        assert found is not None
+        assert found.amr == ("swk", "pin")

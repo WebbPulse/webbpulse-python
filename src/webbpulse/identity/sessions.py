@@ -67,12 +67,14 @@ class PresentedSession:
     """A live refresh family, as `SessionService.peek` read it without touching it.
 
     `auth_time` is the family's last authentication in epoch seconds: the login, or a
-    later step-up.
+    later step-up. `amr` is the sign-in's `amr`, empty for a family started before it was
+    recorded.
     """
 
     user_id: str
     family_id: str
     auth_time: int
+    amr: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -156,6 +158,29 @@ class SessionService:
                 exc_info=True,
             )
         return 0
+
+    def family_amr(self, family_id: str) -> tuple[str, ...]:
+        """The sign-in `amr` a family was started with, for a step-up to build on.
+
+        Empty when the family recorded none, the store cannot read a family, or the read
+        fails, so the caller falls back to `pwd` as a refresh does. Never raises.
+        """
+        if not family_id:
+            return ()
+        try:
+            return tuple(self._store.family_amr(family_id))
+        except NotImplementedError:
+            _log.warning(
+                "This store cannot read a refresh family's amr.",
+                extra={"event": "session.family_amr_unsupported", "family_id": family_id},
+            )
+        except Exception:
+            _log.warning(
+                "Could not read a refresh family's amr.",
+                extra={"event": "session.family_amr_read_failed", "family_id": family_id},
+                exc_info=True,
+            )
+        return ()
 
     def _mint(
         self,
@@ -365,6 +390,7 @@ class SessionService:
             user_id=record.user_id,
             family_id=record.family_id,
             auth_time=self._auth_time(record),
+            amr=record.amr,
         )
 
     def revoke_family(self, family_id: str) -> int:
