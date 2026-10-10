@@ -28,7 +28,9 @@ Leg one returns **no access token**, but an MFA ticket: `typ` `mfa_ticket`, `aud
 3. `200 {access_token, ...}` plus `Set-Cookie` refresh.
 
 The ticket carries the first factor's `amr` (`pwd`, or `oauth` and the provider), so the
-session the second leg issues reports how the sign-in really began.
+session the second leg issues reports how the sign-in really began. `mfa` is added when the
+`amr` holds two distinct factors from `AMR_FACTOR_METHODS`; an OAuth provider name is not
+one, so `["oauth", "google"]` alone never carries `mfa`.
 
 With `passkeys_second_factor` on, a user with a registered passkey gets `passkey` in
 `factors`, even with no TOTP enrolled. The SPA then calls `POST /login/mfa/passkey/options

@@ -114,7 +114,9 @@ enabled the callback returns the `mfa_required` challenge instead of tokens: a p
 proving who somebody is does not prove possession of their second factor, and without this
 "add Google to your account" would be a way to turn MFA off. The access token carries
 `amr: ["oauth", "<provider>"]`, both the general fact and the specific one, so a policy can
-require any federated sign-in or Google in particular.
+require any federated sign-in or Google in particular. The provider name is not a second
+factor, so an OAuth-only session carries no `mfa`; it gains `mfa` only once TOTP, a passkey
+or a password step-up adds a real second factor.
 
 **Client secrets are arguments, not settings, and are never logged.** They arrive as
 `oauth_client_secrets` on `build_identity_router` because they come from the product's own

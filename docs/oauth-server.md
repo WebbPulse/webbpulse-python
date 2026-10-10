@@ -156,7 +156,9 @@ client could change it.
 A product whose tenants carry their own auth policy passes `session_tenant_resolver`
 instead. It receives the consenting `AuthorizationSubject`, whose `amr` says how the session
 signed in, and wins over `tenant_resolver` for both the list and the re-check, so a tenant
-the session may not enter is never offered and cannot be posted.
+the session may not enter is never offered and cannot be posted. An OAuth-only session
+reports `["oauth", "<provider>"]` with no `mfa`, so a tenant policy that requires `mfa`
+holds it out until the session steps up with TOTP or a passkey.
 
 The form carries the authorization parameters through the user's browser, so they are
 covered by an HMAC that also binds the signed-in user id, which is never sent. A scope or

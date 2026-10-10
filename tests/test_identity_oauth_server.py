@@ -1799,7 +1799,7 @@ class TestSessionTenantResolver:
     def test_a_google_session_is_offered_and_may_grant_the_google_only_workspace(self, fake_kms: Any) -> None:
         """The list and the re-check both see the bearer's `amr`."""
         app = SessionAwareApp(fake_kms)
-        headers = app.bearer(["oauth", "google", "mfa"])
+        headers = app.bearer(["oauth", "google"])
 
         context = app.authorize(headers)
         response = app.consent(context, GOOGLE_ONLY, headers)
@@ -1808,7 +1808,7 @@ class TestSessionTenantResolver:
         assert context.tenant_required is True
         assert response.status_code == 303
         assert "code=" in response.headers["location"]
-        assert [subject.amr for subject in app.subjects] == [("oauth", "google", "mfa")] * 2
+        assert [subject.amr for subject in app.subjects] == [("oauth", "google")] * 2
         assert {subject.user_id for subject in app.subjects} == {USER}
 
     def test_a_password_session_is_not_offered_the_google_only_workspace(self, fake_kms: Any) -> None:
@@ -1829,7 +1829,7 @@ class TestSessionTenantResolver:
         """With both mounted, only the session-aware resolver is consulted."""
         app = SessionAwareApp(fake_kms, legacy_resolver=True)
 
-        context = app.authorize(app.bearer(["oauth", "google", "mfa"]))
+        context = app.authorize(app.bearer(["oauth", "google"]))
 
         assert [tenant.id for tenant in context.tenants] == [TENANT, GOOGLE_ONLY]
         assert len(app.subjects) == 1
@@ -1842,7 +1842,7 @@ class TestSessionTenantResolver:
 
         context = app.authorize()
 
-        assert app.subjects[-1].amr == ("oauth", "google", "mfa")
+        assert app.subjects[-1].amr == ("oauth", "google")
         assert app.subjects[-1].session_id == issued.family_id
         assert GOOGLE_ONLY in [tenant.id for tenant in context.tenants]
 

@@ -27,6 +27,8 @@ from webbpulse.identity.storage import (
     TotpFactorRecord,
     hash_token,
 )
+from webbpulse.identity.oauth import AMR_OAUTH
+from webbpulse.identity.passkeys import AMR_PASSKEY, AMR_PIN
 
 if TYPE_CHECKING:  # pragma: no cover
     from collections.abc import Mapping, Sequence
@@ -36,6 +38,8 @@ if TYPE_CHECKING:  # pragma: no cover
     from webbpulse.identity.storage import IdentityStores
 
 __all__ = [
+    "AMR_FACTOR_METHODS",
+    "AMR_HARDWARE_KEY",
     "AMR_MFA",
     "AMR_OTP",
     "AMR_PASSWORD",
@@ -62,6 +66,12 @@ AMR_MFA: Final = "mfa"
 
 AMR_RECOVERY: Final = "recovery"
 
+AMR_HARDWARE_KEY: Final = "hwk"
+
+AMR_FACTOR_METHODS: Final[frozenset[str]] = frozenset(
+    {AMR_PASSWORD, AMR_OTP, AMR_RECOVERY, AMR_PASSKEY, AMR_HARDWARE_KEY, AMR_PIN, AMR_OAUTH}
+)
+
 TOTP_FACTOR: Final = "totp"
 
 PASSKEY_FACTOR: Final = "passkey"
@@ -74,9 +84,14 @@ _RECOVERY_GROUP: Final = 5
 
 
 def access_token_amr(amr: Sequence[str]) -> tuple[str, ...]:
-    """The `amr` an access token carries for these methods: deduplicated, with `mfa` added when more than one."""
+    """The `amr` an access token carries for these methods: deduplicated, with `mfa` added for two factors.
+
+    Only values in `AMR_FACTOR_METHODS` count as factors, so the provider name an OAuth
+    sign-in records beside `oauth` does not turn one factor into two.
+    """
     methods = list(dict.fromkeys(amr))
-    if len(methods) > 1 and AMR_MFA not in methods:
+    factors = {method for method in methods if method in AMR_FACTOR_METHODS}
+    if len(factors) > 1 and AMR_MFA not in methods:
         methods.append(AMR_MFA)
     return tuple(methods)
 

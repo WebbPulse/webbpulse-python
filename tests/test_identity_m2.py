@@ -767,7 +767,7 @@ def test_refresh_keeps_the_sign_in_amr(flows: IdentityFlows, hooks: FakeHooks, s
 
     assert refreshed.user == user
     claims = jwt.decode(refreshed.access_token, options={"verify_signature": False})
-    assert claims["amr"] == ["oauth", "github", "mfa"]
+    assert claims["amr"] == ["oauth", "github"]
 
 
 def test_refresh_of_a_family_without_amr_reports_a_password(

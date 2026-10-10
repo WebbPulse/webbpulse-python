@@ -47,7 +47,7 @@ from webbpulse.identity.flows import (
     LoginRejected,
     MfaChallengeRequired,
 )
-from webbpulse.identity.mfa import AMR_PASSWORD, MfaRejected
+from webbpulse.identity.mfa import AMR_PASSWORD, MfaRejected, access_token_amr
 from webbpulse.identity.oauth_routes import OAUTH_PROVIDERS_CACHE_CONTROL
 from webbpulse.identity.passkey_routes import (
     LOGIN_MFA_PASSKEY_OPTIONS_PATH,
@@ -2474,6 +2474,59 @@ class TestPasskeySecondFactorRoutes:
 
 OAUTH_GOOGLE = ["oauth", "google"]
 PASSKEY_SIGN_IN = [AMR_PASSKEY, AMR_PIN]
+
+
+class TestMfaCountsFactors:
+    """`mfa` is added for two distinct factors, and a provider name beside `oauth` is not one."""
+
+    @pytest.mark.parametrize(
+        ("amr", "expected"),
+        [
+            (["oauth", "google"], ("oauth", "google")),
+            (["oauth", "github", "google"], ("oauth", "github", "google")),
+            (["oauth", "google", "otp"], ("oauth", "google", "otp", "mfa")),
+            (["oauth", "google", AMR_PASSKEY], ("oauth", "google", AMR_PASSKEY, "mfa")),
+            (["oauth", "google", AMR_PASSKEY, AMR_PIN], ("oauth", "google", AMR_PASSKEY, AMR_PIN, "mfa")),
+            ([AMR_PASSWORD, "otp"], (AMR_PASSWORD, "otp", "mfa")),
+            ([AMR_PASSWORD, "recovery"], (AMR_PASSWORD, "recovery", "mfa")),
+            ([AMR_PASSKEY, AMR_PIN], (AMR_PASSKEY, AMR_PIN, "mfa")),
+            ([AMR_PASSKEY], (AMR_PASSKEY,)),
+            ([AMR_PASSWORD, AMR_PASSWORD], (AMR_PASSWORD,)),
+            ([AMR_PASSWORD, "otp", "mfa"], (AMR_PASSWORD, "otp", "mfa")),
+        ],
+    )
+    def test_the_rule(self, amr: list[str], expected: tuple[str, ...]) -> None:
+        """Only methods in `AMR_FACTOR_METHODS` count toward `mfa`."""
+        assert access_token_amr(amr) == expected
+
+    def test_an_oauth_sign_in_without_a_second_factor_has_no_mfa(
+        self, flows: IdentityFlows, hooks: FakeHooks, stores: IdentityStores
+    ) -> None:
+        """An OAuth-only sign-in and its refresh carry `oauth` and the provider, never `mfa`."""
+        user = seed_account(hooks, stores)
+        result = flows.issue_for_oauth(user, provider="google")
+        assert _claims_of(result.access_token)["amr"] == ["oauth", "google"]
+        assert _claims_of(flows.refresh(result.refresh_token).access_token)["amr"] == ["oauth", "google"]
+
+    def test_a_password_and_totp_sign_in_has_mfa(
+        self, flows: IdentityFlows, hooks: FakeHooks, stores: IdentityStores
+    ) -> None:
+        """Password then TOTP is two factors."""
+        user = seed_account(hooks, stores)
+        secret = _enrol_totp(flows)
+        with pytest.raises(MfaChallengeRequired) as caught:
+            flows.login(email=EMAIL, password=PASSWORD)
+        result = flows.complete_mfa(ticket=caught.value.challenge.ticket, code=_next_code(secret))
+        assert result.user == user
+        assert _claims_of(result.access_token)["amr"] == [AMR_PASSWORD, "otp", "mfa"]
+
+    def test_an_oauth_family_refreshes_without_mfa(
+        self, flows: IdentityFlows, hooks: FakeHooks, stores: IdentityStores
+    ) -> None:
+        """A refresh mints the family's sign-in `amr`, so an OAuth family refreshes without `mfa`."""
+        seed_account(hooks, stores)
+        issued = flows.sessions.start_family(USER_ID, amr=OAUTH_GOOGLE)
+        assert _claims_of(flows.refresh(issued.token).access_token)["amr"] == OAUTH_GOOGLE
 
 
 class TestStepUpKeepsTheSignInAmr:
