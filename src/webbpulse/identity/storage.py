@@ -107,7 +107,7 @@ IDENTITY_TTL_ATTRIBUTE: Final = "expires_at"
 BILLING_MODE: Final = "PAY_PER_REQUEST"
 """On-demand billing, matching the platform module's default for every identity table."""
 
-type IdentityTokenPurpose = Literal["verify_email", "reset_password", "mfa_ticket"]
+type IdentityTokenPurpose = Literal["verify_email", "reset_password", "mfa_ticket", "desktop_handoff"]
 
 type WebAuthnChallengePurpose = Literal["register", "login", "step_up"]
 
@@ -189,7 +189,11 @@ class RefreshTokenRecord:
 
 @dataclass(frozen=True, slots=True)
 class IdentityTokenRecord:
-    """A single-use, time-limited link: email verification or password reset."""
+    """A single-use, time-limited token: an email link, an MFA ticket or a desktop handoff code.
+
+    `attributes` holds purpose-specific data the redeemer needs, such as the PKCE challenge
+    and session state a desktop handoff code is bound to. It is empty for the email links.
+    """
 
     token_hash: str
     purpose: IdentityTokenPurpose
@@ -197,6 +201,7 @@ class IdentityTokenRecord:
     created_at: str
     expires_at: int
     consumed_at: str = ""
+    attributes: Mapping[str, Any] = field(default_factory=dict)
 
 
 @dataclass(frozen=True, slots=True)
@@ -1276,6 +1281,7 @@ class DynamoIdentityTokenStore(IdentityTokenStore):
                 "created_at": record.created_at,
                 "expires_at": record.expires_at,
                 "consumed_at": record.consumed_at,
+                **({"attributes": dict(record.attributes)} if record.attributes else {}),
             }
         )
 
@@ -1657,7 +1663,7 @@ def _refresh_record_from_item(item: Mapping[str, Any]) -> RefreshTokenRecord:
 def _identity_token_from_item(item: Mapping[str, Any]) -> IdentityTokenRecord:
     """Build an `IdentityTokenRecord` from a DynamoDB item, rejecting an unknown purpose."""
     purpose = str(item.get("purpose", ""))
-    if purpose not in {"verify_email", "reset_password", "mfa_ticket"}:
+    if purpose not in {"verify_email", "reset_password", "mfa_ticket", "desktop_handoff"}:
         raise ValueError(f"Unknown identity token purpose {purpose!r} on token {str(item.get('token_hash', ''))[:8]}.")
     return IdentityTokenRecord(
         token_hash=str(item["token_hash"]),
@@ -1666,6 +1672,7 @@ def _identity_token_from_item(item: Mapping[str, Any]) -> IdentityTokenRecord:
         created_at=str(item.get("created_at", "")),
         expires_at=int(item.get("expires_at", 0)),
         consumed_at=str(item.get("consumed_at", "")),
+        attributes=dict(item.get("attributes") or {}),
     )
 
 

@@ -56,6 +56,8 @@ permanently.
 | `email_accent_color`, `email_legal_line` | `""`, `""` | Email button and link accent (`#rrggbb`, empty is the default accent) and the footer legal line |
 | `google_client_id`, `github_client_id` | `""` | Client **ids** only; secrets never live here |
 | `oauth_redirect_uris` | `[]` | Exact-match allow-list; empty means `<issuer>/oauth/callback` |
+| `desktop_handoff_schemes` | `[]` | Custom URL schemes a desktop app receives a handoff code on, such as `["myapp"]`. Empty leaves the handoff routes unmounted. Web schemes (`http`, `https`, `javascript` and the like) are refused |
+| `desktop_handoff_code_ttl` | 60 seconds | Capped at `MAX_HANDOFF_CODE_TTL` (2 minutes), must be positive |
 
 Derived: `active_signing_key_arn`, `previous_signing_key_arns`, `discovery_url`, `jwks_url`,
 `local_signer_seed_value`, `cookie_kwargs()` for `Response.set_cookie`.

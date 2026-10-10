@@ -146,6 +146,29 @@ for the user, which a password change calls.
 **A logout cannot invalidate an already-issued access token**, which is why the lifetime is
 short (3.2). Anything needing instant revocation MUST be enforced by the owning domain.
 
+#### Desktop session handoff
+
+A desktop app signs in through the browser session rather than asking for credentials.
+Mounted only when `desktop_handoff_schemes` names at least one scheme.
+
+1. The app generates a PKCE verifier, and opens the web app with its S256 challenge and its
+   scheme.
+2. The signed-in browser calls `POST /desktop-handoff` with its bearer token and
+   `{code_challenge, code_challenge_method: "S256", scheme}`, and gets `{code, expires_in}`.
+   An unlisted scheme is `400 HANDOFF_SCHEME_NOT_ALLOWED`; no browser session is `401`.
+3. The browser opens `<scheme>://auth/handoff?code=...`.
+4. The app calls `POST /desktop-handoff/exchange` with `{code, code_verifier, scheme}` and
+   gets the same response and refresh cookie as `POST /login`.
+
+The code is 256 bits, lives `desktop_handoff_code_ttl` (60 seconds), and only its hash is
+stored, as a `desktop_handoff` row in `identity-tokens`. It carries the browser family's sign-in
+`amr` and the original `auth_time`, so the desktop session has the same MFA level and is no
+fresher. The exchange **consumes the code before checking anything else**, so a replay, a
+wrong verifier or a wrong scheme burns it, and every failure is the same
+`400 HANDOFF_INVALID`. `may_authenticate` runs again on the exchange. The code and the
+verifier are never logged; the audit events are `session.handoff_minted`,
+`session.handoff_exchanged` and their `_failed` counterparts.
+
 #### Email verification and password reset
 
 One primitive: a single-use, time-limited link. `POST /verify-email` and `POST /reset` request

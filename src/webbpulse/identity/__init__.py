@@ -77,6 +77,16 @@ from webbpulse.identity.crypto import (
     SecretMasterKeyCipher,
     encryption_context,
 )
+from webbpulse.identity.desktop_handoff import (
+    HANDOFF_CHALLENGE_METHOD,
+    HANDOFF_INVALID_MESSAGE,
+    HANDOFF_PURPOSE,
+    DesktopHandoffService,
+    HandoffRejected,
+    MintedHandoff,
+    RedeemedHandoff,
+    normalise_scheme,
+)
 from webbpulse.identity.device_grant import (
     DEVICE_APPROVE_PATH,
     DEVICE_CODE_GRANT_TYPE,
@@ -331,6 +341,9 @@ from webbpulse.identity.passwords import (
 )
 from webbpulse.identity.router import (
     ALLOWED_FETCH_SITES,
+    DESKTOP_HANDOFF_EXCHANGE_PATH,
+    DESKTOP_HANDOFF_LIMIT,
+    DESKTOP_HANDOFF_PATH,
     DISCOVERY_CACHE_CONTROL,
     HEALTH_PATH,
     JWKS_CACHE_CONTROL,
@@ -978,3 +991,18 @@ __all__ += [
 ]
 """The symbols the tenant-scoped API key and share token work added, appended rather than
 merged into the list above so two parallel edits to this module do not collide."""
+
+__all__ += [
+    "DESKTOP_HANDOFF_EXCHANGE_PATH",
+    "DESKTOP_HANDOFF_LIMIT",
+    "DESKTOP_HANDOFF_PATH",
+    "HANDOFF_CHALLENGE_METHOD",
+    "HANDOFF_INVALID_MESSAGE",
+    "HANDOFF_PURPOSE",
+    "DesktopHandoffService",
+    "HandoffRejected",
+    "MintedHandoff",
+    "RedeemedHandoff",
+    "normalise_scheme",
+]
+"""The browser to desktop session handoff, appended for the same reason as the block above."""

@@ -63,8 +63,10 @@ Attributes beyond the keys:
   reset do. The user index projects `KEYS_ONLY` and its name is read from
   `IDENTITY_REFRESH_USER_INDEX`; a table provisioned without it makes
   `revoke_all_for_user` raise, which `SessionService` reports as nothing revoked.
-- **`identity-tokens`** (verification and reset): `purpose`, `user_id`, `created_at`,
-  `consumed_at`, `expires_at`.
+- **`identity-tokens`** (verification, reset, MFA tickets and desktop handoff codes):
+  `purpose`, `user_id`, `created_at`, `consumed_at`, `expires_at`, and for a
+  `desktop_handoff` row an `attributes` map holding the PKCE challenge, scheme, `amr`,
+  `auth_time` and source family.
 - **`webauthn-challenges`**: `user_id` (absent for a discoverable-credential login, present
   for a registration or a step-up), `challenge`, `purpose` (`register`, `login` or
   `step_up`, which is what keeps the three ceremonies from answering each other),
@@ -105,7 +107,7 @@ for spec in TABLES:
 | Table | TTL attribute | Window |
 |---|---|---|
 | `refresh-tokens` | `expires_at` | 30 days rolling, 90 absolute |
-| `identity-tokens` | `expires_at` | 24 h verify, 1 h reset |
+| `identity-tokens` | `expires_at` | 24 h verify, 1 h reset, 60 s desktop handoff |
 | `webauthn-challenges` | `expires_at` | 5 minutes |
 | `oauth-states` | `expires_at` | 10 minutes |
 | `login-attempts` | `expires_at` | 30 days |

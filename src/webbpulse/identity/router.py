@@ -38,6 +38,9 @@ if TYPE_CHECKING:  # pragma: no cover
 
 __all__ = [
     "ALLOWED_FETCH_SITES",
+    "DESKTOP_HANDOFF_EXCHANGE_PATH",
+    "DESKTOP_HANDOFF_LIMIT",
+    "DESKTOP_HANDOFF_PATH",
     "DISCOVERY_CACHE_CONTROL",
     "HEALTH_PATH",
     "IDENTITY_ROUTE_RESPONSES",
@@ -94,6 +97,9 @@ TOTP_DISABLE_PATH = "/totp/disable"
 RECOVERY_CODES_PATH = "/recovery-codes"
 STEP_UP_PATH = "/step-up"
 
+DESKTOP_HANDOFF_PATH = "/desktop-handoff"
+DESKTOP_HANDOFF_EXCHANGE_PATH = "/desktop-handoff/exchange"
+
 RESET_REQUESTED_MESSAGE: Final = "If that address has an account, a link is on its way."
 
 LOGIN_IP_LIMIT: Final = (20, 900)
@@ -108,6 +114,8 @@ VERIFY_IP_LIMIT: Final = (10, 3600)
 
 TOTP_VERIFY_LIMIT: Final = (10, 900)
 TOTP_ENROL_IP_LIMIT: Final = (10, 3600)
+
+DESKTOP_HANDOFF_LIMIT: Final = (30, 900)
 
 ALLOWED_FETCH_SITES: Final = frozenset({"same-origin", "same-site", "none"})
 
@@ -882,6 +890,19 @@ def _mount_flows(
         success_body=success_body,
     )
 
+    if flows.desktop_handoff is not None:
+        _mount_desktop_handoff(
+            router,
+            prefix=prefix,
+            flows=flows,
+            tokens=tokens,
+            limits=limits,
+            context=context,
+            rejected=rejected,
+            success_body=success_body,
+            set_refresh_cookie=set_refresh_cookie,
+        )
+
     if flows.mfa is not None:
         _mount_mfa(
             router,
@@ -1262,6 +1283,98 @@ def _mount_step_up(
         return JSONResponse(success_body(result))
 
 
+def _mount_desktop_handoff(
+    router: APIRouter,
+    *,
+    prefix: str,
+    flows: Any,
+    tokens: TokenService,
+    limits: Callable[..., list[Any]],
+    context: Callable[[Request], tuple[str, str]],
+    rejected: Callable[[Request, Any], JSONResponse],
+    success_body: Callable[[Any], dict[str, Any]],
+    set_refresh_cookie: Callable[[JSONResponse, str], JSONResponse],
+) -> None:
+    """Add the browser to desktop handoff routes, mounted only when a scheme is allowlisted."""
+    from fastapi import Body
+    from fastapi.responses import JSONResponse
+
+    from webbpulse.identity.flows import LoginRejected
+
+    @router.post(
+        f"{prefix}{DESKTOP_HANDOFF_PATH}",
+        dependencies=limits(("desktop-handoff", DESKTOP_HANDOFF_LIMIT, "ip")),
+    )
+    async def mint_desktop_handoff(request: _FastAPIRequest, payload: dict[str, Any] = Body(...)) -> JSONResponse:
+        """Mint a single-use code a desktop app redeems for its own session.
+
+        Takes `code_challenge`, `code_challenge_method` (`S256`) and `scheme`, and answers
+        `code` and `expires_in`. Needs a browser session's bearer token.
+        """
+        presented = _presented_claims(request, tokens)
+        claims = _claims_from_request(request, tokens)
+        subject = claims.get("sub", "")
+        if not subject:
+            return rejected(
+                request,
+                LoginRejected("Sign in first.", error_code="NOT_AUTHENTICATED", status_code=401),
+            )
+        ip, _ = context(request)
+        try:
+            minted = await run_sync(
+                lambda: flows.mint_desktop_handoff(
+                    user_id=subject,
+                    session_id=claims.get("sid", ""),
+                    token_amr=_amr_claim(presented or {}),
+                    auth_time=_int_claim(claims.get("auth_time", "")),
+                    code_challenge=str(payload.get("code_challenge", "")),
+                    code_challenge_method=str(payload.get("code_challenge_method", "")),
+                    scheme=str(payload.get("scheme", "")),
+                    ip=ip,
+                )
+            )
+        except LoginRejected as exc:
+            return rejected(request, exc)
+        return JSONResponse(
+            {"code": minted.code, "expires_in": minted.expires_in},
+            headers={"Cache-Control": "no-store"},
+        )
+
+    @router.post(
+        f"{prefix}{DESKTOP_HANDOFF_EXCHANGE_PATH}",
+        dependencies=limits(("desktop-handoff-exchange", DESKTOP_HANDOFF_LIMIT, "ip")),
+    )
+    async def exchange_desktop_handoff(request: _FastAPIRequest, payload: dict[str, Any] = Body(...)) -> JSONResponse:
+        """Redeem a handoff code with its PKCE verifier for the same session a sign-in issues.
+
+        Takes `code`, `code_verifier` and `scheme`, and answers like `POST /login`: the
+        access token in the body and the refresh token in the cookie.
+        """
+        if not _fetch_site_allowed(request):
+            return rejected(
+                request,
+                LoginRejected(
+                    "This request did not come from an allowed origin.",
+                    error_code="CROSS_SITE_REQUEST",
+                    status_code=403,
+                ),
+            )
+        ip, user_agent = context(request)
+        try:
+            result = await run_sync(
+                lambda: flows.exchange_desktop_handoff(
+                    code=str(payload.get("code", "")),
+                    code_verifier=str(payload.get("code_verifier", "")),
+                    scheme=str(payload.get("scheme", "")),
+                    ip=ip,
+                    user_agent=user_agent,
+                )
+            )
+        except LoginRejected as exc:
+            return rejected(request, exc)
+        return set_refresh_cookie(JSONResponse(success_body(result)), result.refresh_token)
+
+
 def _mfa_refused(request: Request, exc: MfaRejected) -> JSONResponse:
     """Render an MFA refusal in the shared envelope."""
     from fastapi.responses import JSONResponse
@@ -1536,6 +1649,16 @@ IDENTITY_ROUTE_RESPONSES: Final[dict[tuple[str, str], dict[int, str]]] = {
     ("POST", RECOVERY_CODES_PATH): {
         401: "No bearer token was presented, or the code was refused",
         429: "Too many attempts from this address, or the account is locked",
+    },
+    ("POST", DESKTOP_HANDOFF_PATH): {
+        400: "The scheme is not allowlisted, or the challenge is not a PKCE S256 challenge",
+        401: "No browser session bearer token was presented",
+        429: "Too many handoffs from this address",
+    },
+    ("POST", DESKTOP_HANDOFF_EXCHANGE_PATH): {
+        400: "The code is unknown, spent, expired, or does not match the verifier or scheme",
+        403: "The request came from another site, or the account may not sign in",
+        429: "Too many handoffs from this address",
     },
     ("POST", STEP_UP_PATH): {
         401: "No bearer token was presented, or the password or factor was refused",

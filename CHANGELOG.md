@@ -7,6 +7,17 @@ This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## Unreleased
 
+### Added
+
+- Browser to desktop session handoff (PLAT-55). With `IDENTITY_DESKTOP_HANDOFF_SCHEMES` set,
+  the identity router mounts `POST /desktop-handoff`, where a browser session mints a
+  single-use, PKCE S256 bound code for an allowlisted custom scheme, and
+  `POST /desktop-handoff/exchange`, where the desktop app redeems it with its verifier for
+  the same session a sign-in issues, at the same MFA level. Codes live
+  `desktop_handoff_code_ttl` (60 seconds, at most 2 minutes) as hashed `desktop_handoff` rows
+  in `identity-tokens`. See `docs/identity-flows.md`.
+- `IdentityTokenRecord.attributes`, purpose-specific data a token row carries.
+
 ## 0.88.0
 
 ### Added
