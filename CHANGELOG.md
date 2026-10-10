@@ -7,6 +7,22 @@ This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## Unreleased
 
+## 0.83.0
+
+### Added
+
+- `webbpulse.audit`, an append-only tenant audit log (PLAT-44). One partition per tenant
+  with a ULID sort key, so newest first and time ranges are key conditions, and a sparse
+  `target_key-event_id-index` for one target's history. `AuditEvent` scrubs `payload`,
+  `before` and `after` of secret-looking keys and credential-shaped values on construction.
+  `AuditRecorder` is the best-effort write path with an optional TTL retention,
+  `AuditCatalogue` labels actions and holds per-action payload allowlists, listings are
+  tenant-scoped with signed cursors, and `audit_csv` exports with a formula guard.
+  `AuditAttributes` maps stored names so an existing table (Standupless) adopts it with no
+  data migration. `DynamoAuditLogStore` and `InMemoryAuditLogStore` (`FakeAuditLogStore`).
+- `webbpulse.testing.assert_audit_log_contract` runs the shared contract against any
+  `AuditLogStore`.
+
 ## 0.81.0
 
 ### Added
