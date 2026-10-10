@@ -9,6 +9,9 @@ chromium is not installed, which is the ordinary state of this package's own CI.
 
 from __future__ import annotations
 
+import json
+import sys
+from pathlib import Path
 from typing import ClassVar
 
 import pytest
@@ -22,8 +25,10 @@ from webbpulse.e2e.browser import (
     FailedRequests,
     artifact_name,
     browser_is_available,
+    expected_browser_dirs,
     is_session_probe,
     message_location_url,
+    playwright_browsers_root,
     redact_zip,
     resource_load_status,
     sign_in,
@@ -343,6 +348,37 @@ class TestArtifactNaming:
         assert DEFAULT_ARTIFACTS_DIR == "e2e-browser-artifacts"
 
 
+_BROWSERS_JSON = {
+    "browsers": [
+        {"name": "chromium", "revision": "1243"},
+        {"name": "chromium-headless-shell", "revision": "1243"},
+        {"name": "firefox", "revision": "1543"},
+        {"name": "webkit", "revision": "2359", "revisionOverrides": {"mac14": "2251"}},
+    ]
+}
+
+
+def _write_browsers_json(package: Path) -> Path:
+    """Write a `browsers.json` like the one Playwright ships into a fake package directory."""
+    package.mkdir(parents=True, exist_ok=True)
+    (package / "browsers.json").write_text(json.dumps(_BROWSERS_JSON))
+    return package
+
+
+def _fake_playwright(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Path:
+    """Point the check at a fake driver package and return a cache root to install into."""
+    package = _write_browsers_json(tmp_path / "package")
+    monkeypatch.setattr("webbpulse.e2e.browser._playwright_package_dir", lambda: str(package))
+    return tmp_path / "browsers"
+
+
+def _install(root: Path, directory: str) -> None:
+    """Create one finished build directory, marker included, as `playwright install` does."""
+    build = root / directory
+    build.mkdir(parents=True, exist_ok=True)
+    (build / "INSTALLATION_COMPLETE").write_text("")
+
+
 class TestBrowserAvailability:
     """Tests for the check that decides whether the browser group can run."""
 
@@ -353,6 +389,109 @@ class TestBrowserAvailability:
     def test_the_answer_is_a_string(self) -> None:
         """Empty means available; anything else is the reason it is not."""
         assert isinstance(browser_is_available("chromium"), str)
+
+    def test_an_older_revision_alone_is_not_available(self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+        """A cache holding only a build older than the pinned revision cannot be launched."""
+        root = _fake_playwright(monkeypatch, tmp_path)
+        monkeypatch.setenv("PLAYWRIGHT_BROWSERS_PATH", str(root))
+        _install(root, "chromium_headless_shell-1100")
+        reason = browser_is_available("chromium")
+        assert "chromium_headless_shell-1243" in reason
+        assert str(root) in reason
+
+    def test_the_pinned_revision_is_available(self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+        """The exact build `browsers.json` pins, fully downloaded, answers empty."""
+        root = _fake_playwright(monkeypatch, tmp_path)
+        monkeypatch.setenv("PLAYWRIGHT_BROWSERS_PATH", str(root))
+        _install(root, "chromium_headless_shell-1243")
+        assert browser_is_available("chromium") == ""
+
+    def test_a_headed_chromium_needs_the_full_build(self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+        """Headless launches the headless shell, headed launches full Chromium."""
+        root = _fake_playwright(monkeypatch, tmp_path)
+        monkeypatch.setenv("PLAYWRIGHT_BROWSERS_PATH", str(root))
+        _install(root, "chromium_headless_shell-1243")
+        assert browser_is_available("chromium", headless=False)
+        _install(root, "chromium-1243")
+        assert browser_is_available("chromium", headless=False) == ""
+
+    def test_an_unfinished_download_is_not_available(self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+        """A build directory without Playwright's completion marker is a broken download."""
+        root = _fake_playwright(monkeypatch, tmp_path)
+        monkeypatch.setenv("PLAYWRIGHT_BROWSERS_PATH", str(root))
+        (root / "firefox-1543").mkdir(parents=True)
+        assert browser_is_available("firefox")
+
+    @pytest.mark.skipif(not sys.platform.startswith("linux"), reason="XDG_CACHE_HOME is a Linux rule")
+    def test_xdg_cache_home_redirects_the_cache_root(self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+        """With no explicit path, Linux Playwright looks under `XDG_CACHE_HOME`, not `~/.cache`."""
+        _fake_playwright(monkeypatch, tmp_path)
+        monkeypatch.delenv("PLAYWRIGHT_BROWSERS_PATH", raising=False)
+        home = tmp_path / "home"
+        monkeypatch.setenv("HOME", str(home))
+        _install(home / ".cache" / "ms-playwright", "webkit-2359")
+        cache = tmp_path / "xdg"
+        monkeypatch.setenv("XDG_CACHE_HOME", str(cache))
+        assert playwright_browsers_root() == str(cache / "ms-playwright")
+        assert browser_is_available("webkit")
+        _install(cache / "ms-playwright", "webkit-2359")
+        assert browser_is_available("webkit") == ""
+
+    @pytest.mark.skipif(not sys.platform.startswith("linux"), reason="XDG_CACHE_HOME is a Linux rule")
+    def test_home_cache_is_used_without_xdg_cache_home(self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+        """With neither variable set, the root is `~/.cache/ms-playwright`."""
+        monkeypatch.delenv("PLAYWRIGHT_BROWSERS_PATH", raising=False)
+        monkeypatch.delenv("XDG_CACHE_HOME", raising=False)
+        monkeypatch.setenv("HOME", str(tmp_path))
+        assert playwright_browsers_root() == str(tmp_path / ".cache" / "ms-playwright")
+
+    def test_playwright_browsers_path_wins_over_xdg_cache_home(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        """An explicit `PLAYWRIGHT_BROWSERS_PATH` is the only place looked."""
+        _fake_playwright(monkeypatch, tmp_path)
+        explicit = tmp_path / "browsers"
+        monkeypatch.setenv("PLAYWRIGHT_BROWSERS_PATH", str(explicit))
+        monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path / "xdg"))
+        _install(tmp_path / "xdg" / "ms-playwright", "firefox-1543")
+        assert playwright_browsers_root() == str(explicit)
+        assert browser_is_available("firefox")
+        _install(explicit, "firefox-1543")
+        assert browser_is_available("firefox") == ""
+
+    def test_a_relative_browsers_path_resolves_against_the_working_directory(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        """Playwright resolves a relative path against `INIT_CWD` or the working directory."""
+        monkeypatch.delenv("INIT_CWD", raising=False)
+        monkeypatch.chdir(tmp_path)
+        monkeypatch.setenv("PLAYWRIGHT_BROWSERS_PATH", "pw")
+        assert playwright_browsers_root() == str(tmp_path / "pw")
+
+    def test_browsers_path_zero_means_the_package_local_browsers(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        """`0` is Playwright's switch for browsers inside the driver package itself."""
+        monkeypatch.setenv("PLAYWRIGHT_BROWSERS_PATH", "0")
+        assert playwright_browsers_root(str(tmp_path)) == str(tmp_path / ".local-browsers")
+
+    def test_a_revision_override_adds_its_special_directory(self, tmp_path: Path) -> None:
+        """A macOS override build lives in a `_special` directory, accepted beside the default."""
+        package = _write_browsers_json(tmp_path / "package")
+        dirs = expected_browser_dirs("webkit", "/cache", str(package))
+        assert dirs == ["/cache/webkit-2359", "/cache/webkit_mac14_special-2251"]
+
+    def test_an_unreadable_manifest_falls_back_to_any_finished_build(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        """Without `browsers.json` the check accepts any completed build of the engine."""
+        monkeypatch.setattr("webbpulse.e2e.browser._playwright_package_dir", lambda: str(tmp_path / "missing"))
+        root = tmp_path / "browsers"
+        monkeypatch.setenv("PLAYWRIGHT_BROWSERS_PATH", str(root))
+        assert expected_browser_dirs("firefox", str(root), str(tmp_path / "missing")) is None
+        assert browser_is_available("firefox")
+        _install(root, "firefox-1000")
+        assert browser_is_available("firefox") == ""
 
     def test_the_root_selectors_start_at_the_conventional_mount_points(self) -> None:
         """`#root` and `#app` are what the shell check already looks for."""

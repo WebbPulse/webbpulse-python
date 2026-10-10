@@ -1441,12 +1441,7 @@ def test_a_browser_approves_through_the_real_page(served: tuple[Harness, str]) -
     started = harness.start()
     bearer = {key: value for key, value in harness.browser().items() if key != "Origin"}
     with sync_playwright() as playwright:
-        try:
-            browser = playwright.chromium.launch()
-        except Exception as error:
-            if "Executable doesn't exist" not in str(error):
-                raise
-            pytest.skip("this Playwright's chromium build is not installed where it looks")
+        browser = playwright.chromium.launch()
         try:
             context = browser.new_context(extra_http_headers=bearer)
             page = context.new_page()
