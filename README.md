@@ -70,13 +70,14 @@ its dev dependencies.
 | `webbpulse.ratelimit` | `rate_limit`, `rate_limit_middleware`, `LimitClass`, `classify`, `identity_from_principal`, a fixed window limiter on one DynamoDB table, failing open | [data-access.md](docs/data-access.md) |
 | `webbpulse.email_layout` | `EmailBrand`, `render_email` and the blocks (`Heading`, `Paragraph`, `Button`, `Quote`, `Code`, `BulletList`): one branded, table-based, dark-mode safe email shell with a plain-text alternative, stdlib only | [email-layout.md](docs/email-layout.md) |
 | `webbpulse.email_cap` | `EmailSendCap`, `EmailCapPolicy`, `EmailCapLimits`: outbound email caps per recipient, per tenant and per app day on the rate limits table, off by default, failing open | [email-caps.md](docs/email-caps.md) |
+| `webbpulse.audit` | `AuditRecorder`, `AuditCatalogue`, `DynamoAuditLogStore`, `InMemoryAuditLogStore`, `audit_csv`: an append-only tenant audit log with secret scrubbing, tenant-scoped cursors and a formula-safe CSV export | [audit.md](docs/audit.md) |
 | `webbpulse.security` | `hash_password`, `verify_password`, `needs_rehash`, `create_token`, `decode_token`, `bearer_claims` | [security.md](docs/security.md) |
 | `webbpulse.identity` | App-managed identity: password, session, email link, TOTP, OAuth and passkey flows, plus a KMS-backed `TokenService` and a JWKS | [identity.md](docs/identity.md), [the standard](docs/identity-standard.md) |
 | `webbpulse.identity.oauth_server` | An OAuth 2.1 authorization server for hosting a remote MCP server: discovery, PKCE code grant, dynamic registration, consent | [oauth-server.md](docs/oauth-server.md) |
 | `webbpulse.integrations.github` | `GitHubAppClient`: the App JWT, cached installation tokens, check runs, commit statuses, issue comments and installation reads; `load_github_app_settings` for the standard `GITHUB_*` keys; `convert_manifest_code` for the App manifest flow | [GitHub App client](#github-app-client) |
 | `webbpulse.integrations.stripe` | `load_stripe_settings` for the standard `STRIPE_*` keys; `stripe_client` for a `stripe.StripeClient`; `verify_webhook_event` and `claim_webhook_event` for a verified, exactly-once webhook receiver | [Stripe](#stripe) |
 | `webbpulse.lambda_entry` | `run_uvicorn`, `is_lambda`, `resolve_port`: the AWS Lambda Web Adapter entrypoint, with no Mangum and no handler | [packaging.md](docs/packaging.md) |
-| `webbpulse.testing` | Pytest fixtures: `test_client`, `create_table`, `rate_limit_table`, `make_request_context_headers`, `FakeKms`, `FakeIdempotencyStore`, `FakePresigner`, `FakeQueue`, `FakeWebhookSender`, `sign_stripe_payload`; `assert_entrypoint_isolation` for the per-domain image check; `primary_keys_only` (or `enforce_primary_keys`) makes moto refuse a key that is not exactly the table's primary key, as DynamoDB does | [packaging.md](docs/packaging.md) |
+| `webbpulse.testing` | Pytest fixtures: `test_client`, `create_table`, `rate_limit_table`, `make_request_context_headers`, `FakeKms`, `FakeIdempotencyStore`, `FakePresigner`, `FakeQueue`, `FakeWebhookSender`, `sign_stripe_payload`; `assert_entrypoint_isolation` for the per-domain image check; `assert_audit_log_contract` for any `AuditLogStore`; `primary_keys_only` (or `enforce_primary_keys`) makes moto refuse a key that is not exactly the table's primary key, as DynamoDB does | [packaging.md](docs/packaging.md) |
 | `webbpulse.e2e` | A pytest plugin and generic post-deploy suite: route cut, coverage, reachability, identity, frontend and hygiene against a real stage | [e2e.md](docs/e2e.md) |
 | `webbpulse.ops.config` | The `webbpulse-config` console script: operators set keys in the `<prefix>/app` secret and the `/<prefix>/config` parameter | [Operator config CLI](#operator-config-cli) |
 | `webbpulse.ops.admin` | The `webbpulse-admin` console script: operators grant, revoke and list admins in a product's identity `users` table | [Operator admin CLI](#operator-admin-cli) |
@@ -625,6 +626,7 @@ app.include_router(build_identity_router(settings, hooks, stores, tokens=tokens)
 | [docs/http.md](docs/http.md) | `create_app`, the error envelope shapes, and conditional GET |
 | [docs/email-layout.md](docs/email-layout.md) | The branded email shell and `render_branded` |
 | [docs/email-caps.md](docs/email-caps.md) | Outbound email send caps and `CappedEmailSender` |
+| [docs/audit.md](docs/audit.md) | The tenant audit log: table, recorder, redaction, queries, cursors and CSV export |
 | [docs/error-handlers.md](docs/error-handlers.md) | DynamoDB and custom exception handlers |
 | [docs/events.md](docs/events.md) | The stream and queue consumer route, and publishing an event |
 | [docs/webhooks.md](docs/webhooks.md) | Signed outbound webhooks: the scheme, the retries and the fake |
