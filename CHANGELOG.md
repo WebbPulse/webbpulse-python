@@ -7,6 +7,29 @@ This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## Unreleased
 
+## 0.88.0
+
+### Fixed
+
+- `webbpulse.e2e.browser.browser_is_available` now checks the build Playwright will
+  actually launch (PLAT-18). It used to answer yes when any build directory for the engine
+  existed under `PLAYWRIGHT_BROWSERS_PATH` or `~/.cache/ms-playwright`, so an older
+  revision, or a cache redirected through `XDG_CACHE_HOME`, passed the check and the launch
+  then failed with "Executable doesn't exist". The check now resolves the cache root by
+  Playwright's own rules (`PLAYWRIGHT_BROWSERS_PATH`, with `0` meaning the driver
+  package's `.local-browsers`, then `XDG_CACHE_HOME`, then `~/.cache` on Linux), reads the
+  exact revision from the installed Playwright's `browsers.json`, and requires that build's
+  `INSTALLATION_COMPLETE` marker. When `browsers.json` cannot be read it falls back to any
+  completed build of the engine under the resolved root.
+
+### Added
+
+- `browser_is_available` takes `headless` (default `True`). A headless Chromium is the
+  `chromium-headless-shell` build, a headed one is full Chromium, and the `playwright`
+  fixture passes `E2E_HEADLESS` through.
+- `playwright_browsers_root` and `expected_browser_dirs` in `webbpulse.e2e.browser`, the
+  two halves of the check.
+
 ## 0.86.0
 
 ### Changed

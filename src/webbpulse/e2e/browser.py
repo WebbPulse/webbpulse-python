@@ -37,8 +37,10 @@ __all__ = [
     "FailedRequests",
     "artifact_name",
     "browser_is_available",
+    "expected_browser_dirs",
     "is_session_probe",
     "message_location_url",
+    "playwright_browsers_root",
     "redact_zip",
     "resource_load_status",
 ]
@@ -103,13 +105,15 @@ def artifact_name(node_id: str) -> str:
     return _UNSAFE.sub("-", node_id).strip("-")[:120] or "unnamed"
 
 
-def browser_is_available(browser_name: str) -> str:
+def browser_is_available(browser_name: str, headless: bool = True) -> str:
     """Empty when the named browser can be launched, or the reason it cannot.
 
-    Answered from Playwright's own driver registry rather than by starting a driver, so
-    the package's own unit tests can ask the question cheaply and a machine with no
+    Answered from the files Playwright itself would open rather than by starting a driver,
+    so the package's own unit tests can ask the question cheaply and a machine with no
     browser binary skips the browser group with a reason rather than erroring inside a
-    session fixture.
+    session fixture. The build checked is the exact revision the installed Playwright
+    pins in its `browsers.json`, under the same cache root it resolves, and a headless
+    Chromium is the `chromium-headless-shell` build Playwright launches for that mode.
     """
     if browser_name not in ("chromium", "firefox", "webkit"):
         return f"playwright has no browser named {browser_name!r}"
@@ -118,23 +122,128 @@ def browser_is_available(browser_name: str) -> str:
         from playwright._repo_version import version  # noqa: F401
     except ImportError:
         return "playwright is not installed, so no browser case can run"
-    if not _installed_browser_paths(browser_name):
-        return f"the {browser_name} binary is not installed. Run `python -m playwright install {browser_name}`"
+    package_dir = _playwright_package_dir()
+    root = playwright_browsers_root(package_dir)
+    install = f"Run `python -m playwright install {browser_name}`"
+    expected = expected_browser_dirs(browser_name, root, package_dir, headless=headless)
+    if expected is None:
+        if not _installed_browser_paths(browser_name, root):
+            return f"the {browser_name} binary is not installed under {root}. {install}"
+        return ""
+    if not any(_is_complete_install(path) for path in expected):
+        wanted = ", ".join(os.path.basename(path) for path in expected)
+        return f"the {browser_name} build this Playwright launches ({wanted}) is not installed under {root}. {install}"
     return ""
 
 
-def _installed_browser_paths(browser_name: str) -> list[str]:
-    """Every downloaded build directory for one engine, from Playwright's own cache.
+def _playwright_package_dir() -> str | None:
+    """The bundled driver package directory of the installed Playwright, or None."""
+    try:
+        import playwright
+    except ImportError:
+        return None
+    location = getattr(playwright, "__file__", None)
+    if not location:
+        return None
+    return os.path.join(os.path.dirname(location), "driver", "package")
 
-    Reads the cache directory rather than asking a running driver, because asking costs a
-    node process and answers with a path that exists only after a download.
+
+def playwright_browsers_root(package_dir: str | None = None) -> str:
+    """The browser cache directory Playwright resolves, by the same rules it applies.
+
+    `PLAYWRIGHT_BROWSERS_PATH` wins, with `0` meaning the driver package's own
+    `.local-browsers` and a relative path resolved against `INIT_CWD` or the working
+    directory. Otherwise it is `ms-playwright` under the platform cache directory, which on
+    Linux is `XDG_CACHE_HOME` when set and `~/.cache` when not.
     """
-    root = os.environ.get("PLAYWRIGHT_BROWSERS_PATH", "").strip()
-    if root in ("", "0"):
-        root = os.path.join(os.path.expanduser("~"), ".cache", "ms-playwright")
+    configured = os.environ.get("PLAYWRIGHT_BROWSERS_PATH", "")
+    if configured == "0" and package_dir:
+        root = os.path.join(package_dir, ".local-browsers")
+    elif configured and configured != "0":
+        root = configured
+    else:
+        root = os.path.join(_platform_cache_dir(), "ms-playwright")
+    if not os.path.isabs(root):
+        root = os.path.join(os.environ.get("INIT_CWD") or os.getcwd(), root)
+    return os.path.normpath(root)
+
+
+def _platform_cache_dir() -> str:
+    """The per-user cache directory Playwright uses on this platform."""
+    import sys
+
+    home = os.path.expanduser("~")
+    if sys.platform == "darwin":
+        return os.path.join(home, "Library", "Caches")
+    if sys.platform == "win32":
+        return os.environ.get("LOCALAPPDATA") or os.path.join(home, "AppData", "Local")
+    return os.environ.get("XDG_CACHE_HOME") or os.path.join(home, ".cache")
+
+
+def expected_browser_dirs(
+    browser_name: str, root: str, package_dir: str | None, headless: bool = True
+) -> list[str] | None:
+    """The build directories Playwright would launch this engine from, or None if unknown.
+
+    Read from the `browsers.json` the installed Playwright ships. A headless Chromium uses
+    `chromium-headless-shell` where that file lists it. A platform revision override, which
+    only some macOS hosts take, adds its own `_special` directory beside the default one,
+    since which host matches is decided inside the driver. None means the file could not be
+    read, and the caller falls back to a looser check.
+    """
+    manifest = _read_browsers_json(package_dir)
+    if manifest is None:
+        return None
+    entries = {str(entry.get("name")): entry for entry in manifest if isinstance(entry, Mapping)}
+    name = browser_name
+    if browser_name == "chromium" and headless and "chromium-headless-shell" in entries:
+        name = "chromium-headless-shell"
+    entry = entries.get(name)
+    if entry is None or not entry.get("revision"):
+        return None
+    prefix = name.replace("-", "_")
+    dirs = [os.path.join(root, f"{prefix}-{entry['revision']}")]
+    overrides = entry.get("revisionOverrides") or {}
+    if isinstance(overrides, Mapping):
+        for platform, revision in overrides.items():
+            dirs.append(os.path.join(root, f"{prefix}_{platform}_special-{revision}"))
+    return dirs
+
+
+def _read_browsers_json(package_dir: str | None) -> list[Any] | None:
+    """The `browsers` list from Playwright's `browsers.json`, or None when unreadable."""
+    import json
+
+    if not package_dir:
+        return None
+    try:
+        with open(os.path.join(package_dir, "browsers.json"), encoding="utf-8") as handle:
+            data = json.load(handle)
+    except (OSError, ValueError):
+        return None
+    browsers = data.get("browsers") if isinstance(data, Mapping) else None
+    return browsers if isinstance(browsers, list) else None
+
+
+def _is_complete_install(path: str) -> bool:
+    """Whether a build directory holds the marker Playwright writes once a download finishes."""
+    return os.path.isfile(os.path.join(path, "INSTALLATION_COMPLETE"))
+
+
+def _installed_browser_paths(browser_name: str, root: str) -> list[str]:
+    """Every completed build directory for one engine under the cache root.
+
+    The fallback for a Playwright whose `browsers.json` cannot be read, so any finished
+    build of the engine counts.
+    """
     if not os.path.isdir(root):
         return []
-    return [os.path.join(root, entry) for entry in os.listdir(root) if entry.split("-")[0].startswith(browser_name)]
+    found: list[str] = []
+    for entry in os.listdir(root):
+        path = os.path.join(root, entry)
+        if entry.split("-")[0].startswith(browser_name) and _is_complete_install(path):
+            found.append(path)
+    return found
 
 
 @dataclass
@@ -281,7 +390,7 @@ def browser_artifacts_dir(e2e_env: Any) -> Any:
 @pytest.fixture(scope="session")
 def playwright(e2e_env: Any) -> Iterator[Any]:
     """The Playwright driver for the run, skipping when it or its browser is absent."""
-    reason = browser_is_available(e2e_env.browser_name)
+    reason = browser_is_available(e2e_env.browser_name, headless=e2e_env.headless)
     if reason:
         pytest.skip(reason)
     from playwright.sync_api import sync_playwright
