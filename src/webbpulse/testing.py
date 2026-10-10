@@ -641,7 +641,8 @@ def assert_audit_log_contract(store: Any, *, tenant_id: str = "contract-tenant")
     refuses a duplicate, a listing newest first that never reaches another tenant, cursors
     that resume only the listing they came from, a time range with `since` inclusive and
     `until` exclusive, target, actor and action narrowing, and a purge that removes one
-    tenant's log and no other's.
+    tenant's log and no other's. A recorded API key display prefix and a label-only target
+    read back unchanged, while a full API key is scrubbed before it is stored.
 
     `store` is anything with `webbpulse.audit.AuditLogStore`'s methods. The store must hold
     nothing for `tenant_id` or `<tenant_id>-other` when this is called, because the contract
@@ -649,8 +650,19 @@ def assert_audit_log_contract(store: Any, *, tenant_id: str = "contract-tenant")
     """
     from datetime import UTC, datetime, timedelta
 
-    from webbpulse.audit import AuditActor, AuditEvent, AuditEventExists, AuditQuery, AuditTarget, iter_events
+    from webbpulse.audit import (
+        REDACTED,
+        AuditActor,
+        AuditCatalogue,
+        AuditEvent,
+        AuditEventExists,
+        AuditQuery,
+        AuditRecorder,
+        AuditTarget,
+        iter_events,
+    )
     from webbpulse.dynamodb import InvalidStartKey
+    from webbpulse.identity.api_keys import display_prefix, new_key
 
     other_tenant = f"{tenant_id}-other"
     start = datetime(2026, 1, 1, tzinfo=UTC)
@@ -758,6 +770,34 @@ def assert_audit_log_contract(store: Any, *, tenant_id: str = "contract-tenant")
     assert store.purge_tenant(tenant_id) == len(written), "A purge answers how many rows went."
     assert store.list_events(tenant_id).events == [], "A purged tenant must list empty."
     assert store.purge_tenant(tenant_id) == 0, "A second purge has nothing to do."
+
+    key = new_key()
+    labelled = AuditTarget(label="Deleted key")
+    recorder = AuditRecorder(
+        store,
+        AuditCatalogue({"api_key.created": "API key created", "api_key.revoked": "API key revoked"}),
+        best_effort=False,
+    )
+    created = recorder.record(
+        tenant_id,
+        "api_key.created",
+        actor=alice,
+        target=AuditTarget(type="api_key", id="k1", label="CI"),
+        payload={"prefix": display_prefix(key), "key": key},
+        occurred_at=start,
+    )
+    revoked = recorder.record(
+        tenant_id, "api_key.revoked", actor=bob, target=labelled, occurred_at=start + timedelta(minutes=1)
+    )
+    assert created is not None and revoked is not None
+    assert created.payload == {"prefix": display_prefix(key), "key": REDACTED}, "A full API key is scrubbed."
+    assert revoked.target == labelled, "The recorder keeps a target that has only a label."
+    assert revoked.target_key == "", "A target without a type and an id joins no target index."
+    stored = {event.event_id: event for event in store.list_events(tenant_id).events}
+    assert stored[created.event_id].payload == created.payload, "The display prefix must read back unchanged."
+    assert stored[revoked.event_id].target == labelled, "A label-only target must round trip."
+    assert listed(AuditQuery(target=AuditTarget(type="api_key", id="k1"))) == [created.event_id]
+    assert store.purge_tenant(tenant_id) == 2
     assert len(store.list_events(other_tenant).events) == 1, "A purge must leave other tenants alone."
     store.purge_tenant(other_tenant)
 

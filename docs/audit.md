@@ -48,13 +48,14 @@ page = store.list_events(workspace_id, AuditQuery(action="token.created"), limit
 | --- | --- |
 | `tenant_id` | Hash key: one partition per workspace, org or whatever the product scopes by |
 | `event_id` | Range key: a ULID minted at `occurred_at`, so newest first is one descending query |
-| `target_key` | `<tenant>#<target type>#<target id>`, written only when the event names a target |
+| `target_key` | `<tenant>#<target type>#<target id>`, written only when the target has both a type and an id |
 | `expires_at` | TTL epoch second, written only when the recorder has a `retention` |
 
 `AUDIT_TABLE_SPEC` is the default shape, including the sparse GSI `target_key-event_id-index`
 (`AUDIT_TARGET_INDEX`). Rows are written once with a conditional put and never edited; a
 second append of the same tenant and id raises `AuditEventExists`. The only removals are the
-TTL and `purge_tenant`.
+TTL and `purge_tenant`. A target with only a label, such as a deleted object, keeps its
+`target_label` through `AuditRecorder.build` and `record` but joins no target index.
 
 The other attributes are `action`, `occurred_at` (ISO 8601 with `Z`), `actor_id`,
 `actor_kind`, `source`, `ip`, `amr`, `target_type`, `target_id`, `target_label`, and
@@ -111,7 +112,15 @@ Every `AuditEvent` passes its `payload`, `before` and `after` through the defaul
   are scrubbed, `token_id` and `secret_name` are not.
 - a string shaped like a credential, under any key. `DEFAULT_SECRET_VALUE_PATTERNS` covers
   `wpk_`/`sk_`-style keys, GitHub tokens, Slack tokens, AWS access key ids, PEM private keys,
-  JWTs and bearer headers.
+  JWTs and bearer headers. A `wpk_` or `wps_` value is scrubbed only when it runs past
+  `PREFIX_DISPLAY_LENGTH` characters, so the API key display prefix from
+  `webbpulse.identity.api_keys.display_prefix` is kept in an `api_key.created` payload while a
+  full key is not.
+
+Redaction runs on the write path only. A store reads its rows back through
+`AuditEvent.restore`, which checks the shape but keeps `payload`, `before` and `after` as
+stored, so a row written before a product adopted this module is not scrubbed again on every
+read.
 
 Scrubbed values become `"[redacted]"`. Values are normalised to JSON: datetimes to ISO 8601,
 enums to their value, sets and tuples to lists, `Decimal` to int or float. Anything else, or

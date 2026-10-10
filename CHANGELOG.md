@@ -7,6 +7,34 @@ This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## Unreleased
 
+## 0.84.0
+
+### Fixed
+
+- `webbpulse.audit` keeps the API key display prefix (PLAT-48). The `wpk_` and `wps_` value
+  patterns in `DEFAULT_SECRET_VALUE_PATTERNS` now need more than the eight characters
+  `display_prefix` shows after the prefix, so `{"prefix": display_prefix(key)}` on an
+  `api_key.created` or `api_key.revoked` event is stored as is. A full key is still
+  `[redacted]`.
+- Stored audit rows are no longer scrubbed again on read (PLAT-48). The new
+  `AuditEvent.restore` builds an event from a stored row, checking its shape but keeping
+  `payload`, `before` and `after` as written, and `DynamoAuditLogStore` reads through it.
+  Redaction still runs whenever an `AuditEvent` is built for a write.
+- `AuditRecorder.build` and `record` keep a target that has only a label (PLAT-50). The
+  empty target is used only when `target` is `None`, and `target_key` is still written only
+  when the target has both a type and an id.
+- `assert_audit_log_contract` covers both: a recorded display prefix and a label-only target
+  read back unchanged, and a full API key is scrubbed.
+
+### Adopter impact
+
+- A row stored before adoption with a credential-shaped value, or under a secret key name,
+  now reads back as stored instead of `[redacted]`. Products that relied on read-time
+  scrubbing of legacy rows should scrub those rows once in place.
+- A custom `AuditLogStore` should build read events with `AuditEvent.restore`.
+- Standupless can drop its `dataclasses.replace` workaround and call `AuditRecorder.record`
+  with the label-only target.
+
 ## 0.83.0
 
 ### Security

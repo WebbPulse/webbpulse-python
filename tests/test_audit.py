@@ -40,6 +40,7 @@ from webbpulse.audit import (
     time_floor,
 )
 from webbpulse.dynamodb import InvalidStartKey, Repository, encode_start_key, new_ulid
+from webbpulse.identity.api_keys import PREFIX_DISPLAY_LENGTH, display_prefix, new_key
 from webbpulse.testing import assert_audit_log_contract
 
 PREFIX = "wp-local"
@@ -302,6 +303,56 @@ def test_ordinary_values_survive_scrubbing() -> None:
     assert _event(payload=payload).payload == payload
 
 
+def test_an_api_key_display_prefix_survives_and_a_full_key_does_not() -> None:
+    """The clear-text display prefix is not a credential; one character past it is treated as one."""
+    key = new_key()
+    prefix = display_prefix(key)
+    event = _event(payload={"prefix": prefix, "key": key, "longer": key[: PREFIX_DISPLAY_LENGTH + 1]})
+    assert event.payload == {"prefix": prefix, "key": REDACTED, "longer": REDACTED}
+    share = _fake("wps", "_", "h" * 8)
+    assert _event(payload={"share": share}).payload == {"share": share}
+
+
+def test_a_stored_row_is_not_scrubbed_again_on_read(dynamo_store: DynamoAuditLogStore) -> None:
+    """Redaction runs on the write path only, so a row reads back exactly as it was stored."""
+    table = Repository(AUDIT_TABLE, prefix=PREFIX).table
+    event_id = new_ulid(MOMENT)
+    stored_value = _fake("sk", "_live_", "c" * 20)
+    table.put_item(
+        Item={
+            "tenant_id": TENANT,
+            "event_id": event_id,
+            "action": "workspace.updated",
+            "occurred_at": "2026-10-08T07:01:47Z",
+            "actor_id": "alice",
+            "payload": {"note": stored_value, "password": "legacy"},
+        }
+    )
+    row = dynamo_store.list_events(TENANT).events[0]
+    assert row.payload == {"note": stored_value, "password": "legacy"}
+
+
+def test_restore_keeps_payloads_and_still_checks_the_shape() -> None:
+    """`AuditEvent.restore` skips scrubbing but refuses an event with no tenant or a bad id."""
+    secret = _fake("sk", "_live_", "c" * 20)
+    restored = AuditEvent.restore(
+        tenant_id=TENANT,
+        action="workspace.updated",
+        actor=ALICE,
+        event_id=new_ulid(MOMENT),
+        occurred_at=MOMENT,
+        payload={"note": secret},
+        before={"password": "old"},
+    )
+    assert restored.payload == {"note": secret}
+    assert restored.before == {"password": "old"}
+    assert restored.after is None
+    with pytest.raises(ValueError):
+        AuditEvent.restore(tenant_id="", action="a", actor=ALICE, event_id=new_ulid(MOMENT), occurred_at=MOMENT)
+    with pytest.raises(ValueError):
+        AuditEvent.restore(tenant_id=TENANT, action="a", actor=ALICE, event_id="nope", occurred_at=MOMENT)
+
+
 def test_payloads_are_normalised_to_json() -> None:
     """Datetimes, enums, decimals, sets and tuples become JSON values; anything else is refused."""
     event = _event(
@@ -443,6 +494,27 @@ def test_the_recorder_records_a_system_event() -> None:
     event = AuditRecorder(store, CATALOGUE).record(TENANT, "workspace.updated", actor=SYSTEM_ACTOR)
     assert event is not None
     assert store.events[0].actor == AuditActor(id="system", kind="system", source="system")
+
+
+@pytest.mark.parametrize("store_kind", ["memory", "dynamo"])
+def test_the_recorder_keeps_a_label_only_target(store_kind: str, request: pytest.FixtureRequest) -> None:
+    """A target with only a label round trips through build and record and joins no target index."""
+    store = InMemoryAuditLogStore() if store_kind == "memory" else request.getfixturevalue("dynamo_store")
+    recorder = AuditRecorder(store, CATALOGUE, best_effort=False)
+    labelled = AuditTarget(label="Deleted workspace")
+    built = recorder.build(TENANT, "workspace.updated", actor=ALICE, target=labelled)
+    assert built.target == labelled
+    assert built.target_key == ""
+    recorded = recorder.record(TENANT, "workspace.updated", actor=ALICE, target=labelled)
+    assert recorded is not None
+    assert recorded.target == labelled
+    assert store.list_events(TENANT).events[0].target == labelled
+    if store_kind == "dynamo":
+        table = Repository(AUDIT_TABLE, prefix=PREFIX).table
+        item = table.get_item(Key={"tenant_id": TENANT, "event_id": recorded.event_id})["Item"]
+        assert item["target_label"] == "Deleted workspace"
+        assert "target_key" not in item
+    assert recorder.build(TENANT, "workspace.updated", actor=ALICE).target == AuditTarget()
 
 
 def test_retention_sets_the_ttl(dynamo_store: DynamoAuditLogStore) -> None:
