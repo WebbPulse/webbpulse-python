@@ -7,6 +7,7 @@ cookie attributes and token lifetimes. Secrets are never fields here.
 from __future__ import annotations
 
 import base64
+import re
 from datetime import timedelta
 from typing import Any, Final, Literal
 from urllib.parse import parse_qsl, urlparse
@@ -21,6 +22,7 @@ __all__ = [
     "MAX_AUTHORIZATION_CODE_TTL",
     "MAX_DEVICE_CODE_TTL",
     "MAX_DEVICE_SESSION_TTL",
+    "MAX_HANDOFF_CODE_TTL",
     "MAX_SIGNING_KEYS",
     "UNSET_ENVIRONMENT",
     "IdentitySettings",
@@ -46,6 +48,14 @@ MAX_AUTHORIZATION_CODE_TTL: Final = timedelta(minutes=10)
 MAX_DEVICE_CODE_TTL: Final = timedelta(minutes=30)
 
 MAX_DEVICE_SESSION_TTL: Final = timedelta(hours=24)
+
+MAX_HANDOFF_CODE_TTL: Final = timedelta(minutes=2)
+
+_HANDOFF_SCHEME_PATTERN: Final = re.compile(r"^[a-z][a-z0-9+.-]*$")
+
+_REFUSED_HANDOFF_SCHEMES: Final[frozenset[str]] = frozenset(
+    {"http", "https", "javascript", "data", "file", "blob", "about", "ws", "wss", "mailto", "vbscript", "ftp"}
+)
 
 UNSET_ENVIRONMENT: Final = "production"
 
@@ -442,6 +452,18 @@ class IdentitySettings(BaseSettings):
         default="returnTo",
         description="The query parameter on `device_login_url` that carries the approval URL back.",
     )
+    desktop_handoff_schemes: list[str] = Field(
+        default_factory=list,
+        description=(
+            "The custom URL schemes a desktop app may receive a session handoff code on, such "
+            "as `myapp` or `myapp-staging`, as a JSON array. Empty, the default, leaves the "
+            "handoff routes unmounted. Web schemes such as `https` are refused."
+        ),
+    )
+    desktop_handoff_code_ttl: timedelta = Field(
+        default=timedelta(seconds=60),
+        description="How long a desktop handoff code may wait to be redeemed. Capped at two minutes.",
+    )
 
     @field_validator("environment", mode="before")
     @classmethod
@@ -589,6 +611,32 @@ class IdentitySettings(BaseSettings):
                 f"{MAX_AUTHORIZATION_CODE_TTL} cap. A code is redeemed within seconds by a client "
                 "that already holds the verifier, so a long-lived one is only an interception window."
             )
+        return self
+
+    @field_validator("desktop_handoff_schemes")
+    @classmethod
+    def _check_handoff_schemes(cls, value: list[str]) -> list[str]:
+        """Normalise the handoff schemes and refuse malformed, web or duplicate entries."""
+        cleaned: list[str] = []
+        for entry in value:
+            scheme = entry.strip().lower().removesuffix("://").removesuffix(":")
+            if not _HANDOFF_SCHEME_PATTERN.fullmatch(scheme):
+                raise ValueError(f"desktop_handoff_schemes entry {entry!r} is not a valid URL scheme.")
+            if scheme in _REFUSED_HANDOFF_SCHEMES:
+                raise ValueError(
+                    f"desktop_handoff_schemes entry {scheme!r} is a web or browser scheme. A handoff "
+                    "code must go only to an app that registered its own custom scheme."
+                )
+            if scheme in cleaned:
+                raise ValueError(f"desktop_handoff_schemes lists {scheme!r} twice.")
+            cleaned.append(scheme)
+        return cleaned
+
+    @model_validator(mode="after")
+    def _check_desktop_handoff(self) -> IdentitySettings:
+        """Refuse a handoff code lifetime that is not positive or outlives its cap."""
+        if not timedelta(0) < self.desktop_handoff_code_ttl <= MAX_HANDOFF_CODE_TTL:
+            raise ValueError(f"desktop_handoff_code_ttl must be positive and at most {MAX_HANDOFF_CODE_TTL}.")
         return self
 
     @model_validator(mode="after")

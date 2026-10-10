@@ -43,6 +43,7 @@ from webbpulse.messages import rate_limited
 if TYPE_CHECKING:  # pragma: no cover
     from collections.abc import Callable, Mapping, Sequence
 
+    from webbpulse.identity.desktop_handoff import DesktopHandoffService, MintedHandoff
     from webbpulse.identity.email import EmailMessage, EmailSender
     from webbpulse.identity.hooks import IdentityHooks
     from webbpulse.identity.passkeys import PasskeyService, RegistrationChallenge
@@ -256,6 +257,12 @@ class IdentityFlows:
 
             self.passkeys = PasskeyService(settings, stores)
 
+        self.desktop_handoff: DesktopHandoffService | None = None
+        if settings.desktop_handoff_schemes and stores.identity_tokens is not None:
+            from webbpulse.identity.desktop_handoff import DesktopHandoffService
+
+            self.desktop_handoff = DesktopHandoffService(settings, stores.identity_tokens)
+
     @property
     def passkey_second_factor_enabled(self) -> bool:
         """Whether a passkey can answer the login MFA challenge.
@@ -440,6 +447,143 @@ class IdentityFlows:
             raise MfaChallengeRequired(challenge)
 
         return self._issue(user, ip=ip, user_agent=user_agent, amr=amr)
+
+    def mint_desktop_handoff(
+        self,
+        *,
+        user_id: str,
+        session_id: str,
+        token_amr: Sequence[str],
+        auth_time: int,
+        code_challenge: str,
+        code_challenge_method: str,
+        scheme: str,
+        ip: str = "",
+    ) -> MintedHandoff:
+        """Mint a desktop handoff code for a signed-in browser session.
+
+        The code carries the session's sign-in `amr`, read from its family and falling back
+        to the access token's, and the original `auth_time`, so the desktop session has the
+        same MFA level and no fresher sign-in than the browser had.
+        """
+        from webbpulse.identity.desktop_handoff import HandoffRejected, normalise_scheme
+
+        service = self._require_desktop_handoff()
+        amr = self._sessions.family_amr(session_id) or tuple(m for m in token_amr if m != "mfa") or (AMR_PASSWORD,)
+        try:
+            minted = service.mint(
+                user_id,
+                code_challenge=code_challenge,
+                code_challenge_method=code_challenge_method,
+                scheme=scheme,
+                amr=amr,
+                auth_time=auth_time,
+                family_id=session_id,
+            )
+        except HandoffRejected as refused:
+            _log.info(
+                "Desktop handoff mint refused.",
+                extra={
+                    "event": "session.handoff_mint_failed",
+                    "user_id": user_id,
+                    "family_id": session_id,
+                    "error_code": refused.error_code,
+                    "ip": ip,
+                },
+            )
+            raise LoginRejected(
+                refused.message, error_code=refused.error_code, status_code=refused.status_code
+            ) from None
+        _log.info(
+            "Desktop handoff minted.",
+            extra={
+                "event": "session.handoff_minted",
+                "user_id": user_id,
+                "family_id": session_id,
+                "scheme": normalise_scheme(scheme),
+                "ip": ip,
+            },
+        )
+        return minted
+
+    def exchange_desktop_handoff(
+        self,
+        *,
+        code: str,
+        code_verifier: str,
+        scheme: str,
+        ip: str = "",
+        user_agent: str = "",
+    ) -> AuthResult:
+        """Spend a desktop handoff code and start the desktop app's own session.
+
+        The session is exactly what a sign-in issues: a new refresh family and an access
+        token for the browser audience, carrying the browser session's `amr` and `auth_time`.
+        `may_authenticate` is consulted again, so a disabled account cannot redeem a code.
+        """
+        from webbpulse.identity.desktop_handoff import HANDOFF_INVALID_MESSAGE, HandoffRejected
+
+        service = self._require_desktop_handoff()
+        try:
+            redeemed = service.redeem(code, code_verifier=code_verifier, scheme=scheme)
+        except HandoffRejected as refused:
+            _log.info(
+                "Desktop handoff exchange refused.",
+                extra={"event": "session.handoff_exchange_failed", "error_code": refused.error_code, "ip": ip},
+            )
+            raise LoginRejected(
+                refused.message, error_code=refused.error_code, status_code=refused.status_code
+            ) from None
+
+        user = self._hooks.load_user_by_id(redeemed.user_id)
+        if user is None:
+            raise LoginRejected(HANDOFF_INVALID_MESSAGE, error_code="HANDOFF_INVALID", status_code=400)
+        try:
+            self._hooks.may_authenticate(user)
+        except AuthenticationRefused as refused:
+            _log.info(
+                "Desktop handoff refused by the product's may_authenticate hook.",
+                extra={"event": "session.handoff_exchange_failed", "user_id": redeemed.user_id, "ip": ip},
+            )
+            raise LoginRejected(refused.message, error_code=refused.error_code, status_code=403) from refused
+
+        amr = redeemed.amr or (AMR_PASSWORD,)
+        issued = self._sessions.start_family(
+            redeemed.user_id,
+            device=_device_class(user_agent),
+            ip=ip,
+            auth_time=redeemed.auth_time or None,
+            amr=amr,
+        )
+        access = self._mint_access(user, session_id=issued.family_id, amr=amr, auth_time=issued.auth_time)
+        _log.info(
+            "Desktop handoff exchanged.",
+            extra={
+                "event": "session.handoff_exchanged",
+                "user_id": redeemed.user_id,
+                "family_id": issued.family_id,
+                "source_family_id": redeemed.source_family_id,
+                "scheme": redeemed.scheme,
+                "ip": ip,
+            },
+        )
+        return AuthResult(
+            access_token=access,
+            expires_in=int(self._settings.access_token_ttl.total_seconds()),
+            user=user,
+            refresh_token=issued.token,
+            family_id=issued.family_id,
+        )
+
+    def _require_desktop_handoff(self) -> DesktopHandoffService:
+        """The handoff service, or a 404 refusal when no scheme is allowlisted."""
+        if self.desktop_handoff is None:
+            raise LoginRejected(
+                "Desktop sign-in handoff is not enabled.",
+                error_code="HANDOFF_DISABLED",
+                status_code=404,
+            )
+        return self.desktop_handoff
 
     def _challenge_for(
         self,
