@@ -45,6 +45,7 @@ __all__ = [
     "FakeQueue",
     "FakeWebhookSender",
     "assert_api_key_store_contract",
+    "assert_audit_log_contract",
     "assert_entrypoint_isolation",
     "assert_share_token_store_contract",
     "assert_users_repository_contract",
@@ -631,6 +632,134 @@ def assert_share_token_store_contract(store: Any, *, tenant_id: str = "contract-
     assert verify_share_token(second.plaintext, store) is None
     assert len(store.list_for_target(tenant_id, issue)) == 2, "A revoked link stays listed."
     assert store.revoke_all_for_target(tenant_id, other) == 1, "Another target must be untouched."
+
+
+def assert_audit_log_contract(store: Any, *, tenant_id: str = "contract-tenant") -> None:
+    """Assert one `AuditLogStore` satisfies the shared contract, or raise `AssertionError`.
+
+    The behaviour an admin audit page owes every store: an append that round trips and
+    refuses a duplicate, a listing newest first that never reaches another tenant, cursors
+    that resume only the listing they came from, a time range with `since` inclusive and
+    `until` exclusive, target, actor and action narrowing, and a purge that removes one
+    tenant's log and no other's.
+
+    `store` is anything with `webbpulse.audit.AuditLogStore`'s methods. The store must hold
+    nothing for `tenant_id` or `<tenant_id>-other` when this is called, because the contract
+    asserts exact listings.
+    """
+    from datetime import UTC, datetime, timedelta
+
+    from webbpulse.audit import AuditActor, AuditEvent, AuditEventExists, AuditQuery, AuditTarget, iter_events
+    from webbpulse.dynamodb import InvalidStartKey
+
+    other_tenant = f"{tenant_id}-other"
+    start = datetime(2026, 1, 1, tzinfo=UTC)
+    alice = AuditActor(id="alice", kind="user", source="web", ip="203.0.113.1", amr=("pwd", "otp"))
+    bob = AuditActor(id="bob", kind="api_key", source="api")
+    workspace = AuditTarget(type="workspace", id="w1", label="Main")
+    token = AuditTarget(type="token", id="t1", label="CI token")
+
+    assert store.list_events(tenant_id).events == [], "A tenant with no events must list empty."
+
+    specs = [
+        (alice, "workspace.updated", workspace),
+        (bob, "token.created", token),
+        (alice, "token.revoked", token),
+        (bob, "workspace.updated", workspace),
+        (alice, "variable.updated", AuditTarget()),
+    ]
+    written = [
+        store.append(
+            AuditEvent(
+                tenant_id=tenant_id,
+                action=action,
+                actor=actor,
+                target=target,
+                payload={"step": index, "nested": {"ok": True}},
+                occurred_at=start + timedelta(minutes=index),
+            )
+        )
+        for index, (actor, action, target) in enumerate(specs)
+    ]
+    elsewhere = AuditEvent(tenant_id=other_tenant, action="workspace.updated", actor=alice, target=workspace)
+    store.append(elsewhere)
+    ids = [event.event_id for event in written]
+
+    def listed(query: AuditQuery | None = None) -> list[str]:
+        """Every matching event id, newest first, following cursors."""
+        return [event.event_id for event in iter_events(store, tenant_id, query, page_size=2)]
+
+    page = store.list_events(tenant_id, limit=10)
+    assert [event.event_id for event in page.events] == ids[::-1], "A listing is newest first."
+    assert page.next_cursor is None, "A listing that read everything carries no cursor."
+    newest = page.events[0]
+    assert newest.action == "variable.updated", "The action must round trip."
+    assert newest.actor == alice, "The actor must round trip with its amr."
+    assert not newest.target, "An event with no target must come back with none."
+    assert newest.payload == {"step": 4, "nested": {"ok": True}}, "The payload must round trip as plain JSON."
+    assert newest.occurred_at == start + timedelta(minutes=4), "occurred_at must round trip, aware."
+    assert page.events[1].target == workspace, "The target must round trip with its label."
+
+    try:
+        store.append(written[0])
+    except AuditEventExists:
+        pass
+    else:
+        raise AssertionError("Appending an existing event id must raise AuditEventExists.")
+
+    first = store.list_events(tenant_id, limit=2)
+    assert [event.event_id for event in first.events] == ids[:2:-1]
+    assert first.next_cursor is not None, "A short page must carry a cursor."
+    second = store.list_events(tenant_id, limit=2, cursor=first.next_cursor)
+    assert [event.event_id for event in second.events] == ids[2:0:-1], "A cursor resumes after its page."
+    assert listed() == ids[::-1], "Following cursors must reach every event once."
+    for refused_tenant, refused_cursor in ((other_tenant, first.next_cursor), (tenant_id, "not-a-cursor")):
+        try:
+            store.list_events(refused_tenant, limit=2, cursor=refused_cursor)
+        except InvalidStartKey:
+            pass
+        else:
+            raise AssertionError("A cursor from another listing or a malformed one must raise InvalidStartKey.")
+    try:
+        store.list_events(tenant_id, AuditQuery(target=token), limit=2, cursor=first.next_cursor)
+    except InvalidStartKey:
+        pass
+    else:
+        raise AssertionError("A tenant cursor must not resume a target listing.")
+
+    ranged = listed(AuditQuery(since=start + timedelta(minutes=1), until=start + timedelta(minutes=3)))
+    assert ranged == [ids[2], ids[1]], "since is inclusive and until exclusive."
+    assert listed(AuditQuery(since=start + timedelta(minutes=3))) == [ids[4], ids[3]]
+    assert listed(AuditQuery(until=start + timedelta(minutes=1))) == [ids[0]]
+    assert listed(AuditQuery(since=start + timedelta(minutes=3), until=start + timedelta(minutes=3))) == []
+    try:
+        store.list_events(tenant_id, AuditQuery(until=start + timedelta(minutes=2)), limit=2, cursor=first.next_cursor)
+    except InvalidStartKey:
+        pass
+    else:
+        raise AssertionError("A cursor outside the query's time range must raise InvalidStartKey.")
+
+    assert listed(AuditQuery(target=token)) == [ids[2], ids[1]], "A target listing holds that target's events."
+    assert listed(AuditQuery(target=workspace)) == [ids[3], ids[0]], "A target listing never reaches another tenant."
+    assert listed(AuditQuery(target=AuditTarget(type="token", id="w1"))) == [], "Type and id match together."
+    assert listed(AuditQuery(actor_id="bob")) == [ids[3], ids[1]]
+    assert listed(AuditQuery(action="workspace.updated")) == [ids[3], ids[0]]
+    assert listed(AuditQuery(actor_id="bob", action="workspace.updated")) == [ids[3]]
+    assert listed(AuditQuery(actor_id="alice", target=token, since=start + timedelta(minutes=2))) == [ids[2]]
+
+    for bad_tenant, bad_limit in (("", 10), (tenant_id, 0)):
+        try:
+            store.list_events(bad_tenant, limit=bad_limit)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError("An empty tenant or a limit below one must raise ValueError.")
+
+    assert store.purge_tenant(tenant_id) == len(written), "A purge answers how many rows went."
+    assert store.list_events(tenant_id).events == [], "A purged tenant must list empty."
+    assert store.purge_tenant(tenant_id) == 0, "A second purge has nothing to do."
+    assert len(store.list_events(other_tenant).events) == 1, "A purge must leave other tenants alone."
+    store.purge_tenant(other_tenant)
 
 
 def make_request_context_headers(

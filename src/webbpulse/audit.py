@@ -634,6 +634,7 @@ class DynamoAuditLogStore:
                 raise InvalidStartKey
 
         index_name: str | None = None
+        condition: Any
         filters: Any = None
         if target is not None and self._target_index is not None:
             index_name = self._target_index
@@ -974,9 +975,7 @@ def _json_cell(value: Mapping[str, Any] | None) -> str:
     return json.dumps(value, sort_keys=True, separators=(",", ":")) if value else ""
 
 
-def _cells(
-    event: AuditEvent, catalogue: AuditCatalogue | None, actor_names: Mapping[str, str]
-) -> dict[str, str]:
+def _cells(event: AuditEvent, catalogue: AuditCatalogue | None, actor_names: Mapping[str, str]) -> dict[str, str]:
     """Every exportable column of one event."""
     return {
         "tenant_id": event.tenant_id,
