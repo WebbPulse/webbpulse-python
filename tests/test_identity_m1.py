@@ -170,6 +170,64 @@ def test_plaintext_issuer_refused_outside_local_and_test() -> None:
     assert make_settings(environment="local", issuer="http://localhost:8000").issuer
 
 
+def _unset_environment_settings(monkeypatch: pytest.MonkeyPatch, **overrides: Any) -> IdentitySettings:
+    """Settings built with `IDENTITY_ENVIRONMENT` removed and no `environment` argument."""
+    monkeypatch.delenv("IDENTITY_ENVIRONMENT", raising=False)
+    base: dict[str, Any] = {"issuer": ISSUER, "audience": AUDIENCE, "signing_key_arns": [KEY_A]}
+    base.update(overrides)
+    return IdentitySettings(**base)
+
+
+def test_an_unset_environment_reads_as_production(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A deployment that forgets `IDENTITY_ENVIRONMENT` gets the strictest checks, not local ones."""
+    from webbpulse.config import rate_limits_apply
+    from webbpulse.identity.settings import UNSET_ENVIRONMENT
+
+    settings = _unset_environment_settings(monkeypatch)
+    assert UNSET_ENVIRONMENT == "production"
+    assert settings.environment == "production"
+    assert rate_limits_apply(settings.environment) is True
+
+
+@pytest.mark.parametrize("blank", ["", "   "])
+def test_a_blank_environment_reads_as_production(monkeypatch: pytest.MonkeyPatch, blank: str) -> None:
+    """An empty variable, such as an unset Terraform input, fails closed the same way."""
+    monkeypatch.setenv("IDENTITY_ENVIRONMENT", blank)
+    settings = IdentitySettings(issuer=ISSUER, audience=AUDIENCE, signing_key_arns=[KEY_A])
+    assert settings.environment == "production"
+    assert make_settings(environment=blank).environment == "production"
+
+
+def test_an_unset_environment_refuses_a_plaintext_issuer(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The `http://` allowance needs `local` or `test` named explicitly."""
+    with pytest.raises(ValueError, match="plaintext http"):
+        _unset_environment_settings(monkeypatch, issuer="http://localhost:8000/api/auth")
+
+
+def test_an_unset_environment_refuses_the_local_signer(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The in-process signer needs a non-production environment named explicitly."""
+    with pytest.raises(ValueError, match="refused in environment"):
+        _unset_environment_settings(monkeypatch, signer="local")
+
+
+def test_an_unset_environment_refuses_the_local_authorizer(monkeypatch: pytest.MonkeyPatch) -> None:
+    """In-process token verification never runs on a deployment that did not say it is local."""
+    from webbpulse.identity.local_authorizer import LocalAuthorizerMiddleware
+
+    async def app(scope: Any, receive: Any, send: Any) -> None:
+        """An ASGI app the middleware would wrap."""
+
+    with pytest.raises(ValueError, match="refuses environment"):
+        LocalAuthorizerMiddleware(app, _unset_environment_settings(monkeypatch))
+
+
+def test_an_explicit_environment_is_kept(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Adopters that set the variable see exactly the value they set."""
+    for name in ("local", "test", "staging", "production"):
+        monkeypatch.setenv("IDENTITY_ENVIRONMENT", name)
+        assert IdentitySettings(issuer=ISSUER, audience=AUDIENCE, signing_key_arns=[KEY_A]).environment == name
+
+
 def test_signing_keys_must_be_non_empty_and_unique() -> None:
     """An empty or duplicated `signing_key_arns` list raises."""
     with pytest.raises(ValueError):

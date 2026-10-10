@@ -1156,6 +1156,14 @@ class IdentityFlows:
                 error_code="EMAIL_REQUIRED",
                 status_code=400,
             )
+        from webbpulse.identity.ephemeral_sweep import is_ephemeral_email
+
+        if not is_ephemeral_email(normalised_email):
+            raise LoginRejected(
+                "Ephemeral e2e users must use an e2e-<run>@e2e.invalid address.",
+                error_code="EPHEMERAL_EMAIL_REQUIRED",
+                status_code=400,
+            )
         checked = check_password(password, breach_check=False)
 
         if self._hooks.load_user_by_email(normalised_email) is not None:
@@ -1201,7 +1209,9 @@ class IdentityFlows:
         is the same one production uses and stays exercised.
 
         Returns whether a row was there to delete, so a retry of an already-cleaned run is
-        a `False` rather than an error.
+        a `False` rather than an error. A user whose address is not an
+        `e2e-<run>@e2e.invalid` one is refused with a 403 and left in place, so the route
+        can never remove a real account.
         """
         if not self._settings.ephemeral_users_enabled:
             raise LoginRejected(
@@ -1215,6 +1225,17 @@ class IdentityFlows:
                 "A user id is required.",
                 error_code="USER_ID_REQUIRED",
                 status_code=400,
+            )
+        from webbpulse.identity.ephemeral_sweep import is_ephemeral_email
+
+        current = self._hooks.load_user_by_id(cleaned)
+        if current is None:
+            return False
+        if not is_ephemeral_email(current.get("email") or current.get("email_lower")):
+            raise LoginRejected(
+                "Only ephemeral e2e users can be deleted through this route.",
+                error_code="NOT_EPHEMERAL_USER",
+                status_code=403,
             )
         deleted = bool(self._hooks.delete_user(cleaned))
         _log.info(

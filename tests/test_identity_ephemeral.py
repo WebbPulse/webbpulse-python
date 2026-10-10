@@ -239,6 +239,34 @@ class TestEphemeralFlow:
             flows.create_ephemeral_user(email="", password=PASSWORD)
         assert caught.value.error_code == "EMAIL_REQUIRED"
 
+    @pytest.mark.parametrize(
+        "address",
+        ["owner@example.com", "e2e-run@example.com", "someone@e2e.invalid", "e2e-run@e2e.invalid.example.com"],
+    )
+    def test_it_refuses_an_address_outside_the_e2e_convention(
+        self, address: str, hooks: FakeHooks, module_key: rsa.RSAPrivateKey
+    ) -> None:
+        """Only `e2e-<run>@e2e.invalid` can be created, so the route never mints a real-looking account."""
+        flows = make_flows(hooks, module_key, ephemeral_users_enabled=True)
+        with pytest.raises(LoginRejected) as caught:
+            flows.create_ephemeral_user(email=address, password=PASSWORD)
+        assert caught.value.error_code == "EPHEMERAL_EMAIL_REQUIRED"
+        assert caught.value.status_code == 400
+        assert hooks.users == {}
+
+    def test_delete_refuses_a_real_user_and_leaves_it_in_place(
+        self, hooks: FakeHooks, module_key: rsa.RSAPrivateKey
+    ) -> None:
+        """An admin token cannot turn the e2e delete route against a real account."""
+        real = hooks.create_user(email="owner@example.com", attributes={})
+        flows = make_flows(hooks, module_key, ephemeral_users_enabled=True)
+        with pytest.raises(LoginRejected) as caught:
+            flows.delete_ephemeral_user(str(real["id"]))
+        assert caught.value.error_code == "NOT_EPHEMERAL_USER"
+        assert caught.value.status_code == 403
+        assert hooks.deleted == []
+        assert hooks.load_user_by_id(str(real["id"])) is not None
+
     def test_delete_removes_the_users_row_and_nothing_else(
         self, hooks: FakeHooks, module_key: rsa.RSAPrivateKey
     ) -> None:
@@ -439,6 +467,24 @@ class TestEphemeralRoutesOverHttp:
         assert deleted.status_code == 200, deleted.text
         assert deleted.json() == {"user_id": body["user_id"], "deleted": True}
         assert hooks.load_user_by_email(EMAIL) is None
+
+    def test_a_non_e2e_address_answers_400(self, hooks: FakeHooks, module_key: rsa.RSAPrivateKey) -> None:
+        """The route refuses an address outside the convention before anything is created."""
+        client = self.client(module_key, hooks)
+        payload = {**dict(self.PAYLOAD), "email": "owner@example.com"}
+        response = client.post("/api/auth/e2e/users", json=payload, headers=self.headers_for(self.ADMIN))
+        assert response.status_code == 400
+        assert response.json()["error_code"] == "EPHEMERAL_EMAIL_REQUIRED"
+        assert hooks.users == {}
+
+    def test_deleting_a_real_user_answers_403(self, hooks: FakeHooks, module_key: rsa.RSAPrivateKey) -> None:
+        """The delete route leaves an account outside the convention alone."""
+        real = hooks.create_user(email="owner@example.com", attributes={})
+        client = self.client(module_key, hooks)
+        response = client.delete(f"/api/auth/e2e/users/{real['id']}", headers=self.headers_for(self.ADMIN))
+        assert response.status_code == 403
+        assert response.json()["error_code"] == "NOT_EPHEMERAL_USER"
+        assert hooks.load_user_by_id(str(real["id"])) is not None
 
     def test_an_anonymous_caller_is_refused(self, hooks: FakeHooks, module_key: rsa.RSAPrivateKey) -> None:
         """No claims at all reads as not signed in."""

@@ -7,6 +7,41 @@ This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## Unreleased
 
+## 0.83.0
+
+### Security
+
+- The identity environment fails closed (PLAT-34 L4). `IdentitySettings.environment` and
+  `BaseServiceSettings.environment` used to default to `local`, so a deployment that forgot
+  `IDENTITY_ENVIRONMENT` or `ENVIRONMENT` got the local allowances: an `http://` issuer, the
+  in-process signer, the local authorizer and no rate limits. Both now default to
+  `production`, exposed as `UNSET_ENVIRONMENT`, and a blank `IDENTITY_ENVIRONMENT` reads the
+  same way. An explicitly set value is kept exactly as before.
+- The ephemeral e2e user routes only touch e2e accounts (PLAT-34 L5). `POST
+  /api/auth/e2e/users` answers 400 `EPHEMERAL_EMAIL_REQUIRED` unless the address is
+  `e2e-<run>@e2e.invalid`, the convention the e2e plugin and the sweep already use, and
+  `DELETE /api/auth/e2e/users/{user_id}` answers 403 `NOT_EPHEMERAL_USER` for a user whose
+  address is not one, deleting nothing. A user that is already gone still answers
+  `deleted: false`.
+- The OAuth callback puts the MFA ticket in the URL fragment, `#mfa_ticket=<ticket>`, not the
+  query (PLAT-34 L6), so it never reaches a server log, a proxy or a `Referer` header. The
+  other callback parameters stay in the query.
+
+### Adopter impact
+
+- L4: a local stack, test suite or CI job that relied on the `local` default must set
+  `IDENTITY_ENVIRONMENT=local` (or `test`), and `ENVIRONMENT=local` where it builds a
+  `BaseServiceSettings` subclass that does not set the environment itself. Deployed
+  services that set the variable see no change.
+- L5: no change for suites using the `webbpulse.e2e` plugin. A caller creating ephemeral
+  users with any other address gets a 400.
+- L6: frontends must read `mfa_ticket` from `location.hash`. Release
+  `@webbpulse/auth` with `readOAuthCallback` reading the fragment and `stripOAuthParams`
+  clearing it, and redeploy the adopter frontends (CarModPicker, Standupless) before this
+  version is tagged, because adopters pick up the newest `webbpulse` at build time. Until a
+  frontend does, an MFA-enrolled user signing in with OAuth lands back on the login page
+  without the code prompt.
+
 ## 0.82.0
 
 ### Added

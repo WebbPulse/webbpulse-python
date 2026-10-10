@@ -22,6 +22,7 @@ __all__ = [
     "MAX_DEVICE_CODE_TTL",
     "MAX_DEVICE_SESSION_TTL",
     "MAX_SIGNING_KEYS",
+    "UNSET_ENVIRONMENT",
     "IdentitySettings",
     "OAuthProvider",
     "SignerKind",
@@ -45,6 +46,8 @@ MAX_AUTHORIZATION_CODE_TTL: Final = timedelta(minutes=10)
 MAX_DEVICE_CODE_TTL: Final = timedelta(minutes=30)
 
 MAX_DEVICE_SESSION_TTL: Final = timedelta(hours=24)
+
+UNSET_ENVIRONMENT: Final = "production"
 
 _PLAINTEXT_ISSUER_ENVIRONMENTS: Final[frozenset[str]] = frozenset({"local", "test"})
 
@@ -73,10 +76,12 @@ class IdentitySettings(BaseSettings):
     )
 
     environment: str = Field(
-        default="local",
+        default=UNSET_ENVIRONMENT,
         description=(
             "Which deployment this is. Gates the `http://` issuer allowance and the "
-            "local-development fallbacks, and nothing else."
+            "local-development fallbacks, and nothing else. Unset or blank reads as "
+            "`production`, so a deployment that forgets it gets the strictest checks; a "
+            "local stack or test suite sets `local` or `test` explicitly."
         ),
     )
     issuer: str = Field(
@@ -437,6 +442,14 @@ class IdentitySettings(BaseSettings):
         default="returnTo",
         description="The query parameter on `device_login_url` that carries the approval URL back.",
     )
+
+    @field_validator("environment", mode="before")
+    @classmethod
+    def _blank_environment_is_production(cls, value: Any) -> Any:
+        """Read a blank environment as `UNSET_ENVIRONMENT`, so an empty variable fails closed."""
+        if value is None or (isinstance(value, str) and not value.strip()):
+            return UNSET_ENVIRONMENT
+        return value
 
     @field_validator("issuer", "frontend_base_url", mode="before")
     @classmethod

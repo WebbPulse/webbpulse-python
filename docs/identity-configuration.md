@@ -16,7 +16,7 @@ permanently.
 
 | Field | Default | Meaning |
 |---|---|---|
-| `environment` | `"local"` | Gates the `http://` issuer allowance and the local fallbacks |
+| `environment` | `"production"` | Gates the `http://` issuer allowance and the local fallbacks. Unset or blank reads as `production`, so set `local` or `test` explicitly for a local stack or test suite |
 | `issuer` | required | The `iss` claim, the discovery `issuer`, the authorizer's issuer |
 | `audience` | required | The `aud` claim |
 | `signing_key_arns` | required | KMS RSA_2048 signing keys, active first |

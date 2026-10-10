@@ -65,8 +65,11 @@ renders as text on a blank page. The frontend route named by `return_to`, or
 | --- | --- | --- |
 | `oauth=1` | A login succeeded. The refresh cookie is set on this redirect. | Call `POST /api/auth/refresh` for an access token, then continue |
 | `oauth_linked=1` | A `link` succeeded for the signed-in account | Refresh the settings page's linked-provider list |
-| `mfa_ticket=<ticket>` | The account has a second factor | Prompt for a code and `POST /api/auth/login/totp` with `{mfa_ticket, code}` |
+| `#mfa_ticket=<ticket>` (fragment) | The account has a second factor | Read it from `location.hash`, prompt for a code and `POST /api/auth/login/totp` with `{mfa_ticket, code}` |
 | `oauth_error=<code>` | The flow was refused | Render a message for the code |
+
+The MFA ticket is the one value carried in the URL fragment rather than the query, so it
+never reaches a server, a proxy log or a `Referer` header. The others are query parameters.
 
 It is the only identity route that appears in the OpenAPI document, tagged `identity` and
 `oauth`. The `.well-known` documents are `include_in_schema=False` because API Gateway

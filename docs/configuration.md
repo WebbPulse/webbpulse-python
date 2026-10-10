@@ -26,7 +26,9 @@ def get_settings() -> Settings:
 Construct settings behind a cache in the service, not at import, so a missing environment
 variable fails a request rather than the whole cold start.
 
-`environment` drives two properties. `is_production` is true for production only, never
+`environment` defaults to `production` when unset, so a deployment that forgets it keeps
+its rate limits and production checks; a local stack or test suite sets `local` or `test`
+explicitly. It drives two properties. `is_production` is true for production only, never
 staging. `rate_limiting_enabled` is false for the environments in
 `RATE_LIMIT_FREE_ENVIRONMENTS`, which are `staging` and `local`, and true everywhere else, by
 the `rate_limits_apply` convention. Staging sits behind the access gate and hosts the full e2e

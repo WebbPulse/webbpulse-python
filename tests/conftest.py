@@ -2,7 +2,9 @@
 
 Loads the package's own fixtures as a pytest plugin and holds every moto test to
 DynamoDB's primary key rule. The OS keyring is replaced by keyring's null backend, so no
-test can read or write a real credential store.
+test can read or write a real credential store. `IDENTITY_ENVIRONMENT` defaults to `local`
+for the suite, because an unset identity environment now reads as production; a test of
+that default removes it.
 """
 
 from __future__ import annotations
@@ -18,6 +20,7 @@ if TYPE_CHECKING:
 pytest_plugins = ["webbpulse.testing"]
 
 os.environ["PYTHON_KEYRING_BACKEND"] = "keyring.backends.null.Keyring"
+os.environ.setdefault("IDENTITY_ENVIRONMENT", "local")
 
 
 @pytest.fixture(autouse=True)

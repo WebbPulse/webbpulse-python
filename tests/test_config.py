@@ -34,14 +34,25 @@ class ServiceSettings(BaseServiceSettings):
     table_prefix: str = "webbpulse-test"
 
 
-def test_defaults_are_safe_for_local_use() -> None:
-    """Unconfigured settings default to the local, non-production values."""
+def test_defaults_fail_closed_to_production(monkeypatch: MonkeyPatch) -> None:
+    """An unset environment reads as production, so a forgotten variable keeps every check on."""
+    monkeypatch.delenv("ENVIRONMENT", raising=False)
     settings = ServiceSettings()
-    assert settings.environment == "local"
+    assert settings.environment == "production"
+    assert settings.is_production is True
+    assert settings.rate_limiting_enabled is True
     assert settings.log_level == "INFO"
     assert settings.app_secrets_arn == ""
     assert settings.cors_allow_origins == []
+
+
+def test_local_is_still_available_when_set(monkeypatch: MonkeyPatch) -> None:
+    """A local stack that names itself keeps the local, non-production behaviour."""
+    monkeypatch.setenv("ENVIRONMENT", "local")
+    settings = ServiceSettings()
+    assert settings.environment == "local"
     assert settings.is_production is False
+    assert settings.rate_limiting_enabled is False
 
 
 def test_environment_is_read_from_the_environment(monkeypatch: MonkeyPatch) -> None:
