@@ -488,7 +488,7 @@ def test_audit_csv_guards_formulas_and_maps_columns() -> None:
     rows = list(csv.reader(io.StringIO(audit_csv([event], catalogue=CATALOGUE, actor_names={"alice": "+Alice"}))))
     header, row = rows
     cells = dict(zip(header, row, strict=True))
-    assert cells["target_label"] == "'=HYPERLINK(\"http://x\")"
+    assert cells["target_label"] == '\'=HYPERLINK("http://x")'
     assert cells["actor_name"] == "'+Alice"
     assert cells["label"] == "Token created"
     assert cells["amr"] == "pwd otp mfa"
