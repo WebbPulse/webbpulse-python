@@ -514,7 +514,10 @@ from webbpulse.identity.verifier import (
     DEFAULT_COOLDOWN,
     DEFAULT_TIMEOUT,
     JwksVerifier,
+    cached_verifier,
+    clear_verifier_cache,
     discovery_jwks_uri,
+    verified_bearer_subject,
 )
 
 __all__ = [
@@ -855,10 +858,12 @@ __all__ = [
     "build_jwks",
     "build_oauth_server_router",
     "build_protected_resource_metadata",
+    "cached_verifier",
     "check_password",
     "claims_for_key",
     "claims_or_api_key",
     "claims_scopes",
+    "clear_verifier_cache",
     "coerce_claims",
     "constant_time_equals",
     "create_identity_tables",
@@ -929,6 +934,7 @@ __all__ = [
     "users_key_attribute",
     "users_repository",
     "validate_redirect_uri",
+    "verified_bearer_subject",
     "verify_api_key",
 ]
 

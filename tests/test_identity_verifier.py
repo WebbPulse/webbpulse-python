@@ -4,18 +4,23 @@ from __future__ import annotations
 
 import json
 import time
+from collections.abc import Iterator
 from typing import Any
 
 import pytest
+from starlette.requests import Request
 
 from webbpulse.identity import (
     InvalidToken,
     JwksVerifier,
     KmsSigner,
     build_jwks,
+    cached_verifier,
+    clear_verifier_cache,
     discovery_jwks_uri,
     mint_test_token,
     public_jwk_from_kms,
+    verified_bearer_subject,
 )
 from webbpulse.testing import FakeKms
 
@@ -219,3 +224,105 @@ def test_discovery_refuses_a_foreign_jwks_uri(monkeypatch: pytest.MonkeyPatch) -
     monkeypatch.setattr("urllib.request.urlopen", lambda *a, **k: Response())
     with pytest.raises(InvalidToken):
         discovery_jwks_uri(ISSUER)
+
+
+def _bearer_request(authorization: str | None) -> Request:
+    """A bare request carrying `authorization`, or no Authorization header at all."""
+    headers = [] if authorization is None else [(b"authorization", authorization.encode())]
+    return Request({"type": "http", "method": "GET", "path": "/", "headers": headers})
+
+
+@pytest.fixture
+def fresh_cache() -> Iterator[None]:
+    """Start and end each cache test with no verifiers built."""
+    clear_verifier_cache()
+    yield
+    clear_verifier_cache()
+
+
+@pytest.mark.usefixtures("fresh_cache")
+def test_cached_verifier_returns_one_instance_per_key() -> None:
+    """The same issuer, audience and URI share an instance, and its key set cache."""
+    first = cached_verifier(ISSUER, AUDIENCE)
+    assert first is not None
+    assert cached_verifier(f" {ISSUER}/ ", [AUDIENCE, " "]) is first
+    assert cached_verifier(ISSUER, [AUDIENCE, f"{ISSUER}/device"]) is not first
+    assert cached_verifier(ISSUER, AUDIENCE, jwks_uri=f"{ISSUER}/keys") is not first
+
+
+@pytest.mark.usefixtures("fresh_cache")
+def test_cached_verifier_honours_an_explicit_jwks_uri() -> None:
+    """A blank URI means the issuer default, and a set one is used as given."""
+    default = cached_verifier(ISSUER, AUDIENCE, jwks_uri="  ")
+    assert default is not None
+    assert default.jwks_uri == f"{ISSUER}/.well-known/jwks.json"
+    explicit = cached_verifier(ISSUER, AUDIENCE, jwks_uri=f"{ISSUER}/keys")
+    assert explicit is not None
+    assert explicit.jwks_uri == f"{ISSUER}/keys"
+
+
+@pytest.mark.usefixtures("fresh_cache")
+@pytest.mark.parametrize(("issuer", "audience"), [("", AUDIENCE), ("  ", AUDIENCE), (ISSUER, ""), (ISSUER, [" ", ""])])
+def test_cached_verifier_is_none_without_an_issuer_and_audience(issuer: str, audience: str | list[str]) -> None:
+    """A function without the identity environment gets no verifier rather than an error."""
+    assert cached_verifier(issuer, audience) is None
+
+
+@pytest.mark.usefixtures("fresh_cache")
+def test_clear_verifier_cache_drops_the_instances() -> None:
+    """After a clear the next call builds a new verifier."""
+    first = cached_verifier(ISSUER, AUDIENCE)
+    clear_verifier_cache()
+    assert cached_verifier(ISSUER, AUDIENCE) is not first
+
+
+def test_verified_bearer_subject_reads_a_verified_token(verifier: JwksVerifier, signer: KmsSigner) -> None:
+    """A valid Bearer token yields its `sub`, whatever the scheme's case."""
+    presented = token(signer)
+    assert verified_bearer_subject(_bearer_request(f"Bearer {presented}"), verifier) == (
+        "01234567-89ab-7def-8123-456789abcdef"
+    )
+    assert verified_bearer_subject(_bearer_request(f"bearer {presented}"), verifier) == (
+        "01234567-89ab-7def-8123-456789abcdef"
+    )
+
+
+def test_verified_bearer_subject_accepts_a_plain_callable() -> None:
+    """Any claims callable works, such as `TokenService.verify_access_token`."""
+    seen: list[str] = []
+
+    def verify(presented: str) -> dict[str, Any]:
+        seen.append(presented)
+        return {"sub": "user-1"}
+
+    assert verified_bearer_subject(_bearer_request("Bearer abc"), verify) == "user-1"
+    assert seen == ["abc"]
+
+
+def test_verified_bearer_subject_is_empty_for_a_bad_token(verifier: JwksVerifier, signer: KmsSigner) -> None:
+    """An expired, foreign or garbled token reads as anonymous rather than raising."""
+    expired = token(signer, now=int(time.time()) - 4000, expires_in=600)
+    assert verified_bearer_subject(_bearer_request(f"Bearer {expired}"), verifier) == ""
+    foreign = token(signer, audience="someone-elses-api")
+    assert verified_bearer_subject(_bearer_request(f"Bearer {foreign}"), verifier) == ""
+    assert verified_bearer_subject(_bearer_request("Bearer not-a-jwt"), verifier) == ""
+
+
+@pytest.mark.parametrize("authorization", [None, "", "Basic dXNlcjpwYXNz", "Bearer ", "Bearer   "])
+def test_verified_bearer_subject_is_empty_without_a_bearer(authorization: str | None) -> None:
+    """No credential means no verification call at all."""
+
+    def verify(presented: str) -> dict[str, Any]:
+        raise AssertionError("must not be called")
+
+    assert verified_bearer_subject(_bearer_request(authorization), verify) == ""
+
+
+def test_verified_bearer_subject_is_empty_without_a_verifier() -> None:
+    """A function that could not build a verifier treats every caller as anonymous."""
+    assert verified_bearer_subject(_bearer_request("Bearer abc"), None) == ""
+
+
+def test_verified_bearer_subject_ignores_a_non_string_subject() -> None:
+    """A `sub` that is not a string is no subject."""
+    assert verified_bearer_subject(_bearer_request("Bearer abc"), lambda _: {"sub": 42}) == ""

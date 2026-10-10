@@ -52,6 +52,7 @@ See [the configuration surface](identity-configuration.md) for the switch and
 | `LocalSigner` | An in-process RSA signer standing in for KMS on a local stack, refused in production |
 | `TABLES` | The ten identity tables as `TableSpec`, matching the Terraform identity module |
 | `JwksVerifier` | Verifying an access token against the issuer's published JWKS, with no KMS grant |
+| `cached_verifier` and `verified_bearer_subject` | One `JwksVerifier` per issuer and audience for the process, and the optional-auth `sub` of a verified Bearer token |
 | `authorizer_claims` | Reading and coercing what the authorizer put on the request |
 | `CredentialStore` and friends | Storage interfaces, with DynamoDB and in-memory implementations |
 

@@ -21,11 +21,16 @@ from fastapi.testclient import TestClient
 from starlette.requests import Request
 
 from webbpulse.http import (
+    DOMAIN_HEADER,
     DYNAMODB_RETRY_AFTER_SECONDS,
+    MANGUM_EVENT_SCOPE_KEY,
+    MONOLITH_DOMAIN,
     REQUEST_CONTEXT_HEADER,
     REQUEST_ID_HEADER,
     ROUTE_KEY_HEADER,
+    DomainHeaderMiddleware,
     ErrorSpec,
+    TrailingSlashMiddleware,
     bind_user_id,
     client_ip,
     create_app,
@@ -40,12 +45,18 @@ from webbpulse.http import (
 from webbpulse.logging import configure_logging
 
 
-def _request(headers: dict[str, str] | None = None, client: tuple[str, int] | None = None) -> Request:
-    """Build a bare Starlette request with the given headers and optional peer address."""
+def _request(
+    headers: dict[str, str] | None = None,
+    client: tuple[str, int] | None = None,
+    event: Any = None,
+) -> Request:
+    """Build a bare Starlette request with the given headers, peer address and Mangum event."""
     raw = [(k.lower().encode(), v.encode()) for k, v in (headers or {}).items()]
     scope: dict[str, Any] = {"type": "http", "method": "GET", "path": "/", "headers": raw}
     if client is not None:
         scope["client"] = client
+    if event is not None:
+        scope[MANGUM_EVENT_SCOPE_KEY] = event
     return Request(scope)
 
 
@@ -117,6 +128,143 @@ def test_client_ip_handles_a_context_without_a_usable_source_ip(context: dict[st
     """A context missing a usable source IP degrades to the peer address."""
     request = _request(_context_header(context), client=("127.0.0.1", 5000))
     assert client_ip(request) == "127.0.0.1"
+
+
+@pytest.mark.parametrize("section", ["http", "identity"])
+def test_client_ip_reads_a_context_nested_under_request_context(section: str) -> None:
+    """A header whose context sits under `requestContext` resolves like a flat one."""
+    request = _request(_context_header({"requestContext": {section: {"sourceIp": "192.0.2.5"}}}))
+    assert client_ip(request) == "192.0.2.5"
+
+
+def test_client_ip_prefers_the_flat_header_context_to_a_nested_one() -> None:
+    """The flat shape is what the Web Adapter sends, so it wins over a nested copy."""
+    request = _request(
+        _context_header({"http": {"sourceIp": "203.0.113.7"}, "requestContext": {"http": {"sourceIp": "192.0.2.5"}}})
+    )
+    assert client_ip(request) == "203.0.113.7"
+
+
+@pytest.mark.parametrize("section", ["http", "identity"])
+def test_client_ip_reads_the_mangum_event(section: str) -> None:
+    """Under Mangum the source IP is in the raw event's `requestContext`."""
+    request = _request(event={"requestContext": {section: {"sourceIp": "198.51.100.9"}}}, client=("127.0.0.1", 1))
+    assert client_ip(request) == "198.51.100.9"
+
+
+def test_client_ip_prefers_v2_in_the_mangum_event() -> None:
+    """The 2.0 shape wins in the event too."""
+    event = {"requestContext": {"http": {"sourceIp": "203.0.113.7"}, "identity": {"sourceIp": "198.51.100.9"}}}
+    assert client_ip(_request(event=event)) == "203.0.113.7"
+
+
+def test_client_ip_prefers_the_header_to_the_mangum_event() -> None:
+    """The adapter header is read before the event, flat or nested."""
+    event = {"requestContext": {"http": {"sourceIp": "198.51.100.9"}}}
+    flat = _request(_context_header({"http": {"sourceIp": "203.0.113.7"}}), event=event)
+    assert client_ip(flat) == "203.0.113.7"
+    nested = _request(_context_header({"requestContext": {"identity": {"sourceIp": "192.0.2.5"}}}), event=event)
+    assert client_ip(nested) == "192.0.2.5"
+
+
+def test_client_ip_falls_through_a_header_without_a_source_ip_to_the_event() -> None:
+    """A header context with no usable IP does not stop the event being read."""
+    request = _request(
+        {**_context_header({"http": {"sourceIp": ""}}), "X-Forwarded-For": "10.0.0.1"},
+        event={"requestContext": {"http": {"sourceIp": "198.51.100.9"}}},
+    )
+    assert client_ip(request) == "198.51.100.9"
+
+
+def test_client_ip_reads_the_event_past_a_malformed_header() -> None:
+    """A header that is not JSON is skipped, not fatal."""
+    event = {"requestContext": {"http": {"sourceIp": "1.2.3.4"}}}
+    request = _request({REQUEST_CONTEXT_HEADER: "{not json"}, event=event)
+    assert client_ip(request) == "1.2.3.4"
+
+
+@pytest.mark.parametrize(
+    "event",
+    [{}, {"requestContext": None}, {"requestContext": "nope"}, {"requestContext": {"http": {}}}, "not-a-mapping"],
+)
+def test_client_ip_handles_an_event_without_a_usable_source_ip(event: Any) -> None:
+    """An event missing a usable source IP degrades to the peer, or `unknown`."""
+    assert client_ip(_request(event=event, client=("127.0.0.1", 5000))) == "127.0.0.1"
+    assert client_ip(_request(event=event, client=("127.0.0.1", 5000)), local_fallback=False) == "unknown"
+
+
+def _routed_app(domain: str = "posts") -> Any:
+    """A FastAPI app with one slashless and one slashed route, wrapped in both host middlewares."""
+    app = FastAPI()
+
+    @app.get("/items")
+    def items() -> dict[str, str]:
+        return {"route": "items"}
+
+    @app.post("/folders/")
+    def folders() -> dict[str, str]:
+        return {"route": "folders"}
+
+    @app.get("/")
+    def root() -> dict[str, str]:
+        return {"route": "root"}
+
+    app.add_middleware(TrailingSlashMiddleware, router=app.router)
+    app.add_middleware(DomainHeaderMiddleware, domain=domain)
+    return app
+
+
+def test_trailing_slash_middleware_serves_either_spelling() -> None:
+    """A stray slash, or a missing one, reaches the declared route with no redirect."""
+    client = TestClient(_routed_app())
+    added = client.get("/items/", follow_redirects=False)
+    assert added.status_code == 200
+    assert added.json() == {"route": "items"}
+    dropped = client.post("/folders", follow_redirects=False)
+    assert dropped.status_code == 200
+    assert dropped.json() == {"route": "folders"}
+
+
+def test_trailing_slash_middleware_leaves_matches_and_misses_alone() -> None:
+    """An exact match is untouched, the root is never rewritten, and an unknown path is a 404."""
+    client = TestClient(_routed_app())
+    assert client.get("/items").json() == {"route": "items"}
+    assert client.get("/").json() == {"route": "root"}
+    assert client.get("/missing/", follow_redirects=False).status_code == 404
+
+
+def test_domain_header_middleware_stamps_every_response() -> None:
+    """Successes and routing errors alike name the application that answered."""
+    client = TestClient(_routed_app("billing"))
+    assert client.get("/items").headers[DOMAIN_HEADER] == "billing"
+    assert client.get("/missing").headers[DOMAIN_HEADER] == "billing"
+
+
+def test_domain_header_middleware_takes_another_header_name() -> None:
+    """`header` renames the stamp, and the monolith constant reads as such."""
+    app = FastAPI()
+
+    @app.get("/")
+    def root() -> dict[str, str]:
+        return {}
+
+    app.add_middleware(DomainHeaderMiddleware, domain=MONOLITH_DOMAIN, header="X-Served-By")
+    response = TestClient(app).get("/")
+    assert response.headers["x-served-by"] == "monolith"
+    assert DOMAIN_HEADER not in response.headers
+
+
+def test_host_middlewares_pass_non_http_scopes_through() -> None:
+    """A lifespan scope reaches the wrapped app untouched."""
+    seen: list[str] = []
+
+    async def inner(scope: Any, receive: Any, send: Any) -> None:
+        seen.append(scope["type"])
+
+    router = APIRouter()
+    stack = DomainHeaderMiddleware(TrailingSlashMiddleware(inner, router=router), domain="posts")
+    asyncio.run(stack({"type": "lifespan"}, None, None))
+    assert seen == ["lifespan"]
 
 
 def test_health_route_is_always_two_hundred() -> None:

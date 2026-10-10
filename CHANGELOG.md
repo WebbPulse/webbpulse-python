@@ -7,6 +7,29 @@ This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## Unreleased
 
+## 0.81.0
+
+### Added
+
+- `webbpulse.http.client_ip` also reads a request context nested under `requestContext` in
+  the `x-amzn-request-context` header, and the `requestContext` of the `aws.event` scope key
+  Mangum sets, each with HTTP API v2 `http.sourceIp` before REST v1 `identity.sourceIp`
+  (PLAT-36). Order: the flat header context, the nested header context, the Mangum event,
+  then the peer address or `"unknown"`. Callers that only send the flat header see no
+  change. `MANGUM_EVENT_SCOPE_KEY` names the scope key.
+- `webbpulse.identity.cached_verifier(issuer, audience, *, jwks_uri=None)`: one process-wide
+  `JwksVerifier` per issuer, audience set and JWKS URI, or None when the issuer or every
+  audience is blank. `clear_verifier_cache()` drops them for tests.
+- `webbpulse.identity.verified_bearer_subject(request, verifier)`: the `sub` of the
+  request's Bearer token verified in process, or `""` for no header, no verifier or a token
+  that does not verify. `verifier` is a `JwksVerifier` or any claims callable, such as
+  `TokenService.verify_access_token`.
+- `webbpulse.http.TrailingSlashMiddleware(app, router)` serves a path whose trailing slash
+  no route declares by rewriting it to the spelling that matches, with no redirect, and
+  `webbpulse.http.DomainHeaderMiddleware(app, domain, *, header=DOMAIN_HEADER)` stamps every
+  response with the application that answered. `DOMAIN_HEADER` (`x-webbpulse-domain`) and
+  `MONOLITH_DOMAIN` (`monolith`) come with them.
+
 ## 0.80.0
 
 ### Added
