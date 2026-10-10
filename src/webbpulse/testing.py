@@ -662,7 +662,7 @@ def assert_audit_log_contract(store: Any, *, tenant_id: str = "contract-tenant")
         iter_events,
     )
     from webbpulse.dynamodb import InvalidStartKey
-    from webbpulse.identity.api_keys import display_prefix, new_api_key
+    from webbpulse.identity.api_keys import display_prefix, new_key
 
     other_tenant = f"{tenant_id}-other"
     start = datetime(2026, 1, 1, tzinfo=UTC)
@@ -771,7 +771,7 @@ def assert_audit_log_contract(store: Any, *, tenant_id: str = "contract-tenant")
     assert store.list_events(tenant_id).events == [], "A purged tenant must list empty."
     assert store.purge_tenant(tenant_id) == 0, "A second purge has nothing to do."
 
-    key = new_api_key()
+    key = new_key()
     labelled = AuditTarget(label="Deleted key")
     recorder = AuditRecorder(
         store,

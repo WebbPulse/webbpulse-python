@@ -40,7 +40,7 @@ from webbpulse.audit import (
     time_floor,
 )
 from webbpulse.dynamodb import InvalidStartKey, Repository, encode_start_key, new_ulid
-from webbpulse.identity.api_keys import PREFIX_DISPLAY_LENGTH, display_prefix, new_api_key
+from webbpulse.identity.api_keys import PREFIX_DISPLAY_LENGTH, display_prefix, new_key
 from webbpulse.testing import assert_audit_log_contract
 
 PREFIX = "wp-local"
@@ -305,7 +305,7 @@ def test_ordinary_values_survive_scrubbing() -> None:
 
 def test_an_api_key_display_prefix_survives_and_a_full_key_does_not() -> None:
     """The clear-text display prefix is not a credential; one character past it is treated as one."""
-    key = new_api_key()
+    key = new_key()
     prefix = display_prefix(key)
     event = _event(payload={"prefix": prefix, "key": key, "longer": key[: PREFIX_DISPLAY_LENGTH + 1]})
     assert event.payload == {"prefix": prefix, "key": REDACTED, "longer": REDACTED}
