@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 from collections.abc import Callable
+from dataclasses import replace
+from typing import Any, cast
 
 import pytest
 
@@ -204,6 +206,78 @@ def test_a_theme_replaces_every_palette_colour_font_and_radius() -> None:
     assert "-apple-system" not in html
 
 
+DARK_FIRST = EmailBrand(
+    product_name="Acme",
+    logo_url="https://cdn.example.com/logo.png",
+    accent_color="#b8451a",
+    dark_accent_color="#f2703a",
+    home_url="https://acme.example.com",
+    footer_links=(EmailLink("Help", "https://acme.example.com/help"),),
+    theme=replace(APP_THEME, scheme="dark"),
+)
+
+
+def test_a_dark_first_theme_draws_the_dark_palette_inline() -> None:
+    """Body, wrapper, card, text, button and links carry the dark tokens inline, and no light colour is left."""
+    html, text = _render(DARK_FIRST)
+
+    page, card = APP_DARK.page, APP_DARK.card
+    assert f'<body class="wp-bg" bgcolor="{page}" style="margin:0;padding:0;background-color:{page};">' in html
+    assert f'class="wp-bg" bgcolor="{page}" style="background-color:{page};"' in html
+    assert f'bgcolor="{card}" style="background-color:{card};border:1px solid {APP_DARK.line};' in html
+    assert f"color:{APP_DARK.text};" in html
+    assert f"color:{APP_DARK.muted};" in html
+    assert 'bgcolor="#f2703a" style="border-radius:6px;background-color:#f2703a;"' in html
+    assert "color:#17120f;text-decoration:none" in html
+    assert f"color:{DARK_FIRST.dark_link_color};text-decoration:underline" in html
+    for light in (APP_LIGHT.page, APP_LIGHT.card, APP_LIGHT.line, APP_LIGHT.muted, "#b8451a"):
+        assert light not in html
+    assert "Open Acme:\nhttps://acme.example.com/open" in text
+
+
+def test_a_dark_first_theme_declares_dark_and_pins_it_against_inversion() -> None:
+    """The scheme is declared dark first, and the dark rules sit under the media query and both Outlook flags."""
+    html, _ = _render(DARK_FIRST)
+
+    assert '<meta name="color-scheme" content="dark light">' in html
+    assert '<meta name="supported-color-schemes" content="dark light">' in html
+    assert ":root{color-scheme:dark light;supported-color-schemes:dark light;}" in html
+    assert f".wp-bg{{background-color:{APP_DARK.page} !important;}}" in html
+    assert f"[data-ogsc] .wp-text{{color:{APP_DARK.text} !important;}}" in html
+    assert f"[data-ogsb] .wp-card{{background-color:{APP_DARK.card} !important;" in html
+    assert "prefers-color-scheme:light" not in html
+
+
+def _ratio(first: str, second: str) -> float:
+    """The WCAG contrast ratio of two `#rrggbb` colours, computed here so the test does not trust the module."""
+
+    def luminance(color: str) -> float:
+        """Relative luminance of one colour."""
+        channels = [int(color[index : index + 2], 16) / 255 for index in (1, 3, 5)]
+        red, green, blue = (c / 12.92 if c <= 0.03928 else ((c + 0.055) / 1.055) ** 2.4 for c in channels)
+        return 0.2126 * red + 0.7152 * green + 0.0722 * blue
+
+    lighter, darker = sorted((luminance(first), luminance(second)), reverse=True)
+    return (lighter + 0.05) / (darker + 0.05)
+
+
+def test_the_dark_first_button_and_links_reach_contrast_on_the_dark_card() -> None:
+    """Text on the button and links on the card read at 4.5:1 or more, for a pale and a deep workspace accent too."""
+    for brand in (DARK_FIRST, DARK_FIRST.with_accent("#1d4ed8"), DARK_FIRST.with_accent("#fde68a")):
+        assert _ratio(brand.dark_accent_foreground, brand.dark_accent) >= 4.5
+        assert _ratio(brand.dark_link_color, APP_DARK.card) >= 4.5
+
+
+def test_the_light_theme_stays_light_first() -> None:
+    """A theme that names no scheme keeps light inline and declares light first."""
+    brand = EmailBrand(product_name="Acme", accent_color="#b8451a", dark_accent_color="#f2703a", theme=APP_THEME)
+    html, _ = _render(brand)
+
+    assert APP_THEME.scheme == "light"
+    assert '<meta name="color-scheme" content="light dark">' in html
+    assert f'bgcolor="{APP_LIGHT.card}" style="background-color:{APP_LIGHT.card};' in html
+
+
 def test_a_new_accent_replaces_the_dark_accent_too() -> None:
     """A workspace accent shows in both schemes unless a dark one is given with it."""
     brand = EmailBrand(accent_color="#b8451a", dark_accent_color="#f2703a", theme=APP_THEME)
@@ -240,6 +314,7 @@ def _palette(base: EmailPalette, **changes: str) -> EmailPalette:
         lambda: EmailTheme(card_radius=99),
         lambda: EmailTheme(on_accent_dark="black"),
         lambda: EmailBrand(dark_accent_color="navy"),
+        lambda: EmailTheme(scheme=cast(Any, "sepia")),
     ],
 )
 def test_an_invalid_theme_value_raises(build: Callable[[], object]) -> None:

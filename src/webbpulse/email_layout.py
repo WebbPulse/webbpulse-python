@@ -9,8 +9,9 @@ passes plain strings and never markup.
 Email clients drop SVG, apply `<style>` unevenly and invert colours in dark mode on their
 own. The layout therefore keeps every colour inline, declares `color-scheme` for the
 clients that honour it, and carries a `prefers-color-scheme` block, plus Outlook's
-`data-ogsc` selectors, for the clients that read one. Stdlib only, so it can be imported
-without any extra.
+`data-ogsc` and `data-ogsb` selectors, for the clients that read one. A theme is light
+first by default; a dark-first theme draws its dark palette inline for a product whose
+app is dark by default. Stdlib only, so it can be imported without any extra.
 """
 
 from __future__ import annotations
@@ -19,7 +20,7 @@ import html
 import re
 from collections.abc import Sequence
 from dataclasses import dataclass, field, replace
-from typing import Final
+from typing import Final, Literal
 from urllib.parse import urlsplit
 
 __all__ = [
@@ -27,6 +28,7 @@ __all__ = [
     "DEFAULT_DARK",
     "DEFAULT_LIGHT",
     "DEFAULT_THEME",
+    "SCHEMES",
     "BulletList",
     "Button",
     "Code",
@@ -51,6 +53,9 @@ DEFAULT_ACCENT: Final = "#4b55c8"
 
 FONT_STACK: Final = "-apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif"
 MONO_STACK: Final = "ui-monospace, SFMono-Regular, Menlo, Consolas, monospace"
+
+SCHEMES: Final = ("light", "dark")
+"""The schemes a theme can draw inline: light first, or dark first."""
 
 _HEX = re.compile(r"^#(?:[0-9a-fA-F]{3}|[0-9a-fA-F]{6})$")
 _SAFE_SCHEMES: Final = frozenset({"http", "https", "mailto"})
@@ -178,10 +183,13 @@ DEFAULT_DARK: Final = EmailPalette(
 class EmailTheme:
     """A product's design tokens as the shell uses them, so its emails read like its app.
 
-    `light` is inline on every element; `dark` is applied by the clients that read
-    `prefers-color-scheme` or Outlook's `data-ogsc`. `on_accent_light` and `on_accent_dark`
-    are the two candidates for text on a filled accent, and the one with more contrast wins.
-    Radii are in pixels: the card, the button, and quotes and code.
+    With `scheme` "light", the default, `light` is inline on every element and `dark` is
+    applied by the clients that read `prefers-color-scheme` or Outlook's `data-ogsc`. With
+    "dark", for a product whose app is dark by default, `dark` and the dark accent are
+    inline, so the message is dark in every client and in either system mode, and the same
+    rules pin it against a client's own inversion; `light` is then unused. `on_accent_light`
+    and `on_accent_dark` are the two candidates for text on a filled accent, and the one
+    with more contrast wins. Radii are in pixels: the card, the button, and quotes and code.
     """
 
     light: EmailPalette = DEFAULT_LIGHT
@@ -193,9 +201,12 @@ class EmailTheme:
     card_radius: int = 12
     button_radius: int = 8
     inline_radius: int = 4
+    scheme: Literal["light", "dark"] = "light"
 
     def __post_init__(self) -> None:
-        """Normalise the on-accent colours and refuse a font stack that could break out of a style."""
+        """Normalise the on-accent colours, refuse a font stack that could break out of a style, check the scheme."""
+        if self.scheme not in SCHEMES:
+            raise ValueError(f"EmailTheme.scheme must be one of {', '.join(SCHEMES)}, not {self.scheme!r}.")
         for name in ("on_accent_light", "on_accent_dark"):
             object.__setattr__(self, name, _hex_or_raise("EmailTheme", name, getattr(self, name)))
         for name in ("font_stack", "mono_stack"):
@@ -397,6 +408,23 @@ class EmailBrand:
 
 
 @dataclass(frozen=True, slots=True)
+class _Ink:
+    """The colours the inline styles carry: the base palette, the accent, text on it and links."""
+
+    palette: EmailPalette
+    accent: str
+    on_accent: str
+    link: str
+
+
+def _ink(brand: EmailBrand) -> _Ink:
+    """The inline colours for the theme's scheme, so a client that drops `<style>` still shows it."""
+    if brand.theme.scheme == "dark":
+        return _Ink(brand.theme.dark, brand.dark_accent, brand.dark_accent_foreground, brand.dark_link_color)
+    return _Ink(brand.theme.light, brand.accent, brand.accent_foreground, brand.link_color)
+
+
+@dataclass(frozen=True, slots=True)
 class RenderedEmail:
     """Both parts of one message, rendered from the same blocks."""
 
@@ -443,7 +471,7 @@ def _inline_html(brand: EmailBrand, parts: Sequence[Inline]) -> str:
         if isinstance(part, EmailLink):
             out.append(
                 f'<a class="wp-link" href="{_e(part.url)}" target="_blank" '
-                f'style="color:{brand.link_color};text-decoration:underline;">{_e(part.label)}</a>'
+                f'style="color:{_ink(brand).link};text-decoration:underline;">{_e(part.label)}</a>'
             )
         elif isinstance(part, Strong):
             out.append(f'<strong style="font-weight:600;">{_e(part.text)}</strong>')
@@ -455,50 +483,51 @@ def _inline_html(brand: EmailBrand, parts: Sequence[Inline]) -> str:
 def _block_html(brand: EmailBrand, block: EmailBlock) -> str:
     """One block as table-safe HTML with inline styles."""
     theme = brand.theme
-    light = theme.light
+    ink = _ink(brand)
+    base = ink.palette
     if isinstance(block, Heading):
-        style = _text_style(brand, 20, 28, light.text, weight=600)
+        style = _text_style(brand, 20, 28, base.text, weight=600)
         return f'<h1 class="wp-text" style="{style}">{_e(block.text)}</h1>\n'
     if isinstance(block, Paragraph):
         if block.muted:
-            style = _text_style(brand, 13, 20, light.muted)
+            style = _text_style(brand, 13, 20, base.muted)
             return f'<p class="wp-muted" style="{style}">{_inline_html(brand, block.parts)}</p>\n'
-        style = _text_style(brand, 15, 24, light.text)
+        style = _text_style(brand, 15, 24, base.text)
         return f'<p class="wp-text" style="{style}">{_inline_html(brand, block.parts)}</p>\n'
     if isinstance(block, Button):
         url = _e(block.url)
         radius = theme.button_radius
         markup = (
             '<table role="presentation" cellpadding="0" cellspacing="0" border="0" style="margin:8px 0 24px;">'
-            f'<tr><td class="wp-button" align="center" bgcolor="{brand.accent}" '
-            f'style="border-radius:{radius}px;background-color:{brand.accent};">'
+            f'<tr><td class="wp-button" align="center" bgcolor="{ink.accent}" '
+            f'style="border-radius:{radius}px;background-color:{ink.accent};">'
             f'<a class="wp-button-text" href="{url}" target="_blank" style="display:inline-block;padding:12px 22px;'
             f"font-family:{theme.font_stack};font-size:15px;line-height:20px;font-weight:600;"
-            f'color:{brand.accent_foreground};text-decoration:none;border-radius:{radius}px;">{_e(block.label)}</a>'
+            f'color:{ink.on_accent};text-decoration:none;border-radius:{radius}px;">{_e(block.label)}</a>'
             "</td></tr></table>\n"
         )
         if block.show_url:
-            style = _text_style(brand, 13, 20, light.muted, margin="-12px 0 24px")
+            style = _text_style(brand, 13, 20, base.muted, margin="-12px 0 24px")
             markup += (
                 f'<p class="wp-muted" style="{style}word-break:break-all;">Or open this link: '
                 f'<a class="wp-link" href="{url}" target="_blank" '
-                f'style="color:{brand.link_color};text-decoration:underline;">{url}</a></p>\n'
+                f'style="color:{ink.link};text-decoration:underline;">{url}</a></p>\n'
             )
         return markup
     if isinstance(block, Quote):
         return (
             '<table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0" '
             'style="margin:0 0 16px;"><tr>'
-            f'<td class="wp-quote wp-rule" style="border-left:3px solid {brand.accent};background-color:{light.quote};'
+            f'<td class="wp-quote wp-rule" style="border-left:3px solid {ink.accent};background-color:{base.quote};'
             f"padding:12px 16px;border-radius:{theme.inline_radius}px;font-family:{theme.font_stack};"
-            f'font-size:14px;line-height:22px;color:{light.quote_text};">{_e(block.text)}</td></tr></table>\n'
+            f'font-size:14px;line-height:22px;color:{base.quote_text};">{_e(block.text)}</td></tr></table>\n'
         )
     if isinstance(block, Code):
         return (
             '<table role="presentation" cellpadding="0" cellspacing="0" border="0" style="margin:0 0 16px;"><tr>'
-            f'<td class="wp-quote" style="background-color:{light.quote};padding:14px 20px;'
+            f'<td class="wp-quote" style="background-color:{base.quote};padding:14px 20px;'
             f"border-radius:{theme.button_radius}px;font-family:{theme.mono_stack};font-size:28px;line-height:34px;"
-            f'font-weight:600;letter-spacing:6px;color:{light.text};">{_e(block.text)}</td></tr></table>\n'
+            f'font-weight:600;letter-spacing:6px;color:{base.text};">{_e(block.text)}</td></tr></table>\n'
         )
     items: list[str] = []
     for item in block.items:
@@ -506,17 +535,26 @@ def _block_html(brand: EmailBrand, block: EmailBlock) -> str:
         if item.detail:
             detail = (
                 f'<div class="wp-quote wp-rule" style="margin:6px 0 0;padding:8px 12px;'
-                f"border-left:3px solid {brand.accent};background-color:{light.quote};"
+                f"border-left:3px solid {ink.accent};background-color:{base.quote};"
                 f"border-radius:{theme.inline_radius}px;font-size:14px;line-height:20px;"
-                f'color:{light.quote_text};">{_e(item.detail)}</div>'
+                f'color:{base.quote_text};">{_e(item.detail)}</div>'
             )
-        style = _text_style(brand, 15, 22, light.text, margin="0 0 8px")
+        style = _text_style(brand, 15, 22, base.text, margin="0 0 8px")
         items.append(f'<li class="wp-text" style="{style}">{_e(item.text)}{detail}</li>')
     return f'<ul style="margin:0 0 16px;padding:0 0 0 20px;">{"".join(items)}</ul>\n'
 
 
+def _color_schemes(brand: EmailBrand) -> str:
+    """The `color-scheme` value, naming the scheme drawn inline first."""
+    return "dark light" if brand.theme.scheme == "dark" else "light dark"
+
+
 def _style_block(brand: EmailBrand) -> str:
-    """The head styles: dark mode for the clients that honour it, and a narrow-screen padding."""
+    """The head styles: dark mode for the clients that honour it, and a narrow-screen padding.
+
+    The dark rules are also what a dark-first theme draws inline, so there they only pin the
+    message against a client that would otherwise remap its colours.
+    """
     dark = brand.theme.dark
     rules = [
         f".wp-bg{{background-color:{dark.page} !important;}}",
@@ -529,10 +567,11 @@ def _style_block(brand: EmailBrand) -> str:
         f".wp-button{{background-color:{brand.dark_accent} !important;}}",
         f".wp-button-text{{color:{brand.dark_accent_foreground} !important;}}",
     ]
-    outlook = "\n".join(f"[data-ogsc] {rule}" for rule in rules)
+    outlook = "\n".join(f"[data-{flag}] {rule}" for flag in ("ogsc", "ogsb") for rule in rules)
+    schemes = _color_schemes(brand)
     return (
         "<style>\n"
-        ":root{color-scheme:light dark;supported-color-schemes:light dark;}\n"
+        f":root{{color-scheme:{schemes};supported-color-schemes:{schemes};}}\n"
         "body{margin:0;padding:0;}\n"
         "@media (max-width:620px){.wp-container{width:100% !important;}.wp-pad{padding:24px 20px !important;}}\n"
         f"@media (prefers-color-scheme:dark){{{''.join(rules)}}}\n"
@@ -560,9 +599,9 @@ def _header_html(brand: EmailBrand) -> str:
         if brand.home_url:
             name = (
                 f'<a class="wp-text" href="{_e(brand.home_url)}" target="_blank" '
-                f'style="color:{brand.theme.light.text};text-decoration:none;">{name}</a>'
+                f'style="color:{_ink(brand).palette.text};text-decoration:none;">{name}</a>'
             )
-        style = _text_style(brand, 17, 24, brand.theme.light.text, weight=600, margin="0")
+        style = _text_style(brand, 17, 24, _ink(brand).palette.text, weight=600, margin="0")
         cells.append(f'<td class="wp-text" style="vertical-align:middle;{style}">{name}</td>')
     return (
         '<tr><td style="padding:0 4px 20px;">'
@@ -573,14 +612,15 @@ def _header_html(brand: EmailBrand) -> str:
 
 def _footer_html(brand: EmailBrand, note: Paragraph | None, links: Sequence[EmailLink]) -> str:
     """The footer: why the reader got this, the links, and the product and legal line."""
-    muted = _text_style(brand, 12, 18, brand.theme.light.muted, margin="0 0 8px")
+    ink = _ink(brand)
+    muted = _text_style(brand, 12, 18, ink.palette.muted, margin="0 0 8px")
     rows: list[str] = []
     if note is not None:
         rows.append(f'<p class="wp-muted" style="{muted}">{_inline_html(brand, note.parts)}</p>')
     if links:
         joined = " &nbsp;&middot;&nbsp; ".join(
             f'<a class="wp-link" href="{_e(link.url)}" target="_blank" '
-            f'style="color:{brand.link_color};text-decoration:underline;">{_e(link.label)}</a>'
+            f'style="color:{ink.link};text-decoration:underline;">{_e(link.label)}</a>'
             for link in links
         )
         rows.append(f'<p class="wp-muted" style="{muted}">{joined}</p>')
@@ -610,8 +650,9 @@ def _render_html(
             f"{'&#847;&zwnj;&nbsp;' * 30}</div>\n"
         )
     body = "".join(_block_html(brand, block) for block in blocks)
-    light = brand.theme.light
-    page = light.page
+    base = _ink(brand).palette
+    page = base.page
+    schemes = _color_schemes(brand)
     return (
         "<!doctype html>\n"
         '<html lang="en" xmlns="http://www.w3.org/1999/xhtml">\n'
@@ -619,12 +660,12 @@ def _render_html(
         '<meta charset="utf-8">\n'
         '<meta name="viewport" content="width=device-width, initial-scale=1">\n'
         '<meta name="x-apple-disable-message-reformatting">\n'
-        '<meta name="color-scheme" content="light dark">\n'
-        '<meta name="supported-color-schemes" content="light dark">\n'
+        f'<meta name="color-scheme" content="{schemes}">\n'
+        f'<meta name="supported-color-schemes" content="{schemes}">\n'
         f"<title>{_e(subject)}</title>\n"
         f"{_style_block(brand)}\n"
         "</head>\n"
-        f'<body class="wp-bg" style="margin:0;padding:0;background-color:{page};">\n'
+        f'<body class="wp-bg" bgcolor="{page}" style="margin:0;padding:0;background-color:{page};">\n'
         f"{hidden}"
         f'<table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0" class="wp-bg" '
         f'bgcolor="{page}" style="background-color:{page};">\n'
@@ -632,8 +673,8 @@ def _render_html(
         '<table role="presentation" class="wp-container" width="560" cellpadding="0" cellspacing="0" border="0" '
         'style="width:560px;max-width:560px;">\n'
         f"{_header_html(brand)}"
-        f'<tr><td class="wp-card wp-pad" bgcolor="{light.card}" style="background-color:{light.card};'
-        f'border:1px solid {light.line};border-radius:{brand.theme.card_radius}px;padding:32px;">\n'
+        f'<tr><td class="wp-card wp-pad" bgcolor="{base.card}" style="background-color:{base.card};'
+        f'border:1px solid {base.line};border-radius:{brand.theme.card_radius}px;padding:32px;">\n'
         f"{body}"
         "</td></tr>\n"
         f"{_footer_html(brand, note, links)}"
