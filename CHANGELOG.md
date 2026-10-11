@@ -7,6 +7,20 @@ This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## Unreleased
 
+## 0.91.0
+
+### Added
+
+- `EmailTheme.scheme` (STUP-211). `"dark"` makes a theme dark first: the dark palette and dark
+  accent are inline, `color-scheme` is declared `dark light`, and the dark rules pin the
+  message against client inversion, for a product whose app is dark by default. The default
+  `"light"` renders as before.
+
+### Changed
+
+- The email shell repeats its dark rules under Outlook's `[data-ogsb]` as well as
+  `[data-ogsc]`, and the body carries the page colour as `bgcolor`.
+
 ## 0.90.0
 
 ### Changed

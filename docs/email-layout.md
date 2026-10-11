@@ -49,8 +49,12 @@ theme = EmailTheme(
 brand = EmailBrand(accent_color="#b8451a", dark_accent_color="#f2703a", theme=theme)
 ```
 
-- `light` is inline on every element. `dark` is applied by clients that read
-  `prefers-color-scheme` or Outlook's `data-ogsc`.
+- `scheme="light"`, the default: `light` is inline on every element, and `dark` is applied by
+  clients that read `prefers-color-scheme` or Outlook's `data-ogsc` and `data-ogsb`.
+- `scheme="dark"`, for a product whose app is dark by default: `dark` and the dark accent are
+  inline, `color-scheme` is declared `dark light`, and the same dark rules pin the message
+  against a client's own inversion. The message is dark in every client and either system
+  mode, and `light` is unused.
 - `dark_accent_color` repaints the button, its text and the quote rule in dark mode. Empty uses
   the accent. `with_accent(color, dark=None)` replaces both, so a workspace colour shows in each
   scheme.
@@ -73,9 +77,10 @@ brand = EmailBrand(accent_color="#b8451a", dark_accent_color="#f2703a", theme=th
 
 - The logo must be a PNG or JPEG at an absolute URL. Gmail and Outlook drop SVG.
 - Layout is nested `role="presentation"` tables, 560px wide, with every colour inline, so a
-  client that strips `<style>` still renders the light design.
+  client that strips `<style>` still renders the theme's own scheme. The body and the wrapper
+  table both carry the page colour as `bgcolor` and inline style.
 - Dark mode: `color-scheme` meta tags, a `prefers-color-scheme: dark` block for Apple Mail and
-  others, and the same rules under `[data-ogsc]` for Outlook. Gmail applies its own
+  others, and the same rules under `[data-ogsc]` and `[data-ogsb]` for Outlook. Gmail applies its own
   inversion, which the inline colours survive.
 
 ## Identity emails
