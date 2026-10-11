@@ -41,7 +41,7 @@ permanently.
 | `email_verification_ttl` | 24 hours | |
 | `password_reset_ttl` | 1 hour | |
 | `clock_skew_leeway` | 30 seconds | Tolerance on local `exp` and `nbf` checks |
-| `cookie_name` | `"wp_refresh"` | |
+| `cookie_name` | `""` | Empty derives from `environment`: `wp_refresh` in production, local and test, `wp_refresh_<environment>` elsewhere |
 | `cookie_domain` | `""` | Registrable domain; empty is host-only |
 | `cookie_path` | `""` | Empty derives from the issuer's path |
 | `cookie_samesite` | `"lax"` | `lax`, `strict` or `none` |
