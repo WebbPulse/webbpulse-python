@@ -7,6 +7,18 @@ This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## Unreleased
 
+## 0.90.0
+
+### Changed
+
+- The refresh cookie name now defaults per environment (STUP-210): `wp_refresh` in
+  production, local and test, and `wp_refresh_<environment>` anywhere else, such as
+  `wp_refresh_staging`. A production cookie on the registrable domain also reaches a staging
+  API at `api.staging.<domain>`; under one shared name only one cookie survives parsing, so a
+  staging browser session dropped to sign-in whenever a production tab rotated its token. An
+  explicit `IDENTITY_COOKIE_NAME` still wins. Staging sessions sign in once more after the
+  upgrade, since the old cookie name is no longer read.
+
 ## 0.89.0
 
 ### Added

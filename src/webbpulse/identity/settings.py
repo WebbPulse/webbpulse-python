@@ -18,6 +18,7 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 from webbpulse.email_layout import EmailTheme
 
 __all__ = [
+    "DEFAULT_COOKIE_NAME",
     "MAX_ACCESS_TOKEN_TTL",
     "MAX_AUTHORIZATION_CODE_TTL",
     "MAX_DEVICE_CODE_TTL",
@@ -62,6 +63,10 @@ UNSET_ENVIRONMENT: Final = "production"
 _PLAINTEXT_ISSUER_ENVIRONMENTS: Final[frozenset[str]] = frozenset({"local", "test"})
 
 _LOCAL_SIGNER_REFUSED_ENVIRONMENTS: Final[frozenset[str]] = frozenset({"production", "prod"})
+
+DEFAULT_COOKIE_NAME: Final = "wp_refresh"
+
+_UNSUFFIXED_COOKIE_ENVIRONMENTS: Final[frozenset[str]] = frozenset({"production", "prod", "local", "test"})
 
 _DEFAULT_MCP_SCOPES: Final[list[str]] = ["mcp:read", "mcp:write"]
 
@@ -204,7 +209,15 @@ class IdentitySettings(BaseSettings):
         description="Tolerance when verifying `exp` and `nbf` locally, for clock skew.",
     )
 
-    cookie_name: str = Field(default="wp_refresh")
+    cookie_name: str = Field(
+        default="",
+        description=(
+            "The refresh cookie's name. Empty derives it from `environment`: "
+            "`wp_refresh` in production, local and test, and `wp_refresh_<environment>` "
+            "anywhere else, so a staging host under the production domain never receives "
+            "a production cookie under its own name."
+        ),
+    )
     cookie_domain: str = Field(
         default="",
         description=(
@@ -758,6 +771,24 @@ class IdentitySettings(BaseSettings):
                 "same `kid` twice in the JWKS, which some verifiers reject."
             )
         return cleaned
+
+    @model_validator(mode="after")
+    def _default_cookie_name_to_environment(self) -> IdentitySettings:
+        """Derive `cookie_name` from `environment` when it was not set explicitly.
+
+        A production refresh cookie is scoped to the registrable domain, so the browser also
+        sends it to a staging API at `api.staging.<domain>`. Two cookies under one name reach
+        that API and only one survives parsing, which signs the staging session out whenever
+        the production tab rotates its token. A distinct name per environment keeps them apart.
+        """
+        if not self.cookie_name.strip():
+            environment = self.environment.strip().lower()
+            if environment in _UNSUFFIXED_COOKIE_ENVIRONMENTS:
+                self.cookie_name = DEFAULT_COOKIE_NAME
+            else:
+                suffix = re.sub(r"[^a-z0-9_-]", "_", environment)
+                self.cookie_name = f"{DEFAULT_COOKIE_NAME}_{suffix}"
+        return self
 
     @model_validator(mode="after")
     def _default_cookie_path_to_issuer_path(self) -> IdentitySettings:

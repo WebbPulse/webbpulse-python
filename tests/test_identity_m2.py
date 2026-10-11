@@ -1369,6 +1369,54 @@ def test_an_explicit_cookie_path_overrides_the_issuer() -> None:
     assert settings.cookie_path == "/"
 
 
+@pytest.mark.parametrize("environment", ["production", "prod", "local", "test", "", "  Production "])
+def test_the_cookie_name_is_unsuffixed_in_production_local_and_test(environment: str) -> None:
+    """Production, local and test, and a blank environment read as production, keep `wp_refresh`."""
+    assert make_settings(environment=environment).cookie_name == "wp_refresh"
+
+
+@pytest.mark.parametrize(
+    ("environment", "expected"),
+    [("staging", "wp_refresh_staging"), ("Dev", "wp_refresh_dev"), ("qa.eu", "wp_refresh_qa_eu")],
+)
+def test_other_environments_suffix_the_cookie_name(environment: str, expected: str) -> None:
+    """Any other environment gets its own name, so a production cookie on the parent domain never collides."""
+    assert make_settings(environment=environment).cookie_name == expected
+
+
+def test_an_explicit_cookie_name_overrides_the_environment() -> None:
+    """An explicitly configured `cookie_name` is kept, whatever the environment is."""
+    assert make_settings(environment="staging", cookie_name="sid").cookie_name == "sid"
+
+
+def test_staging_ignores_a_production_cookie_on_the_shared_parent_domain(
+    kms: FakeKms, hooks: FakeHooks, stores: IdentityStores, attempts: InMemoryLoginAttemptStore
+) -> None:
+    """A staging refresh reads its own cookie, so a production cookie sent alongside it is ignored."""
+    from webbpulse.http import register_error_handlers
+
+    app = FastAPI()
+    register_error_handlers(app, error_codes=True)
+    app.include_router(
+        build_identity_router(
+            make_settings(environment="staging"),
+            hooks,
+            stores,
+            kms_client=kms,
+            attempts=attempts,
+            limiter_enabled=False,
+        )
+    )
+    seed_account(hooks, stores)
+    with TestClient(app, base_url="https://api.example.com") as staging:
+        staging.post("/api/auth/login", json={"email": EMAIL, "password": PASSWORD})
+        staging.cookies.set("wp_refresh", "a production token", path="/api/auth")
+        refreshed = staging.post("/api/auth/refresh")
+
+    assert refreshed.status_code == 200
+    assert "wp_refresh_staging=" in refreshed.headers["set-cookie"]
+
+
 def test_login_sets_an_httponly_secure_samesite_lax_cookie(
     client: TestClient, hooks: FakeHooks, stores: IdentityStores
 ) -> None:

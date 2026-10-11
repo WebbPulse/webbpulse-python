@@ -415,6 +415,10 @@ Set-Cookie: wp_refresh=<token>; Domain=<registrable domain>; Path=/api/auth;
             HttpOnly; Secure; SameSite=Lax; Max-Age=2592000
 ```
 
+- The name is `wp_refresh` in production and `wp_refresh_<environment>` anywhere else. A
+  production cookie scoped to `<domain>` also reaches `api.staging.<domain>`, and two cookies
+  under one name reach that API with only one surviving parsing, so a shared name signs the
+  staging session out whenever a production tab rotates its token.
 - `httponly` is **always `True`**: a control, not a setting.
 - `SameSite=Lax` is available only because of the shared parent domain; it withholds the cookie
   from cross-site subresource requests including `fetch`, the CSRF vector. `None` is required
