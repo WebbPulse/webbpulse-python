@@ -376,7 +376,7 @@ and deployment concerns and they stay in the post deploy run, which is the requi
 | `access_log` | Find an access log entry by request id: the window scan first, then a bounded wait. Skips on a local stack, which has no access log |
 | `route_probes` | Every live route probed once, up front, so the group waits out one delivery lag rather than one per route |
 | `suite_requests` | Every request this run made, gathered from the shared record the clients all append to, so a whole-run check sees everything without any case registering itself |
-| `access_log_health` | This run's own access log entries, correlated by request id from one forced window scan. Skips where `E2E_ACCESS_LOG_GROUP` is unset |
+| `access_log_health` | This run's own access log entries, correlated by request id from one forced window scan, rescanned within the lookup wait budget when that scan finds none of them yet. Skips where `E2E_ACCESS_LOG_GROUP` is unset |
 | `uncovered_routes` | The product's coverage allowlist, from `pytest_e2e_uncovered_routes`, with methods normalised to uppercase |
 | `expected_unavailable` | The routes this stage deliberately answers 503 on, from `pytest_e2e_expected_unavailable`, parsed into an error code and a reason |
 | `route_coverage` | What this run covered, left uncovered, allowlisted and what is stale, measured against the deployed operations |

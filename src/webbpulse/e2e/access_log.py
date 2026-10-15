@@ -20,7 +20,7 @@ from __future__ import annotations
 
 import json
 import time
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any
 
@@ -307,6 +307,47 @@ class AccessLogLookup:
             if remaining <= 0:
                 return None
             self._sleep(min(self._poll_seconds, remaining))
+
+    def correlate(self, request_ids: Iterable[str]) -> tuple[AccessLogEntry, ...]:
+        """The entries for `request_ids`, from one window scan and a bounded wait when it finds none.
+
+        The run-wide sweep's lookup. One forced scan serves every id that has already been
+        delivered. When that scan carries none of them, the run is younger than the delivery
+        lag: API Gateway takes about 45 seconds to deliver an access log line, and a short
+        suite reaches the sweep before its first line lands. The wait then rescans every poll
+        interval until any of the ids appears or `wait_seconds` runs out.
+
+        The settle rule `find` applies is not used here. It reads a miss after a later scan as
+        evidence the entry is not coming, which holds once the window carries the run's other
+        entries and does not hold while it carries none of them. A run whose entries never land
+        still comes back empty once the budget is spent, and the caller fails on that.
+
+        An id the scans did not cache gets the per-id filtered read, as before.
+        """
+        ids = [request_id for request_id in request_ids if request_id]
+        if not ids:
+            return ()
+        self.scan_window(force=True)
+        if not any(request_id in self._cache for request_id in ids):
+            self._await_any(ids)
+        entries = []
+        for request_id in ids:
+            entry = self._cache.get(request_id) or self.read_one(request_id)
+            if entry is not None:
+                entries.append(entry)
+        return tuple(entries)
+
+    def _await_any(self, request_ids: Sequence[str]) -> None:
+        """Rescan the window every poll interval until one of `request_ids` is cached or the budget ends."""
+        deadline = self._clock() + self._wait_seconds
+        while True:
+            remaining = deadline - self._clock()
+            if remaining <= 0:
+                return
+            self._sleep(min(self._poll_seconds, remaining))
+            self.scan_window(force=True)
+            if any(request_id in self._cache for request_id in request_ids):
+                return
 
     def _read(self, request_id: str, start_time_ms: int | None) -> AccessLogEntry | None:
         """One attempt at an id, always a real read rather than a throttled no-op.

@@ -619,3 +619,68 @@ class TestSettleIsPerLookup:
         entry = lookup.find("req-late")
         assert entry is not None
         assert entry.route_key == "GET /late"
+
+
+class DelayedLogs:
+    """A CloudWatch Logs stand-in whose events become visible only once a fake clock passes their delivery time."""
+
+    def __init__(self, clock: Clock, delivered_at: float | None, request_ids: list[str]) -> None:
+        """Deliver every one of `request_ids` at `delivered_at`, or never when it is None."""
+        self.clock = clock
+        self.delivered_at = delivered_at
+        self.request_ids = request_ids
+        self.calls: list[dict[str, Any]] = []
+
+    def filter_log_events(self, **kwargs: Any) -> dict[str, Any]:
+        """The events delivered by now, narrowed to the filter pattern when one is set."""
+        self.calls.append(kwargs)
+        if self.delivered_at is None or self.clock.now < self.delivered_at:
+            return {"events": []}
+        pattern = str(kwargs.get("filterPattern", "")).strip('"')
+        return {
+            "events": [
+                {"message": line(requestId=request_id), "timestamp": 1_000}
+                for request_id in self.request_ids
+                if not pattern or pattern == request_id
+            ]
+        }
+
+
+class TestCorrelateWaitsForDelivery:
+    """The run-wide sweep waits out delivery lag when its first scan correlates nothing."""
+
+    def lookup(self, client: DelayedLogs, clock: Clock) -> AccessLogLookup:
+        """A lookup on the default budget, driven by the fake clock."""
+        return AccessLogLookup(client, LOG_GROUP, sleeper=clock.sleep, clock=clock)
+
+    def test_a_run_whose_lines_land_at_45_seconds_is_correlated(self) -> None:
+        """Lines delivered 45 seconds after the sweep starts are found by a rescan."""
+        clock = Clock()
+        client = DelayedLogs(clock, 45.0, ["req-1", "req-2"])
+        entries = self.lookup(client, clock).correlate(["req-1", "", "req-2"])
+        assert [entry.request_id for entry in entries] == ["req-1", "req-2"]
+        assert 45.0 <= clock.now < 60.0
+
+    def test_a_run_whose_lines_never_land_comes_back_empty_within_the_budget(self) -> None:
+        """Nothing delivered inside the wait budget returns no entries after a bounded wait."""
+        clock = Clock()
+        client = DelayedLogs(clock, None, ["req-1"])
+        entries = self.lookup(client, clock).correlate(["req-1"])
+        assert entries == ()
+        assert clock.now == pytest.approx(120.0)
+
+    def test_lines_already_delivered_cost_no_wait(self) -> None:
+        """A first scan that correlates anything returns without sleeping."""
+        clock = Clock()
+        client = DelayedLogs(clock, 0.0, ["req-1"])
+        entries = self.lookup(client, clock).correlate(["req-1"])
+        assert [entry.request_id for entry in entries] == ["req-1"]
+        assert clock.now == 0.0
+        assert len(client.calls) == 1
+
+    def test_no_request_ids_reads_nothing(self) -> None:
+        """A run with no recorded ids makes no CloudWatch read and no wait."""
+        clock = Clock()
+        client = DelayedLogs(clock, 0.0, [])
+        assert self.lookup(client, clock).correlate(["", ""]) == ()
+        assert client.calls == []

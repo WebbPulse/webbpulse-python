@@ -956,7 +956,9 @@ def access_log_health(
 
     Scanned as one window rather than one lookup per request: the run's entries all land in
     the same delivery window, so a single forced scan costs one CloudWatch read for the
-    whole suite where per-id lookups would cost hundreds.
+    whole suite where per-id lookups would cost hundreds. When that scan carries none of
+    this run's ids, the sweep waits for delivery within the lookup's budget and rescans,
+    because a short suite reaches this point before the gateway has delivered its lines.
 
     Only this run's ids are returned. The log group carries every request the stage served,
     including other suites and real traffic, and failing this run for someone else's 5xx
@@ -967,15 +969,7 @@ def access_log_health(
             "E2E_ACCESS_LOG_GROUP is unset, so there is no access log to sweep. The sweep "
             "reads the gateway's own record of this run, which nothing else can substitute."
         )
-    access_log.scan_window(force=True)
-    entries = []
-    for record in suite_requests:
-        if not record.request_id:
-            continue
-        entry = access_log.read_one(record.request_id)
-        if entry is not None:
-            entries.append(entry)
-    return tuple(entries)
+    return access_log.correlate(record.request_id for record in suite_requests)
 
 
 @pytest.fixture(scope="session")
@@ -1213,8 +1207,9 @@ def _controller_access_log(
     """This run's access log entries, or None and the reason the sweep was not made.
 
     Built the way the `access_log_health` fixture builds it, from one forced window scan
-    correlated by request id, and skipped on exactly the same condition: an unset
-    `E2E_ACCESS_LOG_GROUP`, which is a local stack and anything else with no log to read.
+    correlated by request id with the same bounded wait for delivery, and skipped on exactly
+    the same condition: an unset `E2E_ACCESS_LOG_GROUP`, which is a local stack and anything
+    else with no log to read.
     """
     if not env.access_log_group:
         return None, (
@@ -1225,15 +1220,7 @@ def _controller_access_log(
 
     session = boto3.session.Session(region_name=env.aws_region)
     lookup = AccessLogLookup(session.client("logs"), env.access_log_group)
-    lookup.scan_window(force=True)
-    entries = []
-    for request in requests:
-        if not request.request_id:
-            continue
-        entry = lookup.read_one(request.request_id)
-        if entry is not None:
-            entries.append(entry)
-    return tuple(entries), ""
+    return lookup.correlate(request.request_id for request in requests), ""
 
 
 def pytest_terminal_summary(terminalreporter: Any) -> None:
