@@ -7,6 +7,16 @@ This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## Unreleased
 
+## 0.92.1
+
+### Fixed
+
+- The e2e run-wide access log sweep waits for delivery (PLAT-64). When its first window scan
+  correlates none of the run's request ids, `AccessLogLookup.correlate` rescans every poll
+  interval within the lookup's wait budget, so a short suite that reaches the sweep before
+  API Gateway delivers its lines (about 45 seconds) no longer fails
+  `test_the_access_log_carries_this_runs_requests`. A run whose lines never land still fails.
+
 ## 0.92.0
 
 ### Changed
