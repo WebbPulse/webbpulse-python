@@ -222,9 +222,11 @@ def test_a_dark_first_theme_draws_the_dark_palette_inline() -> None:
     html, text = _render(DARK_FIRST)
 
     page, card = APP_DARK.page, APP_DARK.card
-    assert f'<body class="wp-bg" bgcolor="{page}" style="margin:0;padding:0;background-color:{page};">' in html
-    assert f'class="wp-bg" bgcolor="{page}" style="background-color:{page};"' in html
-    assert f'bgcolor="{card}" style="background-color:{card};border:1px solid {APP_DARK.line};' in html
+    page_fill = f"background-color:{page};background-image:linear-gradient({page},{page});"
+    card_fill = f"background-color:{card};background-image:linear-gradient({card},{card});"
+    assert f'<body class="wp-bg body" bgcolor="{page}" style="margin:0;padding:0;{page_fill}">' in html
+    assert f'class="wp-bg" bgcolor="{page}" style="{page_fill}"' in html
+    assert f'bgcolor="{card}" style="{card_fill}border:1px solid {APP_DARK.line};' in html
     assert f"color:{APP_DARK.text};" in html
     assert f"color:{APP_DARK.muted};" in html
     assert 'bgcolor="#f2703a" style="border-radius:6px;background-color:#f2703a;"' in html
@@ -266,6 +268,38 @@ def test_the_dark_first_button_and_links_reach_contrast_on_the_dark_card() -> No
     for brand in (DARK_FIRST, DARK_FIRST.with_accent("#1d4ed8"), DARK_FIRST.with_accent("#fde68a")):
         assert _ratio(brand.dark_accent_foreground, brand.dark_accent) >= 4.5
         assert _ratio(brand.dark_link_color, APP_DARK.card) >= 4.5
+
+
+def test_a_dark_first_theme_guards_against_gmail_inversion() -> None:
+    """Dark surfaces repeat their fill as a gradient and the text sits in Gmail-only blend-mode wrappers."""
+    html, _ = _render(DARK_FIRST)
+
+    for color in (APP_DARK.page, APP_DARK.card):
+        assert f"background-image:linear-gradient({color},{color});" in html
+    assert f"linear-gradient({APP_DARK.quote}," not in html
+    assert "u + .body .wp-gmail-screen{background:#000000;mix-blend-mode:screen;}" in html
+    assert "u + .body .wp-gmail-difference{background:#000000;mix-blend-mode:difference;}" in html
+    assert '<body class="wp-bg body"' in html
+    wrapper = '<div class="wp-gmail-screen"><div class="wp-gmail-difference">'
+    assert html.count(wrapper) == 3
+    card = html.split('class="wp-card wp-pad"', 1)[1].split("</td></tr>\n<tr><td", 1)[0]
+    assert wrapper + '<h1 class="wp-text"' in card
+    for blended in html.split(wrapper)[1:]:
+        content = blended.split("</div></div>", 1)[0]
+        assert "<img" not in content
+        assert "linear-gradient" not in content
+
+
+def test_a_light_theme_carries_no_gmail_guard() -> None:
+    """The light scheme renders no gradient fill, no blend-mode wrapper and no Gmail selector."""
+    for brand in (BRAND, EmailBrand(product_name="Acme", accent_color="#b8451a", theme=APP_THEME)):
+        html, _ = _render(brand)
+
+        assert "linear-gradient" not in html
+        assert "mix-blend-mode" not in html
+        assert "wp-gmail" not in html
+        assert "u + .body" not in html
+        assert '<body class="wp-bg" bgcolor=' in html
 
 
 def test_the_light_theme_stays_light_first() -> None:

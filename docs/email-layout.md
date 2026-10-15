@@ -80,8 +80,19 @@ brand = EmailBrand(accent_color="#b8451a", dark_accent_color="#f2703a", theme=th
   client that strips `<style>` still renders the theme's own scheme. The body and the wrapper
   table both carry the page colour as `bgcolor` and inline style.
 - Dark mode: `color-scheme` meta tags, a `prefers-color-scheme: dark` block for Apple Mail and
-  others, and the same rules under `[data-ogsc]` and `[data-ogsb]` for Outlook. Gmail applies its own
-  inversion, which the inline colours survive.
+  others, and the same rules under `[data-ogsc]` and `[data-ogsb]` for Outlook.
+- Gmail's phone apps ignore `color-scheme` and invert colours themselves, which turns a dark
+  message white. A dark-first theme guards against it in two ways. The page and the card
+  repeat their fill as `background-image: linear-gradient(<hex>,<hex>)`, because Gmail
+  inverts background colours but not background images. The header name, the card content
+  and the footer sit in two wrappers, `wp-gmail-screen` and `wp-gmail-difference`, that are
+  black only under Gmail's `u + .body` selector (the body carries class `body`). When Gmail
+  inverts the wrappers to white and the text to dark, the difference layer turns the text
+  light again and the screen layer lays it over the gradient. Where Gmail inverts nothing,
+  both layers leave the colours as drawn. Nothing inside a wrapper may be an image or a
+  gradient fill, because the difference layer would invert it. That is why the logo stays
+  outside them, and why quotes and code keep plain colour fills. The light scheme renders
+  none of this.
 
 ## Identity emails
 
