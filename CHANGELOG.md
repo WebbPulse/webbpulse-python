@@ -7,6 +7,17 @@ This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## Unreleased
 
+## 0.92.0
+
+### Changed
+
+- A dark-first theme now stays dark in the Gmail phone apps (PLAT-61), which ignore
+  `color-scheme` and invert the message themselves. The page and card fills repeat as one-colour
+  `linear-gradient` background images, which Gmail does not invert. The header name, the card
+  content and the footer sit in `mix-blend-mode` screen and difference wrappers. They apply only
+  under Gmail's `u + .body` selector and keep the text light. The light scheme renders exactly
+  as before.
+
 ## 0.91.0
 
 ### Added

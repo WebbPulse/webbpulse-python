@@ -11,7 +11,8 @@ own. The layout therefore keeps every colour inline, declares `color-scheme` for
 clients that honour it, and carries a `prefers-color-scheme` block, plus Outlook's
 `data-ogsc` and `data-ogsb` selectors, for the clients that read one. A theme is light
 first by default; a dark-first theme draws its dark palette inline for a product whose
-app is dark by default. Stdlib only, so it can be imported without any extra.
+app is dark by default, and guards it against the Gmail apps' own inversion with gradient
+fills and blend-mode wrappers. Stdlib only, so it can be imported without any extra.
 """
 
 from __future__ import annotations
@@ -549,6 +550,43 @@ def _color_schemes(brand: EmailBrand) -> str:
     return "dark light" if brand.theme.scheme == "dark" else "light dark"
 
 
+def _fill(brand: EmailBrand, color: str) -> str:
+    """A surface's fill as inline style, repeated as a one-colour gradient for a dark-first theme.
+
+    The Gmail apps invert background colours in dark mode, turning a dark message white, but
+    leave background images alone, so the gradient keeps a dark-first surface dark there.
+    """
+    style = f"background-color:{color};"
+    if brand.theme.scheme == "dark":
+        style += f"background-image:linear-gradient({color},{color});"
+    return style
+
+
+def _gmail_blend(brand: EmailBrand, content: str) -> str:
+    """`content` inside the Gmail blend-mode wrappers for a dark-first theme, otherwise unchanged.
+
+    The wrappers are black only under Gmail's `u + .body` selector. When a Gmail app inverts
+    them to white and the light text to dark, the difference layer turns the text light
+    again and the screen layer lays it over the surface's gradient; where Gmail inverts
+    nothing, both layers leave the colours as drawn. The content must hold no image and no
+    gradient fill, since the difference layer would invert those, so the wrappers sit inside
+    each gradient surface and the surfaces nested in them keep plain colour fills.
+    """
+    if brand.theme.scheme != "dark":
+        return content
+    return f'<div class="wp-gmail-screen"><div class="wp-gmail-difference">{content}</div></div>'
+
+
+def _gmail_rules(brand: EmailBrand) -> str:
+    """The Gmail-only blend-mode rules a dark-first theme needs, or nothing for a light one."""
+    if brand.theme.scheme != "dark":
+        return ""
+    return (
+        "u + .body .wp-gmail-screen{background:#000000;mix-blend-mode:screen;}\n"
+        "u + .body .wp-gmail-difference{background:#000000;mix-blend-mode:difference;}\n"
+    )
+
+
 def _style_block(brand: EmailBrand) -> str:
     """The head styles: dark mode for the clients that honour it, and a narrow-screen padding.
 
@@ -576,6 +614,7 @@ def _style_block(brand: EmailBrand) -> str:
         "@media (max-width:620px){.wp-container{width:100% !important;}.wp-pad{padding:24px 20px !important;}}\n"
         f"@media (prefers-color-scheme:dark){{{''.join(rules)}}}\n"
         f"{outlook}\n"
+        f"{_gmail_rules(brand)}"
         "</style>"
     )
 
@@ -602,7 +641,7 @@ def _header_html(brand: EmailBrand) -> str:
                 f'style="color:{_ink(brand).palette.text};text-decoration:none;">{name}</a>'
             )
         style = _text_style(brand, 17, 24, _ink(brand).palette.text, weight=600, margin="0")
-        cells.append(f'<td class="wp-text" style="vertical-align:middle;{style}">{name}</td>')
+        cells.append(f'<td class="wp-text" style="vertical-align:middle;{style}">{_gmail_blend(brand, name)}</td>')
     return (
         '<tr><td style="padding:0 4px 20px;">'
         '<table role="presentation" cellpadding="0" cellspacing="0" border="0"><tr>'
@@ -629,7 +668,7 @@ def _footer_html(brand: EmailBrand, note: Paragraph | None, links: Sequence[Emai
         rows.append(f'<p class="wp-muted" style="{muted}">{signature}</p>')
     if not rows:
         return ""
-    return f'<tr><td style="padding:20px 4px 0;">{"".join(rows)}</td></tr>\n'
+    return f'<tr><td style="padding:20px 4px 0;">{_gmail_blend(brand, "".join(rows))}</td></tr>\n'
 
 
 def _render_html(
@@ -653,6 +692,7 @@ def _render_html(
     base = _ink(brand).palette
     page = base.page
     schemes = _color_schemes(brand)
+    body_class = "wp-bg body" if brand.theme.scheme == "dark" else "wp-bg"
     return (
         "<!doctype html>\n"
         '<html lang="en" xmlns="http://www.w3.org/1999/xhtml">\n'
@@ -665,17 +705,17 @@ def _render_html(
         f"<title>{_e(subject)}</title>\n"
         f"{_style_block(brand)}\n"
         "</head>\n"
-        f'<body class="wp-bg" bgcolor="{page}" style="margin:0;padding:0;background-color:{page};">\n'
+        f'<body class="{body_class}" bgcolor="{page}" style="margin:0;padding:0;{_fill(brand, page)}">\n'
         f"{hidden}"
         f'<table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0" class="wp-bg" '
-        f'bgcolor="{page}" style="background-color:{page};">\n'
+        f'bgcolor="{page}" style="{_fill(brand, page)}">\n'
         '<tr><td align="center" style="padding:32px 16px;">\n'
         '<table role="presentation" class="wp-container" width="560" cellpadding="0" cellspacing="0" border="0" '
         'style="width:560px;max-width:560px;">\n'
         f"{_header_html(brand)}"
-        f'<tr><td class="wp-card wp-pad" bgcolor="{base.card}" style="background-color:{base.card};'
+        f'<tr><td class="wp-card wp-pad" bgcolor="{base.card}" style="{_fill(brand, base.card)}'
         f'border:1px solid {base.line};border-radius:{brand.theme.card_radius}px;padding:32px;">\n'
-        f"{body}"
+        f"{_gmail_blend(brand, body)}"
         "</td></tr>\n"
         f"{_footer_html(brand, note, links)}"
         "</table>\n"
