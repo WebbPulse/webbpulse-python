@@ -445,7 +445,9 @@ def test_start_sends_a_deflated_authn_request_over_http_redirect(harness: Harnes
     assert record.binding == "digest"
 
 
-@pytest.mark.parametrize("url", ["javascript:alert(1)", "http://idp.example.test/sso", "https://user:pw@idp.example.test/"])
+@pytest.mark.parametrize(
+    "url", ["javascript:alert(1)", "http://idp.example.test/sso", "https://user:pw@idp.example.test/"]
+)
 def test_start_refuses_an_unsafe_identity_provider_url(idp: Idp, url: str) -> None:
     """The browser is never sent to a script URL, plain HTTP or embedded credentials."""
     harness = Harness(idp, make_connection(idp, idp_sso_url=url))
@@ -564,9 +566,7 @@ def _same_id(root: Any, signed: Any, evil: Any) -> None:
 
 
 @pytest.mark.parametrize("mutate", [_sibling, _in_extensions, _nested, _same_id])
-def test_signature_wrapping_is_refused(
-    harness: Harness, idp: Idp, mutate: Callable[[Any, Any, Any], None]
-) -> None:
+def test_signature_wrapping_is_refused(harness: Harness, idp: Idp, mutate: Callable[[Any, Any, Any], None]) -> None:
     """Only one assertion may exist, as a direct child, and it must be the element signed."""
     record = harness.begin()
     document = _wrap(idp.response(record.nonce), mutate)
