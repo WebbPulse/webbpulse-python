@@ -7,6 +7,22 @@ This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## Unreleased
 
+## 0.94.0
+
+### Added
+
+- `webbpulse.identity.scim`, a SCIM 2.0 provisioning router (RFC 7643 and 7644) for Okta
+  and Entra ID (PLAT-68). `build_scim_router(service)` mounts Users and Groups (list with
+  filters, `.search`, get, create, replace, PATCH, delete) and the public
+  ServiceProviderConfig, ResourceTypes and Schemas endpoints, with `startIndex` and
+  `count` paging, weak ETags and SCIM error bodies. The product stores directory users and
+  groups through `ScimHooks`; `active` changes run `deactivate_user` and `reactivate_user`,
+  and member-only group PATCHes go straight to `add_group_members` and
+  `remove_group_members`. Bearer tokens are per-tenant `api_keys` keys with the `scim`
+  scope, minted by `mint_scim_token` and stored only as hashes. Entra quirks are accepted:
+  capitalised ops, string booleans, path-less dotted and URN keys, and filtered email paths
+  that create the element. No new dependencies beyond the `identity` extra.
+
 ## 0.93.0
 
 ### Added
