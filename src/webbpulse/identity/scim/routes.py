@@ -38,6 +38,10 @@ if TYPE_CHECKING:  # pragma: no cover
     from starlette.requests import Request
     from starlette.responses import Response
 
+    type _FastAPIRequest = Request
+else:
+    _FastAPIRequest = None
+
 __all__ = [
     "SCIM_MEDIA_TYPE",
     "SCIM_PREFIX",
@@ -50,16 +54,13 @@ SCIM_MEDIA_TYPE: Final = "application/scim+json"
 SCIM_PREFIX: Final = "/scim/v2"
 MAX_BODY_BYTES: Final = 1_000_000
 
-_FastAPIRequest: Any = None
-
 
 def _bind_fastapi_request() -> None:
     """Put `fastapi.Request` in this module's globals, so FastAPI can resolve the annotation."""
-    global _FastAPIRequest
-    if _FastAPIRequest is None:
+    if globals().get("_FastAPIRequest") is None:
         from fastapi import Request as _Request
 
-        _FastAPIRequest = _Request
+        globals()["_FastAPIRequest"] = _Request
 
 
 def _response(body: Any, status: int = 200, headers: dict[str, str] | None = None) -> Response:

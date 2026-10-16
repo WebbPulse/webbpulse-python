@@ -11,7 +11,7 @@ import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
-from webbpulse.identity import api_keys
+import webbpulse.identity.api_keys as api_keys
 from webbpulse.identity.scim import (
     ENTERPRISE_USER_SCHEMA,
     GROUP_SCHEMA,

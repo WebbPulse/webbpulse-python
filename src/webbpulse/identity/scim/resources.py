@@ -505,7 +505,7 @@ def project_resource(
                 target[key] = copy.deepcopy(value)
                 continue
             if isinstance(value, list):
-                picked = []
+                picked: list[dict[str, Any]] = []
                 for item in value:
                     if isinstance(item, Mapping):
                         inner = _key_in(item, sub)

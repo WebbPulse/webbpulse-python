@@ -336,16 +336,22 @@ def _compare(actual: Any, op: str, expected: Any, case_exact: bool) -> bool:
         if op == "co":
             return right in left
         return left.startswith(right) if op == "sw" else left.endswith(right)
-    numeric = isinstance(left, int | float) and isinstance(right, int | float)
-    if not numeric and not (isinstance(left, str) and isinstance(right, str)):
-        return False
+    if isinstance(left, int | float) and isinstance(right, int | float):
+        return _ordered(op, left, right)
+    if isinstance(left, str) and isinstance(right, str):
+        return _ordered(op, left, right)
+    return False
+
+
+def _ordered[T: (int | float, str)](op: str, left: T, right: T) -> bool:
+    """One ordering comparison between two numbers or two strings."""
     if op == "gt":
-        return bool(left > right)
+        return left > right
     if op == "ge":
-        return bool(left >= right)
+        return left >= right
     if op == "lt":
-        return bool(left < right)
-    return bool(left <= right)
+        return left < right
+    return left <= right
 
 
 def _evaluate(

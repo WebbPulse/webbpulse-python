@@ -20,8 +20,8 @@ from dataclasses import dataclass
 from datetime import datetime
 from typing import Any, Final
 
+import webbpulse.identity.api_keys as api_keys
 from webbpulse.dynamodb import now_iso
-from webbpulse.identity import api_keys
 from webbpulse.identity.scim.errors import ScimError
 from webbpulse.identity.scim.filters import ScimFilter, parse_filter
 from webbpulse.identity.scim.patch import apply_patch, member_changes, parse_patch_request
