@@ -699,6 +699,15 @@ wheels = [
 ]
 
 [[package]]
+name = "dnspython"
+version = "2.9.0"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/ef/4a/50822184bd67cc6493f0fb6a880749158fcd31ab3fa07409acfd91f9fc85/dnspython-2.9.0.tar.gz", hash = "sha256:b44dc6b18f07a8b1c56676a19fbfdb5209415b046a9cece286baafa87ff3f7f1", size = 423560, upload-time = "2026-10-09T00:07:24.352Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/10/02/cdcc9b7c051786a103c3b09e1003a82fa0c66bcb91ffbdabcfbf7b4163b9/dnspython-2.9.0-py3-none-any.whl", hash = "sha256:9a4aedb833c3c1b49214d04d44d3032ab7a9135f7c1d29a549b4ff78fd82fda9", size = 354822, upload-time = "2026-10-09T00:07:22.622Z" },
+]
+
+[[package]]
 name = "docker"
 version = "7.2.0"
 source = { registry = "https://pypi.org/simple" }
@@ -2796,6 +2805,11 @@ security = [
     { name = "bcrypt" },
     { name = "pyjwt" },
 ]
+sso = [
+    { name = "dnspython" },
+    { name = "httpx" },
+    { name = "pyjwt", extra = ["crypto"] },
+]
 stripe = [
     { name = "stripe" },
 ]
@@ -2819,7 +2833,7 @@ dev = [
     { name = "pytest-cov" },
     { name = "pytest-xdist" },
     { name = "ruff" },
-    { name = "webbpulse", extra = ["aws-otel", "device-login", "dynamodb", "e2e", "fastapi", "github", "identity", "oauth", "otel", "passkeys", "security", "stripe", "testing", "tf"] },
+    { name = "webbpulse", extra = ["aws-otel", "device-login", "dynamodb", "e2e", "fastapi", "github", "identity", "oauth", "otel", "passkeys", "security", "sso", "stripe", "testing", "tf"] },
 ]
 
 [package.metadata]
@@ -2833,12 +2847,14 @@ requires-dist = [
     { name = "botocore", marker = "extra == 'dynamodb'", specifier = ">=1.35" },
     { name = "botocore", marker = "extra == 'tf'", specifier = ">=1.35" },
     { name = "cryptography", marker = "extra == 'e2e'", specifier = ">=43" },
+    { name = "dnspython", marker = "extra == 'sso'", specifier = ">=2.6" },
     { name = "fastapi", marker = "extra == 'fastapi'", specifier = ">=0.115" },
     { name = "fastapi", marker = "extra == 'identity'", specifier = ">=0.115" },
     { name = "httpx", marker = "extra == 'device-login'", specifier = ">=0.27" },
     { name = "httpx", marker = "extra == 'e2e'", specifier = ">=0.27" },
     { name = "httpx", marker = "extra == 'github'", specifier = ">=0.27" },
     { name = "httpx", marker = "extra == 'oauth'", specifier = ">=0.27" },
+    { name = "httpx", marker = "extra == 'sso'", specifier = ">=0.27" },
     { name = "httpx", marker = "extra == 'tf'", specifier = ">=0.27" },
     { name = "httpx2", marker = "extra == 'testing'", specifier = ">=2" },
     { name = "keyring", marker = "extra == 'device-login'", specifier = ">=25" },
@@ -2855,6 +2871,7 @@ requires-dist = [
     { name = "pyjwt", marker = "extra == 'security'", specifier = ">=2.15.1,<3" },
     { name = "pyjwt", extras = ["crypto"], marker = "extra == 'github'", specifier = ">=2.15.1" },
     { name = "pyjwt", extras = ["crypto"], marker = "extra == 'identity'", specifier = ">=2.15.1" },
+    { name = "pyjwt", extras = ["crypto"], marker = "extra == 'sso'", specifier = ">=2.15.1" },
     { name = "pytest", marker = "extra == 'e2e'", specifier = ">=8" },
     { name = "pytest", marker = "extra == 'testing'", specifier = ">=8" },
     { name = "starlette", marker = "extra == 'fastapi'", specifier = ">=0.40" },
@@ -2862,7 +2879,7 @@ requires-dist = [
     { name = "uvicorn", marker = "extra == 'fastapi'", specifier = ">=0.32" },
     { name = "webauthn", marker = "extra == 'passkeys'", specifier = ">=2.7,<4" },
 ]
-provides-extras = ["aws-otel", "device-login", "dynamodb", "e2e", "fastapi", "github", "identity", "oauth", "otel", "passkeys", "security", "stripe", "testing", "tf"]
+provides-extras = ["aws-otel", "device-login", "dynamodb", "e2e", "fastapi", "github", "identity", "oauth", "otel", "passkeys", "security", "sso", "stripe", "testing", "tf"]
 
 [package.metadata.requires-dev]
 dev = [
@@ -2872,7 +2889,7 @@ dev = [
     { name = "pytest-cov", specifier = ">=6" },
     { name = "pytest-xdist", specifier = ">=3" },
     { name = "ruff", specifier = ">=0.8" },
-    { name = "webbpulse", extras = ["aws-otel", "device-login", "dynamodb", "e2e", "fastapi", "github", "identity", "oauth", "otel", "passkeys", "security", "stripe", "testing", "tf"] },
+    { name = "webbpulse", extras = ["aws-otel", "device-login", "dynamodb", "e2e", "fastapi", "github", "identity", "oauth", "otel", "passkeys", "security", "sso", "stripe", "testing", "tf"] },
 ]
 
 [[package]]

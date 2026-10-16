@@ -23,6 +23,7 @@ from webbpulse.identity.crypto import (
 )
 from webbpulse.identity.oauth import AMR_OAUTH
 from webbpulse.identity.passkeys import AMR_PASSKEY, AMR_PIN
+from webbpulse.identity.sso import AMR_SSO, SSO_CONNECTION_AMR_PREFIX
 from webbpulse.identity.storage import (
     IdentityTokenRecord,
     RecoveryCodeRecord,
@@ -69,7 +70,7 @@ AMR_RECOVERY: Final = "recovery"
 AMR_HARDWARE_KEY: Final = "hwk"
 
 AMR_FACTOR_METHODS: Final[frozenset[str]] = frozenset(
-    {AMR_PASSWORD, AMR_OTP, AMR_RECOVERY, AMR_PASSKEY, AMR_HARDWARE_KEY, AMR_PIN, AMR_OAUTH}
+    {AMR_PASSWORD, AMR_OTP, AMR_RECOVERY, AMR_PASSKEY, AMR_HARDWARE_KEY, AMR_PIN, AMR_OAUTH, AMR_SSO}
 )
 
 TOTP_FACTOR: Final = "totp"
@@ -87,9 +88,10 @@ def access_token_amr(amr: Sequence[str]) -> tuple[str, ...]:
     """The `amr` an access token carries for these methods: deduplicated, with `mfa` added for two factors.
 
     Only values in `AMR_FACTOR_METHODS` count as factors, so the provider name an OAuth
-    sign-in records beside `oauth` does not turn one factor into two.
+    sign-in records beside `oauth` does not turn one factor into two. A single sign-on
+    connection marker is internal to the family and never reaches a token.
     """
-    methods = list(dict.fromkeys(amr))
+    methods = [method for method in dict.fromkeys(amr) if not method.startswith(SSO_CONNECTION_AMR_PREFIX)]
     factors = {method for method in methods if method in AMR_FACTOR_METHODS}
     if len(factors) > 1 and AMR_MFA not in methods:
         methods.append(AMR_MFA)

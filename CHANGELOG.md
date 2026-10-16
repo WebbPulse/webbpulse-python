@@ -7,6 +7,23 @@ This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## Unreleased
 
+## 0.93.0
+
+### Added
+
+- `webbpulse.identity` per-tenant OIDC single sign-on (PLAT-66), behind the new `sso`
+  extra: `SsoConnection` with a sealed client secret, `SsoHooks` for the product's
+  connection table and login policy, `SsoService` reusing the OAuth state and link tables
+  with PKCE, nonce and RFC 9207 `iss` checks, and `PublicUrlGuard` refusing non-HTTPS and
+  non-public provider URLs. `build_identity_router(sso=...)` mounts `POST /sso/start` and
+  `GET /sso/oidc/{connection_id}/callback`.
+- `IdentityFlows.issue_for_sso`: the session's `amr` carries `sso` and the protocol, the
+  access token carries `sso_connection`, and both survive refresh. MFA and
+  `may_authenticate` still apply.
+- DNS TXT domain verification: `domain_verification_challenge`, `is_domain_verified` and
+  `DnsPythonTxtResolver`, with a configurable `<prefix>-verification=<token>` record.
+- A CI job signing in against a throwaway Keycloak.
+
 ## 0.92.1
 
 ### Fixed
