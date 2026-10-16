@@ -1,8 +1,9 @@
 """Per-tenant single sign-on: connections, the login resolver, and the SSO service.
 
-Protocol-neutral, so a SAML connection can join the same session issuance later. The OIDC
-leg lives in `sso_oidc.py` and the routes in `sso_routes.py`. Synchronous and free of
-FastAPI, and importable without the `sso` extra.
+Protocol-neutral: OIDC and SAML connections share one state table, one link table and one
+session issuance. The OIDC leg lives in `sso_oidc.py`, the SAML leg in `sso_saml.py` and the
+routes in `sso_routes.py`. Synchronous and free of FastAPI, and importable without the `sso`
+or `saml` extras.
 """
 
 from __future__ import annotations
@@ -12,7 +13,7 @@ import re
 import secrets
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Any, Final, Literal
+from typing import TYPE_CHECKING, Any, Final, Literal, Protocol
 from urllib.parse import urlsplit
 
 from webbpulse.dynamodb import now_iso, ttl_in
@@ -36,15 +37,20 @@ if TYPE_CHECKING:  # pragma: no cover
     from webbpulse.identity.oauth import HttpClient, OAuthLinkStore, OAuthStateStore
     from webbpulse.identity.settings import IdentitySettings
     from webbpulse.identity.sso_oidc import OidcSsoClient, UrlGuard
+    from webbpulse.identity.sso_saml import SamlSsoClient
 
 __all__ = [
     "AMR_SSO",
+    "SAML_DEFAULT_EMAIL_ATTRIBUTES",
+    "SAML_DEFAULT_NAME_ATTRIBUTES",
     "SSO_CONNECTION_AMR_PREFIX",
     "SSO_CONNECTION_CLAIM",
     "SSO_LINK_PROVIDER_PREFIX",
     "SSO_PROTOCOL_OIDC",
     "SSO_PROTOCOL_SAML",
+    "AssertionReplayStore",
     "OidcConnectionConfig",
+    "SamlConnectionConfig",
     "SsoAuthorization",
     "SsoConnection",
     "SsoHooks",
@@ -144,6 +150,56 @@ class OidcConnectionConfig:
     extra_authorize_params: Mapping[str, str] = field(default_factory=dict)
 
 
+SAML_DEFAULT_EMAIL_ATTRIBUTES: Final[tuple[str, ...]] = (
+    "email",
+    "mail",
+    "emailAddress",
+    "urn:oid:0.9.2342.19200300.100.1.3",
+    "http://schemas.xmlsoap.org/ws/2005/05/identity/claims/emailaddress",
+)
+
+SAML_DEFAULT_NAME_ATTRIBUTES: Final[tuple[str, ...]] = (
+    "name",
+    "displayName",
+    "urn:oid:2.16.840.1.113730.3.1.241",
+    "http://schemas.microsoft.com/identity/claims/displayname",
+    "http://schemas.xmlsoap.org/ws/2005/05/identity/claims/name",
+)
+
+
+@dataclass(frozen=True, slots=True)
+class SamlConnectionConfig:
+    """What a SAML connection needs of its identity provider.
+
+    `idp_certificates` are the PEM or bare base64 signing certificates; more than one lets a
+    tenant rotate without downtime. `sp_entity_id` defaults to the connection's metadata URL.
+    `subject_attribute` names an attribute to use as the durable subject instead of the
+    NameID, which a transient NameID requires. `parse_saml_idp_metadata` in `sso_saml.py`
+    builds one from the provider's metadata.
+    """
+
+    idp_entity_id: str
+    idp_sso_url: str
+    idp_certificates: tuple[str, ...]
+    sp_entity_id: str = ""
+    name_id_format: str = ""
+    subject_attribute: str = ""
+    email_attributes: tuple[str, ...] = SAML_DEFAULT_EMAIL_ATTRIBUTES
+    name_attributes: tuple[str, ...] = SAML_DEFAULT_NAME_ATTRIBUTES
+
+
+class AssertionReplayStore(Protocol):
+    """The one-shot claim that stops a SAML assertion being used twice.
+
+    `webbpulse.dynamodb.IdempotencyStore` and `webbpulse.testing.FakeIdempotencyStore` both
+    satisfy it, so this module never imports the `dynamodb` extra.
+    """
+
+    def claim(self, key: str, ttl_seconds: float) -> bool:
+        """Claim `key` for `ttl_seconds`, answering whether this caller won."""
+        ...
+
+
 @dataclass(frozen=True, slots=True)
 class SsoConnection:
     """One tenant's identity provider connection, loaded through `SsoHooks`.
@@ -161,6 +217,7 @@ class SsoConnection:
     jit_provisioning: bool = True
     display_name: str = ""
     oidc: OidcConnectionConfig | None = None
+    saml: SamlConnectionConfig | None = None
 
     def trusts_email(self, email: str) -> bool:
         """Whether an address the provider asserted is on one of this tenant's verified domains."""
@@ -199,6 +256,7 @@ class SsoAuthorization:
     authorization_url: str
     state: str
     connection_id: str
+    protocol: SsoProtocol = "oidc"
 
 
 class SsoHooks(ABC):
@@ -253,11 +311,15 @@ class SsoService:
         http_client: HttpClient | None = None,
         url_guard: UrlGuard | None = None,
         oidc_client: OidcSsoClient | None = None,
+        saml_replay: AssertionReplayStore | None = None,
+        saml_client: SamlSsoClient | None = None,
     ) -> None:
-        """Hold the settings, both hook surfaces, the stores, the cipher and the OIDC client.
+        """Hold the settings, both hook surfaces, the stores, the cipher and the protocol clients.
 
         `url_guard` checks every provider URL this service fetches; the default refuses
-        anything but HTTPS to a public address.
+        anything but HTTPS to a public address. SAML is enabled by `saml_replay`, the store
+        that remembers spent assertion ids, or by a ready `saml_client`; it needs the `saml`
+        extra only when a response is verified.
         """
         self._settings = settings
         self._hooks = hooks
@@ -274,10 +336,39 @@ class SsoService:
                 leeway=settings.clock_skew_leeway,
             )
         self._oidc = oidc_client
+        if saml_client is None and saml_replay is not None:
+            from webbpulse.identity.sso_saml import SamlSsoClient as _SamlSsoClient
+
+            saml_client = _SamlSsoClient(replay=saml_replay, leeway=settings.clock_skew_leeway)
+        self._saml = saml_client
+
+    @property
+    def saml_enabled(self) -> bool:
+        """Whether this service verifies SAML responses, which mounts the SAML routes."""
+        return self._saml is not None
 
     def callback_url(self, connection: SsoConnection) -> str:
-        """The redirect URI registered with the provider: one per connection and protocol."""
+        """The redirect URI registered with the provider: one per connection and protocol.
+
+        For SAML it is the assertion consumer service URL.
+        """
+        if connection.protocol == SSO_PROTOCOL_SAML:
+            return self.acs_url(connection)
         return f"{self._settings.issuer}/sso/{connection.protocol}/{connection.connection_id}/callback"
+
+    def acs_url(self, connection: SsoConnection) -> str:
+        """The SAML assertion consumer service URL, which takes the HTTP-POST binding."""
+        return f"{self._settings.issuer}/sso/saml/{connection.connection_id}/acs"
+
+    def saml_metadata_url(self, connection: SsoConnection) -> str:
+        """Where the connection's SAML service provider metadata is served."""
+        return f"{self._settings.issuer}/sso/saml/{connection.connection_id}/metadata"
+
+    def sp_entity_id(self, connection: SsoConnection) -> str:
+        """The service provider entity id: the configured one, or the metadata URL."""
+        if connection.saml is not None and connection.saml.sp_entity_id:
+            return connection.saml.sp_entity_id
+        return self.saml_metadata_url(connection)
 
     def connection(self, connection_id: str) -> SsoConnection:
         """An enabled connection by id, refusing an unknown, malformed or disabled one alike."""
@@ -316,12 +407,10 @@ class SsoService:
                 self._sso_hooks.find_connection(email=email.strip().lower(), tenant_hint=tenant_hint.strip())
             )
 
+        if connection.protocol == SSO_PROTOCOL_SAML:
+            return self._start_saml(connection, return_to=return_to, binding=binding)
         if connection.protocol != SSO_PROTOCOL_OIDC or connection.oidc is None:
-            raise SsoRejected(
-                "That single sign-on connection is not available.",
-                error_code="SSO_PROTOCOL_UNSUPPORTED",
-                status_code=501,
-            )
+            raise _unsupported()
 
         state = _b64url(secrets.token_bytes(32))
         verifier = new_pkce_verifier()
@@ -365,6 +454,82 @@ class SsoService:
             connection_id=connection.connection_id,
         )
 
+    def _start_saml(self, connection: SsoConnection, *, return_to: str, binding: str) -> SsoAuthorization:
+        """Write a state holding a fresh AuthnRequest id, and build the HTTP-Redirect URL.
+
+        The state rides back as `RelayState`; the request id is stored in the state's `nonce`
+        and must come back as the response's `InResponseTo`.
+        """
+        saml = self._require_saml(connection)
+        state = _b64url(secrets.token_bytes(32))
+        request_id = f"_{secrets.token_hex(20)}"
+        acs = self.acs_url(connection)
+        authorization_url = saml.authn_request_url(
+            connection,
+            request_id=request_id,
+            acs_url=acs,
+            sp_entity_id=self.sp_entity_id(connection),
+            relay_state=state,
+        )
+        self._states.put(
+            OAuthStateRecord(
+                state=state,
+                provider=sso_link_provider(connection.connection_id),
+                mode="login",
+                created_at=now_iso(),
+                expires_at=ttl_in(OAUTH_STATE_TTL_SECONDS),
+                nonce=request_id,
+                return_to=_resolve_return_to(self._settings.frontend_base_url, return_to),
+                redirect_uri=acs,
+                binding=binding,
+            )
+        )
+        _log.info(
+            "SSO authorization started.",
+            extra={
+                "event": "sso.start",
+                "connection_id": connection.connection_id,
+                "tenant_id": connection.tenant_id,
+                "protocol": connection.protocol,
+            },
+        )
+        return SsoAuthorization(
+            authorization_url=authorization_url,
+            state=state,
+            connection_id=connection.connection_id,
+            protocol=SSO_PROTOCOL_SAML,
+        )
+
+    def _require_saml(self, connection: SsoConnection) -> SamlSsoClient:
+        """The SAML client, when this service has one and the connection is configured."""
+        if self._saml is None or connection.protocol != SSO_PROTOCOL_SAML or connection.saml is None:
+            raise _unsupported()
+        return self._saml
+
+    def saml_metadata(self, connection: SsoConnection) -> str:
+        """The connection's SAML service provider metadata document."""
+        return self._require_saml(connection).sp_metadata(
+            connection,
+            sp_entity_id=self.sp_entity_id(connection),
+            acs_url=self.acs_url(connection),
+        )
+
+    def identity_from_saml_response(
+        self,
+        connection: SsoConnection,
+        *,
+        saml_response: str,
+        state_record: OAuthStateRecord,
+    ) -> SsoIdentity:
+        """Verify a posted `SAMLResponse` against the spent state, returning what it asserted."""
+        return self._require_saml(connection).identity_from_response(
+            connection,
+            saml_response=saml_response,
+            request_id=state_record.nonce,
+            acs_url=state_record.redirect_uri or self.acs_url(connection),
+            sp_entity_id=self.sp_entity_id(connection),
+        )
+
     def consume_state(self, state: str, *, connection_id: str) -> OAuthStateRecord:
         """Spend a state exactly once, refusing one that belongs to another connection.
 
@@ -393,11 +558,7 @@ class SsoService:
         provider sent none.
         """
         if connection.oidc is None:
-            raise SsoRejected(
-                "That single sign-on connection is not available.",
-                error_code="SSO_PROTOCOL_UNSUPPORTED",
-                status_code=501,
-            )
+            raise _unsupported()
         return self._oidc.identity_from_callback(
             connection,
             code=code,
@@ -536,6 +697,15 @@ class SsoService:
                 "Could not record an SSO sign-in on its link.",
                 extra={"event": "sso.touch_failed", "connection_id": identity.connection_id},
             )
+
+
+def _unsupported() -> SsoRejected:
+    """The refusal for a connection whose protocol this deployment cannot run."""
+    return SsoRejected(
+        "That single sign-on connection is not available.",
+        error_code="SSO_PROTOCOL_UNSUPPORTED",
+        status_code=501,
+    )
 
 
 def _resolve_return_to(base: str, requested: str) -> str:

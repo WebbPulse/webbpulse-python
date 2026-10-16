@@ -22,6 +22,20 @@ This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   scope, minted by `mint_scim_token` and stored only as hashes. Entra quirks are accepted:
   capitalised ops, string booleans, path-less dotted and URN keys, and filtered email paths
   that create the element. No new dependencies beyond the `identity` extra.
+- `webbpulse.identity` per-tenant SAML 2.0 single sign-on (PLAT-67), behind the new `saml`
+  extra (`signxml`, `lxml`, `httpx`, no `xmlsec`). `SsoConnection.saml` takes a
+  `SamlConnectionConfig`, and `SsoService(saml_replay=...)` mounts
+  `GET /sso/saml/{connection_id}/metadata` and the HTTP-POST assertion consumer
+  `POST /sso/saml/{connection_id}/acs`. `POST /sso/start` answers an HTTP-Redirect
+  AuthnRequest for a SAML connection.
+- Response verification in `webbpulse.identity.sso_saml.SamlSsoClient`: a signed assertion
+  is required and only the signed element is read, with destination, recipient,
+  `InResponseTo`, audience and time checks, DOCTYPE refusal, and replay protection through
+  any `AssertionReplayStore` such as `IdempotencyStore`.
+- IdP metadata import by XML or URL: `parse_saml_idp_metadata` and
+  `fetch_saml_idp_metadata`, the latter through `PublicUrlGuard`.
+- SAML sign-in issues the same SSO session as OIDC, with `amr` `["sso", "saml"]`.
+- The `sso-keycloak` CI job also signs in over SAML against the throwaway Keycloak.
 
 ## 0.93.0
 

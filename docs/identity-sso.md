@@ -1,12 +1,14 @@
 # Single sign-on
 
-Per-tenant OIDC single sign-on and DNS TXT domain verification for `webbpulse.identity`.
+Per-tenant OIDC and SAML 2.0 single sign-on and DNS TXT domain verification for
+`webbpulse.identity`.
 Install the `sso` extra (`httpx`, `dnspython`, `PyJWT[crypto]`). A product that never passes
 `sso=` to `build_identity_router` mounts nothing new and imports none of these.
 
 The nouns are generic: a **tenant** is whatever the product sells to (a workspace, an
-organisation), and a **connection** is one tenant's identity provider. SAML (PLAT-67) will
-use the same model with `protocol="saml"`.
+organisation), and a **connection** is one tenant's identity provider, with
+`protocol="oidc"` or `protocol="saml"`. Both share the state table, the link table and the
+session issuance.
 
 ## Wiring
 
@@ -43,6 +45,36 @@ opened only for the token exchange. It is never logged.
 | `GET <prefix>/sso/oidc/{connection_id}/callback` | Always a 303 to the frontend: `sso=1` with the refresh cookie, `sso_error=<code>` on failure, or `#mfa_ticket=` when MFA is enrolled |
 
 Register `<issuer>/sso/oidc/<connection_id>/callback` as the redirect URI at the provider.
+
+## SAML
+
+Install the `saml` extra as well (`signxml`, `lxml`, `httpx`; manylinux wheels on x86_64 and
+arm64, no `xmlsec`). Pass `saml_replay=` to `SsoService`, any store with
+`claim(key, ttl_seconds) -> bool` such as `webbpulse.dynamodb.IdempotencyStore`, and two
+more routes mount:
+
+| Route | Answers |
+| --- | --- |
+| `GET <prefix>/sso/saml/{connection_id}/metadata` | The SP metadata to import at the IdP. The SP entity id defaults to this URL |
+| `POST <prefix>/sso/saml/{connection_id}/acs` | The HTTP-POST assertion consumer. Always a 303, as the OIDC callback |
+
+`POST /sso/start` answers the HTTP-Redirect URL carrying an unsigned AuthnRequest, with the
+state as `RelayState`. The binding cookie is `SameSite=None` for a SAML start, since the
+response arrives as a cross-site POST.
+
+Build `SamlConnectionConfig` by hand or from the IdP's metadata with
+`parse_saml_idp_metadata(xml)` or `fetch_saml_idp_metadata(url)` (through `PublicUrlGuard`,
+no redirects, 1 MiB cap), then `.connection_config()`. Several `idp_certificates` allow
+rotation. A transient NameID needs `subject_attribute`.
+
+Checks: the assertion signature is required (a response signature is checked when present),
+only the element the signature covers is read, and exactly one unencrypted assertion is
+allowed, so wrapping attacks fail. `Destination`, `Recipient` and `InResponseTo` must match
+the ACS and the spent state's AuthnRequest id, the audience must be the SP entity id, and
+`NotBefore`, `NotOnOrAfter` and `SessionNotOnOrAfter` are checked with the settings' clock
+skew leeway. A DOCTYPE is refused before parsing. Each assertion id is claimed in the replay
+store until it expires. A SAML session's `amr` is `["sso", "saml"]`. Encrypted assertions
+and signed AuthnRequests are not supported.
 
 ## Sessions
 

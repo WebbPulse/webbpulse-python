@@ -92,11 +92,11 @@ jobs:
           docker logs keycloak
           exit 1
 
-      - name: Run the Keycloak sign-in test
+      - name: Run the Keycloak OIDC and SAML sign-in tests
         run: |
           set -o pipefail
           uv run pytest tests/test_identity_sso_keycloak.py -rs | tee pytest.log
-          grep -Eq "\b1 passed\b" pytest.log
+          grep -Eq "\b2 passed\b" pytest.log
 
       - name: Show Keycloak logs on failure
         if: failure()
