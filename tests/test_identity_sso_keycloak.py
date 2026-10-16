@@ -199,8 +199,14 @@ def _sign_in_at_keycloak(http: httpx.Client, authorization_url: str) -> dict[str
     )
     assert match, "Keycloak login form not found"
     action = urljoin(str(page.url), html.unescape(match.group(1)))
-    response = http.post(action, data={"username": "pat", "password": PASSWORD, "credentialId": ""})
-    assert response.status_code in {302, 303}, response.text[:500]
+    cookies = "; ".join(f"{cookie.name}={cookie.value}" for cookie in http.cookies.jar)
+    response = http.post(
+        action,
+        data={"username": "pat", "password": PASSWORD, "credentialId": ""},
+        headers={"cookie": cookies},
+    )
+    feedback = re.search(r'kc-feedback-text">([^<]*)<', response.text)
+    assert response.status_code in {302, 303}, feedback.group(1) if feedback else response.text[:500]
     location = response.headers["location"]
     return {key: values[0] for key, values in parse_qs(urlsplit(location).query).items()}
 
@@ -242,6 +248,7 @@ def test_a_keycloak_user_signs_in_and_gets_an_sso_session() -> None:
         oauth_links=InMemoryOAuthLinkStore(),
     )
     host = urlsplit(KEYCLOAK_URL).hostname or ""
+    idp_http = httpx.Client(timeout=30.0, follow_redirects=False)
     service = SsoService(
         settings,
         hooks,
@@ -249,16 +256,18 @@ def test_a_keycloak_user_signs_in_and_gets_an_sso_session() -> None:
         states=stores.require_oauth_states(),
         links=stores.require_oauth_links(),
         cipher=cipher,
-        http_client=HttpxClient(),
+        http_client=HttpxClient(client=idp_http),
         url_guard=PublicUrlGuard(trusted_hosts={host}),
     )
     kms = FakeKms()
     app = FastAPI()
-    app.include_router(build_identity_router(settings, hooks, stores, kms_client=kms, limiter_enabled=False, sso=service))
+    app.include_router(
+        build_identity_router(settings, hooks, stores, kms_client=kms, limiter_enabled=False, sso=service)
+    )
     client = TestClient(app, base_url="https://testserver", follow_redirects=False)
     prefix = identity_prefix(settings)
 
-    with httpx.Client(timeout=30.0, follow_redirects=False) as http:
+    with idp_http, httpx.Client(timeout=30.0, follow_redirects=False) as http:
         _provision_realm(http, client_secret=client_secret, redirect_uri=redirect_uri)
 
         for expected in ("provisioned", "linked"):

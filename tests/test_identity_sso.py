@@ -309,7 +309,9 @@ class FakeSsoHooks(SsoHooks):
     ) -> None:
         """Record the outcome, or refuse when told to."""
         if self.refuse:
-            raise SsoRejected("You are not a member of this organisation.", error_code="SSO_NOT_A_MEMBER", status_code=403)
+            raise SsoRejected(
+                "You are not a member of this organisation.", error_code="SSO_NOT_A_MEMBER", status_code=403
+            )
         self.logins.append((str(user["id"]), connection.connection_id, outcome))
 
 
@@ -518,7 +520,7 @@ def test_a_connection_trusts_only_its_verified_domains(cipher: SecretMasterKeyCi
 def test_a_client_secret_round_trips_and_is_bound_to_its_connection(cipher: SecretMasterKeyCipher) -> None:
     """A sealed secret moved to another connection does not open."""
     sealed = seal_oidc_client_secret(cipher, connection_id="one", client_secret=CLIENT_SECRET)
-    assert CLIENT_SECRET.encode() not in sealed.ciphertext
+    assert CLIENT_SECRET not in sealed.ciphertext
     assert open_oidc_client_secret(cipher, connection_id="one", sealed=sealed) == CLIENT_SECRET
     with pytest.raises(SsoRejected) as excinfo:
         open_oidc_client_secret(cipher, connection_id="two", sealed=sealed)
@@ -558,7 +560,12 @@ def test_start_finds_a_connection_by_tenant_slug(service: SsoService) -> None:
 
 @pytest.mark.parametrize(
     "kwargs",
-    [{"email": "pat@unknown.example"}, {"tenant_hint": "nobody"}, {"connection_id": "missing"}, {"connection_id": "a/b"}],
+    [
+        {"email": "pat@unknown.example"},
+        {"tenant_hint": "nobody"},
+        {"connection_id": "missing"},
+        {"connection_id": "a/b"},
+    ],
 )
 def test_start_answers_one_not_found_for_every_miss(service: SsoService, kwargs: dict[str, str]) -> None:
     """The response does not reveal which tenants exist."""
@@ -1228,10 +1235,10 @@ def test_the_dnspython_resolver_joins_strings_and_maps_failures(monkeypatch: pyt
     resolver = DnsPythonTxtResolver(nameservers=["192.0.2.53"])
     assert resolver.txt_records("acme.example") == ["example-verification=tok-1"]
 
-    outcome["raise"] = dns.resolver.NXDOMAIN()
+    outcome["raise"] = dns.resolver.NXDOMAIN()  # type: ignore[no-untyped-call]
     assert resolver.txt_records("acme.example") == []
 
-    outcome["raise"] = dns.exception.Timeout()
+    outcome["raise"] = dns.exception.Timeout()  # type: ignore[no-untyped-call]
     with pytest.raises(DomainVerificationUnavailable):
         resolver.txt_records("acme.example")
 

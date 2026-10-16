@@ -166,7 +166,8 @@ def is_domain_verified(
     challenge = domain_verification_challenge(domain, token, prefix=prefix)
     lookup = resolver if resolver is not None else DnsPythonTxtResolver()
     found = any(
-        constant_time_equals(record.strip(), challenge.record_value) for record in lookup.txt_records(challenge.record_name)
+        constant_time_equals(record.strip(), challenge.record_value)
+        for record in lookup.txt_records(challenge.record_name)
     )
     _log.info(
         "Domain verification checked.",
