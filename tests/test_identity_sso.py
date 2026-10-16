@@ -585,10 +585,10 @@ def test_a_disabled_connection_cannot_start(
     assert excinfo.value.error_code == "SSO_CONNECTION_NOT_FOUND"
 
 
-def test_a_saml_connection_is_not_started_by_this_release(
+def test_a_saml_connection_without_saml_wiring_answers_501(
     hooks: FakeHooks, stores: IdentityStores, cipher: SecretMasterKeyCipher, provider: FakeOidcProvider
 ) -> None:
-    """SAML shares the model but has no protocol leg yet."""
+    """A SAML connection on a service with no SAML replay store or config is unsupported."""
     saml = SsoConnection(connection_id="conn_saml", tenant_id=TENANT_ID, protocol="saml", verified_domains=(DOMAIN,))
     service = make_service(hooks, FakeSsoHooks([saml]), stores, cipher, provider)
     with pytest.raises(SsoRejected) as excinfo:

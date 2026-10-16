@@ -1,7 +1,7 @@
-"""An OIDC single sign-on against a real Keycloak, run by the `sso-keycloak` CI job.
+"""OIDC and SAML single sign-on against a real Keycloak, run by the `sso-keycloak` CI job.
 
 Skipped unless `KEYCLOAK_URL` points at a Keycloak started in dev mode with the bootstrap
-admin `admin`/`admin`. The test builds its own realm, client and user, so it needs nothing
+admin `admin`/`admin`. Each test builds its own realm, client and user, so it needs nothing
 else and leaves nothing behind but that throwaway container.
 """
 
@@ -46,6 +46,8 @@ from webbpulse.identity import (
     seal_oidc_client_secret,
 )
 from webbpulse.identity.oauth import HttpxClient
+from webbpulse.identity.sso_saml import SamlSsoClient, fetch_saml_idp_metadata
+from webbpulse.testing import FakeIdempotencyStore
 
 KEYCLOAK_URL = os.environ.get("KEYCLOAK_URL", "").rstrip("/")
 
@@ -55,6 +57,8 @@ KEY = "arn:aws:kms:us-west-2:111122223333:key/aaaaaaaa-1111-1111-1111-aaaaaaaaaa
 ISSUER = "https://api.example.test/api/auth"
 FRONTEND = "https://app.example.test"
 REALM = "acme"
+SAML_REALM = "acme-saml"
+SAML_CONNECTION_ID = "conn_keycloak_saml"
 CLIENT_ID = "example-app"
 CONNECTION_ID = "conn_keycloak"
 DOMAIN = "acme.example"
@@ -288,3 +292,191 @@ def test_a_keycloak_user_signs_in_and_gets_an_sso_session() -> None:
     assert claims["amr"] == [AMR_SSO, "oidc"]
     assert claims[SSO_CONNECTION_CLAIM] == CONNECTION_ID
     assert len(hooks.users) == 1
+
+
+def _settings() -> IdentitySettings:
+    """The identity settings both protocols' tests share."""
+    return IdentitySettings(
+        environment="test",
+        issuer=ISSUER,
+        audience="example-test",
+        signing_key_arns=[KEY],
+        email_verification_required=False,
+        frontend_base_url=FRONTEND,
+        product_name="Example",
+        support_email="support@example.com",
+    )
+
+
+def _provision_saml_realm(http: httpx.Client, *, sp_entity_id: str, acs_url: str) -> None:
+    """Create a realm with a SAML client that signs its assertions, and one user.
+
+    The client takes unsigned AuthnRequests, names the subject by username, and sends the
+    email as a basic `email` attribute.
+    """
+    headers = _admin(http)
+    http.delete(f"{KEYCLOAK_URL}/admin/realms/{SAML_REALM}", headers=headers)
+    http.post(
+        f"{KEYCLOAK_URL}/admin/realms", headers=headers, json={"realm": SAML_REALM, "enabled": True}
+    ).raise_for_status()
+    http.post(
+        f"{KEYCLOAK_URL}/admin/realms/{SAML_REALM}/clients",
+        headers=headers,
+        json={
+            "clientId": sp_entity_id,
+            "protocol": "saml",
+            "enabled": True,
+            "frontchannelLogout": False,
+            "redirectUris": [acs_url],
+            "attributes": {
+                "saml.assertion.signature": "true",
+                "saml.server.signature": "true",
+                "saml.client.signature": "false",
+                "saml.encrypt": "false",
+                "saml.authnstatement": "true",
+                "saml.force.post.binding": "true",
+                "saml.signature.algorithm": "RSA_SHA256",
+                "saml_force_name_id_format": "true",
+                "saml_name_id_format": "username",
+                "saml_assertion_consumer_url_post": acs_url,
+            },
+            "protocolMappers": [
+                {
+                    "name": "email",
+                    "protocol": "saml",
+                    "protocolMapper": "saml-user-property-mapper",
+                    "config": {
+                        "user.attribute": "email",
+                        "attribute.name": "email",
+                        "attribute.nameformat": "Basic",
+                        "friendly.name": "email",
+                    },
+                }
+            ],
+        },
+    ).raise_for_status()
+    http.post(
+        f"{KEYCLOAK_URL}/admin/realms/{SAML_REALM}/users",
+        headers=headers,
+        json={
+            "username": "pat",
+            "email": EMAIL,
+            "firstName": "Pat",
+            "lastName": "Example",
+            "emailVerified": True,
+            "enabled": True,
+            "requiredActions": [],
+            "credentials": [{"type": "password", "value": PASSWORD, "temporary": False}],
+        },
+    ).raise_for_status()
+
+
+def _hidden_input(page: str, name: str) -> str:
+    """The value of a named hidden input on Keycloak's auto-submitting POST binding page."""
+    match = re.search(rf'name="{name}"[^>]*value="([^"]*)"', page) or re.search(
+        rf'value="([^"]*)"[^>]*name="{name}"', page
+    )
+    assert match, f"{name} not found on the POST binding page"
+    return html.unescape(match.group(1))
+
+
+def _saml_sign_in_at_keycloak(http: httpx.Client, authorization_url: str, acs_url: str) -> dict[str, str]:
+    """Load the login page, submit the password, and return the form Keycloak posts to the ACS."""
+    page = http.get(authorization_url, follow_redirects=True)
+    assert page.status_code == 200, page.text[:500]
+    match = re.search(r'id="kc-form-login"[^>]*action="([^"]+)"', page.text) or re.search(
+        r'action="([^"]+)"[^>]*id="kc-form-login"', page.text
+    )
+    assert match, "Keycloak login form not found"
+    action = urljoin(str(page.url), html.unescape(match.group(1)))
+    cookies = "; ".join(f"{cookie.name}={cookie.value}" for cookie in http.cookies.jar)
+    response = http.post(
+        action,
+        data={"username": "pat", "password": PASSWORD, "credentialId": ""},
+        headers={"cookie": cookies},
+    )
+    feedback = re.search(r'kc-feedback-text">([^<]*)<', response.text)
+    assert response.status_code == 200, feedback.group(1) if feedback else response.text[:500]
+    target = re.search(r'<form[^>]*action="([^"]+)"', response.text)
+    assert target, response.text[:500]
+    assert html.unescape(target.group(1)) == acs_url
+    return {
+        "SAMLResponse": _hidden_input(response.text, "SAMLResponse"),
+        "RelayState": _hidden_input(response.text, "RelayState"),
+    }
+
+
+def test_a_keycloak_user_signs_in_over_saml_and_gets_an_sso_session() -> None:
+    """Import Keycloak's IdP metadata, sign in over SAML twice, refresh, and refuse a replay."""
+    settings = _settings()
+    acs_url = f"{ISSUER}/sso/saml/{SAML_CONNECTION_ID}/acs"
+    sp_entity_id = f"{ISSUER}/sso/saml/{SAML_CONNECTION_ID}/metadata"
+    host = urlsplit(KEYCLOAK_URL).hostname or ""
+    guard = PublicUrlGuard(trusted_hosts={host})
+    hooks = Hooks()
+    stores = IdentityStores(
+        credentials=InMemoryCredentialStore(),
+        refresh_tokens=InMemoryRefreshTokenStore(),
+        oauth_states=InMemoryOAuthStateStore(),
+        oauth_links=InMemoryOAuthLinkStore(),
+    )
+    kms = FakeKms()
+    prefix = identity_prefix(settings)
+
+    with httpx.Client(timeout=30.0, follow_redirects=False) as http:
+        _provision_saml_realm(http, sp_entity_id=sp_entity_id, acs_url=acs_url)
+        metadata = fetch_saml_idp_metadata(
+            f"{KEYCLOAK_URL}/realms/{SAML_REALM}/protocol/saml/descriptor", url_guard=guard, client=http
+        )
+        assert metadata.entity_id == f"{KEYCLOAK_URL}/realms/{SAML_REALM}"
+        connection = SsoConnection(
+            connection_id=SAML_CONNECTION_ID,
+            tenant_id="tenant-acme",
+            protocol="saml",
+            verified_domains=(DOMAIN,),
+            saml=metadata.connection_config(),
+        )
+        connections = Connections(connection)
+        service = SsoService(
+            settings,
+            hooks,
+            connections,
+            states=stores.require_oauth_states(),
+            links=stores.require_oauth_links(),
+            cipher=SecretMasterKeyCipher(os.urandom(32)),
+            url_guard=guard,
+            saml_client=SamlSsoClient(replay=FakeIdempotencyStore(), trusted_hosts={host}),
+        )
+        app = FastAPI()
+        app.include_router(
+            build_identity_router(settings, hooks, stores, kms_client=kms, limiter_enabled=False, sso=service)
+        )
+        client = TestClient(app, base_url="https://testserver", follow_redirects=False)
+
+        served = client.get(f"{prefix}/sso/saml/{SAML_CONNECTION_ID}/metadata")
+        assert served.status_code == 200, served.text
+        assert sp_entity_id in served.text
+
+        form: dict[str, str] = {}
+        for expected in ("provisioned", "linked"):
+            http.cookies.clear()
+            started = client.post(f"{prefix}/sso/start", json={"email": EMAIL})
+            assert started.status_code == 200, started.text
+            form = _saml_sign_in_at_keycloak(http, started.json()["authorization_url"], acs_url)
+
+            finished = client.post(f"{prefix}/sso/saml/{SAML_CONNECTION_ID}/acs", data=form)
+            assert finished.status_code == 303
+            assert finished.headers["location"].endswith("sso=1"), finished.headers["location"]
+            assert connections.outcomes[-1] == expected
+
+    refreshed = client.post(f"{prefix}/refresh")
+    assert refreshed.status_code == 200, refreshed.text
+    claims = TokenService(settings, kms).verify_access_token(refreshed.json()["access_token"])
+    assert claims["amr"] == [AMR_SSO, "saml"]
+    assert claims[SSO_CONNECTION_CLAIM] == SAML_CONNECTION_ID
+    assert len(hooks.users) == 1
+    assert next(iter(hooks.users.values()))["email"] == EMAIL
+
+    replayed = client.post(f"{prefix}/sso/saml/{SAML_CONNECTION_ID}/acs", data=form)
+    assert replayed.status_code == 303
+    assert "sso_error=" in replayed.headers["location"]

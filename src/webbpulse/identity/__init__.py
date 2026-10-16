@@ -450,12 +450,16 @@ from webbpulse.identity.share_tokens import (
 )
 from webbpulse.identity.sso import (
     AMR_SSO,
+    SAML_DEFAULT_EMAIL_ATTRIBUTES,
+    SAML_DEFAULT_NAME_ATTRIBUTES,
     SSO_CONNECTION_AMR_PREFIX,
     SSO_CONNECTION_CLAIM,
     SSO_LINK_PROVIDER_PREFIX,
     SSO_PROTOCOL_OIDC,
     SSO_PROTOCOL_SAML,
+    AssertionReplayStore,
     OidcConnectionConfig,
+    SamlConnectionConfig,
     SsoAuthorization,
     SsoConnection,
     SsoHooks,
@@ -485,6 +489,8 @@ from webbpulse.identity.sso_oidc import (
 from webbpulse.identity.sso_routes import (
     SSO_OIDC_CALLBACK_PATH,
     SSO_ROUTE_RESPONSES,
+    SSO_SAML_ACS_PATH,
+    SSO_SAML_METADATA_PATH,
     SSO_START_IP_LIMIT,
     SSO_START_PATH,
     register_sso_routes,
@@ -1109,3 +1115,14 @@ __all__ += [
 ]
 """Per-tenant single sign-on and DNS domain verification, appended for the same reason as the
 blocks above."""
+
+__all__ += [
+    "SAML_DEFAULT_EMAIL_ATTRIBUTES",
+    "SAML_DEFAULT_NAME_ATTRIBUTES",
+    "SSO_SAML_ACS_PATH",
+    "SSO_SAML_METADATA_PATH",
+    "AssertionReplayStore",
+    "SamlConnectionConfig",
+]
+"""SAML single sign-on's pure names. `webbpulse.identity.sso_saml` itself is never imported
+here, so an install without the `saml` extra loads neither `lxml` nor `signxml`."""

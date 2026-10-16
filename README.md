@@ -43,6 +43,7 @@ The base install carries only `pydantic` and `pydantic-settings`. Everything els
 | `identity` | `PyJWT[crypto]`, `fastapi` | `webbpulse.identity` |
 | `oauth` | `httpx` | OAuth sign-in, on top of `identity` |
 | `sso` | `httpx`, `dnspython`, `PyJWT[crypto]` | Per-tenant OIDC single sign-on and DNS domain verification, on top of `identity` |
+| `saml` | `signxml`, `lxml`, `httpx` | Per-tenant SAML 2.0 single sign-on, on top of `sso` |
 | `device-login` | `httpx`, `keyring` | `webbpulse.device_login`, a CLI signing in through the identity device grant |
 | `github` | `httpx`, `PyJWT[crypto]` | `webbpulse.integrations.github` |
 | `stripe` | `stripe` | `webbpulse.integrations.stripe` |
@@ -74,7 +75,7 @@ its dev dependencies.
 | `webbpulse.audit` | `AuditRecorder`, `AuditCatalogue`, `DynamoAuditLogStore`, `InMemoryAuditLogStore`, `audit_csv`: an append-only tenant audit log with secret scrubbing, tenant-scoped cursors and a formula-safe CSV export | [audit.md](docs/audit.md) |
 | `webbpulse.security` | `hash_password`, `verify_password`, `needs_rehash`, `create_token`, `decode_token`, `bearer_claims` | [security.md](docs/security.md) |
 | `webbpulse.identity` | App-managed identity: password, session, email link, TOTP, OAuth and passkey flows, plus a KMS-backed `TokenService` and a JWKS | [identity.md](docs/identity.md), [the standard](docs/identity-standard.md) |
-| `webbpulse.identity.sso` | `SsoService`, `SsoConnection`, `SsoHooks`, `OidcSsoClient`, `PublicUrlGuard` and the DNS TXT domain verification helpers: per-tenant OIDC single sign-on issuing sessions whose `amr` carries `sso` | [identity-sso.md](docs/identity-sso.md) |
+| `webbpulse.identity.sso` | `SsoService`, `SsoConnection`, `SsoHooks`, `OidcSsoClient`, `PublicUrlGuard` and the DNS TXT domain verification helpers: per-tenant OIDC and SAML single sign-on issuing sessions whose `amr` carries `sso` | [identity-sso.md](docs/identity-sso.md) |
 | `webbpulse.identity.scim` | `build_scim_router`, `ScimService`, `ScimHooks`, `mint_scim_token`: SCIM 2.0 user and group provisioning for Okta and Entra ID, with per-tenant bearer tokens | [identity-scim.md](docs/identity-scim.md) |
 | `webbpulse.identity.oauth_server` | An OAuth 2.1 authorization server for hosting a remote MCP server: discovery, PKCE code grant, dynamic registration, consent | [oauth-server.md](docs/oauth-server.md) |
 | `webbpulse.integrations.github` | `GitHubAppClient`: the App JWT, cached installation tokens, check runs, commit statuses, issue comments and installation reads; `load_github_app_settings` for the standard `GITHUB_*` keys; `convert_manifest_code` for the App manifest flow | [GitHub App client](#github-app-client) |
@@ -630,7 +631,7 @@ app.include_router(build_identity_router(settings, hooks, stores, tokens=tokens)
 | [docs/identity-frontend.md](docs/identity-frontend.md) | Standard section 7: the frontend contract and the error codes |
 | [docs/identity.md](docs/identity.md) | The identity package: routes, services, stores and wiring |
 | [docs/identity-oauth.md](docs/identity-oauth.md) | OAuth sign-in and account linking |
-| [docs/identity-sso.md](docs/identity-sso.md) | Per-tenant OIDC single sign-on and DNS domain verification |
+| [docs/identity-sso.md](docs/identity-sso.md) | Per-tenant OIDC and SAML single sign-on and DNS domain verification |
 | [docs/identity-scim.md](docs/identity-scim.md) | SCIM 2.0 provisioning: hooks, tokens, routes and IdP quirks |
 | [docs/oauth-server.md](docs/oauth-server.md) | The OAuth 2.1 authorization server for a remote MCP server |
 | [docs/identity-passkeys.md](docs/identity-passkeys.md) | WebAuthn registration, passwordless sign-in and credential management |
