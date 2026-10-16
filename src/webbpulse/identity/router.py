@@ -34,6 +34,7 @@ if TYPE_CHECKING:  # pragma: no cover
     from webbpulse.identity.passkeys import PasskeyRejected
     from webbpulse.identity.service import TokenService
     from webbpulse.identity.settings import IdentitySettings
+    from webbpulse.identity.sso import SsoService
     from webbpulse.identity.tokens import KmsClient
 
 __all__ = [
@@ -176,6 +177,7 @@ def build_identity_router(
     tenant_resolver: TenantResolver | None = None,
     device_grant_stores: DeviceGrantStores | None = None,
     session_tenant_resolver: SessionTenantResolver | None = None,
+    sso: SsoService | None = None,
 ) -> APIRouter:
     """The identity router for a product, mounted with no prefix.
 
@@ -186,6 +188,7 @@ def build_identity_router(
     the built-in OAuth consent screen; `consent_renderer` replaces it. `device_grant_stores`
     backs the device authorization grant and is required when `device_grant_enabled` is on.
     `session_tenant_resolver` wins over `tenant_resolver` and sees the consenting session.
+    `sso` mounts the single sign-on start and callback routes, and needs the flows mounted.
     """
     from fastapi import APIRouter
     from fastapi.responses import JSONResponse
@@ -219,6 +222,12 @@ def build_identity_router(
             resolved_stores,
             device_grants=resolved_stores.device_grants or device_stores.grants,
             device_codes=resolved_stores.device_codes or device_stores.codes,
+        )
+
+    if sso is not None and (hooks is None or resolved_stores.credentials is None):
+        raise ValueError(
+            "build_identity_router was given `sso` but no hooks or no credential store. "
+            "Single sign-on issues sessions through the flows, which need both."
         )
 
     prefix = identity_prefix(settings)
@@ -288,6 +297,7 @@ def build_identity_router(
             kms_client=kms_client,
             oauth_client_secrets=oauth_client_secrets,
             device_grant_stores=device_stores,
+            sso=sso,
         )
 
     if settings.mcp_oauth_enabled:
@@ -549,12 +559,14 @@ def _declare_identity_responses(router: APIRouter, prefix: str) -> None:
     from webbpulse.identity.ephemeral_routes import EPHEMERAL_ROUTE_RESPONSES
     from webbpulse.identity.oauth_routes import OAUTH_ROUTE_RESPONSES
     from webbpulse.identity.passkey_routes import PASSKEY_ROUTE_RESPONSES
+    from webbpulse.identity.sso_routes import SSO_ROUTE_RESPONSES
 
     for table in (
         IDENTITY_ROUTE_RESPONSES,
         OAUTH_ROUTE_RESPONSES,
         PASSKEY_ROUTE_RESPONSES,
         EPHEMERAL_ROUTE_RESPONSES,
+        SSO_ROUTE_RESPONSES,
     ):
         _declare_route_responses(router, prefix, table)
 
@@ -606,10 +618,12 @@ def _mount_flows(
     kms_client: Any = None,
     oauth_client_secrets: Mapping[str, str] | None = None,
     device_grant_stores: DeviceGrantStores | None = None,
+    sso: SsoService | None = None,
 ) -> None:
     """Add the M2 flow routes, and M3's four email routes, to an already-built router.
 
-    Also mounts the MFA, OAuth and passkey routes when their collaborators are present.
+    Also mounts the MFA, OAuth, single sign-on and passkey routes when their collaborators
+    are present.
     Every route returns an explicit `JSONResponse`.
     """
     from fastapi import Body, Depends
@@ -943,6 +957,19 @@ def _mount_flows(
                 success_body=success_body,
                 set_refresh_cookie=set_refresh_cookie,
             )
+
+    if sso is not None:
+        from webbpulse.identity.sso_routes import register_sso_routes
+
+        register_sso_routes(
+            router,
+            prefix=prefix,
+            settings=settings,
+            sso=sso,
+            flows=flows,
+            limits=limits,
+            context=context,
+        )
 
     if flows.passkeys is not None:
         from webbpulse.identity.passkey_routes import register_passkey_routes

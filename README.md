@@ -42,6 +42,7 @@ The base install carries only `pydantic` and `pydantic-settings`. Everything els
 | `security` | `PyJWT`, `bcrypt` | `webbpulse.security` |
 | `identity` | `PyJWT[crypto]`, `fastapi` | `webbpulse.identity` |
 | `oauth` | `httpx` | OAuth sign-in, on top of `identity` |
+| `sso` | `httpx`, `dnspython`, `PyJWT[crypto]` | Per-tenant OIDC single sign-on and DNS domain verification, on top of `identity` |
 | `device-login` | `httpx`, `keyring` | `webbpulse.device_login`, a CLI signing in through the identity device grant |
 | `github` | `httpx`, `PyJWT[crypto]` | `webbpulse.integrations.github` |
 | `stripe` | `stripe` | `webbpulse.integrations.stripe` |
@@ -73,6 +74,7 @@ its dev dependencies.
 | `webbpulse.audit` | `AuditRecorder`, `AuditCatalogue`, `DynamoAuditLogStore`, `InMemoryAuditLogStore`, `audit_csv`: an append-only tenant audit log with secret scrubbing, tenant-scoped cursors and a formula-safe CSV export | [audit.md](docs/audit.md) |
 | `webbpulse.security` | `hash_password`, `verify_password`, `needs_rehash`, `create_token`, `decode_token`, `bearer_claims` | [security.md](docs/security.md) |
 | `webbpulse.identity` | App-managed identity: password, session, email link, TOTP, OAuth and passkey flows, plus a KMS-backed `TokenService` and a JWKS | [identity.md](docs/identity.md), [the standard](docs/identity-standard.md) |
+| `webbpulse.identity.sso` | `SsoService`, `SsoConnection`, `SsoHooks`, `OidcSsoClient`, `PublicUrlGuard` and the DNS TXT domain verification helpers: per-tenant OIDC single sign-on issuing sessions whose `amr` carries `sso` | [identity-sso.md](docs/identity-sso.md) |
 | `webbpulse.identity.oauth_server` | An OAuth 2.1 authorization server for hosting a remote MCP server: discovery, PKCE code grant, dynamic registration, consent | [oauth-server.md](docs/oauth-server.md) |
 | `webbpulse.integrations.github` | `GitHubAppClient`: the App JWT, cached installation tokens, check runs, commit statuses, issue comments and installation reads; `load_github_app_settings` for the standard `GITHUB_*` keys; `convert_manifest_code` for the App manifest flow | [GitHub App client](#github-app-client) |
 | `webbpulse.integrations.stripe` | `load_stripe_settings` for the standard `STRIPE_*` keys; `stripe_client` for a `stripe.StripeClient`; `verify_webhook_event` and `claim_webhook_event` for a verified, exactly-once webhook receiver; `StripeGateway` for checkout, portal, one customer per owner, seats and cancel on delete | [Stripe](#stripe), [stripe.md](docs/stripe.md) |
@@ -544,6 +546,8 @@ where the data lives.
 | `KmsClient` | Protocol | `src/webbpulse/identity/tokens.py` | The KMS surface `TokenService` signs with, so a test can substitute one |
 | `KmsDataKeyClient` | Protocol | `src/webbpulse/identity/crypto.py` | The KMS surface `EnvelopeCipher` seals TOTP seeds with |
 | `HttpClient` | Protocol | `src/webbpulse/identity/oauth.py` | The OAuth provider leg. `HttpxClient` ships |
+| `SsoHooks` | ABC | `src/webbpulse/identity/sso.py` | The product's connection table, tenant lookup and `on_sso_login` policy |
+| `TxtResolver` | Protocol | `src/webbpulse/identity/domain_verification.py` | TXT lookups for domain verification. `DnsPythonTxtResolver` ships |
 | `SesV2Client` | Protocol | `src/webbpulse/identity/email.py` | The SES v2 surface `SesV2EmailSender` calls |
 
 `IdentityStores` in `src/webbpulse/identity/storage.py` is the container that carries the
@@ -625,6 +629,7 @@ app.include_router(build_identity_router(settings, hooks, stores, tokens=tokens)
 | [docs/identity-frontend.md](docs/identity-frontend.md) | Standard section 7: the frontend contract and the error codes |
 | [docs/identity.md](docs/identity.md) | The identity package: routes, services, stores and wiring |
 | [docs/identity-oauth.md](docs/identity-oauth.md) | OAuth sign-in and account linking |
+| [docs/identity-sso.md](docs/identity-sso.md) | Per-tenant OIDC single sign-on and DNS domain verification |
 | [docs/oauth-server.md](docs/oauth-server.md) | The OAuth 2.1 authorization server for a remote MCP server |
 | [docs/identity-passkeys.md](docs/identity-passkeys.md) | WebAuthn registration, passwordless sign-in and credential management |
 | [docs/http.md](docs/http.md) | `create_app`, the error envelope shapes, and conditional GET |

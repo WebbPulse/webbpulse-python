@@ -448,6 +448,32 @@ class IdentityFlows:
 
         return self._issue(user, ip=ip, user_agent=user_agent, amr=amr)
 
+    def issue_for_sso(
+        self,
+        user: Mapping[str, Any],
+        *,
+        connection_id: str,
+        protocol: str,
+        ip: str = "",
+        user_agent: str = "",
+    ) -> AuthResult:
+        """Issue the same token pair a password login gets, for a completed single sign-on.
+
+        Protocol-neutral, so an OIDC and a SAML connection issue alike. MFA and
+        `may_authenticate` are honoured as for OAuth. `amr` carries `sso` and the protocol,
+        and the access token names the connection in `sso_connection`, through every refresh.
+        """
+        from webbpulse.identity.sso import sso_session_amr
+
+        self._hooks.may_authenticate(user)
+
+        amr = list(sso_session_amr(protocol, connection_id))
+        challenge = self._challenge_for(user, amr=amr)
+        if challenge is not None:
+            raise MfaChallengeRequired(challenge)
+
+        return self._issue(user, ip=ip, user_agent=user_agent, amr=amr)
+
     def mint_desktop_handoff(
         self,
         *,
@@ -1906,11 +1932,18 @@ class IdentityFlows:
     ) -> str:
         """The single place an access token is minted, and so the single place `amr` is set.
 
-        `amr` and `auth_time` are applied after `claims_for`, so a product hook cannot
-        overwrite them. `mfa` is added alongside the specific factor when more than one was used.
+        `amr`, `auth_time` and `sso_connection` are applied after `claims_for`, so a product
+        hook cannot overwrite them. `mfa` is added alongside the specific factor when more
+        than one was used.
         """
+        from webbpulse.identity.sso import SSO_CONNECTION_CLAIM, sso_connection_from_amr
+
         claims = dict(self._hooks.claims_for(user))
         claims["amr"] = list(access_token_amr(amr))
+        claims.pop(SSO_CONNECTION_CLAIM, None)
+        connection_id = sso_connection_from_amr(amr)
+        if connection_id:
+            claims[SSO_CONNECTION_CLAIM] = connection_id
         claims["auth_time"] = int(time.time()) if auth_time is None else auth_time
         return self._tokens.mint_access_token(
             _user_id(user),
