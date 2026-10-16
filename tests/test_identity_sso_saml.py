@@ -16,7 +16,6 @@ from urllib.parse import parse_qs, urlsplit
 
 import httpx
 import pytest
-import signxml
 from cryptography import x509
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import padding, rsa, utils
@@ -24,6 +23,8 @@ from cryptography.x509.oid import NameOID
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 from lxml import etree
+from signxml.algorithms import CanonicalizationMethod
+from signxml.signer import XMLSigner
 
 from webbpulse.identity import (
     AMR_SSO,
@@ -123,7 +124,7 @@ class Idp:
 
     def _sign(self, element: Any, element_id: str, key: rsa.RSAPrivateKey | None, cert: str | None) -> Any:
         """Sign an element in place of its placeholder, with exclusive canonicalisation."""
-        signer = signxml.XMLSigner(c14n_algorithm=signxml.CanonicalizationMethod.EXCLUSIVE_XML_CANONICALIZATION_1_0)
+        signer = XMLSigner(c14n_algorithm=CanonicalizationMethod.EXCLUSIVE_XML_CANONICALIZATION_1_0)
         return signer.sign(element, key=key or self.key, cert=cert or self.cert, reference_uri=element_id)
 
     def assertion(
@@ -655,7 +656,7 @@ def test_a_replayed_assertion_is_refused(harness: Harness, idp: Idp) -> None:
         {"response_issuer": "https://evil.example.test"},
     ],
 )
-def test_a_response_meant_for_someone_else_is_refused(harness: Harness, idp: Idp, field: dict[str, str]) -> None:
+def test_a_response_meant_for_someone_else_is_refused(harness: Harness, idp: Idp, field: dict[str, Any]) -> None:
     """Audience, recipient, destination, request id and issuer must all match."""
     record = harness.begin()
     assert refused_code(harness, idp.response(record.nonce, **field), record) == "SSO_SAML_INVALID"
@@ -673,7 +674,7 @@ def test_a_doctype_is_refused_before_any_entity_is_expanded(harness: Harness, id
     secret = tmp_path / "secret.txt"
     secret.write_text("top-secret")
     record = harness.begin()
-    document = idp.response(record.nonce, name_id="&xxe;")
+    document = idp.response(record.nonce).replace(f">{SUBJECT}<", ">&xxe;<", 1)
     document = f'<!DOCTYPE r [<!ENTITY xxe SYSTEM "file://{secret}">]>{document}'
     assert refused_code(harness, document, record) == "SSO_SAML_INVALID"
 

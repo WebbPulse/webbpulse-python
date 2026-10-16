@@ -409,7 +409,7 @@ class SsoService:
 
         if connection.protocol == SSO_PROTOCOL_SAML:
             return self._start_saml(connection, return_to=return_to, binding=binding)
-        if connection.protocol != SSO_PROTOCOL_OIDC or connection.oidc is None:
+        if connection.oidc is None:
             raise _unsupported()
 
         state = _b64url(secrets.token_bytes(32))

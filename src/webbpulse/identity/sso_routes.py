@@ -298,7 +298,7 @@ def _register_saml_routes(
     from fastapi.responses import Response
 
     from webbpulse.identity.oauth import OAUTH_LINK_BINDING_COOKIE, OAuthRejected, link_binding_matches
-    from webbpulse.identity.sso import SsoRejected
+    from webbpulse.identity.sso import SSO_PROTOCOL_SAML, SsoRejected
 
     def malformed() -> SsoRejected:
         """The refusal for a post that is not a SAML HTTP-POST binding form."""
