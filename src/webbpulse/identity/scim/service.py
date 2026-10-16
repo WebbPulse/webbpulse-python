@@ -94,9 +94,7 @@ class ScimQuery:
         resource_type: ScimResourceType,
     ) -> ScimPage[T]:
         """Filter by the rendered form, then slice the page."""
-        matched = [
-            item for item in items if self.filter is None or self.filter.matches(render(item), resource_type)
-        ]
+        matched = [item for item in items if self.filter is None or self.filter.matches(render(item), resource_type)]
         start = max(self.start_index, 1) - 1
         return ScimPage(resources=tuple(matched[start : start + max(self.count, 0)]), total_results=len(matched))
 
@@ -322,9 +320,7 @@ class ScimService:
         parsed = ScimUser.from_resource(body)
         self._ensure_unique(tenant_id, parsed.user_name)
         stamp = now_iso()
-        created = self.hooks.create_user(
-            tenant_id, dataclasses.replace(parsed, created=stamp, last_modified=stamp)
-        )
+        created = self.hooks.create_user(tenant_id, dataclasses.replace(parsed, created=stamp, last_modified=stamp))
         self._record("scim.user_created", tenant_id, created.id)
         if not created.active:
             self.hooks.deactivate_user(tenant_id, created)

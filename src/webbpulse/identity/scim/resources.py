@@ -291,9 +291,7 @@ class ScimUser:
                 continue
             body[key] = copy.deepcopy(value)
         if self.groups:
-            body["groups"] = [
-                {**item.as_dict(base_url, resource="Groups"), "type": "direct"} for item in self.groups
-            ]
+            body["groups"] = [{**item.as_dict(base_url, resource="Groups"), "type": "direct"} for item in self.groups]
         body["meta"] = _meta(
             resource_type="User",
             location=f"{base_url}/Users/{self.id}",

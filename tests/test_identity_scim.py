@@ -391,9 +391,7 @@ def test_a_taken_user_name_answers_409(client: TestClient) -> None:
 def test_okta_deactivates_and_reactivates_through_patch(client: TestClient, hooks: MemoryHooks) -> None:
     """Okta's path-less replace of `active` runs the deactivate and reactivate hooks."""
     user_id = _create_user(client)["id"]
-    response = client.patch(
-        f"/scim/v2/Users/{user_id}", **_scim(_patch({"op": "replace", "value": {"active": False}}))
-    )
+    response = client.patch(f"/scim/v2/Users/{user_id}", **_scim(_patch({"op": "replace", "value": {"active": False}})))
     assert response.status_code == 200
     assert response.json()["active"] is False
     assert hooks.deactivated == [user_id]
@@ -456,9 +454,7 @@ def test_entra_lookups_by_user_name_and_external_id(client: TestClient) -> None:
     assert missing.json()["totalResults"] == 0
     assert missing.json()["Resources"] == []
     created = _create_user(client, ENTRA_CREATE_USER)
-    found = client.get(
-        "/scim/v2/Users", params={"filter": f'externalId eq "{ENTRA_CREATE_USER["externalId"]}"'}
-    ).json()
+    found = client.get("/scim/v2/Users", params={"filter": f'externalId eq "{ENTRA_CREATE_USER["externalId"]}"'}).json()
     assert [item["id"] for item in found["Resources"]] == [created["id"]]
     wrong_case = client.get(
         "/scim/v2/Users", params={"filter": f'externalId eq "{ENTRA_CREATE_USER["externalId"].upper()}"'}
@@ -544,7 +540,7 @@ def test_patch_refusals(client: TestClient) -> None:
         (_patch({"op": "move", "path": "title", "value": "x"}), "invalidSyntax"),
         (_patch({"op": "add", "path": "title"}), "invalidSyntax"),
         (_patch({"op": "replace", "path": "emails[type eq]", "value": "x"}), "invalidPath"),
-        (_patch({"op": "replace", "path": 'emails[type co "w"].value', "value": "x"}), "noTarget"),
+        (_patch({"op": "replace", "path": 'emails[type co "zz"].value', "value": "x"}), "noTarget"),
         ({"schemas": [PATCH_OP_SCHEMA], "Operations": []}, "invalidSyntax"),
         ({"schemas": ["urn:example:wrong"], "Operations": [{"op": "add", "value": {}}]}, "invalidSyntax"),
     ]
@@ -697,7 +693,7 @@ def test_okta_pushes_group_members(client: TestClient, hooks: MemoryHooks) -> No
     assert [member.value for member in hooks.members[(TENANT, group_id)]] == [second]
     group = client.get(f"/scim/v2/Groups/{group_id}").json()
     assert group["members"] == [
-        {"value": second, "$ref": f"{BASE_URL}/Users/{second}", "type": "User"},
+        {"value": second, "$ref": f"{BASE_URL}/Users/{second}", "display": "second", "type": "User"},
     ]
 
 
@@ -891,9 +887,7 @@ def test_helpers() -> None:
         "userName": "alice",
         ENTERPRISE_USER_SCHEMA: {"department": "Sales", "employeeNumber": "7"},
     }
-    projected = project_resource(
-        resource, USER_RESOURCE_TYPE, attributes=[f"{ENTERPRISE_USER_SCHEMA}:department"]
-    )
+    projected = project_resource(resource, USER_RESOURCE_TYPE, attributes=[f"{ENTERPRISE_USER_SCHEMA}:department"])
     assert projected == {
         "schemas": [USER_SCHEMA, ENTERPRISE_USER_SCHEMA],
         "id": "u1",

@@ -299,9 +299,7 @@ _GROUP: Final = ScimSchema(
 USER_RESOURCE_TYPE: Final = ScimResourceType("User", "/Users", _USER, (_ENTERPRISE_USER,))
 GROUP_RESOURCE_TYPE: Final = ScimResourceType("Group", "/Groups", _GROUP)
 
-_SCHEMAS: Final[Mapping[str, ScimSchema]] = {
-    item.id.lower(): item for item in (_USER, _ENTERPRISE_USER, _GROUP)
-}
+_SCHEMAS: Final[Mapping[str, ScimSchema]] = {item.id.lower(): item for item in (_USER, _ENTERPRISE_USER, _GROUP)}
 
 
 def resource_type(kind: ResourceKind) -> ScimResourceType:
