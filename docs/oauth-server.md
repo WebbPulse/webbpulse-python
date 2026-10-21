@@ -160,6 +160,11 @@ the session may not enter is never offered and cannot be posted. An OAuth-only s
 reports `["oauth", "<provider>"]` with no `mfa`, so a tenant policy that requires `mfa`
 holds it out until the session steps up with TOTP or a passkey.
 
+A tenant policy can also tighten after consent. `refresh_guard`, passed to
+`build_identity_router`, is handed the `ConsentRecord` each refresh continues before the
+refresh token is spent. An explicit `False` answers `invalid_grant` and leaves the token
+live, so the grant works again if the product's answer changes; an exception propagates.
+
 The form carries the authorization parameters through the user's browser, so they are
 covered by an HMAC that also binds the signed-in user id, which is never sent. A scope or
 redirect URI edited in the browser, a form minted in another account's session, or a form

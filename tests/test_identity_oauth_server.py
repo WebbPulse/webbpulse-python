@@ -712,7 +712,9 @@ class TestClientStore:
         assert record.expires_at == 0
 
 
-def _service_with_refresh(fake_kms: Any) -> tuple[OAuthServerService, OAuthServerStores, InMemoryRefreshTokenStore]:
+def _service_with_refresh(
+    fake_kms: Any, refresh_guard: Any = None
+) -> tuple[OAuthServerService, OAuthServerStores, InMemoryRefreshTokenStore]:
     """An `OAuthServerService` with flows, so a granted code also starts a refresh family."""
     settings = build_settings()
     tokens = TokenService(settings, fake_kms)
@@ -724,7 +726,8 @@ def _service_with_refresh(fake_kms: Any) -> tuple[OAuthServerService, OAuthServe
         tokens,
     )
     stores = build_stores()
-    return OAuthServerService(settings, stores, tokens, flows=flows), stores, refresh_tokens
+    service = OAuthServerService(settings, stores, tokens, flows=flows, refresh_guard=refresh_guard)
+    return service, stores, refresh_tokens
 
 
 def _grant(service: OAuthServerService, *, tenant_id: str = TENANT) -> dict[str, Any]:
@@ -950,6 +953,83 @@ class TestConsentStoreHelpers:
         deleted = store.delete_for_tenant(USER, "t1")
         assert sorted(record.consent_id for record in deleted) == ["c1", "c2"]
         assert [record.consent_id for record in store.list_for_user(USER)] == ["c3"]
+
+
+class TestRefreshGuard:
+    """A product's `refresh_guard` can decline a refresh without spending its token."""
+
+    def test_a_declined_refresh_is_refused_and_leaves_the_token_unspent(self, fake_kms: Any) -> None:
+        """The refusal is `invalid_grant`, and the same token refreshes once the guard allows it."""
+        allowed = {"value": False}
+        service, _, refresh_tokens = _service_with_refresh(fake_kms, lambda consent: allowed["value"])
+        body = _grant(service)
+
+        with pytest.raises(OAuthServerError) as exc:
+            _refresh(service, body["refresh_token"])
+
+        assert exc.value.error == "invalid_grant"
+        assert not any(record.is_consumed or record.revoked for record in refresh_tokens._items.values())
+        allowed["value"] = True
+        refreshed = _refresh(service, body["refresh_token"])
+        assert refreshed["refresh_token"]
+
+    def test_the_guard_sees_the_grant_the_family_continues(self, fake_kms: Any) -> None:
+        """The guard is handed the consent of the tenant the family was started for."""
+        seen: list[ConsentRecord] = []
+
+        def guard(consent: ConsentRecord) -> bool:
+            """Record the consent and allow the refresh."""
+            seen.append(consent)
+            return True
+
+        service, _, _ = _service_with_refresh(fake_kms, guard)
+        _grant(service, tenant_id="workspace-2")
+        body = _grant(service)
+
+        _refresh(service, body["refresh_token"])
+
+        assert [consent.tenant_id for consent in seen] == [TENANT]
+
+    def test_only_an_explicit_false_declines(self, fake_kms: Any) -> None:
+        """A guard answering anything but `False` lets the refresh through."""
+        service, _, _ = _service_with_refresh(fake_kms, lambda consent: None)
+        body = _grant(service)
+
+        assert _refresh(service, body["refresh_token"])["refresh_token"]
+
+    def test_an_exception_from_the_guard_propagates_and_spends_nothing(self, fake_kms: Any) -> None:
+        """A failing guard is never read as consent, and the token survives for a retry."""
+
+        def guard(consent: ConsentRecord) -> bool:
+            """Fail as a product store outage would."""
+            raise RuntimeError("policy store unavailable")
+
+        service, _, refresh_tokens = _service_with_refresh(fake_kms, guard)
+        body = _grant(service)
+
+        with pytest.raises(RuntimeError):
+            _refresh(service, body["refresh_token"])
+
+        assert not any(record.is_consumed or record.revoked for record in refresh_tokens._items.values())
+
+    def test_the_guard_is_not_asked_about_a_token_with_no_grant(self, fake_kms: Any) -> None:
+        """A family with no grant behind it is refused by the consent check, not the guard."""
+        calls: list[ConsentRecord] = []
+
+        def guard(consent: ConsentRecord) -> bool:
+            """Record the question and decline."""
+            calls.append(consent)
+            return False
+
+        service, _, _ = _service_with_refresh(fake_kms, guard)
+        assert service._flows is not None
+        stray = service._flows.sessions.start_family(USER, device="firefox").token
+
+        with pytest.raises(OAuthServerError) as exc:
+            _refresh(service, stray)
+
+        assert exc.value.error == "invalid_grant"
+        assert calls == []
 
 
 def _legacy_family(service: OAuthServerService) -> str:

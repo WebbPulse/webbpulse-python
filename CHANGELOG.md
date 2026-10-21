@@ -7,6 +7,19 @@ This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## Unreleased
 
+## 0.98.0
+
+### Added
+
+- `refresh_guard` on `OAuthServerService`, `build_oauth_server_router`,
+  `build_identity_router` and `build_dynamo_router` (STUP-295). It is asked about
+  the standing grant an MCP refresh continues before the refresh token is spent, and an
+  explicit `False` refuses the refresh with `invalid_grant` while leaving the token live,
+  so a product can close grants given before a tenant tightened its sign-in policy and
+  reopen them if the policy is relaxed. An exception from the guard propagates.
+  `PresentedSession` now carries the family's `device`, which is how the grant is found
+  without rotating.
+
 ## 0.97.0
 
 ### Security
