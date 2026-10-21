@@ -60,6 +60,7 @@ __all__ = [
     "ConsentRenderer",
     "OAuthServerError",
     "OAuthServerService",
+    "RefreshGuard",
     "SessionTenantResolver",
     "TenantChoice",
     "build_authorization_server_metadata",
@@ -91,6 +92,9 @@ step at all. OAuth 2.1 removes it."""
 
 _BEYOND_CONSENT: Final = "A refresh may not ask for a scope the user did not grant. Authorize again to widen it."
 """Why a refresh asking beyond its consent is refused."""
+
+_REFUSED_BY_GUARD: Final = "This authorization no longer meets the sign-in policy of its workspace. Authorize again."
+"""Why a refresh the product's `refresh_guard` declined is refused."""
 
 TOKEN_ENDPOINT_AUTH_METHODS: Final[tuple[str, ...]] = ("none",)
 
@@ -263,6 +267,13 @@ type SessionTenantResolver = Callable[[AuthorizationSubject], Sequence[TenantCho
 whose auth policy the session does not meet, such as a sign-in method policy read from `amr`.
 """
 
+type RefreshGuard = Callable[[ConsentRecord], bool]
+"""Whether a refresh may continue this standing grant, asked before the token is spent.
+
+Only an explicit `False` refuses. The product answers from state it owns, such as a
+tenant's sign-in policy tightened after the grant was given.
+"""
+
 
 def build_authorization_server_metadata(settings: IdentitySettings) -> dict[str, Any]:
     """The RFC 8414 authorization server metadata document.
@@ -400,16 +411,20 @@ class OAuthServerService:
         tokens: TokenService,
         *,
         flows: IdentityFlows | None = None,
+        refresh_guard: RefreshGuard | None = None,
     ) -> None:
         """Bind the service to its settings, stores and token service.
 
         `flows` is optional and only used to issue the refresh family behind a granted
         token, so a product mounting the server without the password flows still works.
+        `refresh_guard` is asked about the grant a refresh continues before its token is
+        spent, so a declined refresh can succeed later once the product's answer changes.
         """
         self._settings = settings
         self._stores = stores
         self._tokens = tokens
         self._flows = flows
+        self._refresh_guard = refresh_guard
         self._seed_first_party_clients()
 
     def _seed_first_party_clients(self) -> None:
@@ -736,6 +751,8 @@ class OAuthServerService:
         The new token carries the scopes the user consented to, or the narrower set the
         client asks for (RFC 6749 section 6). A scope beyond the consent is refused with
         `invalid_scope` before the token is spent, so a grant never widens on refresh.
+        A grant the `refresh_guard` declines is refused with `invalid_grant`, also before
+        the token is spent.
         """
         moment = int(time.time()) if now is None else now
         token = params.get("refresh_token", "")
@@ -754,6 +771,8 @@ class OAuthServerService:
             raise OAuthServerError("invalid_target", "resource does not name a resource this server protects.")
         if requested and not self._refresh_could_cover(token, params.get("client_id", ""), tuple(requested)):
             raise OAuthServerError("invalid_scope", _BEYOND_CONSENT)
+        if not self._refresh_allowed(token, params.get("client_id", "")):
+            raise OAuthServerError("invalid_grant", _REFUSED_BY_GUARD)
 
         outcome = self._flows.sessions.rotate(token)
         if outcome.issued is None:
@@ -782,6 +801,22 @@ class OAuthServerService:
             "refresh_token": outcome.issued.token,
             "scope": " ".join(scopes),
         }
+
+    def _refresh_allowed(self, token: str, client_id: str) -> bool:
+        """Whether the `refresh_guard` lets this token continue its grant, read without spending it.
+
+        A token or grant that cannot be read answers `True` and is refused by the rotation
+        and consent checks that follow. An exception from the guard propagates.
+        """
+        if self._refresh_guard is None or self._flows is None:
+            return True
+        presented = self._flows.sessions.peek(token)
+        if presented is None:
+            return True
+        consent = self._consent_for_refresh(presented.user_id, client_id, presented.device)
+        if consent is None:
+            return True
+        return self._refresh_guard(consent) is not False
 
     def _refresh_could_cover(self, token: str, client_id: str, requested: tuple[str, ...]) -> bool:
         """Whether some grant the token's user holds to this client covers `requested`.
@@ -925,6 +960,7 @@ def build_oauth_server_router(
     tenant_resolver: TenantResolver | None = None,
     session_tenant_resolver: SessionTenantResolver | None = None,
     limits: Callable[..., list[Any]] | None = None,
+    refresh_guard: RefreshGuard | None = None,
     subject_resolver: Callable[[Request], str] | None = None,
     authorization_subject_resolver: Callable[[Request], AuthorizationSubject | None] | None = None,
 ) -> APIRouter:
@@ -938,13 +974,14 @@ def build_oauth_server_router(
     no `auth_time` and so always counts as stale when `mcp_consent_max_age` is set.
     `consent_renderer` wins over `consent_theme`, which brands the built-in screen.
     `session_tenant_resolver` wins over `tenant_resolver`, which sees only the user id.
+    `refresh_guard` is asked before each refresh rotates, as `OAuthServerService` documents.
     """
     from fastapi import APIRouter
     from fastapi.responses import JSONResponse, RedirectResponse
 
     _bind_fastapi_request()
 
-    service = OAuthServerService(settings, stores, tokens, flows=flows)
+    service = OAuthServerService(settings, stores, tokens, flows=flows, refresh_guard=refresh_guard)
     from webbpulse.identity.consent_page import build_consent_renderer
 
     render = consent_renderer or build_consent_renderer(consent_theme)

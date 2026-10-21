@@ -27,6 +27,7 @@ if TYPE_CHECKING:  # pragma: no cover
     from webbpulse.identity.oauth_server import (
         AuthorizationSubject,
         ConsentRenderer,
+        RefreshGuard,
         SessionTenantResolver,
         TenantResolver,
     )
@@ -184,6 +185,7 @@ def build_identity_router(
     device_grant_stores: DeviceGrantStores | None = None,
     session_tenant_resolver: SessionTenantResolver | None = None,
     sso: SsoService | None = None,
+    refresh_guard: RefreshGuard | None = None,
 ) -> APIRouter:
     """The identity router for a product, mounted with no prefix.
 
@@ -195,6 +197,7 @@ def build_identity_router(
     backs the device authorization grant and is required when `device_grant_enabled` is on.
     `session_tenant_resolver` wins over `tenant_resolver` and sees the consenting session.
     `sso` mounts the single sign-on start and callback routes, and needs the flows mounted.
+    `refresh_guard` is asked before each MCP refresh rotates its token.
     """
     from fastapi import APIRouter
     from fastapi.responses import JSONResponse
@@ -323,6 +326,7 @@ def build_identity_router(
             consent_theme=consent_theme,
             tenant_resolver=tenant_resolver,
             session_tenant_resolver=session_tenant_resolver,
+            refresh_guard=refresh_guard,
         )
 
     if device_stores is not None and hooks is not None:
@@ -362,6 +366,7 @@ def _mount_oauth_server(
     consent_theme: ConsentTheme | None,
     tenant_resolver: TenantResolver | None,
     session_tenant_resolver: SessionTenantResolver | None = None,
+    refresh_guard: RefreshGuard | None = None,
 ) -> None:
     """Mount the OAuth 2.1 authorization server, behind `mcp_oauth_enabled`.
 
@@ -400,6 +405,7 @@ def _mount_oauth_server(
             session_tenant_resolver=session_tenant_resolver,
             limits=limits,
             authorization_subject_resolver=subject_resolver,
+            refresh_guard=refresh_guard,
         )
     )
 

@@ -69,13 +69,14 @@ class PresentedSession:
 
     `auth_time` is the family's last authentication in epoch seconds: the login, or a
     later step-up. `amr` is the sign-in's `amr`, empty for a family started before it was
-    recorded.
+    recorded. `device` is the label the family was started under.
     """
 
     user_id: str
     family_id: str
     auth_time: int
     amr: tuple[str, ...] = ()
+    device: str = ""
 
 
 @dataclass(frozen=True, slots=True)
@@ -292,6 +293,7 @@ class SessionService:
             now=moment,
             auth_time=self._auth_time(record),
             amr=record.amr,
+            device=record.device or UNKNOWN_DEVICE,
         )
 
         previous = self._store.consume(

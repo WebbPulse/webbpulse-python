@@ -22,7 +22,7 @@ if TYPE_CHECKING:  # pragma: no cover
     from webbpulse.identity.email import EmailSender
     from webbpulse.identity.hooks import IdentityHooks
     from webbpulse.identity.lockout import LoginAttemptStore
-    from webbpulse.identity.oauth_server import ConsentRenderer, SessionTenantResolver, TenantResolver
+    from webbpulse.identity.oauth_server import ConsentRenderer, RefreshGuard, SessionTenantResolver, TenantResolver
     from webbpulse.identity.oauth_server_storage import OAuthServerStores
     from webbpulse.identity.service import TokenService
     from webbpulse.identity.settings import IdentitySettings
@@ -173,6 +173,7 @@ def build_dynamo_router(
     api_keys: bool = False,
     device_grant_stores: DeviceGrantStores | None = None,
     session_tenant_resolver: SessionTenantResolver | None = None,
+    refresh_guard: RefreshGuard | None = None,
 ) -> APIRouter:
     """The identity router over the DynamoDB tables under `prefix`.
 
@@ -217,6 +218,7 @@ def build_dynamo_router(
         tenant_resolver=tenant_resolver,
         device_grant_stores=device_grant_stores,
         session_tenant_resolver=session_tenant_resolver,
+        refresh_guard=refresh_guard,
     )
 
 
