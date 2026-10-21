@@ -43,6 +43,8 @@ __all__ = [
     "SesV2EmailSender",
     "email_brand",
     "render_branded",
+    "render_email_change",
+    "render_email_changed",
     "render_password_changed",
     "render_password_reset",
     "render_registration_notice",
@@ -54,7 +56,7 @@ _log = logging.getLogger(__name__)
 CHARSET: Final = "UTF-8"
 
 TRANSACTIONAL_PURPOSES: Final[frozenset[str]] = frozenset(
-    {"verify_email", "reset_password", "password_changed", "registration_notice"}
+    {"verify_email", "reset_password", "password_changed", "registration_notice", "change_email", "email_changed"}
 )
 """The `purpose` tags `CappedEmailSender` counts as transactional, besides any `mfa` prefix."""
 
@@ -458,4 +460,54 @@ def render_password_changed(settings: IdentitySettings, *, to: str, link: str) -
             *_support(settings),
         ],
         tags={"purpose": "password_changed"},
+    )
+
+
+def render_email_change(settings: IdentitySettings, *, to: str, link: str, expiry: str) -> EmailMessage:
+    """Render the confirmation sent to the address a user asked to move their sign-in to."""
+    product = _product(settings)
+    return render_branded(
+        email_brand(settings),
+        to=to,
+        subject=f"Confirm your new email address for {settings.product_name}".strip(),
+        preheader=f"Confirm this address to start signing in to {product} with it.",
+        blocks=[
+            Heading("Confirm your new email address"),
+            Paragraph(
+                f"Someone asked to change the sign-in address on a {product} account to this one. "
+                "Confirm it to finish the change."
+            ),
+            Button("Confirm your new address", link, show_url=True),
+            Paragraph(f"The link works once and expires in {expiry}."),
+            Paragraph("If this was not you, you can ignore this message and nothing will change.", muted=True),
+            *_support(settings),
+        ],
+        tags={"purpose": "change_email"},
+    )
+
+
+def render_email_changed(settings: IdentitySettings, *, to: str, new_address: str) -> EmailMessage:
+    """Render the notice sent to the old address once the sign-in address has moved.
+
+    `new_address` arrives masked, so the old mailbox learns where the account went without
+    the full address of whoever took it. There is no reset link: it would mail the new
+    address, so the remedy is the support contact.
+    """
+    product = _product(settings)
+    return render_branded(
+        email_brand(settings),
+        to=to,
+        subject=f"Your {settings.product_name} sign-in address was changed".strip(),
+        preheader="Every other signed-in session was ended.",
+        blocks=[
+            Heading("Your sign-in address was changed"),
+            Paragraph(
+                f"The sign-in address on your {product} account was just changed to {new_address}, "
+                "and every other signed-in session was ended. This address no longer signs in."
+            ),
+            Paragraph("If this was you, there is nothing to do."),
+            Paragraph("If it was not you, contact us right away so we can secure the account."),
+            *_support(settings),
+        ],
+        tags={"purpose": "email_changed"},
     )

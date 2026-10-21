@@ -32,6 +32,7 @@ __all__ = [
     "RotationOutcome",
     "RotationResult",
     "SessionService",
+    "SessionSummary",
 ]
 
 _log = logging.getLogger(__name__)
@@ -74,6 +75,25 @@ class PresentedSession:
     user_id: str
     family_id: str
     auth_time: int
+    amr: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True, slots=True)
+class SessionSummary:
+    """One live refresh family as the session list shows it to its owner.
+
+    `family_id` is the session id the access token's `sid` claim carries. `device` is the
+    coarse class the family was started under, `ip` the address it was first seen from,
+    `started_at` when the sign-in happened and `last_active_at` when it last refreshed.
+    `expires_at` is the current generation's expiry in epoch seconds.
+    """
+
+    family_id: str
+    device: str
+    ip: str
+    started_at: str
+    last_active_at: str
+    expires_at: int
     amr: tuple[str, ...] = ()
 
 
@@ -475,6 +495,52 @@ class SessionService:
                 },
             )
             return 0
+
+    def list_for_user(self, user_id: str, *, now: datetime | None = None) -> list[SessionSummary]:
+        """The user's live sessions, most recently active first.
+
+        A family is live when its newest generation is neither revoked, expired nor past the
+        absolute cap. A store that cannot enumerate a user's families reports none rather
+        than failing the call, exactly as `revoke_all_for_user` does.
+        """
+        moment = now or datetime.now(UTC)
+        try:
+            records = self._store.latest_by_family_for_user(user_id)
+        except NotImplementedError:
+            _log.warning(
+                "This store cannot enumerate a user's families, so no session was listed.",
+                extra={"event": "session.list_unsupported", "user_id": user_id},
+            )
+            return []
+        summaries = [
+            SessionSummary(
+                family_id=record.family_id,
+                device=record.device or UNKNOWN_DEVICE,
+                ip=record.ip_first_seen,
+                started_at=record.family_started_at or record.created_at,
+                last_active_at=record.created_at,
+                expires_at=record.expires_at,
+                amr=record.amr,
+            )
+            for record in records
+            if not record.revoked
+            and not is_expired(record.expires_at, now=moment)
+            and not self._past_absolute_cap(record, moment)
+        ]
+        return sorted(summaries, key=lambda summary: summary.last_active_at, reverse=True)
+
+    def revoke_owned_family(self, user_id: str, family_id: str, *, now: datetime | None = None) -> int | None:
+        """Revoke one of the user's own live sessions, returning how many rows changed.
+
+        `None` when no live family of that id belongs to this user, so somebody else's
+        session id reads exactly like one that never existed.
+        """
+        if not family_id:
+            return None
+        owned = {summary.family_id for summary in self.list_for_user(user_id, now=now)}
+        if family_id not in owned:
+            return None
+        return self._store.revoke_family(family_id)
 
     def _family_started_at(self, record: RefreshTokenRecord) -> datetime:
         """Read when the family began, for the absolute cap.

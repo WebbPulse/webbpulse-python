@@ -128,6 +128,20 @@ class DynamoUsersHooks[UserT: User](BaseIdentityHooks):
             )
         self._users.update(user_id, email_verified=True)
 
+    def change_email(self, user_id: str, email: str) -> None:
+        """Move this user's sign-in address and mark it verified, on the `users` row.
+
+        The repository rewrites the indexed `email_lower` with it, so sign-in by the new
+        address works at once.
+
+        Raises:
+            ValueError: When no row has this id. The link is already spent, so a failure has
+                to be visible rather than passing silently.
+        """
+        if self._users.get(user_id) is None:
+            raise ValueError(f"change_email found no user with id {user_id!r}. The link was consumed.")
+        self._users.update(user_id, email=email, email_verified=True)
+
     def delete_user(self, user_id: str) -> bool:
         """Hard-delete this product's users row, returning whether one was there.
 
