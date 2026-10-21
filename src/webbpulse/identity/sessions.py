@@ -293,7 +293,6 @@ class SessionService:
             now=moment,
             auth_time=self._auth_time(record),
             amr=record.amr,
-            device=record.device or UNKNOWN_DEVICE,
         )
 
         previous = self._store.consume(
@@ -413,6 +412,7 @@ class SessionService:
             family_id=record.family_id,
             auth_time=self._auth_time(record),
             amr=record.amr,
+            device=record.device or UNKNOWN_DEVICE,
         )
 
     def revoke_family(self, family_id: str) -> int:
