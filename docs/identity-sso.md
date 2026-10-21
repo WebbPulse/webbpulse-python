@@ -65,11 +65,14 @@ response arrives as a cross-site POST.
 Build `SamlConnectionConfig` by hand or from the IdP's metadata with
 `parse_saml_idp_metadata(xml)` or `fetch_saml_idp_metadata(url)` (through `PublicUrlGuard`,
 no redirects, 1 MiB cap), then `.connection_config()`. Several `idp_certificates` allow
-rotation. A transient NameID needs `subject_attribute`.
+rotation. A transient NameID needs `subject_attribute`. The email comes from the configured
+`email_attributes`, then the `.../claims/emailaddress` claim, then an emailAddress-format
+NameID, which covers Okta and Entra defaults.
 
-Checks: the assertion signature is required (a response signature is checked when present),
-only the element the signature covers is read, and exactly one unencrypted assertion is
-allowed, so wrapping attacks fail. `Destination`, `Recipient` and `InResponseTo` must match
+Checks: the assertion must be signed, or sit in a signed Response (Entra's response-only
+mode); every signature present must verify. Only elements a verified signature covers are
+read, and exactly one unencrypted assertion, a direct child of the Response, is allowed, so
+wrapping attacks fail. `Destination`, `Recipient` and `InResponseTo` must match
 the ACS and the spent state's AuthnRequest id, the audience must be the SP entity id, and
 `NotBefore`, `NotOnOrAfter` and `SessionNotOnOrAfter` are checked with the settings' clock
 skew leeway. A DOCTYPE is refused before parsing. Each assertion id is claimed in the replay
@@ -103,10 +106,16 @@ is required when the provider advertises it. The token endpoint uses `client_sec
 unless the connection says `client_secret_post`.
 
 `PublicUrlGuard` refuses provider URLs that are not HTTPS, carry credentials, or resolve to
-any non-public address, so a tenant cannot point discovery at the metadata service. It
-resolves before the request, so DNS rebinding between the check and the connect is not
-covered; run the API without a route to private networks it should not reach. Pass
-`trusted_hosts` only for a local test provider.
+any non-public address, IPv6 forms that embed a private IPv4 address included, so a tenant
+cannot point discovery at the metadata service. The default clients connect only to the
+addresses the guard approved: `PublicUrlGuard.transport()` re-checks every request, each
+redirect hop included, and sends it to a vetted IP literal with the `Host` header and TLS
+server name left as the original host, so the certificate is still verified against it and
+a rebinding DNS answer cannot move the connection. A product that passes its own
+`http_client` to `SsoService` or `OidcSsoClient`, or its own `client` to
+`fetch_saml_idp_metadata`, should build it on that transport, for example
+`HttpxClient(transport_factory=guard.transport)`. Pass `trusted_hosts` only for a local test
+provider; those hosts are reached without pinning.
 
 ## Domain verification
 

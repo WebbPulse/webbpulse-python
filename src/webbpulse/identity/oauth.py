@@ -19,7 +19,7 @@ from webbpulse.dynamodb import now_iso, ttl_in
 from webbpulse.identity.storage import constant_time_equals, is_expired
 
 if TYPE_CHECKING:  # pragma: no cover
-    from collections.abc import Mapping
+    from collections.abc import Callable, Mapping
 
     from webbpulse.dynamodb import Repository
     from webbpulse.identity.hooks import IdentityHooks
@@ -132,20 +132,29 @@ class HttpxClient:
     """`HttpClient` over `httpx`, built once and reused.
 
     Sets an explicit timeout on every call, and builds the client lazily so importing this
-    module needs no `httpx`.
+    module needs no `httpx`. `transport_factory` supplies the transport the built client uses,
+    such as `PublicUrlGuard.transport` to pin each request to an approved address.
     """
 
-    def __init__(self, *, timeout: float = 10.0, client: Any = None) -> None:
-        """Hold the per-call timeout, and an already-built client when one is supplied."""
+    def __init__(
+        self,
+        *,
+        timeout: float = 10.0,
+        client: Any = None,
+        transport_factory: Callable[[], Any] | None = None,
+    ) -> None:
+        """Hold the per-call timeout, an already-built client, or a factory for the transport."""
         self._timeout = timeout
         self._client = client
+        self._transport_factory = transport_factory
 
     def _require(self) -> Any:
         """Build the `httpx` client on first use, and return it thereafter."""
         if self._client is None:
             import httpx
 
-            self._client = httpx.Client(timeout=self._timeout, follow_redirects=False)
+            transport = self._transport_factory() if self._transport_factory is not None else None
+            self._client = httpx.Client(timeout=self._timeout, follow_redirects=False, transport=transport)
         return self._client
 
     def post_form(self, url: str, *, data: Mapping[str, str], headers: Mapping[str, str]) -> HttpResponse:

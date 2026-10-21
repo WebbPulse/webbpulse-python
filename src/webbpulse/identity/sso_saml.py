@@ -71,6 +71,7 @@ _NAMEID_TRANSIENT: Final = "urn:oasis:names:tc:SAML:2.0:nameid-format:transient"
 _NAMEID_EMAIL: Final = "urn:oasis:names:tc:SAML:1.1:nameid-format:emailAddress"
 _NAMEID_ENTITY: Final = "urn:oasis:names:tc:SAML:2.0:nameid-format:entity"
 _CM_BEARER: Final = "urn:oasis:names:tc:SAML:2.0:cm:bearer"
+_EMAIL_CLAIM: Final = "http://schemas.xmlsoap.org/ws/2005/05/identity/claims/emailaddress"
 
 SAML_RESPONSE_MAX_BYTES: Final = 256 * 1024
 """The largest base64 `SAMLResponse` accepted, before it is decoded."""
@@ -335,10 +336,11 @@ class SamlSsoClient:
     ) -> SsoIdentity:
         """Verify a posted `SAMLResponse` and return the identity its one signed assertion carries.
 
-        Only the element the assertion signature covers is read, so a wrapped or moved
-        assertion is refused. `request_id` is the AuthnRequest id from the spent state, which
-        rules out unsolicited responses. The assertion id is claimed last, so a refused
-        response never burns it.
+        The assertion must be signed itself, or sit inside a signed Response, as Entra can be
+        set to do; with both, both must verify. Only elements a verified signature covers are
+        read, so a wrapped or moved assertion is refused. `request_id` is the AuthnRequest id
+        from the spent state, which rules out unsolicited responses. The assertion id is
+        claimed last, so a refused response never burns it.
         """
         config = self._config(connection)
         if not request_id:
@@ -371,8 +373,13 @@ class SamlSsoClient:
         if not assertion_id:
             raise _invalid(connection, "assertion_id")
 
+        response_signed = root.find(_ds("Signature")) is not None
+        assertion_signed = assertions[0].find(_ds("Signature")) is not None
+        if not response_signed and not assertion_signed:
+            raise _invalid(connection, "unsigned")
         response = root
-        if root.find(_ds("Signature")) is not None:
+        assertion: Any = None
+        if response_signed:
             response = self._verified(
                 connection,
                 config,
@@ -381,14 +388,18 @@ class SamlSsoClient:
                 tag=_p("Response"),
                 element_id=_attr(root, "ID"),
             )
-        assertion = self._verified(
-            connection,
-            config,
-            root,
-            location=f"./{_a('Assertion')}/",
-            tag=_a("Assertion"),
-            element_id=assertion_id,
-        )
+            assertion = _only_assertion(connection, response, assertion_id)
+        if assertion_signed:
+            assertion = self._verified(
+                connection,
+                config,
+                root,
+                location=f"./{_a('Assertion')}/",
+                tag=_a("Assertion"),
+                element_id=assertion_id,
+            )
+        if assertion is None:
+            raise _invalid(connection, "signature")
 
         now = self._clock()
         self._check_response(connection, config, response, request_id=request_id, acs_url=acs_url)
@@ -574,7 +585,11 @@ class SamlSsoClient:
         return expiries
 
     def _identity(self, connection: SsoConnection, config: SamlConnectionConfig, assertion: Any) -> SsoIdentity:
-        """The subject, email, name and attributes the verified assertion carries."""
+        """The subject, email, name and attributes the verified assertion carries.
+
+        The email comes from the configured attributes, then the WS-Federation emailaddress
+        claim, then an emailAddress-format NameID, which covers Okta and Entra defaults.
+        """
         attributes: dict[str, list[str]] = {}
         friendly: dict[str, list[str]] = {}
         for attribute in assertion.iter(_a("Attribute")):
@@ -606,7 +621,7 @@ class SamlSsoClient:
         if not subject or len(subject) > _MAX_SUBJECT_LENGTH:
             raise _invalid(connection, "subject")
 
-        email = first(config.email_attributes or SAML_DEFAULT_EMAIL_ATTRIBUTES)
+        email = first(config.email_attributes or SAML_DEFAULT_EMAIL_ATTRIBUTES) or first((_EMAIL_CLAIM,))
         if not email and name_id_format == _NAMEID_EMAIL:
             email = name_id_value
         name = first(config.name_attributes or SAML_DEFAULT_NAME_ATTRIBUTES)
@@ -622,6 +637,14 @@ class SamlSsoClient:
             name=name,
             attributes={**attributes, "name_id": name_id_value, "name_id_format": name_id_format},
         )
+
+
+def _only_assertion(connection: SsoConnection, response: Any, assertion_id: str) -> Any:
+    """The one assertion a verified Response holds, as a direct child with the expected id."""
+    found = list(response.iter(_a("Assertion")))
+    if len(found) != 1 or found[0].getparent() is not response or _attr(found[0], "ID") != assertion_id:
+        raise _invalid(connection, "assertion_count")
+    return found[0]
 
 
 def _invalid(connection: SsoConnection, reason: str) -> SsoRejected:
@@ -750,19 +773,25 @@ def fetch_saml_idp_metadata(
 ) -> SamlIdpMetadata:
     """Fetch identity provider metadata by URL and parse it, through the URL guard.
 
-    The default guard refuses anything but HTTPS to a public address. Redirects are not
-    followed, and a body over `SAML_METADATA_MAX_BYTES` is refused.
+    The default guard refuses anything but HTTPS to a public address, and with a
+    `PublicUrlGuard` the default client connects only to the addresses it approved. Redirects
+    are not followed, and a body over `SAML_METADATA_MAX_BYTES` is refused.
     """
     from webbpulse.identity.sso_oidc import PublicUrlGuard
 
-    (url_guard or PublicUrlGuard())(url)
+    guard = url_guard or PublicUrlGuard()
+    guard(url)
     try:
         import httpx
     except ImportError as exc:
         raise _not_installed() from exc
 
     owned = client is None
-    session = client if client is not None else httpx.Client(timeout=timeout, follow_redirects=False)
+    if client is not None:
+        session = client
+    else:
+        transport = guard.transport() if isinstance(guard, PublicUrlGuard) else None
+        session = httpx.Client(timeout=timeout, follow_redirects=False, transport=transport)
     try:
         with session.stream("GET", url, headers={"Accept": "application/samlmetadata+xml, application/xml"}) as reply:
             if reply.status_code != 200:
