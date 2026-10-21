@@ -565,3 +565,79 @@ def test_a_taken_address_is_a_409_over_http(client: TestClient) -> None:
     response = client.post(url(EMAIL_CHANGE_PATH), json={"email": TAKEN_EMAIL}, headers=bearer(access))
     assert response.status_code == 409
     assert response.json()["error_code"] == "EMAIL_TAKEN"
+
+
+def test_a_reset_link_mailed_to_the_old_address_dies_with_the_change(
+    flows: IdentityFlows, sender: RecordingEmailSender
+) -> None:
+    """A reset link issued before the change cannot be spent after it, so the old mailbox cannot take the account."""
+    flows.request_password_reset(EMAIL)
+    stale_reset = token_from(sender, EMAIL)
+    flows.request_email_change(user_id=USER_ID, new_email=NEW_EMAIL)
+    flows.confirm_email_change(token_from(sender, NEW_EMAIL))
+
+    with pytest.raises(ConfirmationFailed):
+        flows.confirm_password_reset(token=stale_reset, new_password="another long passphrase here")
+
+
+class NoUserIndexTokenStore(InMemoryIdentityTokenStore):
+    """An identity token store that cannot find a user's links, like the DynamoDB table."""
+
+    def revoke_for_user(self, user_id: str, purpose: Any) -> int:
+        """Refuse, as a table with no user index does."""
+        raise NotImplementedError
+
+
+def test_the_address_binding_kills_old_links_where_the_store_cannot_revoke(
+    kms: FakeKms, hooks: FakeHooks, sender: RecordingEmailSender
+) -> None:
+    """With no user index, the address each link was mailed to still refuses a stale reset or verification."""
+    from webbpulse.security import hash_password
+
+    stores = IdentityStores(
+        credentials=InMemoryCredentialStore(),
+        refresh_tokens=InMemoryRefreshTokenStore(),
+        identity_tokens=NoUserIndexTokenStore(),
+    )
+    stores.require_credentials().put(
+        CredentialRecord(
+            user_id=USER_ID,
+            credential_type=PASSWORD_CREDENTIAL_TYPE,
+            secret=hash_password(normalise_password(PASSWORD)),
+        )
+    )
+    flows = build_flows(kms, hooks, stores, sender)
+    flows.request_password_reset(EMAIL)
+    stale_reset = token_from(sender, EMAIL)
+    hooks.users[USER_ID]["email_verified"] = False
+    flows.request_verification(EMAIL)
+    stale_verify = token_from(sender, EMAIL)
+    hooks.users[USER_ID]["email_verified"] = True
+
+    flows.request_email_change(user_id=USER_ID, new_email=NEW_EMAIL)
+    flows.confirm_email_change(token_from(sender, NEW_EMAIL))
+
+    with pytest.raises(ConfirmationFailed):
+        flows.confirm_password_reset(token=stale_reset, new_password="another long passphrase here")
+    with pytest.raises(ConfirmationFailed):
+        flows.confirm_verification(stale_verify)
+
+
+def test_a_second_change_link_dies_once_the_first_lands(flows: IdentityFlows, sender: RecordingEmailSender) -> None:
+    """Two pending changes cannot both land: the second link was bound to the address the first replaced."""
+    flows.request_email_change(user_id=USER_ID, new_email=NEW_EMAIL)
+    first = token_from(sender, NEW_EMAIL)
+    flows.request_email_change(user_id=USER_ID, new_email="third@example.net")
+    second = token_from(sender, "third@example.net")
+    flows.confirm_email_change(first)
+
+    with pytest.raises(ConfirmationFailed):
+        flows.confirm_email_change(second)
+
+
+def test_a_reset_link_still_works_when_the_address_has_not_moved(
+    flows: IdentityFlows, sender: RecordingEmailSender
+) -> None:
+    """The binding refuses nothing for an account whose address is unchanged."""
+    flows.request_password_reset(EMAIL)
+    assert flows.confirm_password_reset(token=token_from(sender, EMAIL), new_password="another long passphrase here")

@@ -50,7 +50,7 @@ if TYPE_CHECKING:  # pragma: no cover
     from webbpulse.identity.service import TokenService
     from webbpulse.identity.sessions import SessionSummary
     from webbpulse.identity.settings import IdentitySettings
-    from webbpulse.identity.storage import IdentityStores, PasskeyRecord
+    from webbpulse.identity.storage import IdentityStores, IdentityTokenPurpose, IdentityTokenRecord, PasskeyRecord
     from webbpulse.identity.verification import LinkService
 
 __all__ = [
@@ -1069,6 +1069,7 @@ class IdentityFlows:
         except ConfirmationFailed as exc:
             links.log_refusal(exc, "verify_email")
             raise
+        self._refuse_moved_address(record)
 
         self._hooks.mark_email_verified(record.user_id)
         _log.info(
@@ -1096,7 +1097,7 @@ class IdentityFlows:
             return
 
         links = self._require_links()
-        issued = links.issue(_user_id(user), "reset_password")
+        issued = links.issue(_user_id(user), "reset_password", attributes={"email": normalised})
         from webbpulse.identity.email import render_password_reset
         from webbpulse.identity.verification import describe_expiry
 
@@ -1131,6 +1132,7 @@ class IdentityFlows:
         except ConfirmationFailed as exc:
             links.log_refusal(exc, "reset_password")
             raise
+        self._refuse_moved_address(record)
 
         checked = check_password(new_password, breach_check=self._settings.password_breach_check)
 
@@ -1677,7 +1679,11 @@ class IdentityFlows:
         issued = links.issue(
             user_id,
             "change_email",
-            attributes={"new_email": normalised, "family_id": family_id},
+            attributes={
+                "new_email": normalised,
+                "family_id": family_id,
+                "email": _normalise_email(str(user.get("email", ""))),
+            },
         )
         from webbpulse.identity.email import render_email_change
         from webbpulse.identity.verification import describe_expiry
@@ -1713,6 +1719,7 @@ class IdentityFlows:
         except ConfirmationFailed as exc:
             links.log_refusal(exc, "change_email")
             raise
+        self._refuse_moved_address(record)
 
         new_email = _normalise_email(str(record.attributes.get("new_email", "")))
         if not _looks_like_email(new_email):
@@ -1722,6 +1729,7 @@ class IdentityFlows:
         old_email = str((previous or {}).get("email", "")).strip()
 
         hook(record.user_id, new_email)
+        self._revoke_outstanding_links(record.user_id)
         revoked = self._revoke_families(record.user_id, keep_family_id=str(record.attributes.get("family_id", "")))
         revoked += self._revoke_device_grants(record.user_id)
         _log.info(
@@ -1736,6 +1744,42 @@ class IdentityFlows:
         if old_email and _normalise_email(old_email) != new_email:
             self._send_email_changed(old_email, new_email)
         return record.user_id
+
+    def _refuse_moved_address(self, record: IdentityTokenRecord) -> None:
+        """Refuse a link mailed to an address the account no longer signs in with.
+
+        Links carry the address they were mailed to, so a reset or verification link that
+        reached the old mailbox stops working once the address changes, on every token store.
+        A link with no recorded address predates the binding and is judged on expiry alone, as
+        is a user the hooks return with no address.
+        """
+        bound = str(record.attributes.get("email", "") or "")
+        if not bound:
+            return
+        user = self._hooks.load_user_by_id(record.user_id)
+        current = _normalise_email(str((user or {}).get("email", "")))
+        if current and current != _normalise_email(bound):
+            from webbpulse.identity.verification import ConfirmationFailed
+
+            refusal = ConfirmationFailed("address_changed")
+            self._require_links().log_refusal(refusal, record.purpose)
+            raise refusal
+
+    def _revoke_outstanding_links(self, user_id: str) -> None:
+        """Spend every outstanding email link for a user, where the token store can find them.
+
+        A store with no user index cannot, and the address binding checked on confirm
+        covers it instead.
+        """
+        tokens = self._stores.identity_tokens
+        if tokens is None:
+            return
+        purposes: tuple[IdentityTokenPurpose, ...] = ("reset_password", "verify_email", "change_email")
+        for purpose in purposes:
+            try:
+                tokens.revoke_for_user(user_id, purpose)
+            except NotImplementedError:
+                return
 
     def _require_email_change_hook(self) -> Callable[[str, str], None]:
         """The product's `change_email` hook, or a 501 when it offers none.
@@ -1843,7 +1887,7 @@ class IdentityFlows:
                 self._require_email()
             return
         links = self._require_links()
-        issued = links.issue(user_id, "verify_email")
+        issued = links.issue(user_id, "verify_email", attributes={"email": _normalise_email(email)})
         from webbpulse.identity.email import render_verification
         from webbpulse.identity.verification import describe_expiry
 

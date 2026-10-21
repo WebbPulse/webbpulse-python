@@ -1236,12 +1236,12 @@ def _mount_flows(
         """Spend an email change link, move the sign-in address and end the other sessions."""
         ip, _ = context(request)
         try:
-            user_id = await run_sync(lambda: flows.confirm_email_change(str(payload.get("token", "")), ip=ip))
+            await run_sync(lambda: flows.confirm_email_change(str(payload.get("token", "")), ip=ip))
         except ConfirmationFailed as exc:
             return link_refused(request, exc)
         except LoginRejected as exc:
             return rejected(request, exc)
-        return JSONResponse({"changed": True, "user_id": user_id})
+        return JSONResponse({"changed": True})
 
 
 def _mount_mfa(
