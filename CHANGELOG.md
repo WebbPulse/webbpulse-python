@@ -7,6 +7,25 @@ This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## Unreleased
 
+## 0.97.0
+
+### Security
+
+- SSO provider fetches can no longer be DNS rebound onto a private address (PLAT-71).
+  `PublicUrlGuard.transport()` builds an `httpx` transport that checks every request, each
+  redirect hop included, and connects to an address from that same check, with the `Host`
+  header and TLS server name kept as the original host so the certificate is verified as
+  before. `OidcSsoClient` and `fetch_saml_idp_metadata` use it by default with a
+  `PublicUrlGuard`. A product that passes its own HTTP client should build it on
+  `guard.transport()`, for example `HttpxClient(transport_factory=guard.transport)`.
+- `PublicUrlGuard` also refuses IPv6 addresses that embed a non-public IPv4 address:
+  IPv4-mapped, 6to4 and the NAT64 prefix `64:ff9b::/96`.
+
+### Added
+
+- `PublicUrlGuard.addresses(url)` returns the vetted addresses, and `HttpxClient` takes a
+  `transport_factory`.
+
 ## 0.96.0
 
 ### Changed

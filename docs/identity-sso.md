@@ -106,10 +106,16 @@ is required when the provider advertises it. The token endpoint uses `client_sec
 unless the connection says `client_secret_post`.
 
 `PublicUrlGuard` refuses provider URLs that are not HTTPS, carry credentials, or resolve to
-any non-public address, so a tenant cannot point discovery at the metadata service. It
-resolves before the request, so DNS rebinding between the check and the connect is not
-covered; run the API without a route to private networks it should not reach. Pass
-`trusted_hosts` only for a local test provider.
+any non-public address, IPv6 forms that embed a private IPv4 address included, so a tenant
+cannot point discovery at the metadata service. The default clients connect only to the
+addresses the guard approved: `PublicUrlGuard.transport()` re-checks every request, each
+redirect hop included, and sends it to a vetted IP literal with the `Host` header and TLS
+server name left as the original host, so the certificate is still verified against it and
+a rebinding DNS answer cannot move the connection. A product that passes its own
+`http_client` to `SsoService` or `OidcSsoClient`, or its own `client` to
+`fetch_saml_idp_metadata`, should build it on that transport, for example
+`HttpxClient(transport_factory=guard.transport)`. Pass `trusted_hosts` only for a local test
+provider; those hosts are reached without pinning.
 
 ## Domain verification
 

@@ -773,19 +773,25 @@ def fetch_saml_idp_metadata(
 ) -> SamlIdpMetadata:
     """Fetch identity provider metadata by URL and parse it, through the URL guard.
 
-    The default guard refuses anything but HTTPS to a public address. Redirects are not
-    followed, and a body over `SAML_METADATA_MAX_BYTES` is refused.
+    The default guard refuses anything but HTTPS to a public address, and with a
+    `PublicUrlGuard` the default client connects only to the addresses it approved. Redirects
+    are not followed, and a body over `SAML_METADATA_MAX_BYTES` is refused.
     """
     from webbpulse.identity.sso_oidc import PublicUrlGuard
 
-    (url_guard or PublicUrlGuard())(url)
+    guard = url_guard or PublicUrlGuard()
+    guard(url)
     try:
         import httpx
     except ImportError as exc:
         raise _not_installed() from exc
 
     owned = client is None
-    session = client if client is not None else httpx.Client(timeout=timeout, follow_redirects=False)
+    if client is not None:
+        session = client
+    else:
+        transport = guard.transport() if isinstance(guard, PublicUrlGuard) else None
+        session = httpx.Client(timeout=timeout, follow_redirects=False, transport=transport)
     try:
         with session.stream("GET", url, headers={"Accept": "application/samlmetadata+xml, application/xml"}) as reply:
             if reply.status_code != 200:
