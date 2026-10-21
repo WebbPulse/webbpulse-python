@@ -7,6 +7,20 @@ This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## Unreleased
 
+## 0.96.0
+
+### Changed
+
+- `webbpulse.identity.sso_saml` accepts a signed Response around an unsigned Assertion
+  (PLAT-70), as Entra sends when set to sign the response only. The wrapping defences hold:
+  exactly one assertion as a direct child of the Response, and every field is read from the
+  element a verified signature covers. When the assertion carries its own signature as
+  well, that one must also verify; a response with neither is refused.
+- The SAML email falls back to the
+  `http://schemas.xmlsoap.org/ws/2005/05/identity/claims/emailaddress` claim and then to an
+  emailAddress-format NameID even when a connection names its own `email_attributes`, so
+  Okta and Entra defaults sign in without a hand-set `email` attribute.
+
 ## 0.95.0
 
 ### Added
