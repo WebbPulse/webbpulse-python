@@ -1,7 +1,9 @@
 """The OIDC leg of single sign-on: discovery, the authorization URL, and ID token verification.
 
 Every provider URL is checked by a `UrlGuard` before it is fetched, so a tenant cannot
-point its connection at an address inside the network. Needs the `sso` extra at call time.
+point its connection at an address inside the network. With `PublicUrlGuard`, the default
+HTTP client also connects only to the addresses the guard approved, so a rebinding DNS
+answer cannot move the connection elsewhere. Needs the `sso` extra at call time.
 """
 
 from __future__ import annotations
@@ -23,6 +25,8 @@ from webbpulse.identity.storage import constant_time_equals
 
 if TYPE_CHECKING:  # pragma: no cover
     from collections.abc import Iterable, Mapping
+
+    import httpx
 
     from webbpulse.identity.crypto import SealedSecret, TotpCipher
     from webbpulse.identity.oauth import HttpClient
@@ -67,6 +71,8 @@ _RESERVED_CLAIMS: Final = frozenset({"nonce", "at_hash", "c_hash", "s_hash", "si
 
 type Resolver = Callable[[str], Iterable[str]]
 
+_NAT64_PREFIX: Final = ipaddress.IPv6Network("64:ff9b::/96")
+
 
 def seal_oidc_client_secret(cipher: TotpCipher, *, connection_id: str, client_secret: str) -> SealedSecret:
     """Seal a connection's client secret for storage, bound to that connection id."""
@@ -102,12 +108,27 @@ def _system_resolver(host: str) -> list[str]:
     return [str(info[4][0]) for info in socket.getaddrinfo(host, None)]
 
 
+def _is_public(address: ipaddress.IPv4Address | ipaddress.IPv6Address) -> bool:
+    """Whether an address is globally routable, including any IPv4 address an IPv6 one embeds."""
+    if not address.is_global or address.is_multicast:
+        return False
+    if isinstance(address, ipaddress.IPv6Address):
+        embedded = address.ipv4_mapped or address.sixtofour
+        if embedded is None and address in _NAT64_PREFIX:
+            embedded = ipaddress.IPv4Address(int(address) & 0xFFFFFFFF)
+        if embedded is not None and (not embedded.is_global or embedded.is_multicast):
+            return False
+    return True
+
+
 class PublicUrlGuard:
     """The default guard: HTTPS only, and every resolved address must be public.
 
     Refuses loopback, private, link-local, reserved and multicast addresses, so a tenant's
     issuer cannot reach the instance metadata service or anything else inside the network.
-    `trusted_hosts` skips both checks for named hosts, for a local test provider.
+    `trusted_hosts` skips both checks for named hosts, for a local test provider. Calling the
+    guard only checks; `transport()` builds an `httpx` transport that also connects to the
+    addresses it approved, which closes the DNS rebinding gap between check and connect.
     """
 
     def __init__(self, *, trusted_hosts: Iterable[str] = (), resolver: Resolver | None = None) -> None:
@@ -117,10 +138,18 @@ class PublicUrlGuard:
 
     def __call__(self, url: str) -> None:
         """Return when `url` is HTTPS to a public address, or raise `SsoRejected`."""
+        self.addresses(url)
+
+    def addresses(self, url: str) -> tuple[str, ...]:
+        """The public addresses `url` may be fetched from, empty for a trusted host.
+
+        Resolves once and raises `SsoRejected` unless the URL is HTTPS and every address is
+        public, so a caller that connects to one of these never looks the name up again.
+        """
         parts = urlsplit(url)
         host = (parts.hostname or "").lower()
         if host and host in self._trusted:
-            return
+            return ()
         if parts.scheme != "https" or not host or parts.username or parts.password:
             raise _unsafe_url(url, "scheme")
         try:
@@ -130,8 +159,27 @@ class PublicUrlGuard:
         if not addresses:
             raise _unsafe_url(url, "unresolvable")
         for address in addresses:
-            if not address.is_global or address.is_multicast:
+            if not _is_public(address):
                 raise _unsafe_url(url, "private")
+        return tuple(dict.fromkeys(str(address) for address in addresses))
+
+    def transport(self) -> httpx.BaseTransport:
+        """An `httpx` transport that re-checks every request and connects to an approved address.
+
+        Every request through it, each redirect hop included, is checked again, and the
+        connection goes to a literal address from that check while the `Host` header and TLS
+        server name stay the original host. Needs `httpx`.
+        """
+        from webbpulse.identity.pinned_transport import PinnedAddressTransport
+
+        return PinnedAddressTransport(self.addresses)
+
+
+def _pinned_http_client(guard: UrlGuard, *, timeout: float = 10.0) -> HttpClient:
+    """The default provider HTTP client: pinned to approved addresses when the guard can say which."""
+    if isinstance(guard, PublicUrlGuard):
+        return HttpxClient(timeout=timeout, transport_factory=guard.transport)
+    return HttpxClient(timeout=timeout)
 
 
 def _unsafe_url(url: str, reason: str) -> SsoRejected:
@@ -179,8 +227,8 @@ class OidcSsoClient:
     ) -> None:
         """Hold the cipher, the HTTP client, the URL guard, the clock leeway and the cache TTL."""
         self._cipher = cipher
-        self._http = http_client if http_client is not None else HttpxClient()
         self._guard: UrlGuard = url_guard if url_guard is not None else PublicUrlGuard()
+        self._http = http_client if http_client is not None else _pinned_http_client(self._guard)
         self._leeway = leeway.total_seconds() if isinstance(leeway, timedelta) else float(leeway)
         self._metadata_ttl = metadata_ttl
         self._clock = clock
