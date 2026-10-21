@@ -65,11 +65,14 @@ response arrives as a cross-site POST.
 Build `SamlConnectionConfig` by hand or from the IdP's metadata with
 `parse_saml_idp_metadata(xml)` or `fetch_saml_idp_metadata(url)` (through `PublicUrlGuard`,
 no redirects, 1 MiB cap), then `.connection_config()`. Several `idp_certificates` allow
-rotation. A transient NameID needs `subject_attribute`.
+rotation. A transient NameID needs `subject_attribute`. The email comes from the configured
+`email_attributes`, then the `.../claims/emailaddress` claim, then an emailAddress-format
+NameID, which covers Okta and Entra defaults.
 
-Checks: the assertion signature is required (a response signature is checked when present),
-only the element the signature covers is read, and exactly one unencrypted assertion is
-allowed, so wrapping attacks fail. `Destination`, `Recipient` and `InResponseTo` must match
+Checks: the assertion must be signed, or sit in a signed Response (Entra's response-only
+mode); every signature present must verify. Only elements a verified signature covers are
+read, and exactly one unencrypted assertion, a direct child of the Response, is allowed, so
+wrapping attacks fail. `Destination`, `Recipient` and `InResponseTo` must match
 the ACS and the spent state's AuthnRequest id, the audience must be the SP entity id, and
 `NotBefore`, `NotOnOrAfter` and `SessionNotOnOrAfter` are checked with the settings' clock
 skew leeway. A DOCTYPE is refused before parsing. Each assertion id is claimed in the replay

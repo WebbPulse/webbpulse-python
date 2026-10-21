@@ -514,17 +514,149 @@ def test_a_tampered_name_id_is_refused(harness: Harness, idp: Idp) -> None:
 
 
 def test_an_unsigned_assertion_is_refused(harness: Harness, idp: Idp) -> None:
-    """Signed assertions are required."""
+    """With neither the assertion nor the response signed, nothing is trusted."""
     record = harness.begin()
     document = idp.response(record.nonce, assertion=idp.assertion(record.nonce, sign=False))
     assert refused_code(harness, document, record) == "SSO_SAML_INVALID"
 
 
-def test_a_signed_response_around_an_unsigned_assertion_is_refused(harness: Harness, idp: Idp) -> None:
-    """A response signature alone does not stand in for the assertion's own."""
+def test_a_signed_response_around_an_unsigned_assertion_is_accepted(harness: Harness, idp: Idp) -> None:
+    """A response signature covers its one assertion, so the assertion need not be signed too."""
     record = harness.begin()
     document = idp.response(record.nonce, assertion=idp.assertion(record.nonce, sign=False), sign_response=True)
+    identity = harness.verify(document, record)
+    assert identity.subject == SUBJECT
+    assert identity.email == EMAIL
+
+
+def test_a_response_signed_by_another_key_around_an_unsigned_assertion_is_refused(harness: Harness, idp: Idp) -> None:
+    """The response signature must verify under a configured certificate."""
+    record = harness.begin()
+    key, cert = make_key_and_cert("attacker")
+    attacker = Idp(key, cert)
+    document = attacker.response(record.nonce, assertion=idp.assertion(record.nonce, sign=False), sign_response=True)
     assert refused_code(harness, document, record) == "SSO_SAML_INVALID"
+    assert harness.replay.claims == []
+
+
+def test_a_signed_response_with_a_badly_signed_assertion_is_refused(harness: Harness, idp: Idp) -> None:
+    """When the assertion carries its own signature, that signature must verify as well."""
+    record = harness.begin()
+    key, cert = make_key_and_cert("attacker")
+    assertion = idp.assertion(record.nonce, key=key, cert=cert)
+    document = idp.response(record.nonce, assertion=assertion, sign_response=True)
+    assert refused_code(harness, document, record) == "SSO_SAML_INVALID"
+
+
+def test_a_tampered_name_id_under_a_response_signature_is_refused(harness: Harness, idp: Idp) -> None:
+    """Any change inside the signed response breaks its digest."""
+    record = harness.begin()
+    document = idp.response(record.nonce, assertion=idp.assertion(record.nonce, sign=False), sign_response=True)
+    tampered = document.replace(f">{SUBJECT}<", ">admin<")
+    assert tampered != document
+    assert refused_code(harness, tampered, record) == "SSO_SAML_INVALID"
+
+
+def _response_signed_only(idp: Idp, record: OAuthStateRecord) -> Any:
+    """A parsed response signed as a whole around an unsigned assertion."""
+    document = idp.response(record.nonce, assertion=idp.assertion(record.nonce, sign=False), sign_response=True)
+    return etree.fromstring(document.encode("utf-8"))
+
+
+def _evil_copy(assertion: Any) -> Any:
+    """A copy of an assertion naming another subject."""
+    evil = etree.fromstring(etree.tostring(assertion))
+    evil.find(f"{{{A_NS}}}Subject/{{{A_NS}}}NameID").text = "admin"
+    return evil
+
+
+def test_an_extra_assertion_beside_a_signed_response_is_refused(harness: Harness, idp: Idp) -> None:
+    """A second assertion inside the signed response is refused before any field is read."""
+    record = harness.begin()
+    root = _response_signed_only(idp, record)
+    signed = root.find(f"{{{A_NS}}}Assertion")
+    evil = _evil_copy(signed)
+    evil.set("ID", "_evil")
+    root.insert(list(root).index(signed), evil)
+    assert refused_code(harness, etree.tostring(root), record) == "SSO_SAML_INVALID"
+    assert harness.replay.claims == []
+
+
+def test_a_swapped_assertion_under_a_response_signature_is_refused(harness: Harness, idp: Idp) -> None:
+    """Replacing the assertion with another of the same id breaks the response digest."""
+    record = harness.begin()
+    root = _response_signed_only(idp, record)
+    signed = root.find(f"{{{A_NS}}}Assertion")
+    root.replace(signed, _evil_copy(signed))
+    assert refused_code(harness, etree.tostring(root), record) == "SSO_SAML_INVALID"
+    assert harness.replay.claims == []
+
+
+def test_a_signed_response_moved_under_an_unsigned_one_is_refused(harness: Harness, idp: Idp) -> None:
+    """A valid signed response hidden in `Extensions` of an unsigned one proves nothing."""
+    record = harness.begin()
+    signed = _response_signed_only(idp, record)
+    outer = etree.fromstring(idp.response(record.nonce, assertion=idp.assertion(record.nonce, sign=False)).encode())
+    outer.remove(outer.find(f"{{{A_NS}}}Assertion"))
+    etree.SubElement(outer, f"{{{P_NS}}}Extensions").append(signed)
+    assert refused_code(harness, etree.tostring(outer), record) == "SSO_SAML_INVALID"
+
+
+EMAIL_NAME_ID = "urn:oasis:names:tc:SAML:1.1:nameid-format:emailAddress"
+CLAIMS = "http://schemas.xmlsoap.org/ws/2005/05/identity/claims"
+
+
+def test_an_entra_shaped_response_signed_only_yields_the_identity(harness: Harness, idp: Idp) -> None:
+    """Entra set to sign the response only, with its default claim URIs and an object id."""
+    record = harness.begin()
+    attributes = {
+        "http://schemas.microsoft.com/identity/claims/tenantid": ["0000aaaa-11bb-22cc-33dd-444444eeeeee"],
+        "http://schemas.microsoft.com/identity/claims/objectidentifier": ["1111bbbb-22cc-33dd-44ee-555555ffffff"],
+        "http://schemas.microsoft.com/identity/claims/displayname": ["Pat Example"],
+        f"{CLAIMS}/givenname": ["Pat"],
+        f"{CLAIMS}/surname": ["Example"],
+        f"{CLAIMS}/emailaddress": [EMAIL],
+        f"{CLAIMS}/name": [EMAIL],
+    }
+    assertion = idp.assertion(record.nonce, sign=False, name_id="AbCdEf123456", attributes=attributes)
+    identity = harness.verify(idp.response(record.nonce, assertion=assertion, sign_response=True), record)
+    assert identity.subject == "AbCdEf123456"
+    assert identity.email == EMAIL
+    assert identity.name == "Pat Example"
+
+
+def test_an_entra_shaped_email_claim_is_used_beside_custom_email_attributes(idp: Idp) -> None:
+    """A connection naming its own email attribute still falls back to the emailaddress claim."""
+    harness = Harness(idp, make_connection(idp, email_attributes=("work_email",)))
+    record = harness.begin()
+    assertion = idp.assertion(record.nonce, sign=False, attributes={f"{CLAIMS}/emailaddress": [EMAIL]})
+    identity = harness.verify(idp.response(record.nonce, assertion=assertion, sign_response=True), record)
+    assert identity.email == EMAIL
+
+
+def test_an_okta_shaped_response_takes_the_email_from_the_name_id(harness: Harness, idp: Idp) -> None:
+    """Okta defaults: both signed, an emailAddress NameID and no attribute statements."""
+    record = harness.begin()
+    assertion = idp.assertion(record.nonce, name_id=EMAIL, name_id_format=EMAIL_NAME_ID, attributes={})
+    identity = harness.verify(idp.response(record.nonce, assertion=assertion, sign_response=True), record)
+    assert identity.subject == EMAIL
+    assert identity.email == EMAIL
+    assert identity.attributes["name_id_format"] == EMAIL_NAME_ID
+
+
+def test_an_okta_shaped_name_id_email_is_used_beside_custom_email_attributes(idp: Idp) -> None:
+    """An emailAddress NameID still supplies the email when the configured attributes are absent."""
+    harness = Harness(idp, make_connection(idp, email_attributes=("work_email",)))
+    record = harness.begin()
+    document = idp.response(record.nonce, name_id=EMAIL, name_id_format=EMAIL_NAME_ID, attributes={})
+    assert harness.verify(document, record).email == EMAIL
+
+
+def test_a_persistent_name_id_is_never_taken_as_the_email(harness: Harness, idp: Idp) -> None:
+    """Without an email attribute, a NameID of another format leaves the email empty."""
+    record = harness.begin()
+    document = idp.response(record.nonce, name_id=EMAIL, attributes={})
+    assert harness.verify(document, record).email == ""
 
 
 def _wrap(document: str, mutate: Callable[[Any, Any, Any], None]) -> bytes:
