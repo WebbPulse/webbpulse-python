@@ -10,7 +10,7 @@ import logging
 import secrets
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
-from typing import TYPE_CHECKING, Final
+from typing import TYPE_CHECKING, Any, Final
 from urllib.parse import quote, urlencode
 
 from webbpulse.dynamodb import now_iso
@@ -22,11 +22,14 @@ from webbpulse.identity.storage import (
 )
 
 if TYPE_CHECKING:  # pragma: no cover
+    from collections.abc import Mapping
+
     from webbpulse.identity.settings import IdentitySettings
     from webbpulse.identity.storage import IdentityTokenPurpose, IdentityTokenStore
 
 __all__ = [
     "CONFIRMATION_FAILED_MESSAGE",
+    "EMAIL_CHANGE_LINK_PATH",
     "RESET_LINK_PATH",
     "VERIFY_LINK_PATH",
     "ConfirmationFailed",
@@ -41,6 +44,20 @@ CONFIRMATION_FAILED_MESSAGE: Final = "This link is no longer valid. Request a ne
 
 VERIFY_LINK_PATH: Final = "/verify-email"
 RESET_LINK_PATH: Final = "/reset-password"
+EMAIL_CHANGE_LINK_PATH: Final = "/verify-email-change"
+
+_ISSUED_EVENTS: Final[dict[str, str]] = {
+    "verify_email": "email.verification_sent",
+    "change_email": "email.change_requested",
+}
+_CONFIRMED_EVENTS: Final[dict[str, str]] = {
+    "verify_email": "email.verified",
+    "change_email": "email.change_confirmed",
+}
+_LINK_PATHS: Final[dict[str, str]] = {
+    "verify_email": VERIFY_LINK_PATH,
+    "change_email": EMAIL_CHANGE_LINK_PATH,
+}
 
 TOKEN_PARAM: Final = "token"
 
@@ -96,11 +113,14 @@ class LinkService:
         purpose: IdentityTokenPurpose,
         *,
         now: datetime | None = None,
+        attributes: Mapping[str, Any] | None = None,
     ) -> IssuedLink:
         """Mint a link for a user and write its hash.
 
         Does not revoke that user's outstanding links of the same purpose: `identity-tokens`
         carries no user index, and each outstanding link is still single use and short lived.
+        `attributes` is stored on the record for the confirming flow, such as the address an
+        email change moves to.
         """
         moment = now or datetime.now(UTC)
         ttl = self.ttl_for(purpose)
@@ -114,12 +134,13 @@ class LinkService:
                 user_id=user_id,
                 created_at=now_iso(),
                 expires_at=expires_at,
+                attributes=dict(attributes or {}),
             )
         )
         _log.info(
             "Identity link issued.",
             extra={
-                "event": ("email.verification_sent" if purpose == "verify_email" else "password.reset_requested"),
+                "event": _ISSUED_EVENTS.get(purpose, "password.reset_requested"),
                 "user_id": user_id,
                 "purpose": purpose,
             },
@@ -133,12 +154,17 @@ class LinkService:
         )
 
     def ttl_for(self, purpose: IdentityTokenPurpose) -> timedelta:
-        """The lifetime for a purpose: 24 hours to verify, 1 hour to reset.
+        """The lifetime for a purpose: 24 hours to verify, 1 hour to reset or change an address.
 
         A reset link is the credential that changes a password, so its window is the window
-        in which a compromised mailbox is a compromised account.
+        in which a compromised mailbox is a compromised account. An email change link moves
+        the sign-in address, so it is short lived for the same reason.
         """
-        return self._settings.email_verification_ttl if purpose == "verify_email" else self._settings.password_reset_ttl
+        if purpose == "verify_email":
+            return self._settings.email_verification_ttl
+        if purpose == "change_email":
+            return self._settings.email_change_ttl
+        return self._settings.password_reset_ttl
 
     def link_for(self, purpose: IdentityTokenPurpose, token: str) -> str:
         """Build the URL to mail, pointing at the frontend rather than at the API.
@@ -147,7 +173,7 @@ class LinkService:
         cannot burn it, and so a reset can land on a form that collects the new password.
         """
         base = self._settings.frontend_base_url.rstrip("/")
-        path = VERIFY_LINK_PATH if purpose == "verify_email" else RESET_LINK_PATH
+        path = _LINK_PATHS.get(purpose, RESET_LINK_PATH)
         if not token:
             return f"{base}{path}"
         query = urlencode({TOKEN_PARAM: token}, quote_via=quote)
@@ -200,7 +226,7 @@ class LinkService:
         _log.info(
             "Identity link confirmed.",
             extra={
-                "event": "email.verified" if purpose == "verify_email" else "password.reset_used",
+                "event": _CONFIRMED_EVENTS.get(purpose, "password.reset_used"),
                 "user_id": consumed.user_id,
                 "purpose": purpose,
             },

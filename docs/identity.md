@@ -77,6 +77,10 @@ gateway builds the discovery URL as `issuer + "/.well-known/openid-configuration
 | `POST /api/auth/verify-email/confirm` | Spends a verification link and marks the address verified |
 | `POST /api/auth/reset` | Mails a reset link, answering 200 either way |
 | `POST /api/auth/reset/confirm` | Spends a reset link, sets the new password, revokes every session |
+| `GET /api/auth/sessions` | Lists the caller's live sessions, marking the one making the call |
+| `DELETE /api/auth/sessions/{family_id}` | Ends one of the caller's other sessions; another user's id answers 404, the current one 400 |
+| `POST /api/auth/email/change` | Mails a confirmation link to a new sign-in address; needs a sign-in inside `email_change_max_age` |
+| `POST /api/auth/email/change/confirm` | Spends the link, moves the address through `EmailChangeHooks.change_email`, ends other sessions, tells the old address |
 | `POST /api/auth/login/totp` | The second leg of login: exchanges an MFA ticket plus a code for tokens |
 | `POST /api/auth/totp/enrol` | Starts an enrolment and returns the seed and provisioning URI once |
 | `POST /api/auth/totp/activate` | Confirms an enrolment with its first code and returns recovery codes |

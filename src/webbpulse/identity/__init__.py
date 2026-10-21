@@ -149,6 +149,8 @@ from webbpulse.identity.email import (
     SesV2EmailSender,
     email_brand,
     render_branded,
+    render_email_change,
+    render_email_changed,
     render_password_changed,
     render_password_reset,
     render_registration_notice,
@@ -187,6 +189,7 @@ from webbpulse.identity.glue import (
 from webbpulse.identity.hooks import (
     AuthenticationRefused,
     BaseIdentityHooks,
+    EmailChangeHooks,
     HookNotImplemented,
     IdentityHooks,
 )
@@ -357,6 +360,8 @@ from webbpulse.identity.router import (
     DESKTOP_HANDOFF_LIMIT,
     DESKTOP_HANDOFF_PATH,
     DISCOVERY_CACHE_CONTROL,
+    EMAIL_CHANGE_CONFIRM_PATH,
+    EMAIL_CHANGE_PATH,
     HEALTH_PATH,
     JWKS_CACHE_CONTROL,
     LOGIN_PATH,
@@ -372,6 +377,7 @@ from webbpulse.identity.router import (
     RESET_IP_LIMIT,
     RESET_REQUEST_PATH,
     RESET_REQUESTED_MESSAGE,
+    SESSIONS_PATH,
     STEP_UP_PATH,
     TOTP_ACTIVATE_PATH,
     TOTP_DISABLE_PATH,
@@ -416,6 +422,7 @@ from webbpulse.identity.sessions import (
     RotationOutcome,
     RotationResult,
     SessionService,
+    SessionSummary,
 )
 from webbpulse.identity.settings import IdentitySettings, SignerKind, TotpCipherKind
 from webbpulse.identity.share_tokens import (
@@ -575,6 +582,7 @@ from webbpulse.identity.users import (
 )
 from webbpulse.identity.verification import (
     CONFIRMATION_FAILED_MESSAGE,
+    EMAIL_CHANGE_LINK_PATH,
     RESET_LINK_PATH,
     VERIFY_LINK_PATH,
     ConfirmationFailed,
@@ -643,6 +651,9 @@ __all__ = [
     "DIGEST_MESSAGE_TYPE",
     "DISCOVERY_CACHE_CONTROL",
     "DISCOVERY_PATH",
+    "EMAIL_CHANGE_CONFIRM_PATH",
+    "EMAIL_CHANGE_LINK_PATH",
+    "EMAIL_CHANGE_PATH",
     "EMAIL_INDEX",
     "EMAIL_NOT_VERIFIED",
     "EMAIL_UNAVAILABLE_MESSAGE",
@@ -729,6 +740,7 @@ __all__ = [
     "REVOKE_PATH",
     "SCHEME_KMS_ENVELOPE",
     "SCHEME_SECRET_HKDF",
+    "SESSIONS_PATH",
     "STEP_UP_PASSKEY_OPTIONS_PATH",
     "STEP_UP_PATH",
     "STEP_UP_REQUIRED_ERROR_CODE",
@@ -806,6 +818,7 @@ __all__ = [
     "DynamoUsersRepository",
     "DynamoWebAuthnChallengeStore",
     "EmailCapExceeded",
+    "EmailChangeHooks",
     "EmailMessage",
     "EmailSendFailed",
     "EmailSendResult",
@@ -904,6 +917,7 @@ __all__ = [
     "SesV2Client",
     "SesV2EmailSender",
     "SessionService",
+    "SessionSummary",
     "SessionTenantResolver",
     "SignerKind",
     "TableAttribute",
@@ -995,6 +1009,8 @@ __all__ = [
     "register_passkey_availability",
     "register_user_purge_events",
     "render_branded",
+    "render_email_change",
+    "render_email_changed",
     "render_password_changed",
     "render_password_reset",
     "render_registration_notice",

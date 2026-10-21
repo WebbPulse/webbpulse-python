@@ -107,7 +107,7 @@ IDENTITY_TTL_ATTRIBUTE: Final = "expires_at"
 BILLING_MODE: Final = "PAY_PER_REQUEST"
 """On-demand billing, matching the platform module's default for every identity table."""
 
-type IdentityTokenPurpose = Literal["verify_email", "reset_password", "mfa_ticket", "desktop_handoff"]
+type IdentityTokenPurpose = Literal["verify_email", "reset_password", "mfa_ticket", "desktop_handoff", "change_email"]
 
 type WebAuthnChallengePurpose = Literal["register", "login", "step_up"]
 
@@ -366,6 +366,16 @@ class RefreshTokenStore(ABC):
         user's families does for `revoke_all_for_user`.
         """
         raise NotImplementedError("This store cannot enumerate a user's refresh families by device.")
+
+    def latest_by_family_for_user(self, user_id: str) -> list[RefreshTokenRecord]:
+        """The newest generation of every family a user holds, expired and revoked ones included.
+
+        What the session list reads: one record per family, which carries the family's
+        device label, first-seen address, start time and current expiry. The caller filters
+        out what is no longer live. The base raises `NotImplementedError`, as a store that
+        cannot enumerate a user's families does for `revoke_all_for_user`.
+        """
+        raise NotImplementedError("This store cannot enumerate a user's refresh families.")
 
     def set_family_auth_time(self, family_id: str, auth_time: int) -> int:
         """Record a step-up on every generation of a family. Returns how many rows changed.
@@ -761,6 +771,17 @@ class InMemoryRefreshTokenStore(RefreshTokenStore):
                 self._items[token_hash] = dataclasses.replace(record, revoked=True)
                 count += 1
         return count
+
+    def latest_by_family_for_user(self, user_id: str) -> list[RefreshTokenRecord]:
+        """The newest generation of every family a user holds, expired and revoked ones included."""
+        latest: dict[str, RefreshTokenRecord] = {}
+        for record in self._items.values():
+            if record.user_id != user_id:
+                continue
+            current = latest.get(record.family_id)
+            if current is None or record.generation > current.generation:
+                latest[record.family_id] = record
+        return sorted(latest.values(), key=lambda record: record.family_id)
 
     def revoke_all_for_device(self, user_id: str, device: str) -> int:
         """Revoke every family of one user whose `device` label is exactly `device`."""
@@ -1181,6 +1202,42 @@ class DynamoRefreshTokenStore(RefreshTokenStore):
             for item in self._repo.iter_query(Key("user_id").eq(user_id), index_name=self._user_index)
             if item.get("family_id") != except_family_id
         )
+
+    def latest_by_family_for_user(self, user_id: str) -> list[RefreshTokenRecord]:
+        """The newest generation of every family a user holds, expired and revoked ones included.
+
+        Reads the distinct family ids off the `KEYS_ONLY` user index, then asks the family
+        index for each family's highest generation and reads that row consistently. Raises
+        `NotImplementedError` when the store was built with no user index.
+        """
+        from boto3.dynamodb.conditions import Key
+
+        if not self._user_index:
+            raise NotImplementedError(
+                "latest_by_family_for_user needs a user index on `refresh-tokens`, and this store "
+                f"was built with none. Set {REFRESH_USER_INDEX_ENV} to the index name."
+            )
+
+        family_ids: list[str] = []
+        for item in self._repo.iter_query(Key("user_id").eq(user_id), index_name=self._user_index):
+            family_id = str(item.get("family_id", ""))
+            if family_id and family_id not in family_ids:
+                family_ids.append(family_id)
+
+        records: list[RefreshTokenRecord] = []
+        for family_id in family_ids:
+            page = self._repo.query(
+                Key("family_id").eq(family_id),
+                index_name=REFRESH_FAMILY_INDEX,
+                limit=1,
+                ascending=False,
+            )
+            if not page.items:
+                continue
+            record = self.get(str(page.items[0]["token_hash"]))
+            if record is not None and record.user_id == user_id:
+                records.append(record)
+        return records
 
     def revoke_all_for_device(self, user_id: str, device: str) -> int:
         """Revoke every family of one user whose `device` label is exactly `device`.
@@ -1663,7 +1720,7 @@ def _refresh_record_from_item(item: Mapping[str, Any]) -> RefreshTokenRecord:
 def _identity_token_from_item(item: Mapping[str, Any]) -> IdentityTokenRecord:
     """Build an `IdentityTokenRecord` from a DynamoDB item, rejecting an unknown purpose."""
     purpose = str(item.get("purpose", ""))
-    if purpose not in {"verify_email", "reset_password", "mfa_ticket", "desktop_handoff"}:
+    if purpose not in {"verify_email", "reset_password", "mfa_ticket", "desktop_handoff", "change_email"}:
         raise ValueError(f"Unknown identity token purpose {purpose!r} on token {str(item.get('token_hash', ''))[:8]}.")
     return IdentityTokenRecord(
         token_hash=str(item["token_hash"]),

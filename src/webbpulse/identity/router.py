@@ -43,6 +43,8 @@ __all__ = [
     "DESKTOP_HANDOFF_LIMIT",
     "DESKTOP_HANDOFF_PATH",
     "DISCOVERY_CACHE_CONTROL",
+    "EMAIL_CHANGE_CONFIRM_PATH",
+    "EMAIL_CHANGE_PATH",
     "HEALTH_PATH",
     "IDENTITY_ROUTE_RESPONSES",
     "JWKS_CACHE_CONTROL",
@@ -59,6 +61,7 @@ __all__ = [
     "RESET_IP_LIMIT",
     "RESET_REQUESTED_MESSAGE",
     "RESET_REQUEST_PATH",
+    "SESSIONS_PATH",
     "STEP_UP_PATH",
     "TOTP_ACTIVATE_PATH",
     "TOTP_DISABLE_PATH",
@@ -90,6 +93,9 @@ VERIFY_REQUEST_PATH = "/verify-email"
 VERIFY_CONFIRM_PATH = "/verify-email/confirm"
 RESET_REQUEST_PATH = "/reset"
 RESET_CONFIRM_PATH = "/reset/confirm"
+EMAIL_CHANGE_PATH = "/email/change"
+EMAIL_CHANGE_CONFIRM_PATH = "/email/change/confirm"
+SESSIONS_PATH = "/sessions"
 
 LOGIN_TOTP_PATH = "/login/totp"
 TOTP_ENROL_PATH = "/totp/enrol"
@@ -893,6 +899,78 @@ def _mount_flows(
             await run_sync(lambda: device_grant_stores.grants.revoke_all_for_user(subject))
         return clear_refresh_cookie(JSONResponse({"signed_out": True}))
 
+    @router.get(f"{prefix}{SESSIONS_PATH}")
+    async def list_sessions(request: _FastAPIRequest) -> JSONResponse:
+        """List the caller's live sign-in sessions, marking the one this request came from."""
+        subject = _subject_from_request(request, tokens)
+        if not subject:
+            return rejected(
+                request,
+                LoginRejected(
+                    "Sign in to see your sessions.",
+                    error_code="NOT_AUTHENTICATED",
+                    status_code=401,
+                ),
+            )
+        current = _session_from_request(request, tokens)
+        sessions = await run_sync(lambda: flows.list_sessions(subject))
+        return JSONResponse(
+            {
+                "sessions": [
+                    {
+                        "id": session.family_id,
+                        "device": session.device,
+                        "ip": session.ip,
+                        "started_at": session.started_at,
+                        "last_active_at": session.last_active_at,
+                        "expires_at": session.expires_at,
+                        "amr": list(session.amr),
+                        "current": bool(current) and session.family_id == current,
+                    }
+                    for session in sessions
+                ]
+            }
+        )
+
+    @router.delete(f"{prefix}{SESSIONS_PATH}/{{family_id}}")
+    async def revoke_session(request: _FastAPIRequest, family_id: str) -> JSONResponse:
+        """Sign one of the caller's other sessions out.
+
+        Another user's session answers 404 like an unknown one. The session the request came
+        from is refused with 400, since ending it is what `logout` does and clears the cookie.
+        """
+        subject = _subject_from_request(request, tokens)
+        if not subject:
+            return rejected(
+                request,
+                LoginRejected(
+                    "Sign in to manage your sessions.",
+                    error_code="NOT_AUTHENTICATED",
+                    status_code=401,
+                ),
+            )
+        if family_id == _session_from_request(request, tokens):
+            return rejected(
+                request,
+                LoginRejected(
+                    "This is the session you are using. Sign out to end it.",
+                    error_code="CURRENT_SESSION",
+                    status_code=400,
+                ),
+            )
+        ip, _ = context(request)
+        found = await run_sync(lambda: flows.revoke_session(subject, family_id, ip=ip))
+        if not found:
+            return rejected(
+                request,
+                LoginRejected(
+                    "No such session.",
+                    error_code="SESSION_NOT_FOUND",
+                    status_code=404,
+                ),
+            )
+        return JSONResponse({"revoked": True})
+
     _mount_step_up(
         router,
         prefix=prefix,
@@ -1079,6 +1157,91 @@ def _mount_flows(
         except LoginRejected as exc:
             return rejected(request, exc)
         return clear_refresh_cookie(JSONResponse({"reset": True}))
+
+    def email_change_step_up(request: Request) -> JSONResponse | None:
+        """A 401 `STEP_UP_REQUIRED` when the caller's sign-in is older than the email change window."""
+        max_age = int(settings.email_change_max_age.total_seconds())
+        if max_age <= 0:
+            return None
+        import time
+
+        from webbpulse.http import error_body
+        from webbpulse.identity.scopes import (
+            STEP_UP_REQUIRED_ERROR_CODE,
+            STEP_UP_REQUIRED_MESSAGE,
+            _auth_time,
+            step_up_challenge,
+        )
+
+        auth_time = _auth_time(_claims_from_request(request, tokens))
+        if auth_time is not None and time.time() - auth_time <= max_age:
+            return None
+        return JSONResponse(
+            error_body(
+                401,
+                STEP_UP_REQUIRED_MESSAGE,
+                request,
+                error_code=STEP_UP_REQUIRED_ERROR_CODE,
+                max_age=max_age,
+            ),
+            status_code=401,
+            headers={"WWW-Authenticate": step_up_challenge(max_age)},
+        )
+
+    @router.post(
+        f"{prefix}{EMAIL_CHANGE_PATH}",
+        dependencies=limits(
+            ("email-change-email", VERIFY_EMAIL_LIMIT, "email"),
+            ("email-change-ip", VERIFY_IP_LIMIT, "ip"),
+        ),
+    )
+    async def request_email_change(request: _FastAPIRequest, payload: dict[str, Any] = Body(...)) -> JSONResponse:
+        """Mail a confirmation link to a new sign-in address. Nothing changes until it is confirmed.
+
+        Needs a recent sign-in: an older session gets 401 `STEP_UP_REQUIRED` and steps up.
+        """
+        subject = _subject_from_request(request, tokens)
+        if not subject:
+            return rejected(
+                request,
+                LoginRejected(
+                    "Sign in to change your email address.",
+                    error_code="NOT_AUTHENTICATED",
+                    status_code=401,
+                ),
+            )
+        refusal = email_change_step_up(request)
+        if refusal is not None:
+            return refusal
+        ip, _ = context(request)
+        session_id = _session_from_request(request, tokens)
+        try:
+            await run_sync(
+                lambda: flows.request_email_change(
+                    user_id=subject,
+                    new_email=str(payload.get("email", "")),
+                    family_id=session_id,
+                    ip=ip,
+                )
+            )
+        except LoginRejected as exc:
+            return rejected(request, exc)
+        return JSONResponse({"sent": True})
+
+    @router.post(
+        f"{prefix}{EMAIL_CHANGE_CONFIRM_PATH}",
+        dependencies=limits(("email-change-confirm-ip", VERIFY_IP_LIMIT, "ip")),
+    )
+    async def confirm_email_change(request: _FastAPIRequest, payload: dict[str, Any] = Body(...)) -> JSONResponse:
+        """Spend an email change link, move the sign-in address and end the other sessions."""
+        ip, _ = context(request)
+        try:
+            user_id = await run_sync(lambda: flows.confirm_email_change(str(payload.get("token", "")), ip=ip))
+        except ConfirmationFailed as exc:
+            return link_refused(request, exc)
+        except LoginRejected as exc:
+            return rejected(request, exc)
+        return JSONResponse({"changed": True, "user_id": user_id})
 
 
 def _mount_mfa(
@@ -1654,6 +1817,24 @@ IDENTITY_ROUTE_RESPONSES: Final[dict[tuple[str, str], dict[int, str]]] = {
     },
     ("POST", LOGOUT_PATH): {403: "The request did not come from an allowed origin"},
     ("POST", LOGOUT_ALL_PATH): {401: "No bearer token was presented"},
+    ("GET", SESSIONS_PATH): {401: "No bearer token was presented"},
+    ("DELETE", f"{SESSIONS_PATH}/{{family_id}}"): {
+        400: "The session is the one the request came from",
+        401: "No bearer token was presented",
+        404: "No live session of that id belongs to the caller",
+    },
+    ("POST", EMAIL_CHANGE_PATH): {
+        400: "The address is malformed or already the sign-in address",
+        401: "No bearer token was presented, or the sign-in is too old and needs a step-up",
+        409: "Another account already uses the address",
+        429: "Too many email change requests",
+        501: "The product cannot change a sign-in address",
+    },
+    ("POST", EMAIL_CHANGE_CONFIRM_PATH): {
+        400: "The link is unknown, expired or already used",
+        409: "Another account claimed the address since the request",
+        429: "Too many attempts from this address",
+    },
     ("POST", PASSWORD_PATH): {401: "The current password was refused"},
     ("POST", VERIFY_REQUEST_PATH): {429: "Too many verification requests"},
     ("POST", VERIFY_CONFIRM_PATH): {400: "The link is unknown, expired or already used"},

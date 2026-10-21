@@ -12,6 +12,7 @@ from typing import Any, Protocol, runtime_checkable
 __all__ = [
     "AuthenticationRefused",
     "BaseIdentityHooks",
+    "EmailChangeHooks",
     "HookNotImplemented",
     "IdentityHooks",
 ]
@@ -126,6 +127,23 @@ class IdentityHooks(Protocol):
         ...
 
 
+@runtime_checkable
+class EmailChangeHooks(Protocol):
+    """The optional hook a product implements to let a user change their sign-in address.
+
+    Kept out of `IdentityHooks` so a product written before email change existed still
+    satisfies that protocol. The email change flow answers 501 when the hooks lack it.
+    """
+
+    def change_email(self, user_id: str, email: str) -> None:
+        """Move a user's sign-in address to `email` and mark it verified.
+
+        Called only after a confirmation link mailed to `email` has been consumed and the
+        address re-checked as unused, so the link itself is the proof of the new mailbox.
+        """
+        ...
+
+
 class BaseIdentityHooks:
     """A concrete `IdentityHooks` whose unimplemented hooks raise a clear error.
 
@@ -180,6 +198,10 @@ class BaseIdentityHooks:
     def user_repository(self) -> object:
         """Refuse: the product must implement this hook."""
         raise self._not_implemented("user_repository")
+
+    def change_email(self, user_id: str, email: str) -> None:
+        """Refuse: a product that offers email change must implement this hook."""
+        raise self._not_implemented("change_email")
 
     def has_other_sign_in_method(self, user_id: str) -> bool:
         """No methods this package cannot see, the conservative default.

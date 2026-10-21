@@ -7,6 +7,25 @@ This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## Unreleased
 
+## 0.95.0
+
+### Added
+
+- Self-service session list and sign-in address change in `webbpulse.identity` (STUP-293,
+  CAR-5). `GET /sessions` lists the caller's live refresh families with the current one
+  marked, and `DELETE /sessions/{family_id}` ends one of them, scoped to the caller so
+  another user's id answers 404; the calling session answers 400 `CURRENT_SESSION`, since
+  logout ends it. `POST /email/change` mails a single-use `change_email` link (one hour,
+  `email_change_ttl`) to the new address and needs a sign-in inside `email_change_max_age`
+  (ten minutes); `POST /email/change/confirm` re-checks the address is unused, moves it
+  through the new optional `EmailChangeHooks.change_email` (implemented by
+  `DynamoUsersHooks`, 501 `EMAIL_CHANGE_UNSUPPORTED` without it), marks it verified, revokes
+  every other session and device login, and mails the old address a notice with the new
+  one masked. Both POST routes share the verification resend limits.
+  `RefreshTokenStore.latest_by_family_for_user`, `SessionService.list_for_user` and
+  `revoke_owned_family`, `SessionSummary`, and `render_email_change` and
+  `render_email_changed` back them.
+
 ## 0.94.0
 
 ### Added

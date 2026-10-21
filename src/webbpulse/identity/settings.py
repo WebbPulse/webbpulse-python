@@ -204,6 +204,17 @@ class IdentitySettings(BaseSettings):
     mfa_ticket_ttl: timedelta = Field(default=timedelta(minutes=5))
     email_verification_ttl: timedelta = Field(default=timedelta(hours=24))
     password_reset_ttl: timedelta = Field(default=timedelta(hours=1))
+    email_change_ttl: timedelta = Field(
+        default=timedelta(hours=1),
+        description="How long the confirmation link mailed to a new sign-in address stays valid.",
+    )
+    email_change_max_age: timedelta = Field(
+        default=timedelta(minutes=10),
+        description=(
+            "The oldest sign-in that may ask to change the sign-in address. An older session "
+            "gets a 401 `STEP_UP_REQUIRED` and steps up first. Zero turns the check off."
+        ),
+    )
     clock_skew_leeway: timedelta = Field(
         default=timedelta(seconds=30),
         description="Tolerance when verifying `exp` and `nbf` locally, for clock skew.",
@@ -728,6 +739,8 @@ class IdentitySettings(BaseSettings):
         """
         if self.mcp_consent_max_age < timedelta(0):
             raise ValueError("mcp_consent_max_age must be zero, which turns the check off, or positive.")
+        if self.email_change_max_age < timedelta(0):
+            raise ValueError("email_change_max_age must be zero, which turns the check off, or positive.")
         if not self.mcp_login_return_param.strip():
             raise ValueError("mcp_login_return_param must name the query parameter the sign-in page reads.")
         if not self.mcp_login_url:
