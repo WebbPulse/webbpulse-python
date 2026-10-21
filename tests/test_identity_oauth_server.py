@@ -1015,7 +1015,13 @@ class TestRefreshGuard:
     def test_the_guard_is_not_asked_about_a_token_with_no_grant(self, fake_kms: Any) -> None:
         """A family with no grant behind it is refused by the consent check, not the guard."""
         calls: list[ConsentRecord] = []
-        service, _, _ = _service_with_refresh(fake_kms, lambda consent: calls.append(consent) or False)
+
+        def guard(consent: ConsentRecord) -> bool:
+            """Record the question and decline."""
+            calls.append(consent)
+            return False
+
+        service, _, _ = _service_with_refresh(fake_kms, guard)
         assert service._flows is not None
         stray = service._flows.sessions.start_family(USER, device="firefox").token
 
