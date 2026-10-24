@@ -79,6 +79,7 @@ gateway builds the discovery URL as `issuer + "/.well-known/openid-configuration
 | `POST /api/auth/reset/confirm` | Spends a reset link, sets the new password, revokes every session |
 | `GET /api/auth/sessions` | Lists the caller's live sessions, marking the one making the call |
 | `DELETE /api/auth/sessions/{family_id}` | Ends one of the caller's other sessions; another user's id answers 404, the current one 400 |
+| `POST /api/auth/sessions/revoke-others` | Ends every one of the caller's sessions except the current one and answers `{"revoked": <count>}` |
 | `POST /api/auth/email/change` | Mails a confirmation link to a new sign-in address; needs a sign-in inside `email_change_max_age` |
 | `POST /api/auth/email/change/confirm` | Spends the link, moves the address through `EmailChangeHooks.change_email`, ends other sessions, tells the old address |
 | `POST /api/auth/login/totp` | The second leg of login: exchanges an MFA ticket plus a code for tokens |

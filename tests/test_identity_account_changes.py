@@ -15,6 +15,7 @@ from webbpulse.identity import (
     EMAIL_CHANGE_LINK_PATH,
     EMAIL_CHANGE_PATH,
     SESSIONS_PATH,
+    SESSIONS_REVOKE_OTHERS_PATH,
     AuthenticationRefused,
     BaseIdentityHooks,
     ConfirmationFailed,
@@ -303,6 +304,41 @@ def test_revoking_a_session_is_scoped_to_its_owner(flows: IdentityFlows) -> None
     assert flows.list_sessions(USER_ID) == []
 
 
+def test_revoking_other_sessions_keeps_only_the_current_one(flows: IdentityFlows) -> None:
+    """Every other session of the caller ends, and the current one still refreshes."""
+    first = flows.login(email=EMAIL, password=PASSWORD)
+    second = flows.login(email=EMAIL, password=PASSWORD)
+    current = flows.login(email=EMAIL, password=PASSWORD)
+
+    assert flows.revoke_other_sessions(USER_ID, current.family_id) == 2
+
+    assert [session.family_id for session in flows.list_sessions(USER_ID)] == [current.family_id]
+    assert flows.refresh(current.refresh_token).access_token
+    for ended in (first, second):
+        with pytest.raises(LoginRejected):
+            flows.refresh(ended.refresh_token)
+
+
+def test_revoking_other_sessions_with_only_one_is_a_no_op(flows: IdentityFlows) -> None:
+    """A caller with a single session ends none and keeps it."""
+    only = flows.login(email=EMAIL, password=PASSWORD)
+
+    assert flows.revoke_other_sessions(USER_ID, only.family_id) == 0
+    assert [session.family_id for session in flows.list_sessions(USER_ID)] == [only.family_id]
+
+
+def test_revoking_other_sessions_leaves_another_user_alone(flows: IdentityFlows) -> None:
+    """Another user's sessions survive the caller revoking their own others."""
+    mine = flows.login(email=EMAIL, password=PASSWORD)
+    flows.login(email=EMAIL, password=PASSWORD)
+    theirs = flows.login(email=TAKEN_EMAIL, password=PASSWORD)
+
+    assert flows.revoke_other_sessions(USER_ID, mine.family_id) == 1
+
+    assert [session.family_id for session in flows.list_sessions(OTHER_ID)] == [theirs.family_id]
+    assert flows.refresh(theirs.refresh_token).access_token
+
+
 def test_a_store_that_cannot_enumerate_lists_nothing(
     kms: FakeKms, hooks: FakeHooks, sender: RecordingEmailSender
 ) -> None:
@@ -513,6 +549,45 @@ def test_the_session_routes_need_a_bearer(client: TestClient) -> None:
     """Both session routes answer 401 with no token."""
     assert client.get(url(SESSIONS_PATH)).status_code == 401
     assert client.delete(url(f"{SESSIONS_PATH}/anything")).status_code == 401
+
+
+def test_the_revoke_others_route_keeps_the_calling_session(client: TestClient) -> None:
+    """`POST /sessions/revoke-others` ends the other sessions, and the caller still refreshes."""
+    sign_in(client)
+    sign_in(client)
+    access = sign_in(client)
+
+    response = client.post(url(SESSIONS_REVOKE_OTHERS_PATH), headers=bearer(access))
+    assert response.status_code == 200, response.text
+    assert response.json() == {"revoked": 2}
+
+    sessions = client.get(url(SESSIONS_PATH), headers=bearer(access)).json()["sessions"]
+    assert [session["current"] for session in sessions] == [True]
+    assert client.post(url("/refresh")).status_code == 200
+
+
+def test_the_revoke_others_route_with_one_session_revokes_none(client: TestClient) -> None:
+    """A caller with only the current session gets a count of 0."""
+    access = sign_in(client)
+
+    response = client.post(url(SESSIONS_REVOKE_OTHERS_PATH), headers=bearer(access))
+    assert response.status_code == 200
+    assert response.json() == {"revoked": 0}
+
+
+def test_the_revoke_others_route_leaves_another_user_alone(client: TestClient) -> None:
+    """Another user's sessions are untouched by the caller's revoke-others."""
+    theirs = sign_in(client, TAKEN_EMAIL)
+    mine = sign_in(client)
+
+    response = client.post(url(SESSIONS_REVOKE_OTHERS_PATH), headers=bearer(mine))
+    assert response.json() == {"revoked": 0}
+    assert len(client.get(url(SESSIONS_PATH), headers=bearer(theirs)).json()["sessions"]) == 1
+
+
+def test_the_revoke_others_route_needs_a_bearer(client: TestClient) -> None:
+    """Revoke-others answers 401 with no token."""
+    assert client.post(url(SESSIONS_REVOKE_OTHERS_PATH)).status_code == 401
 
 
 def test_another_users_session_answers_404_over_http(client: TestClient) -> None:

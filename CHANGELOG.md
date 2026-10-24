@@ -7,6 +7,16 @@ This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## Unreleased
 
+### Added
+
+- `POST /sessions/revoke-others` in `webbpulse.identity` (PLAT-82) signs out every one of
+  the caller's sessions except the one the access token's `sid` names, and answers 200
+  `{"revoked": <count>}`, 0 when there was no other session. It needs a bearer like the
+  other session routes, is scoped to the caller so another user's sessions are untouched,
+  and logs `session.revoked_others`. `IdentityFlows.revoke_other_sessions` is the flow
+  behind it and `SESSIONS_REVOKE_OTHERS_PATH` the path constant. A gateway that lists
+  identity routes one by one needs an entry for the new path.
+
 ## 0.100.0
 
 ### Security

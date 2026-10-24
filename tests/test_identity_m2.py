@@ -1258,6 +1258,7 @@ def test_the_flows_mount_when_hooks_and_stores_are_supplied(
         "/api/auth/logout-all",
         "/api/auth/sessions",
         "/api/auth/sessions/{family_id}",
+        "/api/auth/sessions/revoke-others",
         "/api/auth/step-up",
     }
 
@@ -1288,6 +1289,7 @@ def test_an_origin_issuer_mounts_every_route_at_the_origin(
         "/logout-all",
         "/sessions",
         "/sessions/{family_id}",
+        "/sessions/revoke-others",
         "/step-up",
     }
 
