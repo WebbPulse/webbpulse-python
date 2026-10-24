@@ -7,6 +7,13 @@ This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## Unreleased
 
+## 0.98.1
+
+### Changed
+
+- `wp-tf --help` now ends with a note that stock `terraform` drives `cloud {}` configs
+  against the plane, and `wp-tf apply` describes itself as the legacy path (TF-100).
+
 ## 0.98.0
 
 ### Added
