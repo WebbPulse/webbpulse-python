@@ -129,6 +129,9 @@ def test_plan_uploads_starts_plan_only_run_and_streams(tmp_path: Path) -> None:
     assert plane.run_body["workspace_id"] == WS_ID
     assert plane.run_body["config_version_id"] == "cv-1"
     assert plane.uploaded[:2] == b"\x1f\x8b"
+    assert "wp-tf: config bundle " in err
+    assert "1 file;" in err
+    assert err.index("config bundle") < err.index("uploading")
     assert "Terraform will perform the following actions:" in out
     assert "Plan: 1 to add." in out
     assert "https://terraform.example.test/runs/run-1" in err

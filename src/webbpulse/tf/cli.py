@@ -49,7 +49,7 @@ from collections.abc import Callable, Mapping, Sequence
 from pathlib import Path
 from typing import IO, TYPE_CHECKING, Any, NoReturn
 
-from .archive import ArchiveError, build_tarball
+from .archive import ArchiveError, build_bundle
 from .credentials import CredentialsError, resolve_token
 from .gate import GateError, resolve_gate
 
@@ -352,9 +352,10 @@ def _start_run(
     workspace = plane.resolve_workspace(args.workspace)
     workspace_id = str(workspace["workspace_id"])
     name = str(workspace.get("name") or workspace_id)
-    tarball = build_tarball(Path(args.directory), str(workspace.get("working_directory") or ""))
-    print(f"{PROG}: uploading {len(tarball)} bytes to {name}", file=stderr, flush=True)
-    config_version_id = plane.upload_config(workspace_id, tarball)
+    bundle = build_bundle(Path(args.directory), str(workspace.get("working_directory") or ""))
+    print(f"{PROG}: config bundle {bundle.describe()}", file=stderr, flush=True)
+    print(f"{PROG}: uploading {bundle.size} bytes to {name}", file=stderr, flush=True)
+    config_version_id = plane.upload_config(workspace_id, bundle.data)
     create = plane.create_plan_run if plan_only else plane.create_apply_run
     run = create(workspace_id, config_version_id, message=args.message, is_destroy=args.destroy)
     run_id = str(run["run_id"])

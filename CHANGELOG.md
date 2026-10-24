@@ -24,6 +24,19 @@ This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `platform`, a family started before the field existed takes it from the user agent on its
   next refresh, and `SessionSummary.browser` and the `GET /sessions` body expose it.
 
+### Changed
+
+- `wp-tf` config uploads (TF-119) leave out what git ignores when there is no
+  `.terraformignore` and the upload root is inside a git work tree, falling back to the
+  defaults when git is missing or the directory is not tracked. go-slug's defaults
+  (`.git/`, `.terraform/` but not `.terraform/modules/`) always apply, and
+  `.terraformignore` patterns follow go-slug: a pattern without a leading `/` matches at
+  any depth even with a slash in the middle, and a `!` rule can reach inside a directory an
+  earlier rule left out. Before the upload wp-tf prints `config bundle <size>, <n> files;`
+  and which rules filtered it. The size limit is now the API's 250,000,000 bytes rather than
+  250 MiB. `archive.build_bundle` returns a `ConfigBundle` with the tarball, file count and
+  ignore source, and `build_tarball` still returns the bytes.
+
 ## 0.100.0
 
 ### Security

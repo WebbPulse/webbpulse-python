@@ -357,9 +357,16 @@ wp-tf logout
   that cannot be read fails the command.
 - **Working directory.** When a workspace has a working directory, run `wp-tf` from that
   directory. The upload is rooted that many levels up, as HCP Terraform does.
-- **What the upload skips.** A `.terraformignore` at the upload root filters it with
-  gitignore rules. `.git`, `.terraform` and local `*.tfstate` files are always skipped.
-  `.tfvars` files are configuration, so they are uploaded. Uploads over 250 MB are refused.
+- **What the upload skips.** go-slug's defaults always apply: `.git/` and `.terraform/` are
+  left out and `.terraform/modules/` is kept. A `.terraformignore` at the upload root then
+  filters it with HCP Terraform's rules: a pattern without a leading `/` matches at any
+  depth, a trailing `/` matches directories, `!` brings a path back and the last match
+  wins. Without a `.terraformignore`, inside a git work tree, every path git ignores is
+  left out too, so a gitignored `.venv` or `node_modules` never ships; with no git it falls
+  back to the defaults. Local `*.tfstate` files are always skipped, and `.tfvars` files are
+  configuration, so they are uploaded. wp-tf prints the bundle size, file count and the
+  rules it used before the upload. Uploads over 250 MB (250,000,000 bytes, the API limit)
+  are refused, and so are symlinks by the runner.
 - **Output and exit codes.** Log lines go to stdout and progress to stderr. It exits `0` when
   the plan or apply succeeds and `1` on any failure or a declined apply. It exits `2` under
   `--detailed-exitcode` when the plan has changes, and `130` after Ctrl-C, which cancels a
