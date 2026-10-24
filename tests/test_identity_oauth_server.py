@@ -1976,7 +1976,7 @@ class TestRefreshFamilyContext:
         assert summary.client_id == "first-party"
 
     def test_a_refresh_records_the_last_seen_ip(self, fake_kms: Any) -> None:
-        """A refresh from a new address keeps the sign-in IP and moves the last-seen one."""
+        """A refresh records its address as last seen, and backfills a sign-in IP that was never known."""
         from webbpulse.identity import SessionService
 
         service, _, refresh_tokens = _service_with_refresh(fake_kms)
@@ -1989,6 +1989,6 @@ class TestRefreshFamilyContext:
         )
 
         (summary,) = SessionService(build_settings(), refresh_tokens).list_for_user(USER)
-        assert summary.ip == ""
+        assert summary.ip == "203.0.113.9"
         assert summary.last_ip == "203.0.113.9"
         assert summary.client == "Bun"
