@@ -91,8 +91,15 @@ brand = EmailBrand(accent_color="#b8451a", dark_accent_color="#f2703a", theme=th
   light again and the screen layer lays it over the gradient. Where Gmail inverts nothing,
   both layers leave the colours as drawn. Nothing inside a wrapper may be an image or a
   gradient fill, because the difference layer would invert it. That is why the logo stays
-  outside them, and why quotes and code keep plain colour fills. The light scheme renders
-  none of this.
+  outside them, and why quotes and code keep plain colour fills.
+- Gmail's inversion and the difference layer cancel only for greys. A saturated accent comes
+  out as its complement, so an orange button would turn light blue. The button, every link
+  and every quote rule therefore carry `wp-gmail-keep`, a second `mix-blend-mode:difference`
+  under `u + .body` that undoes the wrapper's flip and leaves Gmail's own dark-mode version of
+  the accent. A quote's rule is drawn as its own 3px cell, because the quote fill next to it
+  needs the plain double inversion. The card's 1px line is an outer cell with a gradient fill
+  and 1px of padding instead of a border colour, which Gmail would invert to a light hairline.
+  The light scheme renders none of this, byte for byte.
 
 ## Identity emails
 

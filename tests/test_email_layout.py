@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Callable
 from dataclasses import replace
+from pathlib import Path
 from typing import Any, cast
 
 import pytest
@@ -226,7 +227,7 @@ def test_a_dark_first_theme_draws_the_dark_palette_inline() -> None:
     card_fill = f"background-color:{card};background-image:linear-gradient({card},{card});"
     assert f'<body class="wp-bg body" bgcolor="{page}" style="margin:0;padding:0;{page_fill}">' in html
     assert f'class="wp-bg" bgcolor="{page}" style="{page_fill}"' in html
-    assert f'bgcolor="{card}" style="{card_fill}border:1px solid {APP_DARK.line};' in html
+    assert f'bgcolor="{card}" style="{card_fill}border-radius:7px;padding:32px;"' in html
     assert f"color:{APP_DARK.text};" in html
     assert f"color:{APP_DARK.muted};" in html
     assert 'bgcolor="#f2703a" style="border-radius:6px;background-color:#f2703a;"' in html
@@ -290,6 +291,74 @@ def test_a_dark_first_theme_guards_against_gmail_inversion() -> None:
         assert "linear-gradient" not in content
 
 
+def test_a_dark_first_theme_keeps_the_accent_on_brand_under_the_gmail_wrappers() -> None:
+    """The button, every link and every quote rule carry `wp-gmail-keep`, and the neutral surfaces do not."""
+    html, _ = _render(DARK_FIRST)
+
+    assert "u + .body .wp-gmail-keep{mix-blend-mode:difference;}" in html
+    assert '<table class="wp-gmail-keep" role="presentation"' in html
+    links = html.count('<a class="wp-link')
+    assert links == 4
+    assert html.count('<a class="wp-link wp-gmail-keep"') == links
+    rule = '<td class="wp-rule-fill wp-gmail-keep" width="3" bgcolor="#f2703a"'
+    assert html.count(rule) == 2
+    assert "border-left" not in html
+    assert ".wp-rule-fill{background-color:#f2703a !important;}" in html
+    assert html.count("wp-gmail-keep") == 1 + 1 + links + 2
+    for marked in html.split("wp-gmail-keep")[1:]:
+        tag = marked.split(">", 1)[0]
+        assert "wp-quote" not in tag
+        assert "linear-gradient" not in tag
+    wrapper = '<div class="wp-gmail-screen"><div class="wp-gmail-difference">'
+    outside = "".join(part.split("</div></div>", 1)[-1] for part in html.split(wrapper))
+    assert 'class="wp-gmail-keep' not in outside.split("<body", 1)[1]
+
+
+def test_a_dark_first_card_draws_its_line_as_a_gradient_cell() -> None:
+    """The card line is an outer cell Gmail leaves dark, not a border colour Gmail would invert."""
+    html, _ = _render(DARK_FIRST)
+
+    line = APP_DARK.line
+    assert (
+        f'<td class="wp-line" bgcolor="{line}" style="background-color:{line};'
+        f'background-image:linear-gradient({line},{line});border-radius:8px;padding:1px;">'
+    ) in html
+    assert "border:1px solid" not in html
+    assert f"[data-ogsb] .wp-line{{background-color:{line} !important;}}" in html
+
+
+SNAPSHOTS = Path(__file__).parent / "snapshots" / "email_layout"
+SNAPSHOT_BRANDS = {
+    "light_default": BRAND,
+    "light_theme": EmailBrand(
+        product_name="Acme",
+        logo_url="https://cdn.example.com/logo.png",
+        accent_color="#b8451a",
+        dark_accent_color="#f2703a",
+        home_url="https://acme.example.com",
+        footer_links=(EmailLink("Help", "https://acme.example.com/help"),),
+        legal_line="Acme Ltd",
+        theme=APP_THEME,
+    ),
+    "dark_first": DARK_FIRST,
+}
+
+
+@pytest.mark.parametrize("name", ["light_default", "light_theme"])
+def test_the_light_output_is_byte_identical_to_its_snapshot(name: str) -> None:
+    """A light theme renders exactly what webbpulse 0.101.0 rendered, so light products see no change."""
+    html, _ = _render(SNAPSHOT_BRANDS[name])
+
+    assert html == (SNAPSHOTS / f"{name}.html").read_text()
+
+
+def test_the_dark_first_output_matches_its_snapshot() -> None:
+    """The whole dark-first document, Gmail guards included, matches the reviewed snapshot."""
+    html, _ = _render(SNAPSHOT_BRANDS["dark_first"])
+
+    assert html == (SNAPSHOTS / "dark_first.html").read_text()
+
+
 def test_a_light_theme_carries_no_gmail_guard() -> None:
     """The light scheme renders no gradient fill, no blend-mode wrapper and no Gmail selector."""
     for brand in (BRAND, EmailBrand(product_name="Acme", accent_color="#b8451a", theme=APP_THEME)):
@@ -299,6 +368,8 @@ def test_a_light_theme_carries_no_gmail_guard() -> None:
         assert "mix-blend-mode" not in html
         assert "wp-gmail" not in html
         assert "u + .body" not in html
+        assert "wp-rule-fill" not in html
+        assert "wp-line" not in html
         assert '<body class="wp-bg" bgcolor=' in html
 
 
