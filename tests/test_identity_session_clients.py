@@ -1,4 +1,4 @@
-"""Tests for the session list's last-seen IP, client and platform (PLAT-79).
+"""Tests for the session list's last-seen IP, client, platform (PLAT-79) and browser (PLAT-83).
 
 Covers the user agent readers, what a family records at sign-in and on each refresh, the
 fallbacks for rows written before the fields existed, the DynamoDB round trip and the
@@ -16,6 +16,7 @@ from webbpulse.identity import (
     IdentitySettings,
     InMemoryRefreshTokenStore,
     SessionService,
+    browser_from_user_agent,
     client_from_user_agent,
     oauth_client_of_device,
     platform_from_user_agent,
@@ -45,6 +46,26 @@ EDGE_WINDOWS = (
 CHROME_ANDROID = (
     "Mozilla/5.0 (Linux; Android 14; Pixel 8) AppleWebKit/537.36 (KHTML, like Gecko) "
     "Chrome/130.0.0.0 Mobile Safari/537.36"
+)
+OPERA_WINDOWS = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) "
+    "Chrome/130.0.0.0 Safari/537.36 OPR/115.0.0.0"
+)
+SAMSUNG_ANDROID = (
+    "Mozilla/5.0 (Linux; Android 14; SM-S918B) AppleWebKit/537.36 (KHTML, like Gecko) "
+    "SamsungBrowser/26.0 Chrome/122.0.0.0 Mobile Safari/537.36"
+)
+CHROME_IPHONE = (
+    "Mozilla/5.0 (iPhone; CPU iPhone OS 17_5 like Mac OS X) AppleWebKit/605.1.15 "
+    "(KHTML, like Gecko) CriOS/130.0.6723.90 Mobile/15E148 Safari/604.1"
+)
+FIREFOX_IPHONE = (
+    "Mozilla/5.0 (iPhone; CPU iPhone OS 17_5 like Mac OS X) AppleWebKit/605.1.15 "
+    "(KHTML, like Gecko) FxiOS/131.0 Mobile/15E148 Safari/605.1.15"
+)
+EDGE_IPHONE = (
+    "Mozilla/5.0 (iPhone; CPU iPhone OS 17_5 like Mac OS X) AppleWebKit/605.1.15 "
+    "(KHTML, like Gecko) Version/17.0 EdgiOS/130.0.2849.80 Mobile/15E148 Safari/604.1"
 )
 
 
@@ -113,6 +134,39 @@ def test_the_platform_is_a_coarse_operating_system(user_agent: str, platform: st
     assert platform_from_user_agent(user_agent) == platform
 
 
+@pytest.mark.parametrize(
+    ("user_agent", "browser"),
+    [
+        ("", ""),
+        (CHROME_MAC, "Chrome"),
+        (CHROME_ANDROID, "Chrome"),
+        (CHROME_IPHONE, "Chrome"),
+        (SAFARI_IPHONE, "Safari"),
+        (FIREFOX_LINUX, "Firefox"),
+        (FIREFOX_IPHONE, "Firefox"),
+        (EDGE_WINDOWS, "Edge"),
+        (EDGE_IPHONE, "Edge"),
+        (OPERA_WINDOWS, "Opera"),
+        (SAMSUNG_ANDROID, "Samsung Internet"),
+        (ELECTRON_WINDOWS, ""),
+        ("claude-code/2.0.14 (cli)", ""),
+        ("Standupless/12 CFNetwork/1490.0.4 Darwin/23.2.0", ""),
+        ("not a user agent", ""),
+    ],
+)
+def test_the_browser_is_a_coarse_family_checked_in_order(user_agent: str, browser: str) -> None:
+    """Edge, Opera and Samsung Internet win over the Chrome token, Chrome over Safari, and a named client has none."""
+    assert browser_from_user_agent(user_agent) == browser
+
+
+@pytest.mark.parametrize(
+    "user_agent", [CHROME_MAC, EDGE_WINDOWS, OPERA_WINDOWS, SAMSUNG_ANDROID, SAFARI_IPHONE, FIREFOX_LINUX]
+)
+def test_the_browser_never_carries_a_version(user_agent: str) -> None:
+    """The family name holds no digit, so it cannot narrow a person down by version."""
+    assert not any(character.isdigit() for character in browser_from_user_agent(user_agent))
+
+
 def test_the_oauth_client_is_read_off_the_device_label() -> None:
     """Both label shapes the OAuth server writes name their client, and any other label names none."""
     assert oauth_client_of_device("mcp:client-1:tenant-1") == "client-1"
@@ -130,7 +184,23 @@ def test_a_new_family_records_its_ip_client_and_platform(sessions: SessionServic
     assert summary.last_ip == "198.51.100.1"
     assert summary.client == "Standupless"
     assert summary.platform == "Windows"
+    assert summary.browser == ""
     assert summary.client_id == ""
+
+
+def test_a_browser_sign_in_records_its_browser(sessions: SessionService, store: InMemoryRefreshTokenStore) -> None:
+    """A browser sign-in stores its family on the record, and a refresh keeps it."""
+    first = sessions.start_family(USER_ID, device="desktop", ip="198.51.100.1", user_agent=EDGE_WINDOWS)
+    record = store.get(hash_token(first.token))
+    assert record is not None
+    assert record.browser == "Edge"
+
+    rotated = sessions.rotate(first.token, ip="203.0.113.2", user_agent=CHROME_MAC)
+    assert rotated.issued is not None
+
+    (summary,) = sessions.list_for_user(USER_ID)
+    assert summary.browser == "Edge"
+    assert summary.platform == "Windows"
 
 
 def test_a_refresh_moves_the_last_seen_ip_and_keeps_the_sign_in_ip(sessions: SessionService) -> None:
@@ -199,6 +269,38 @@ def test_a_family_started_before_the_fields_existed_falls_back(
     assert after.ip == "198.51.100.1"
     assert after.last_ip == "203.0.113.2"
     assert after.client == "claude-code"
+    assert after.browser == ""
+
+
+def test_a_browser_family_started_before_the_field_existed_falls_back(
+    sessions: SessionService, store: InMemoryRefreshTokenStore
+) -> None:
+    """An old browser row lists no browser, and its first refresh derives one from the user agent."""
+    now = datetime.now(UTC)
+    stamp = now.isoformat(timespec="seconds").replace("+00:00", "Z")
+    store.put(
+        RefreshTokenRecord(
+            token_hash=hash_token("legacy-browser-token"),
+            family_id="legacy-browser",
+            user_id=USER_ID,
+            generation=1,
+            created_at=stamp,
+            expires_at=int((now + timedelta(days=1)).timestamp()),
+            device="desktop",
+            ip_first_seen="198.51.100.1",
+            family_started_at=stamp,
+            platform="macOS",
+        )
+    )
+
+    (before,) = sessions.list_for_user(USER_ID)
+    assert before.browser == ""
+
+    sessions.rotate("legacy-browser-token", ip="203.0.113.2", user_agent=SAFARI_IPHONE)
+
+    (after,) = sessions.list_for_user(USER_ID)
+    assert after.browser == "Safari"
+    assert after.platform == "macOS"
 
 
 def test_the_dynamo_store_round_trips_the_new_fields(dynamodb_resource: Any) -> None:
@@ -226,6 +328,7 @@ def test_the_dynamo_store_round_trips_the_new_fields(dynamodb_resource: Any) -> 
             ip_last_seen="203.0.113.2",
             client="claude-code",
             platform="macOS",
+            browser="Firefox",
             **base,
         )
     )
@@ -233,13 +336,14 @@ def test_the_dynamo_store_round_trips_the_new_fields(dynamodb_resource: Any) -> 
 
     with_fields = store.get("with")
     assert with_fields is not None
-    assert (with_fields.ip_last_seen, with_fields.client, with_fields.platform) == (
+    assert (with_fields.ip_last_seen, with_fields.client, with_fields.platform, with_fields.browser) == (
         "203.0.113.2",
         "claude-code",
         "macOS",
+        "Firefox",
     )
     raw = dynamodb_resource.Table("refresh-tokens").get_item(Key={"token_hash": "without"})["Item"]
-    assert not {"ip_last_seen", "client", "platform"} & raw.keys()
+    assert not {"ip_last_seen", "client", "platform", "browser"} & raw.keys()
     without = store.get("without")
     assert without is not None
-    assert (without.ip_last_seen, without.client, without.platform) == ("", "", "")
+    assert (without.ip_last_seen, without.client, without.platform, without.browser) == ("", "", "", "")

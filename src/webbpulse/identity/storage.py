@@ -165,9 +165,10 @@ class RefreshTokenRecord:
     copied by rotation so every refreshed access token reports how the session began; empty
     means a record written before the field existed. `ip_last_seen` is the address the
     generation was minted from, so the newest generation says where the session was last
-    used; empty for a record written before the field existed. `client` and `platform` are
-    the coarse client and operating system the family was started from, as
-    `client_from_user_agent` and `platform_from_user_agent` read them.
+    used; empty for a record written before the field existed. `client`, `platform` and
+    `browser` are the coarse client, operating system and browser family the family was
+    started from, as `client_from_user_agent`, `platform_from_user_agent` and
+    `browser_from_user_agent` read them.
     """
 
     token_hash: str
@@ -187,6 +188,7 @@ class RefreshTokenRecord:
     ip_last_seen: str = ""
     client: str = ""
     platform: str = ""
+    browser: str = ""
 
     @property
     def is_consumed(self) -> bool:
@@ -1086,7 +1088,7 @@ class DynamoRefreshTokenStore(RefreshTokenStore):
         return _refresh_record_from_item(item) if item is not None else None
 
     def put(self, record: RefreshTokenRecord) -> None:
-        """Write a new generation, leaving `amr`, `ip_last_seen`, `client` and `platform` off a row that has none."""
+        """Write a new generation, leaving `amr` and the empty last-seen and client fields off the row."""
         item: dict[str, Any] = {
             "token_hash": record.token_hash,
             "family_id": record.family_id,
@@ -1104,7 +1106,7 @@ class DynamoRefreshTokenStore(RefreshTokenStore):
         }
         if record.amr:
             item["amr"] = list(record.amr)
-        for name in ("ip_last_seen", "client", "platform"):
+        for name in ("ip_last_seen", "client", "platform", "browser"):
             value = getattr(record, name)
             if value:
                 item[name] = value
@@ -1728,6 +1730,7 @@ def _refresh_record_from_item(item: Mapping[str, Any]) -> RefreshTokenRecord:
         ip_last_seen=str(item.get("ip_last_seen", "")),
         client=str(item.get("client", "")),
         platform=str(item.get("platform", "")),
+        browser=str(item.get("browser", "")),
     )
 
 
