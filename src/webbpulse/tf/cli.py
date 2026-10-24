@@ -1,5 +1,6 @@
-"""`wp-tf`: plan and apply a directory on the control plane and stream the log, like a remote
-`terraform plan` and `terraform apply`.
+"""`wp-tf`: plan a directory on the control plane and operate its runs, for what the stock
+`terraform` CLI cannot do. For a configuration with a `cloud {}` block, prefer stock
+`terraform`; `wp-tf apply` is legacy and gets no new features.
 
     terraform login terraform.webbpulse.com
     wp-tf plan -w platform-staging
@@ -114,6 +115,20 @@ The standard set is:
 state:download and admin are never granted unless named. Applying needs runs:apply, so
 when the plane's default set lacks it, sign in with `wp-tf login --add-scope runs:apply`."""
 
+STOCK_TERRAFORM_NOTE = (
+    "For a configuration with a cloud {} block, prefer stock terraform (terraform login, then "
+    "terraform plan, apply, state and import). wp-tf covers what the stock CLI cannot: device-flow "
+    "login, confirm, discard, status and logs on VCS-triggered runs, workspaces, variables, and "
+    "speculative plans for configurations that carry no cloud {} block. apply is legacy."
+)
+"""The `wp-tf --help` epilog: when to reach for stock `terraform` instead."""
+
+APPLY_LEGACY_NOTE = (
+    "Legacy. Upload a directory, plan, confirm and stream the apply. It keeps working but gets no "
+    "new features; for a configuration with a cloud {} block, use stock terraform apply."
+)
+"""The `wp-tf apply --help` description, marking the command legacy."""
+
 VARIABLE_SCOPES_HINT = (
     "run `wp-tf login --add-scope variables:write` to sign in with a keyring session that has it; "
     "a `terraform login` key is used only when no session, WP_TF_TOKEN or TF_TOKEN_<host> is present"
@@ -142,7 +157,11 @@ class _Parser(argparse.ArgumentParser):
 
 def build_parser() -> argparse.ArgumentParser:
     """The `wp-tf` command line."""
-    parser = _Parser(prog=PROG, description="Plan and apply runs on the WebbPulse Terraform control plane.")
+    parser = _Parser(
+        prog=PROG,
+        description="Plan and operate runs on the WebbPulse Terraform control plane.",
+        epilog=STOCK_TERRAFORM_NOTE,
+    )
     parser.add_argument("--host", help=f"control plane host, as used with terraform login (default {DEFAULT_HOST})")
     parser.add_argument("--api-url", help="API origin, when it should not be discovered from the host")
     parser.add_argument(
@@ -160,7 +179,9 @@ def build_parser() -> argparse.ArgumentParser:
     plan.add_argument("--no-follow", action="store_true", help="print the run id and return without waiting")
 
     apply = commands.add_parser(
-        "apply", help="upload a directory, plan, confirm and stream the apply, like terraform apply"
+        "apply",
+        help="legacy: upload a directory, plan, confirm and stream the apply; prefer stock terraform apply",
+        description=APPLY_LEGACY_NOTE,
     )
     apply.add_argument("directory", nargs="?", default=".", help="configuration directory (default .)")
     apply.add_argument("-w", "--workspace", required=True, help="workspace name or ws- id")

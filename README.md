@@ -85,7 +85,7 @@ its dev dependencies.
 | `webbpulse.e2e` | A pytest plugin and generic post-deploy suite: route cut, coverage, reachability, identity, frontend and hygiene against a real stage | [e2e.md](docs/e2e.md) |
 | `webbpulse.ops.config` | The `webbpulse-config` console script: operators set keys in the `<prefix>/app` secret and the `/<prefix>/config` parameter | [Operator config CLI](#operator-config-cli) |
 | `webbpulse.ops.admin` | The `webbpulse-admin` console script: operators grant, revoke and list admins in a product's identity `users` table | [Operator admin CLI](#operator-admin-cli) |
-| `webbpulse.tf` | The `wp-tf` console script: plan and apply runs on the WebbPulse Terraform control plane from a directory, with the log streamed | [Terraform CLI](#terraform-cli-wp-tf) |
+| `webbpulse.tf` | The `wp-tf` console script: device-flow login, speculative plans and run operations on the WebbPulse Terraform control plane, for what stock `terraform` cannot do | [Terraform CLI](#terraform-cli-wp-tf) |
 
 ## Wiring a FastAPI domain Lambda
 
@@ -278,8 +278,15 @@ usage, `3` no such user, `4` the users table does not exist.
 
 ## Terraform CLI (`wp-tf`)
 
-`wp-tf` replaces a remote `terraform plan` and `terraform apply` against HCP Terraform. It
-tars a directory, starts a run on a control plane workspace and streams the log. Install it with the `tf`
+`wp-tf` covers what the stock `terraform` CLI cannot do against the WebbPulse Terraform
+control plane. For a configuration with a `cloud {}` block, prefer stock `terraform`:
+`terraform login`, then `terraform plan`, `apply`, `state` and `import` work against the plane
+directly. Reach for `wp-tf` for device-flow `login` (a short-lived keyring session, the agent
+path), `confirm`, `discard`, `status` and `logs` on VCS-triggered runs, `workspaces`, `var`, and
+`plan -w WS DIR` for a speculative plan of a configuration that carries no `cloud {}` block.
+`wp-tf apply` is legacy: it keeps working but gets no new features.
+
+`plan` tars a directory, starts a run on a control plane workspace and streams the log. Install it with the `tf`
 extra (`uv tool install "webbpulse[tf]"` against the CodeArtifact index, or add the extra to a
 project).
 
@@ -288,8 +295,8 @@ terraform login terraform.webbpulse.com
 wp-tf plan -w my-workspace                  # plan the current directory
 wp-tf plan infra/prod -w ws-... --detailed-exitcode --destroy
 wp-tf plan -w my-workspace --no-follow      # print the run id and return
-wp-tf apply infra/prod -w my-workspace      # plan, ask, then stream the apply
-wp-tf apply -w my-workspace --auto-approve  # apply without asking
+wp-tf apply infra/prod -w my-workspace      # legacy: plan, ask, then stream the apply
+wp-tf apply -w my-workspace --auto-approve  # legacy: apply without asking
 wp-tf confirm run-... [--comment ...] [--no-follow]
 wp-tf discard run-... [--comment ...]
 wp-tf logs run-... [--phase apply] [-f]
@@ -315,7 +322,7 @@ wp-tf logout
   `runs:apply`) and the named scope, so adding one never drops the rest. `--scope SCOPE`
   asks for exactly the named scopes, for a narrower session. `state:download` and `admin`
   are granted only when named. `wp-tf login --help` lists the standard set.
-- **Apply.** `wp-tf apply` uploads and plans like `plan`, prints the change counts, then asks
+- **Apply (legacy).** Prefer stock `terraform apply` with a `cloud {}` block. `wp-tf apply` uploads and plans like `plan`, prints the change counts, then asks
   `Only 'yes' will be accepted to approve.` on stderr and reads the answer from stdin. Any
   other answer discards the run and exits `1`. Without `--auto-approve` it refuses a stdin
   that is not a terminal instead of waiting. Confirming needs `runs:apply`; a 403 says to run
