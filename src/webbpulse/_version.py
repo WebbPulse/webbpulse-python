@@ -4,4 +4,4 @@
 one-line edit here plus the matching `v<version>` tag.
 """
 
-__version__ = "0.98.1"
+__version__ = "0.99.0"
