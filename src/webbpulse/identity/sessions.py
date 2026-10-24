@@ -7,6 +7,7 @@ of a spent token outside the grace window revokes the whole family.
 from __future__ import annotations
 
 import logging
+import re
 import uuid
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
@@ -27,12 +28,16 @@ if TYPE_CHECKING:  # pragma: no cover
     from webbpulse.identity.settings import IdentitySettings
 
 __all__ = [
+    "OAUTH_CLIENT_DEVICE_PREFIX",
     "IssuedRefresh",
     "PresentedSession",
     "RotationOutcome",
     "RotationResult",
     "SessionService",
     "SessionSummary",
+    "client_from_user_agent",
+    "oauth_client_of_device",
+    "platform_from_user_agent",
 ]
 
 _log = logging.getLogger(__name__)
@@ -40,6 +45,106 @@ _log = logging.getLogger(__name__)
 type RotationOutcome = Literal["rotated", "replayed", "reuse", "expired", "revoked", "unknown"]
 
 UNKNOWN_DEVICE: Final = "unknown"
+
+OAUTH_CLIENT_DEVICE_PREFIX: Final = "mcp:"
+
+_PRODUCT_TOKEN: Final = re.compile(r"([A-Za-z][A-Za-z0-9._-]{0,47})/[0-9A-Za-z._+-]+")
+
+_BROWSER_TOKENS: Final = frozenset(
+    {
+        "mozilla",
+        "applewebkit",
+        "khtml",
+        "gecko",
+        "chrome",
+        "chromium",
+        "crios",
+        "fxios",
+        "safari",
+        "firefox",
+        "version",
+        "mobile",
+        "edg",
+        "edge",
+        "edga",
+        "edgios",
+        "opr",
+        "opera",
+        "samsungbrowser",
+        "electron",
+        "cfnetwork",
+        "darwin",
+        "headlesschrome",
+        "yabrowser",
+        "vivaldi",
+        "brave",
+        "ucbrowser",
+        "duckduckgo",
+        "build",
+        "android",
+        "wv",
+        "trident",
+        "msie",
+    }
+)
+
+_PLATFORMS: Final = (
+    ("iphone", "iOS"),
+    ("ipad", "iOS"),
+    ("ipod", "iOS"),
+    ("cfnetwork", "iOS"),
+    ("android", "Android"),
+    ("cros ", "ChromeOS"),
+    ("windows", "Windows"),
+    ("win32", "Windows"),
+    ("win64", "Windows"),
+    ("macintosh", "macOS"),
+    ("mac os x", "macOS"),
+    ("macos", "macOS"),
+    ("darwin", "macOS"),
+    ("linux", "Linux"),
+    ("x11", "Linux"),
+)
+
+
+def client_from_user_agent(user_agent: str) -> str:
+    """The coarse client a user agent names, such as `claude-code` or an Electron app's name.
+
+    The first product token, without its version, that is not one every browser sends, so
+    a plain browser answers `""` and the device class describes it instead. Never the
+    version or anything finer, which keeps the label from becoming a fingerprint.
+    """
+    if not user_agent:
+        return ""
+    for match in _PRODUCT_TOKEN.finditer(user_agent):
+        name = match.group(1)
+        if name.lower() not in _BROWSER_TOKENS:
+            return name
+    return ""
+
+
+def platform_from_user_agent(user_agent: str) -> str:
+    """The coarse operating system a user agent names: macOS, Windows, Linux, iOS, Android or ChromeOS.
+
+    `""` when the user agent names none of them. Checked in an order that reads a phone
+    before the desktop system its user agent also mentions.
+    """
+    lowered = user_agent.lower()
+    for needle, platform in _PLATFORMS:
+        if needle in lowered:
+            return platform
+    return ""
+
+
+def oauth_client_of_device(device: str) -> str:
+    """The OAuth client id a family's `device` label names, or `""` for a family no client started.
+
+    The OAuth server labels each family it starts `mcp:<client_id>` or
+    `mcp:<client_id>:<tenant_id>`.
+    """
+    if not device.startswith(OAUTH_CLIENT_DEVICE_PREFIX):
+        return ""
+    return device[len(OAUTH_CLIENT_DEVICE_PREFIX) :].split(":", 1)[0]
 
 
 @dataclass(frozen=True, slots=True)
@@ -86,7 +191,10 @@ class SessionSummary:
     `family_id` is the session id the access token's `sid` claim carries. `device` is the
     coarse class the family was started under, `ip` the address it was first seen from,
     `started_at` when the sign-in happened and `last_active_at` when it last refreshed.
-    `expires_at` is the current generation's expiry in epoch seconds.
+    `expires_at` is the current generation's expiry in epoch seconds. `last_ip` is the
+    address it last refreshed from, falling back to `ip` for a family that never recorded
+    one. `client` and `platform` are the coarse client and operating system it was started
+    from, empty when unknown. `client_id` is the OAuth client that started it, if any.
     """
 
     family_id: str
@@ -96,6 +204,10 @@ class SessionSummary:
     last_active_at: str
     expires_at: int
     amr: tuple[str, ...] = ()
+    last_ip: str = ""
+    client: str = ""
+    platform: str = ""
+    client_id: str = ""
 
 
 @dataclass(frozen=True, slots=True)
@@ -132,16 +244,19 @@ class SessionService:
         *,
         device: str = "",
         ip: str = "",
+        user_agent: str = "",
         now: datetime | None = None,
         auth_time: int | None = None,
         amr: Sequence[str] = (),
     ) -> IssuedRefresh:
         """Begin a new family for one login, at generation 1.
 
-        `device` and `ip` are recorded for the audit trail only: nothing in the rotation path
-        compares them, since binding a session to either breaks legitimate users. `auth_time`
-        defaults to the moment the family starts, which is the login. `amr` is how the login
-        was made, and every generation carries it unchanged.
+        `device`, `ip` and the client and platform read from `user_agent` are recorded for
+        the audit trail and the session list only: nothing in the rotation path compares
+        them, since binding a session to any of them breaks legitimate users. The user agent
+        itself is never stored. `auth_time` defaults to the moment the family starts, which
+        is the login. `amr` is how the login was made, and every generation carries it
+        unchanged.
         """
         moment = now or datetime.now(UTC)
         return self._mint(
@@ -150,6 +265,9 @@ class SessionService:
             generation=1,
             device=device or UNKNOWN_DEVICE,
             ip=ip,
+            ip_last_seen=ip,
+            client=client_from_user_agent(user_agent),
+            platform=platform_from_user_agent(user_agent),
             family_started_at=moment,
             now=moment,
             auth_time=int(moment.timestamp()) if auth_time is None else auth_time,
@@ -215,6 +333,9 @@ class SessionService:
         now: datetime,
         auth_time: int,
         amr: tuple[str, ...] = (),
+        ip_last_seen: str = "",
+        client: str = "",
+        platform: str = "",
     ) -> IssuedRefresh:
         """Write one generation of a family and return its plaintext token.
 
@@ -238,6 +359,9 @@ class SessionService:
                 family_started_at=_iso(family_started_at),
                 auth_time=auth_time,
                 amr=amr,
+                ip_last_seen=ip_last_seen,
+                client=client,
+                platform=platform,
             )
         )
         return IssuedRefresh(
@@ -256,13 +380,16 @@ class SessionService:
         presented: str,
         *,
         ip: str = "",
+        user_agent: str = "",
         now: datetime | None = None,
     ) -> RotationResult:
         """Consume a presented refresh token and mint its successor, or refuse.
 
         States are checked in order: unknown, revoked, expired or past the absolute cap, then
         the conditional consume that decides rotation from the grace-or-reuse branch. Never
-        raises: every refusal is a result the caller renders as one identical 401.
+        raises: every refusal is a result the caller renders as one identical 401. The
+        successor records `ip` as where the session was last seen, and a family started
+        before its client and platform were recorded takes them from `user_agent`.
         """
         moment = now or datetime.now(UTC)
         token_hash = hash_token(presented)
@@ -289,6 +416,9 @@ class SessionService:
             generation=record.generation + 1,
             device=record.device or UNKNOWN_DEVICE,
             ip=record.ip_first_seen or ip,
+            ip_last_seen=ip or record.ip_last_seen or record.ip_first_seen,
+            client=record.client or client_from_user_agent(user_agent),
+            platform=record.platform or platform_from_user_agent(user_agent),
             family_started_at=self._family_started_at(record),
             now=moment,
             auth_time=self._auth_time(record),
@@ -367,6 +497,9 @@ class SessionService:
             generation=successor_record.generation,
             device=current.device or UNKNOWN_DEVICE,
             ip=current.ip_first_seen,
+            ip_last_seen=successor_record.ip_last_seen or current.ip_last_seen or current.ip_first_seen,
+            client=successor_record.client or current.client,
+            platform=successor_record.platform or current.platform,
             family_started_at=self._family_started_at(current),
             now=moment,
             auth_time=max(self._auth_time(current), self._auth_time(successor_record)),
@@ -523,6 +656,10 @@ class SessionService:
                 last_active_at=record.created_at,
                 expires_at=record.expires_at,
                 amr=record.amr,
+                last_ip=record.ip_last_seen or record.ip_first_seen,
+                client=record.client,
+                platform=record.platform,
+                client_id=oauth_client_of_device(record.device),
             )
             for record in records
             if not record.revoked

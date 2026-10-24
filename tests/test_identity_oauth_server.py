@@ -1948,3 +1948,47 @@ class TestSessionTenantResolver:
 
         assert found is not None
         assert found.amr == ("swk", "pin")
+
+
+class TestRefreshFamilyContext:
+    """An OAuth client's refresh family records where and from what client it was made (PLAT-79)."""
+
+    def test_the_code_exchange_records_the_ip_and_client(self, fake_kms: Any) -> None:
+        """The token request's IP and user agent reach the family the exchange starts."""
+        from webbpulse.identity import SessionService
+
+        service, _, refresh_tokens = _service_with_refresh(fake_kms)
+        verifier = new_pkce_verifier()
+        request = service.parse_authorization_request(authorize_params(verifier))
+        service.record_consent(request, user_id=USER, tenant_id=TENANT)
+        code = service.issue_code(request, user_id=USER, tenant_id=TENANT)
+
+        service.exchange_code(
+            {"code": code, "client_id": "first-party", "redirect_uri": REDIRECT, "code_verifier": verifier},
+            ip="198.51.100.7",
+            user_agent="claude-code/2.0.14 (cli)",
+        )
+
+        (summary,) = SessionService(build_settings(), refresh_tokens).list_for_user(USER)
+        assert summary.ip == "198.51.100.7"
+        assert summary.last_ip == "198.51.100.7"
+        assert summary.client == "claude-code"
+        assert summary.client_id == "first-party"
+
+    def test_a_refresh_records_the_last_seen_ip(self, fake_kms: Any) -> None:
+        """A refresh records its address as last seen, and backfills a sign-in IP that was never known."""
+        from webbpulse.identity import SessionService
+
+        service, _, refresh_tokens = _service_with_refresh(fake_kms)
+        body = _grant(service)
+
+        service.refresh(
+            {"refresh_token": body["refresh_token"], "client_id": "first-party"},
+            ip="203.0.113.9",
+            user_agent="Bun/1.2.3",
+        )
+
+        (summary,) = SessionService(build_settings(), refresh_tokens).list_for_user(USER)
+        assert summary.ip == "203.0.113.9"
+        assert summary.last_ip == "203.0.113.9"
+        assert summary.client == "Bun"

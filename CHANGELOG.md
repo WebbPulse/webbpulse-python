@@ -7,6 +7,20 @@ This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## Unreleased
 
+### Added
+
+- Session lists now say where and how a session was last used (PLAT-79). Each refresh
+  generation records `ip_last_seen`, a coarse `client` (the first non-browser product
+  token of the user agent, such as `claude-code` or `Standupless`) and a `platform`
+  (macOS, Windows, iOS and so on). The user agent itself is never stored.
+  `SessionSummary` and `GET /sessions` gain `last_ip`, `client`, `platform` and
+  `client_id` (the OAuth client of an MCP session). Rows written before this fall back
+  to the sign-in IP and fill in the client on their next refresh.
+- `client_from_user_agent`, `platform_from_user_agent`, `oauth_client_of_device` and
+  `OAUTH_CLIENT_DEVICE_PREFIX` are exported from `webbpulse.identity`.
+- The OAuth server's token route passes the caller's IP and user agent to the session it
+  starts or rotates.
+
 ## 0.98.1
 
 ### Changed

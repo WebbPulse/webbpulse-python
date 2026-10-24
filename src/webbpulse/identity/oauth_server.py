@@ -659,12 +659,21 @@ class OAuthServerService:
         self._stores.consents.put(record)
         return record
 
-    def exchange_code(self, params: Mapping[str, str], *, now: int | None = None) -> dict[str, Any]:
+    def exchange_code(
+        self,
+        params: Mapping[str, str],
+        *,
+        now: int | None = None,
+        ip: str = "",
+        user_agent: str = "",
+    ) -> dict[str, Any]:
         """Exchange an authorization code for an access token, or raise `OAuthServerError`.
 
         The code is spent first, before anything else is checked, so a failed PKCE or
         redirect comparison still burns it: a code that survived a wrong guess would let an
         attacker holding an intercepted code retry until their own verifier was accepted.
+        `ip` and `user_agent` are the token request's, recorded on the refresh family so the
+        session list can say where and from what client it was made.
         """
         moment = int(time.time()) if now is None else now
         code = params.get("code", "")
@@ -704,9 +713,16 @@ class OAuthServerService:
                 expires_at=moment + int(self._settings.mcp_client_ttl.total_seconds()),
             )
 
-        return self._issue_tokens(record, now=moment)
+        return self._issue_tokens(record, now=moment, ip=ip, user_agent=user_agent)
 
-    def _issue_tokens(self, record: AuthorizationCodeRecord, *, now: int) -> dict[str, Any]:
+    def _issue_tokens(
+        self,
+        record: AuthorizationCodeRecord,
+        *,
+        now: int,
+        ip: str = "",
+        user_agent: str = "",
+    ) -> dict[str, Any]:
         """Mint the access token, and a rotating refresh token where a store exists.
 
         The refresh half reuses the existing family model unchanged: rotation with reuse
@@ -729,21 +745,33 @@ class OAuthServerService:
             "expires_in": int(self._settings.access_token_ttl.total_seconds()),
             "scope": " ".join(record.scopes),
         }
-        refresh = self._start_refresh_family(record)
+        refresh = self._start_refresh_family(record, ip=ip, user_agent=user_agent)
         if refresh is not None:
             body["refresh_token"] = refresh
         return body
 
-    def _start_refresh_family(self, record: AuthorizationCodeRecord) -> str | None:
+    def _start_refresh_family(
+        self, record: AuthorizationCodeRecord, *, ip: str = "", user_agent: str = ""
+    ) -> str | None:
         """Begin a refresh family for this grant, or `None` when no store is configured."""
         if self._flows is None:
             return None
         issued = self._flows.sessions.start_family(
-            record.user_id, device=_refresh_device(record.client_id, record.tenant_id)
+            record.user_id,
+            device=_refresh_device(record.client_id, record.tenant_id),
+            ip=ip,
+            user_agent=user_agent,
         )
         return issued.token
 
-    def refresh(self, params: Mapping[str, str], *, now: int | None = None) -> dict[str, Any]:
+    def refresh(
+        self,
+        params: Mapping[str, str],
+        *,
+        now: int | None = None,
+        ip: str = "",
+        user_agent: str = "",
+    ) -> dict[str, Any]:
         """Rotate a refresh token and mint a new access token for the same grant.
 
         Rotation and reuse detection are the existing `SessionService`'s, so a replayed
@@ -752,7 +780,8 @@ class OAuthServerService:
         client asks for (RFC 6749 section 6). A scope beyond the consent is refused with
         `invalid_scope` before the token is spent, so a grant never widens on refresh.
         A grant the `refresh_guard` declines is refused with `invalid_grant`, also before
-        the token is spent.
+        the token is spent. `ip` and `user_agent` are the token request's, recorded on the
+        successor as where the session was last seen.
         """
         moment = int(time.time()) if now is None else now
         token = params.get("refresh_token", "")
@@ -774,7 +803,7 @@ class OAuthServerService:
         if not self._refresh_allowed(token, params.get("client_id", "")):
             raise OAuthServerError("invalid_grant", _REFUSED_BY_GUARD)
 
-        outcome = self._flows.sessions.rotate(token)
+        outcome = self._flows.sessions.rotate(token, ip=ip, user_agent=user_agent)
         if outcome.issued is None:
             raise OAuthServerError("invalid_grant", "The refresh token is unknown, expired, spent or revoked.")
 
@@ -1199,13 +1228,17 @@ def build_oauth_server_router(
         client library posts a form here, and accepting JSON as well would be a second
         parsing path into the most security-sensitive endpoint on the server.
         """
+        from webbpulse.http import client_ip
+
         params = await _form_params(request)
         grant_type = params.get("grant_type", "")
+        ip = client_ip(request)
+        user_agent = request.headers.get("user-agent", "")
         try:
             if grant_type == "authorization_code":
-                body = service.exchange_code(params)
+                body = service.exchange_code(params, ip=ip, user_agent=user_agent)
             elif grant_type == "refresh_token":
-                body = service.refresh(params)
+                body = service.refresh(params, ip=ip, user_agent=user_agent)
             else:
                 raise OAuthServerError(
                     "unsupported_grant_type",
