@@ -7,6 +7,8 @@ This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## Unreleased
 
+## 0.99.0
+
 ### Added
 
 - Session lists now say where and how a session was last used (PLAT-79). Each refresh
