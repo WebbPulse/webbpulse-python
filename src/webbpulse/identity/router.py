@@ -63,6 +63,7 @@ __all__ = [
     "RESET_REQUESTED_MESSAGE",
     "RESET_REQUEST_PATH",
     "SESSIONS_PATH",
+    "SESSIONS_REVOKE_OTHERS_PATH",
     "STEP_UP_PATH",
     "TOTP_ACTIVATE_PATH",
     "TOTP_DISABLE_PATH",
@@ -97,6 +98,7 @@ RESET_CONFIRM_PATH = "/reset/confirm"
 EMAIL_CHANGE_PATH = "/email/change"
 EMAIL_CHANGE_CONFIRM_PATH = "/email/change/confirm"
 SESSIONS_PATH = "/sessions"
+SESSIONS_REVOKE_OTHERS_PATH = "/sessions/revoke-others"
 
 LOGIN_TOTP_PATH = "/login/totp"
 TOTP_ENROL_PATH = "/totp/enrol"
@@ -947,6 +949,28 @@ def _mount_flows(
                 ]
             }
         )
+
+    @router.post(f"{prefix}{SESSIONS_REVOKE_OTHERS_PATH}")
+    async def revoke_other_sessions(request: _FastAPIRequest) -> JSONResponse:
+        """Sign every one of the caller's sessions out except the one this request came from.
+
+        Answers with how many sessions ended, 0 when the caller had no other. The current
+        session is the access token's `sid`, so the refresh cookie stays valid.
+        """
+        subject = _subject_from_request(request, tokens)
+        if not subject:
+            return rejected(
+                request,
+                LoginRejected(
+                    "Sign in to manage your sessions.",
+                    error_code="NOT_AUTHENTICATED",
+                    status_code=401,
+                ),
+            )
+        current = _session_from_request(request, tokens)
+        ip, _ = context(request)
+        revoked = await run_sync(lambda: flows.revoke_other_sessions(subject, current, ip=ip))
+        return JSONResponse({"revoked": revoked})
 
     @router.delete(f"{prefix}{SESSIONS_PATH}/{{family_id}}")
     async def revoke_session(request: _FastAPIRequest, family_id: str) -> JSONResponse:
@@ -1834,6 +1858,7 @@ IDENTITY_ROUTE_RESPONSES: Final[dict[tuple[str, str], dict[int, str]]] = {
     ("POST", LOGOUT_PATH): {403: "The request did not come from an allowed origin"},
     ("POST", LOGOUT_ALL_PATH): {401: "No bearer token was presented"},
     ("GET", SESSIONS_PATH): {401: "No bearer token was presented"},
+    ("POST", SESSIONS_REVOKE_OTHERS_PATH): {401: "No bearer token was presented"},
     ("DELETE", f"{SESSIONS_PATH}/{{family_id}}"): {
         400: "The session is the one the request came from",
         401: "No bearer token was presented",

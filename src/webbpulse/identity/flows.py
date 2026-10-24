@@ -1655,6 +1655,33 @@ class IdentityFlows:
         )
         return True
 
+    def revoke_other_sessions(self, user_id: str, current_family_id: str, *, ip: str = "") -> int:
+        """Sign every one of the caller's own sessions out except `current_family_id`.
+
+        Returns how many sessions ended. Scoped to `user_id` through the live session list,
+        so another user's families are never touched, and a store that cannot enumerate a
+        user's families ends none.
+        """
+        others = [
+            session.family_id
+            for session in self._sessions.list_for_user(user_id)
+            if session.family_id != current_family_id
+        ]
+        if others:
+            self._revoke_families(user_id, keep_family_id=current_family_id, family_ids=others)
+        revoked = len(others)
+        _log.info(
+            "Other sessions revoked by their owner.",
+            extra={
+                "event": "session.revoked_others",
+                "user_id": user_id,
+                "family_id": current_family_id,
+                "revoked_sessions": revoked,
+                "ip": ip,
+            },
+        )
+        return revoked
+
     def request_email_change(self, *, user_id: str, new_email: str, family_id: str = "", ip: str = "") -> None:
         """Mail a confirmation link to the address a signed-in user wants to sign in with.
 
