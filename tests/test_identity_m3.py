@@ -1527,3 +1527,144 @@ def test_the_503_body_is_identical_for_two_different_accounts(
     first.pop("request_id", None)
     second.pop("request_id", None)
     assert first == second
+
+
+def registration_flows(
+    kms: FakeKms,
+    hooks: FakeHooks,
+    stores: IdentityStores,
+    attempts: InMemoryLoginAttemptStore,
+    **overrides: Any,
+) -> IdentityFlows:
+    """Identity flows over the fakes with these settings overrides and no email sender."""
+    settings = make_settings(**overrides)
+    return IdentityFlows(settings, hooks, stores, TokenService(settings, kms), attempts=attempts)
+
+
+def registration_client(
+    kms: FakeKms,
+    hooks: FakeHooks,
+    stores: IdentityStores,
+    attempts: InMemoryLoginAttemptStore,
+    **overrides: Any,
+) -> TestClient:
+    """A `TestClient` over the identity router with these settings overrides and the limiter off."""
+    from webbpulse.http import register_error_handlers
+
+    app = FastAPI()
+    register_error_handlers(app, error_codes=True)
+    app.include_router(
+        build_identity_router(
+            make_settings(**overrides),
+            hooks,
+            stores,
+            kms_client=kms,
+            attempts=attempts,
+            limiter_enabled=False,
+        )
+    )
+    return TestClient(app, base_url="https://api.example.com")
+
+
+def created_user(hooks: FakeHooks, email: str = EMAIL) -> dict[str, Any]:
+    """The row `create_user` stored for an address."""
+    return hooks.users[hooks.by_email[email]]
+
+
+def test_the_register_route_drops_attributes_by_default(
+    kms: FakeKms, hooks: FakeHooks, stores: IdentityStores, attempts: InMemoryLoginAttemptStore
+) -> None:
+    """With no allowlist, a register body's `is_admin` and billing keys never reach `create_user`."""
+    with registration_client(kms, hooks, stores, attempts) as client:
+        response = client.post(
+            f"{prefix()}/register",
+            json={
+                "email": EMAIL,
+                "password": PASSWORD,
+                "attributes": {
+                    "is_admin": True,
+                    "is_superuser": True,
+                    "subscription_tier": "enterprise",
+                    "stripe_customer_id": "cus_attacker",
+                    "display_name": "Mallory",
+                },
+            },
+        )
+
+    assert response.status_code == 201
+    user = created_user(hooks)
+    for key in ("is_admin", "is_superuser", "subscription_tier", "stripe_customer_id", "display_name"):
+        assert key not in user
+    assert user["email_verified"] is False
+
+
+def test_the_register_route_passes_only_allowlisted_attributes(
+    kms: FakeKms, hooks: FakeHooks, stores: IdentityStores, attempts: InMemoryLoginAttemptStore
+) -> None:
+    """An allowlisted key passes through and every other key is dropped."""
+    with registration_client(kms, hooks, stores, attempts, registration_attributes=["display_name"]) as client:
+        response = client.post(
+            f"{prefix()}/register",
+            json={
+                "email": EMAIL,
+                "password": PASSWORD,
+                "attributes": {"display_name": "Pat", "is_admin": True},
+            },
+        )
+
+    assert response.status_code == 201
+    user = created_user(hooks)
+    assert user["display_name"] == "Pat"
+    assert "is_admin" not in user
+
+
+@pytest.mark.parametrize("raw", [["is_admin"], "is_admin", 1, True])
+def test_the_register_route_drops_a_non_object_attributes_value(
+    kms: FakeKms,
+    hooks: FakeHooks,
+    stores: IdentityStores,
+    attempts: InMemoryLoginAttemptStore,
+    raw: Any,
+) -> None:
+    """A non-object `attributes` value is dropped whole and the registration still succeeds."""
+    with registration_client(kms, hooks, stores, attempts, registration_attributes=["display_name"]) as client:
+        response = client.post(
+            f"{prefix()}/register",
+            json={"email": EMAIL, "password": PASSWORD, "attributes": raw},
+        )
+
+    assert response.status_code == 201
+    assert set(created_user(hooks)) == {"id", "email", "email_verified"}
+
+
+def test_a_client_cannot_override_email_verified_even_when_allowlisted(
+    kms: FakeKms, hooks: FakeHooks, stores: IdentityStores, attempts: InMemoryLoginAttemptStore
+) -> None:
+    """`email_verified` is the server's even when an adopter puts it on the allowlist."""
+    flows = registration_flows(kms, hooks, stores, attempts, registration_attributes=["email_verified"])
+
+    flows.register(email=EMAIL, password=PASSWORD, attributes={"email_verified": True})
+
+    assert created_user(hooks)["email_verified"] is False
+
+
+def test_flows_register_filters_attributes_without_the_router(
+    kms: FakeKms, hooks: FakeHooks, stores: IdentityStores, attempts: InMemoryLoginAttemptStore
+) -> None:
+    """`IdentityFlows.register` applies the allowlist itself, so a direct caller is covered too."""
+    flows = registration_flows(kms, hooks, stores, attempts, registration_attributes=["display_name"])
+
+    flows.register(
+        email=EMAIL,
+        password=PASSWORD,
+        attributes={"display_name": "Pat", "is_service_account": True},
+    )
+
+    user = created_user(hooks)
+    assert user["display_name"] == "Pat"
+    assert "is_service_account" not in user
+
+
+def test_registration_attributes_default_to_empty() -> None:
+    """The allowlist is empty unless the adopter declares one."""
+    assert make_settings().registration_attributes == []

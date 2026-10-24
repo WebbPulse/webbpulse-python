@@ -299,6 +299,10 @@ class IdentityFlows:
 
         Returns `None` when the address already exists, which the router renders as the same
         200 a real registration gets. Raises `LoginRejected` when registration is disabled.
+
+        `attributes` comes from an anonymous request, so only the keys named in
+        `settings.registration_attributes` reach `create_user`, a value that is not a mapping
+        is dropped whole, and `email_verified` is always the server's.
         """
         if not self._settings.registration_enabled:
             raise LoginRejected(
@@ -342,7 +346,8 @@ class IdentityFlows:
         secret = hash_password(checked)
         user = self._hooks.create_user(
             email=normalised_email,
-            attributes=dict(attributes or {}) | {"email_verified": False},
+            attributes=_client_registration_attributes(attributes, self._settings.registration_attributes)
+            | {"email_verified": False},
         )
         user_id = _user_id(user)
 
@@ -2369,6 +2374,20 @@ class IdentityFlows:
             },
         )
         raise LoginRejected(message, error_code=error_code)
+
+
+def _client_registration_attributes(raw: object, allowed: Sequence[str]) -> dict[str, Any]:
+    """The keys of a register request's `attributes` the adopter lets a client set.
+
+    A value that is not a mapping is dropped whole, and so is every key not in `allowed`,
+    so an anonymous caller cannot write `is_admin` or a billing field onto the new row.
+    """
+    from collections.abc import Mapping as RuntimeMapping
+
+    if not allowed or not isinstance(raw, RuntimeMapping):
+        return {}
+    permitted = set(allowed)
+    return {key: value for key, value in raw.items() if isinstance(key, str) and key in permitted}
 
 
 def _normalise_email(email: str) -> str:

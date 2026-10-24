@@ -151,6 +151,16 @@ class IdentitySettings(BaseSettings):
 
     passwords_enabled: bool = True
     registration_enabled: bool = True
+    registration_attributes: list[str] = Field(
+        default_factory=list,
+        description=(
+            "The user attributes an anonymous register request may set, such as "
+            "`display_name`. The register route drops every other key of the body's "
+            "`attributes` object before `create_user` sees it. Empty by default, so a "
+            "request cannot write `is_admin` or a billing field through a store that copies "
+            "attributes onto the row. Server-set keys such as `email_verified` always win."
+        ),
+    )
     email_verification_required: bool = True
     totp_enabled: bool = True
     passkeys_enabled: bool = True
