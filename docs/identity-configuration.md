@@ -25,6 +25,7 @@ permanently.
 | `local_signer_seed` | `""` | The seed `LocalSigner` derives its keys from; empty takes `DEFAULT_LOCAL_SEED` |
 | `passwords_enabled` | `True` | |
 | `registration_enabled` | `True` | |
+| `registration_attributes` | `[]` | The keys of a register body's `attributes` that reach `create_user`; every other key, and a non-object value, is dropped |
 | `email_verification_required` | `True` | |
 | `totp_enabled` | `True` | |
 | `passkeys_enabled` | `True` | |

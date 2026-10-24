@@ -760,8 +760,14 @@ def _mount_flows(
         dependencies=limits(("register", REGISTER_IP_LIMIT, "ip")),
     )
     async def register(request: _FastAPIRequest, payload: dict[str, Any] = Body(...)) -> JSONResponse:
-        """Register an account, returning tokens unless the address already has one."""
+        """Register an account, returning tokens unless the address already has one.
+
+        The body's `attributes` is client supplied: a non-object value is dropped, and the
+        flow keeps only the keys named in `settings.registration_attributes`.
+        """
         ip, user_agent = context(request)
+        raw_attributes = payload.get("attributes")
+        client_attributes = raw_attributes if isinstance(raw_attributes, dict) else {}
         try:
             result = await run_sync(
                 lambda: flows.register(
@@ -769,7 +775,7 @@ def _mount_flows(
                     password=str(payload.get("password", "")),
                     ip=ip,
                     user_agent=user_agent,
-                    attributes=payload.get("attributes") or {},
+                    attributes=client_attributes,
                 )
             )
         except PasswordRejected as exc:

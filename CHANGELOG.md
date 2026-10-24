@@ -7,6 +7,26 @@ This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## Unreleased
 
+## 0.100.0
+
+### Security
+
+- `POST /register` now ignores client-supplied `attributes` unless the adopter allowlists
+  them (PLAT-81). Before this, the anonymous register body's `attributes` object was
+  merged into what `create_user` received, so a store that copies attributes onto the
+  row could be handed `is_admin`, `is_superuser`, `subscription_tier`,
+  `stripe_customer_id` or `is_service_account` at sign-up. `IdentityFlows.register` and
+  the route now keep only the keys named in the new `IdentitySettings.registration_attributes`
+  (default empty), drop a non-object `attributes` value whole, and always set
+  `email_verified` themselves.
+- To opt in, list the keys a sign-up form may set, for example
+  `registration_attributes=["display_name"]` (or `IDENTITY_REGISTRATION_ATTRIBUTES='["display_name"]'`
+  where settings come from the environment). Never list a role, billing or
+  verification field. Adopters that passed `attributes` to `register` and relied on them
+  must add those keys or they are silently dropped.
+- Unchanged: the admin-only ephemeral e2e user route keeps its `attributes` override, and
+  the OAuth, SSO and SCIM create paths build their attributes server side.
+
 ## 0.99.0
 
 ### Added
