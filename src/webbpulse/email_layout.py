@@ -465,15 +465,50 @@ def _text_style(
     )
 
 
+def _dark_first(brand: EmailBrand) -> bool:
+    """Whether the brand's theme draws its dark palette inline."""
+    return brand.theme.scheme == "dark"
+
+
+def _keep_class(brand: EmailBrand) -> str:
+    """The class suffix that keeps an accent element on-brand under the Gmail wrappers, if any."""
+    return " wp-gmail-keep" if _dark_first(brand) else ""
+
+
+def _link_html(brand: EmailBrand, url: str, label: str) -> str:
+    """One accent link, already escaped, kept on-brand under the Gmail wrappers in a dark-first theme."""
+    return (
+        f'<a class="wp-link{_keep_class(brand)}" href="{url}" target="_blank" '
+        f'style="color:{_ink(brand).link};text-decoration:underline;">{label}</a>'
+    )
+
+
+def _ruled_html(brand: EmailBrand, text: str, *, margin: str, padding: str, font: str) -> str:
+    """A dark-first quote surface, its accent rule drawn as a narrow cell of its own on the left.
+
+    Under the Gmail wrappers the rule needs `wp-gmail-keep` to stay on-brand while the quote
+    fill needs the wrappers' plain double inversion, so a dark-first theme draws the rule as
+    a separate narrow cell that carries the class and leaves the quote cell without it.
+    """
+    ink = _ink(brand)
+    radius = brand.theme.inline_radius
+    base = ink.palette
+    return (
+        f'<table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0" style="margin:{margin};">'
+        f'<tr><td class="wp-rule-fill wp-gmail-keep" width="3" bgcolor="{ink.accent}" '
+        f'style="width:3px;background-color:{ink.accent};border-radius:{radius}px 0 0 {radius}px;'
+        'font-size:0;line-height:0;">&nbsp;</td>'
+        f'<td class="wp-quote" style="background-color:{base.quote};padding:{padding};'
+        f'border-radius:0 {radius}px {radius}px 0;{font}color:{base.quote_text};">{text}</td></tr></table>'
+    )
+
+
 def _inline_html(brand: EmailBrand, parts: Sequence[Inline]) -> str:
     """One paragraph's parts as escaped HTML."""
     out: list[str] = []
     for part in parts:
         if isinstance(part, EmailLink):
-            out.append(
-                f'<a class="wp-link" href="{_e(part.url)}" target="_blank" '
-                f'style="color:{_ink(brand).link};text-decoration:underline;">{_e(part.label)}</a>'
-            )
+            out.append(_link_html(brand, _e(part.url), _e(part.label)))
         elif isinstance(part, Strong):
             out.append(f'<strong style="font-weight:600;">{_e(part.text)}</strong>')
         else:
@@ -498,8 +533,9 @@ def _block_html(brand: EmailBrand, block: EmailBlock) -> str:
     if isinstance(block, Button):
         url = _e(block.url)
         radius = theme.button_radius
+        keep = 'class="wp-gmail-keep" ' if _dark_first(brand) else ""
         markup = (
-            '<table role="presentation" cellpadding="0" cellspacing="0" border="0" style="margin:8px 0 24px;">'
+            f'<table {keep}role="presentation" cellpadding="0" cellspacing="0" border="0" style="margin:8px 0 24px;">'
             f'<tr><td class="wp-button" align="center" bgcolor="{ink.accent}" '
             f'style="border-radius:{radius}px;background-color:{ink.accent};">'
             f'<a class="wp-button-text" href="{url}" target="_blank" style="display:inline-block;padding:12px 22px;'
@@ -511,11 +547,13 @@ def _block_html(brand: EmailBrand, block: EmailBlock) -> str:
             style = _text_style(brand, 13, 20, base.muted, margin="-12px 0 24px")
             markup += (
                 f'<p class="wp-muted" style="{style}word-break:break-all;">Or open this link: '
-                f'<a class="wp-link" href="{url}" target="_blank" '
-                f'style="color:{ink.link};text-decoration:underline;">{url}</a></p>\n'
+                f"{_link_html(brand, url, url)}</p>\n"
             )
         return markup
     if isinstance(block, Quote):
+        if _dark_first(brand):
+            font = f"font-family:{theme.font_stack};font-size:14px;line-height:22px;"
+            return _ruled_html(brand, _e(block.text), margin="0 0 16px", padding="12px 16px", font=font) + "\n"
         return (
             '<table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0" '
             'style="margin:0 0 16px;"><tr>'
@@ -533,7 +571,10 @@ def _block_html(brand: EmailBrand, block: EmailBlock) -> str:
     items: list[str] = []
     for item in block.items:
         detail = ""
-        if item.detail:
+        if item.detail and _dark_first(brand):
+            font = "font-size:14px;line-height:20px;"
+            detail = _ruled_html(brand, _e(item.detail), margin="6px 0 0", padding="8px 12px", font=font)
+        elif item.detail:
             detail = (
                 f'<div class="wp-quote wp-rule" style="margin:6px 0 0;padding:8px 12px;'
                 f"border-left:3px solid {ink.accent};background-color:{base.quote};"
@@ -557,7 +598,7 @@ def _fill(brand: EmailBrand, color: str) -> str:
     leave background images alone, so the gradient keeps a dark-first surface dark there.
     """
     style = f"background-color:{color};"
-    if brand.theme.scheme == "dark":
+    if _dark_first(brand):
         style += f"background-image:linear-gradient({color},{color});"
     return style
 
@@ -572,18 +613,26 @@ def _gmail_blend(brand: EmailBrand, content: str) -> str:
     gradient fill, since the difference layer would invert those, so the wrappers sit inside
     each gradient surface and the surfaces nested in them keep plain colour fills.
     """
-    if brand.theme.scheme != "dark":
+    if not _dark_first(brand):
         return content
     return f'<div class="wp-gmail-screen"><div class="wp-gmail-difference">{content}</div></div>'
 
 
 def _gmail_rules(brand: EmailBrand) -> str:
-    """The Gmail-only blend-mode rules a dark-first theme needs, or nothing for a light one."""
-    if brand.theme.scheme != "dark":
+    """The Gmail-only blend-mode rules a dark-first theme needs, or nothing for a light one.
+
+    `wp-gmail-keep` marks an accent element inside the wrappers. A Gmail app's inversion
+    and the wrapper's difference layer cancel for greys but turn a saturated accent into its
+    complement, so the extra difference layer undoes the wrapper's flip and leaves the accent
+    as Gmail's own inversion of it, still on-brand. Where Gmail inverts nothing the wrappers
+    are black and every layer leaves the colours as drawn.
+    """
+    if not _dark_first(brand):
         return ""
     return (
         "u + .body .wp-gmail-screen{background:#000000;mix-blend-mode:screen;}\n"
         "u + .body .wp-gmail-difference{background:#000000;mix-blend-mode:difference;}\n"
+        "u + .body .wp-gmail-keep{mix-blend-mode:difference;}\n"
     )
 
 
@@ -601,10 +650,16 @@ def _style_block(brand: EmailBrand) -> str:
         f".wp-muted{{color:{dark.muted} !important;}}",
         f".wp-link{{color:{brand.dark_link_color} !important;}}",
         f".wp-quote{{background-color:{dark.quote} !important;color:{dark.quote_text} !important;}}",
-        f".wp-rule{{border-left-color:{brand.dark_accent} !important;}}",
+        (
+            f".wp-rule-fill{{background-color:{brand.dark_accent} !important;}}"
+            if _dark_first(brand)
+            else f".wp-rule{{border-left-color:{brand.dark_accent} !important;}}"
+        ),
         f".wp-button{{background-color:{brand.dark_accent} !important;}}",
         f".wp-button-text{{color:{brand.dark_accent_foreground} !important;}}",
     ]
+    if _dark_first(brand):
+        rules.append(f".wp-line{{background-color:{dark.line} !important;}}")
     outlook = "\n".join(f"[data-{flag}] {rule}" for flag in ("ogsc", "ogsb") for rule in rules)
     schemes = _color_schemes(brand)
     return (
@@ -657,11 +712,7 @@ def _footer_html(brand: EmailBrand, note: Paragraph | None, links: Sequence[Emai
     if note is not None:
         rows.append(f'<p class="wp-muted" style="{muted}">{_inline_html(brand, note.parts)}</p>')
     if links:
-        joined = " &nbsp;&middot;&nbsp; ".join(
-            f'<a class="wp-link" href="{_e(link.url)}" target="_blank" '
-            f'style="color:{ink.link};text-decoration:underline;">{_e(link.label)}</a>'
-            for link in links
-        )
+        joined = " &nbsp;&middot;&nbsp; ".join(_link_html(brand, _e(link.url), _e(link.label)) for link in links)
         rows.append(f'<p class="wp-muted" style="{muted}">{joined}</p>')
     signature = " &nbsp;&middot;&nbsp; ".join(_e(part) for part in (brand.product_name, brand.legal_line) if part)
     if signature:
@@ -669,6 +720,33 @@ def _footer_html(brand: EmailBrand, note: Paragraph | None, links: Sequence[Emai
     if not rows:
         return ""
     return f'<tr><td style="padding:20px 4px 0;">{_gmail_blend(brand, "".join(rows))}</td></tr>\n'
+
+
+def _card_html(brand: EmailBrand, content: str) -> str:
+    """The card row around `content`, its 1px line drawn as an outer fill in a dark-first theme.
+
+    A border colour is inverted by the Gmail apps and sits outside the blend wrappers, so a
+    dark-first card draws its line as a gradient-filled outer cell with 1px of padding,
+    which Gmail leaves dark, instead of a border.
+    """
+    base = _ink(brand).palette
+    radius = brand.theme.card_radius
+    if not _dark_first(brand):
+        return (
+            f'<tr><td class="wp-card wp-pad" bgcolor="{base.card}" style="{_fill(brand, base.card)}'
+            f'border:1px solid {base.line};border-radius:{radius}px;padding:32px;">\n'
+            f"{content}"
+            "</td></tr>\n"
+        )
+    return (
+        f'<tr><td class="wp-line" bgcolor="{base.line}" style="{_fill(brand, base.line)}'
+        f'border-radius:{radius}px;padding:1px;">'
+        '<table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0">'
+        f'<tr><td class="wp-card wp-pad" bgcolor="{base.card}" style="{_fill(brand, base.card)}'
+        f'border-radius:{max(radius - 1, 0)}px;padding:32px;">\n'
+        f"{content}"
+        "</td></tr></table></td></tr>\n"
+    )
 
 
 def _render_html(
@@ -692,7 +770,7 @@ def _render_html(
     base = _ink(brand).palette
     page = base.page
     schemes = _color_schemes(brand)
-    body_class = "wp-bg body" if brand.theme.scheme == "dark" else "wp-bg"
+    body_class = "wp-bg body" if _dark_first(brand) else "wp-bg"
     return (
         "<!doctype html>\n"
         '<html lang="en" xmlns="http://www.w3.org/1999/xhtml">\n'
@@ -713,10 +791,7 @@ def _render_html(
         '<table role="presentation" class="wp-container" width="560" cellpadding="0" cellspacing="0" border="0" '
         'style="width:560px;max-width:560px;">\n'
         f"{_header_html(brand)}"
-        f'<tr><td class="wp-card wp-pad" bgcolor="{base.card}" style="{_fill(brand, base.card)}'
-        f'border:1px solid {base.line};border-radius:{brand.theme.card_radius}px;padding:32px;">\n'
-        f"{_gmail_blend(brand, body)}"
-        "</td></tr>\n"
+        f"{_card_html(brand, _gmail_blend(brand, body))}"
         f"{_footer_html(brand, note, links)}"
         "</table>\n"
         "</td></tr>\n"

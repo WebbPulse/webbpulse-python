@@ -5,6 +5,20 @@ Notable changes to the `webbpulse` package. The version here is the one in
 
 This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## 0.102.0
+
+### Fixed
+
+- Dark-first `webbpulse.email_layout` emails keep the brand accent in the Gmail iOS app in
+  dark mode (PLAT-90). Gmail's inversion and the PLAT-61 difference wrapper cancel only for
+  greys, so the accent came out as its complement, a light blue, on the button, links and
+  quote rules. Each of those now carries `wp-gmail-keep`, a Gmail-only
+  `mix-blend-mode:difference` that undoes the wrapper's flip. Quote rules are drawn as their
+  own 3px cell (class `wp-rule-fill`) instead of a left border, and the card's line is an
+  outer gradient-filled cell (class `wp-line`) instead of a 1px border, so Gmail no longer
+  inverts it to a light hairline. Products that snapshot dark-first HTML need to refresh
+  their snapshots. The light scheme output is byte-identical to 0.101.0.
+
 ## 0.101.0
 
 ### Added
