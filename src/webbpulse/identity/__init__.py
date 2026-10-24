@@ -418,12 +418,16 @@ from webbpulse.identity.service import (
     TokenService,
 )
 from webbpulse.identity.sessions import (
+    OAUTH_CLIENT_DEVICE_PREFIX,
     IssuedRefresh,
     PresentedSession,
     RotationOutcome,
     RotationResult,
     SessionService,
     SessionSummary,
+    client_from_user_agent,
+    oauth_client_of_device,
+    platform_from_user_agent,
 )
 from webbpulse.identity.settings import IdentitySettings, SignerKind, TotpCipherKind
 from webbpulse.identity.share_tokens import (
@@ -1144,3 +1148,12 @@ __all__ += [
 ]
 """SAML single sign-on's pure names. `webbpulse.identity.sso_saml` itself is never imported
 here, so an install without the `saml` extra loads neither `lxml` nor `signxml`."""
+
+__all__ += [
+    "OAUTH_CLIENT_DEVICE_PREFIX",
+    "client_from_user_agent",
+    "oauth_client_of_device",
+    "platform_from_user_agent",
+]
+"""How the session list names a family's client, platform and OAuth client, appended for the
+same reason as the blocks above."""

@@ -579,6 +579,7 @@ class IdentityFlows:
             redeemed.user_id,
             device=_device_class(user_agent),
             ip=ip,
+            user_agent=user_agent,
             auth_time=redeemed.auth_time or None,
             amr=amr,
         )
@@ -1191,7 +1192,7 @@ class IdentityFlows:
         if not presented:
             raise LoginRejected("Your session has ended. Sign in again.", error_code="NO_SESSION")
 
-        result = self._sessions.rotate(presented, ip=ip, now=now)
+        result = self._sessions.rotate(presented, ip=ip, user_agent=user_agent, now=now)
         if result.issued is None:
             _log.info(
                 "Refresh refused.",
@@ -2102,7 +2103,9 @@ class IdentityFlows:
     ) -> AuthResult:
         """Start a family that records `amr`, and mint the first access token for it."""
         user_id = _user_id(user)
-        issued = self._sessions.start_family(user_id, device=_device_class(user_agent), ip=ip, amr=amr)
+        issued = self._sessions.start_family(
+            user_id, device=_device_class(user_agent), ip=ip, user_agent=user_agent, amr=amr
+        )
         access = self._mint_access(user, session_id=issued.family_id, amr=amr, auth_time=issued.auth_time)
         return AuthResult(
             access_token=access,

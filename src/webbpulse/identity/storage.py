@@ -163,7 +163,11 @@ class RefreshTokenRecord:
     seconds: the login, or a later step-up. Rotation copies it rather than bumping it, and
     `0` means a record written before the field existed. `amr` is the sign-in's `amr`,
     copied by rotation so every refreshed access token reports how the session began; empty
-    means a record written before the field existed.
+    means a record written before the field existed. `ip_last_seen` is the address the
+    generation was minted from, so the newest generation says where the session was last
+    used; empty for a record written before the field existed. `client` and `platform` are
+    the coarse client and operating system the family was started from, as
+    `client_from_user_agent` and `platform_from_user_agent` read them.
     """
 
     token_hash: str
@@ -180,6 +184,9 @@ class RefreshTokenRecord:
     family_started_at: str = ""
     auth_time: int = 0
     amr: tuple[str, ...] = ()
+    ip_last_seen: str = ""
+    client: str = ""
+    platform: str = ""
 
     @property
     def is_consumed(self) -> bool:
@@ -1079,7 +1086,7 @@ class DynamoRefreshTokenStore(RefreshTokenStore):
         return _refresh_record_from_item(item) if item is not None else None
 
     def put(self, record: RefreshTokenRecord) -> None:
-        """Write a new generation, leaving `amr` off a row that has none."""
+        """Write a new generation, leaving `amr`, `ip_last_seen`, `client` and `platform` off a row that has none."""
         item: dict[str, Any] = {
             "token_hash": record.token_hash,
             "family_id": record.family_id,
@@ -1097,6 +1104,10 @@ class DynamoRefreshTokenStore(RefreshTokenStore):
         }
         if record.amr:
             item["amr"] = list(record.amr)
+        for name in ("ip_last_seen", "client", "platform"):
+            value = getattr(record, name)
+            if value:
+                item[name] = value
         self._repo.put(item)
 
     def consume(
@@ -1714,6 +1725,9 @@ def _refresh_record_from_item(item: Mapping[str, Any]) -> RefreshTokenRecord:
         family_started_at=str(item.get("family_started_at", "")),
         auth_time=int(item.get("auth_time", 0) or 0),
         amr=tuple(str(method) for method in item.get("amr") or ()),
+        ip_last_seen=str(item.get("ip_last_seen", "")),
+        client=str(item.get("client", "")),
+        platform=str(item.get("platform", "")),
     )
 
 
