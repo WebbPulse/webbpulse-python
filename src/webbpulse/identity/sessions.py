@@ -35,6 +35,7 @@ __all__ = [
     "RotationResult",
     "SessionService",
     "SessionSummary",
+    "browser_from_user_agent",
     "client_from_user_agent",
     "oauth_client_of_device",
     "platform_from_user_agent",
@@ -88,6 +89,22 @@ _BROWSER_TOKENS: Final = frozenset(
     }
 )
 
+_BROWSERS: Final = (
+    ("edg/", "Edge"),
+    ("edga/", "Edge"),
+    ("edgios/", "Edge"),
+    ("edge/", "Edge"),
+    ("opr/", "Opera"),
+    ("opera", "Opera"),
+    ("samsungbrowser/", "Samsung Internet"),
+    ("firefox/", "Firefox"),
+    ("fxios/", "Firefox"),
+    ("chrome/", "Chrome"),
+    ("chromium/", "Chrome"),
+    ("crios/", "Chrome"),
+    ("safari/", "Safari"),
+)
+
 _PLATFORMS: Final = (
     ("iphone", "iOS"),
     ("ipad", "iOS"),
@@ -120,6 +137,23 @@ def client_from_user_agent(user_agent: str) -> str:
         name = match.group(1)
         if name.lower() not in _BROWSER_TOKENS:
             return name
+    return ""
+
+
+def browser_from_user_agent(user_agent: str) -> str:
+    """The coarse browser family a user agent names: Edge, Opera, Samsung Internet, Firefox, Chrome or Safari.
+
+    Never a version, which keeps the label from becoming a fingerprint. `""` for anything
+    else, including a non-browser client that `client_from_user_agent` already names.
+    Edge, Opera and Samsung Internet are checked before Chrome, whose token they also
+    send, and Chrome before Safari for the same reason.
+    """
+    if not user_agent or client_from_user_agent(user_agent):
+        return ""
+    lowered = user_agent.lower()
+    for needle, browser in _BROWSERS:
+        if needle in lowered:
+            return browser
     return ""
 
 
@@ -193,8 +227,9 @@ class SessionSummary:
     `started_at` when the sign-in happened and `last_active_at` when it last refreshed.
     `expires_at` is the current generation's expiry in epoch seconds. `last_ip` is the
     address it last refreshed from, falling back to `ip` for a family that never recorded
-    one. `client` and `platform` are the coarse client and operating system it was started
-    from, empty when unknown. `client_id` is the OAuth client that started it, if any.
+    one. `client`, `platform` and `browser` are the coarse client, operating system and
+    browser family it was started from, empty when unknown. `client_id` is the OAuth
+    client that started it, if any.
     """
 
     family_id: str
@@ -208,6 +243,7 @@ class SessionSummary:
     client: str = ""
     platform: str = ""
     client_id: str = ""
+    browser: str = ""
 
 
 @dataclass(frozen=True, slots=True)
@@ -251,7 +287,7 @@ class SessionService:
     ) -> IssuedRefresh:
         """Begin a new family for one login, at generation 1.
 
-        `device`, `ip` and the client and platform read from `user_agent` are recorded for
+        `device`, `ip` and the client, platform and browser read from `user_agent` are recorded for
         the audit trail and the session list only: nothing in the rotation path compares
         them, since binding a session to any of them breaks legitimate users. The user agent
         itself is never stored. `auth_time` defaults to the moment the family starts, which
@@ -268,6 +304,7 @@ class SessionService:
             ip_last_seen=ip,
             client=client_from_user_agent(user_agent),
             platform=platform_from_user_agent(user_agent),
+            browser=browser_from_user_agent(user_agent),
             family_started_at=moment,
             now=moment,
             auth_time=int(moment.timestamp()) if auth_time is None else auth_time,
@@ -336,6 +373,7 @@ class SessionService:
         ip_last_seen: str = "",
         client: str = "",
         platform: str = "",
+        browser: str = "",
     ) -> IssuedRefresh:
         """Write one generation of a family and return its plaintext token.
 
@@ -362,6 +400,7 @@ class SessionService:
                 ip_last_seen=ip_last_seen,
                 client=client,
                 platform=platform,
+                browser=browser,
             )
         )
         return IssuedRefresh(
@@ -389,7 +428,7 @@ class SessionService:
         the conditional consume that decides rotation from the grace-or-reuse branch. Never
         raises: every refusal is a result the caller renders as one identical 401. The
         successor records `ip` as where the session was last seen, and a family started
-        before its client and platform were recorded takes them from `user_agent`.
+        before its client, platform and browser were recorded takes them from `user_agent`.
         """
         moment = now or datetime.now(UTC)
         token_hash = hash_token(presented)
@@ -419,6 +458,7 @@ class SessionService:
             ip_last_seen=ip or record.ip_last_seen or record.ip_first_seen,
             client=record.client or client_from_user_agent(user_agent),
             platform=record.platform or platform_from_user_agent(user_agent),
+            browser=record.browser or browser_from_user_agent(user_agent),
             family_started_at=self._family_started_at(record),
             now=moment,
             auth_time=self._auth_time(record),
@@ -500,6 +540,7 @@ class SessionService:
             ip_last_seen=successor_record.ip_last_seen or current.ip_last_seen or current.ip_first_seen,
             client=successor_record.client or current.client,
             platform=successor_record.platform or current.platform,
+            browser=successor_record.browser or current.browser,
             family_started_at=self._family_started_at(current),
             now=moment,
             auth_time=max(self._auth_time(current), self._auth_time(successor_record)),
@@ -660,6 +701,7 @@ class SessionService:
                 client=record.client,
                 platform=record.platform,
                 client_id=oauth_client_of_device(record.device),
+                browser=record.browser,
             )
             for record in records
             if not record.revoked

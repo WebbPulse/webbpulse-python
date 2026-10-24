@@ -520,6 +520,23 @@ def bearer(token: str) -> dict[str, str]:
     return {"Authorization": f"Bearer {token}"}
 
 
+def test_the_session_list_names_the_browser_family(client: TestClient) -> None:
+    """`GET /sessions` reports the coarse browser family the sign-in's user agent named."""
+    chrome_mac = (
+        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
+        "(KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36"
+    )
+    response = client.post(
+        url("/login"), json={"email": EMAIL, "password": PASSWORD}, headers={"user-agent": chrome_mac}
+    )
+    assert response.status_code == 200, response.text
+
+    listed = client.get(url(SESSIONS_PATH), headers=bearer(str(response.json()["access_token"])))
+    assert listed.status_code == 200
+    (session,) = listed.json()["sessions"]
+    assert (session["browser"], session["platform"], session["client"]) == ("Chrome", "macOS", "")
+
+
 def test_the_session_routes_list_and_revoke_with_the_current_one_marked(client: TestClient) -> None:
     """`GET /sessions` marks the calling session, and `DELETE` ends another but refuses the caller's own."""
     other = sign_in(client)

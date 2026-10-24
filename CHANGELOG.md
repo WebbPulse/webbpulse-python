@@ -16,6 +16,13 @@ This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   and logs `session.revoked_others`. `IdentityFlows.revoke_other_sessions` is the flow
   behind it and `SESSIONS_REVOKE_OTHERS_PATH` the path constant. A gateway that lists
   identity routes one by one needs an entry for the new path.
+- `webbpulse.identity.browser_from_user_agent` (PLAT-83) names the coarse browser family a
+  user agent sends: Edge, Opera, Samsung Internet, Firefox, Chrome or Safari, never a
+  version, and `""` for anything else, including a client `client_from_user_agent` already
+  names. Edge, Opera and Samsung Internet are checked before Chrome, and Chrome before
+  Safari. The refresh token record stores it as `browser` at sign-in next to `client` and
+  `platform`, a family started before the field existed takes it from the user agent on its
+  next refresh, and `SessionSummary.browser` and the `GET /sessions` body expose it.
 
 ## 0.100.0
 

@@ -938,6 +938,7 @@ def _mount_flows(
                         "last_ip": session.last_ip or session.ip,
                         "client": session.client,
                         "platform": session.platform,
+                        "browser": session.browser,
                         "client_id": session.client_id,
                         "started_at": session.started_at,
                         "last_active_at": session.last_active_at,

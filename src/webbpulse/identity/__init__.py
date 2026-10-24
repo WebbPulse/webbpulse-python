@@ -426,6 +426,7 @@ from webbpulse.identity.sessions import (
     RotationResult,
     SessionService,
     SessionSummary,
+    browser_from_user_agent,
     client_from_user_agent,
     oauth_client_of_device,
     platform_from_user_agent,
@@ -1153,9 +1154,10 @@ here, so an install without the `saml` extra loads neither `lxml` nor `signxml`.
 
 __all__ += [
     "OAUTH_CLIENT_DEVICE_PREFIX",
+    "browser_from_user_agent",
     "client_from_user_agent",
     "oauth_client_of_device",
     "platform_from_user_agent",
 ]
-"""How the session list names a family's client, platform and OAuth client, appended for the
-same reason as the blocks above."""
+"""How the session list names a family's client, platform, browser and OAuth client, appended
+for the same reason as the blocks above."""
