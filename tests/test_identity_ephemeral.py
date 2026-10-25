@@ -46,7 +46,8 @@ from webbpulse.identity.ephemeral_sweep import (
     is_ephemeral_email,
     users_scan_source,
 )
-from webbpulse.identity.flows import EPHEMERAL_VIA, IdentityFlows, LoginRejected
+from webbpulse.identity.flows import E2E_USER_ATTRIBUTE, EPHEMERAL_VIA, IdentityFlows, LoginRejected, is_e2e_user
+from webbpulse.identity.users import User
 
 if TYPE_CHECKING:  # pragma: no cover
     from collections.abc import Mapping
@@ -208,6 +209,31 @@ class TestEphemeralFlow:
         created = flows.create_ephemeral_user(email=EMAIL, password=PASSWORD)
         assert hooks.created == [(created["user_id"], EPHEMERAL_VIA)]
 
+    def test_it_marks_the_user_with_the_trusted_e2e_attribute(
+        self, hooks: FakeHooks, module_key: rsa.RSAPrivateKey
+    ) -> None:
+        """The server sets `e2e_user` at creation, so the product's row carries it from the start."""
+        flows = make_flows(hooks, module_key, ephemeral_users_enabled=True)
+        created = flows.create_ephemeral_user(email=EMAIL, password=PASSWORD)
+        user = hooks.users[created["user_id"]]
+        assert user[E2E_USER_ATTRIBUTE] is True
+        assert is_e2e_user(user, flows._settings)
+
+    def test_the_admin_attributes_cannot_unset_the_marker(
+        self, hooks: FakeHooks, module_key: rsa.RSAPrivateKey
+    ) -> None:
+        """`ephemeral_user_attributes` reach `create_user`, but the marker and `email_verified` win."""
+        flows = make_flows(hooks, module_key, ephemeral_users_enabled=True)
+        created = flows.create_ephemeral_user(
+            email=EMAIL,
+            password=PASSWORD,
+            attributes={E2E_USER_ATTRIBUTE: False, "email_verified": False, "is_admin": True},
+        )
+        user = hooks.users[created["user_id"]]
+        assert user[E2E_USER_ATTRIBUTE] is True
+        assert user["email_verified"] is True
+        assert user["is_admin"] is True
+
     def test_the_created_user_has_a_password_credential(self, hooks: FakeHooks, module_key: rsa.RSAPrivateKey) -> None:
         """A user with no credential row could never sign in, which is the whole point."""
         flows = make_flows(hooks, module_key, ephemeral_users_enabled=True)
@@ -345,6 +371,87 @@ class TestEphemeralRouteMounting:
         """
         paths = self.mounted_paths(module_key, ephemeral_users_enabled=True, environment=environment)
         assert not any(path.endswith(EPHEMERAL_USERS_PATH) for path in paths)
+
+
+class TestIsE2eUser:
+    """`is_e2e_user`: the marker, the durable id list, and the production guard."""
+
+    def test_a_marked_user_is_an_e2e_user(self) -> None:
+        """The attribute the ephemeral route sets is enough on its own."""
+        assert is_e2e_user({"id": "user-1", E2E_USER_ATTRIBUTE: True}, make_settings(environment="staging"))
+
+    def test_an_unmarked_user_is_not(self) -> None:
+        """A user with no marker and an unlisted id is a real account."""
+        settings = make_settings(environment="staging", e2e_user_ids=["user-9"])
+        assert not is_e2e_user({"id": "user-1"}, settings)
+        assert not is_e2e_user({"id": "user-1", E2E_USER_ATTRIBUTE: False}, settings)
+
+    @pytest.mark.parametrize("value", ["true", "True", 1, "1", [True]])
+    def test_only_a_boolean_true_marker_counts(self, value: Any) -> None:
+        """A truthy string or number that leaked in from a form is not the server's marker."""
+        assert not is_e2e_user({"id": "user-1", E2E_USER_ATTRIBUTE: value}, make_settings(environment="staging"))
+
+    def test_a_listed_durable_id_is_an_e2e_user(self) -> None:
+        """The durable staging login user has no marker, so its id is listed instead."""
+        settings = make_settings(environment="staging", e2e_user_ids=["durable-1"])
+        assert is_e2e_user({"id": "durable-1"}, settings)
+        assert is_e2e_user({"user_id": "durable-1"}, settings)
+
+    def test_an_empty_id_never_matches(self) -> None:
+        """A user mapping with no id is not matched against the list."""
+        settings = make_settings(environment="staging", e2e_user_ids=["durable-1"])
+        assert not is_e2e_user({}, settings)
+
+    def test_a_user_model_is_read_like_a_mapping(self) -> None:
+        """The shared `User` model carries the field, so a product can pass its row as is."""
+        settings = make_settings(environment="staging", e2e_user_ids=["durable-1"])
+        assert is_e2e_user(User(id="user-1", email=EMAIL, e2e_user=True), settings)
+        assert is_e2e_user(User(id="durable-1", email="person@example.com"), settings)
+        assert not is_e2e_user(User(id="user-2", email="person@example.com"), settings)
+
+    @pytest.mark.parametrize("environment", ["production", "prod", "Production", " PROD "])
+    def test_production_is_never_an_e2e_user(self, environment: str) -> None:
+        """A marked row or a listed id that reached production changes nothing.
+
+        The list is copied in past validation, which refuses it in production, so the
+        helper's own guard is what is under test.
+        """
+        settings = make_settings(environment=environment).model_copy(update={"e2e_user_ids": ["durable-1"]})
+        assert not is_e2e_user({"id": "user-1", E2E_USER_ATTRIBUTE: True}, settings)
+        assert not is_e2e_user({"id": "durable-1"}, settings)
+
+    def test_an_unset_environment_reads_as_production(self) -> None:
+        """A deployment that forgets its environment gets the production answer."""
+        settings = make_settings(environment="")
+        assert settings.environment == "production"
+        assert not is_e2e_user({"id": "user-1", E2E_USER_ATTRIBUTE: True}, settings)
+
+    def test_the_durable_id_list_is_empty_by_default(self) -> None:
+        """No product gets a durable e2e user it did not configure."""
+        assert make_settings().e2e_user_ids == []
+
+    def test_the_durable_id_list_is_refused_in_production(self) -> None:
+        """Configuring durable e2e ids in production fails at startup."""
+        with pytest.raises(ValueError, match="e2e_user_ids"):
+            make_settings(environment="production", e2e_user_ids=["durable-1"])
+
+    def test_the_durable_id_list_is_read_from_a_json_array(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """`IDENTITY_E2E_USER_IDS` is a JSON array, as every list field is, and blanks are dropped."""
+        monkeypatch.setenv("IDENTITY_E2E_USER_IDS", '[" durable-1 ", "", "durable-2"]')
+        assert make_settings(environment="staging").e2e_user_ids == ["durable-1", "durable-2"]
+
+    def test_registration_keeps_its_via_and_gets_no_marker(self, hooks: FakeHooks, module_key: rsa.RSAPrivateKey) -> None:
+        """Existing behaviour is unchanged: password registration reports `password` and stays unmarked."""
+        flows = make_flows(hooks, module_key, registration_attributes=[E2E_USER_ATTRIBUTE])
+        flows.register(
+            email="person@example.com",
+            password=PASSWORD,
+            attributes={E2E_USER_ATTRIBUTE: True},
+        )
+        [(user_id, via)] = hooks.created
+        assert via == "password"
+        assert E2E_USER_ATTRIBUTE not in hooks.users[user_id]
+        assert not is_e2e_user(hooks.users[user_id], flows._settings)
 
 
 class TestCallerIsAdmin:

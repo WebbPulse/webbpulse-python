@@ -25,7 +25,7 @@ permanently.
 | `local_signer_seed` | `""` | The seed `LocalSigner` derives its keys from; empty takes `DEFAULT_LOCAL_SEED` |
 | `passwords_enabled` | `True` | |
 | `registration_enabled` | `True` | |
-| `registration_attributes` | `[]` | The keys of a register body's `attributes` that reach `create_user`; every other key, and a non-object value, is dropped |
+| `registration_attributes` | `[]` | The keys of a register body's `attributes` that reach `create_user`; every other key, a non-object value, and the reserved `e2e_user` are dropped |
 | `email_verification_required` | `True` | |
 | `totp_enabled` | `True` | |
 | `passkeys_enabled` | `True` | |
@@ -34,6 +34,7 @@ permanently.
 | `oauth_providers` | `["google","github"]` | `OAuthProvider` literals |
 | `password_breach_check` | `False` | Opt in to the breach corpus check (5.2) |
 | `mfa_required_for_roles` | `[]` | |
+| `e2e_user_ids` | `[]` | Durable e2e user ids `is_e2e_user` treats as e2e users; `IDENTITY_E2E_USER_IDS` is a JSON array; refused in production |
 | `access_token_ttl` | 10 minutes | Capped at `MAX_ACCESS_TOKEN_TTL` (1 hour), must be positive |
 | `refresh_token_ttl` | 30 days | Rolling, reset on each rotation |
 | `refresh_absolute_ttl` | 90 days | MUST NOT be shorter than `refresh_token_ttl` |
