@@ -63,6 +63,10 @@ class User(BaseModel):
     email_verified: bool = False
     disabled: bool = False
     is_admin: bool = False
+    e2e_user: bool = False
+    """Set only by the ephemeral e2e route, through `E2E_USER_ATTRIBUTE`. Read it with
+    `is_e2e_user`, which ignores it in production."""
+
     created_at: datetime = Field(default_factory=_utc_now)
 
     @property

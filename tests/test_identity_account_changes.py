@@ -34,7 +34,7 @@ from webbpulse.identity import (
     render_email_change,
     render_email_changed,
 )
-from webbpulse.identity.flows import PASSWORD_CREDENTIAL_TYPE, IdentityFlows, LoginRejected
+from webbpulse.identity.flows import E2E_USER_ATTRIBUTE, PASSWORD_CREDENTIAL_TYPE, IdentityFlows, LoginRejected
 from webbpulse.identity.storage import CredentialRecord
 
 if TYPE_CHECKING:  # pragma: no cover
@@ -633,6 +633,28 @@ def test_the_email_change_routes_round_trip(client: TestClient, hooks: FakeHooks
     reused = client.post(url(EMAIL_CHANGE_CONFIRM_PATH), json={"token": token_from(sender, NEW_EMAIL)})
     assert reused.status_code == 400
     assert reused.json()["error_code"] == "INVALID_LINK"
+
+
+def test_a_profile_change_body_cannot_mark_the_user_as_e2e(
+    client: TestClient, hooks: FakeHooks, sender: RecordingEmailSender
+) -> None:
+    """The email change routes, the package's only profile write, ignore a client `e2e_user`."""
+    access = sign_in(client)
+
+    requested = client.post(
+        url(EMAIL_CHANGE_PATH),
+        json={"email": NEW_EMAIL, E2E_USER_ATTRIBUTE: True, "attributes": {E2E_USER_ATTRIBUTE: True}},
+        headers=bearer(access),
+    )
+    assert requested.status_code == 200, requested.text
+    confirmed = client.post(
+        url(EMAIL_CHANGE_CONFIRM_PATH),
+        json={"token": token_from(sender, NEW_EMAIL), E2E_USER_ATTRIBUTE: True},
+    )
+    assert confirmed.status_code == 200
+
+    assert hooks.users[USER_ID]["email"] == NEW_EMAIL
+    assert E2E_USER_ATTRIBUTE not in hooks.users[USER_ID]
 
 
 def test_an_email_change_needs_a_bearer_and_a_recent_sign_in(

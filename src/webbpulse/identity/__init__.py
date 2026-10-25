@@ -170,6 +170,7 @@ from webbpulse.identity.events import (
     users_key_attribute,
 )
 from webbpulse.identity.flows import (
+    E2E_USER_ATTRIBUTE,
     EMAIL_UNAVAILABLE_MESSAGE,
     INVALID_CREDENTIALS_MESSAGE,
     PASSWORD_CREDENTIAL_TYPE,
@@ -179,6 +180,7 @@ from webbpulse.identity.flows import (
     MfaChallengeRequired,
     PurgeResult,
     RateLimited,
+    is_e2e_user,
 )
 from webbpulse.identity.glue import (
     build_dynamo_router,
@@ -659,6 +661,7 @@ __all__ = [
     "DIGEST_MESSAGE_TYPE",
     "DISCOVERY_CACHE_CONTROL",
     "DISCOVERY_PATH",
+    "E2E_USER_ATTRIBUTE",
     "EMAIL_CHANGE_CONFIRM_PATH",
     "EMAIL_CHANGE_LINK_PATH",
     "EMAIL_CHANGE_PATH",
@@ -995,6 +998,7 @@ __all__ = [
     "is_api_key",
     "is_api_key_actor",
     "is_browser_session",
+    "is_e2e_user",
     "is_expired",
     "kid_for_der",
     "lockout_state",

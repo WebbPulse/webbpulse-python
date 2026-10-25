@@ -54,6 +54,7 @@ if TYPE_CHECKING:  # pragma: no cover
     from webbpulse.identity.verification import LinkService
 
 __all__ = [
+    "E2E_USER_ATTRIBUTE",
     "EPHEMERAL_VIA",
     "INVALID_CREDENTIALS_MESSAGE",
     "PASSWORD_CREDENTIAL_TYPE",
@@ -63,6 +64,7 @@ __all__ = [
     "MfaChallengeRequired",
     "PurgeResult",
     "RateLimited",
+    "is_e2e_user",
 ]
 
 _log = logging.getLogger(__name__)
@@ -81,6 +83,17 @@ same shape and the same words whatever account was asked about.
 REGISTRATION_VIA: Final = "password"
 
 EPHEMERAL_VIA: Final = "e2e-ephemeral"
+
+E2E_USER_ATTRIBUTE: Final = "e2e_user"
+"""The reserved user attribute that marks an account the ephemeral e2e route created.
+
+Only `create_ephemeral_user` sets it, as `True`, after every other attribute so the admin's
+`attributes` cannot unset it. Registration drops it from client input even when an adopter's
+`registration_attributes` names it, and OAuth, SSO and SCIM provisioning never pass it. Read
+it through `is_e2e_user`, which also honours the durable id list and refuses production.
+"""
+
+_E2E_REFUSED_ENVIRONMENTS: Final[frozenset[str]] = frozenset({"production", "prod"})
 
 
 class LoginRejected(Exception):
@@ -1361,7 +1374,7 @@ class IdentityFlows:
         secret = hash_password(checked)
         user = self._hooks.create_user(
             email=normalised_email,
-            attributes=dict(attributes or {}) | {"email_verified": True},
+            attributes=dict(attributes or {}) | {"email_verified": True, E2E_USER_ATTRIBUTE: True},
         )
         user_id = _user_id(user)
 
@@ -2413,8 +2426,32 @@ def _client_registration_attributes(raw: object, allowed: Sequence[str]) -> dict
 
     if not allowed or not isinstance(raw, RuntimeMapping):
         return {}
-    permitted = set(allowed)
+    permitted = set(allowed) - {E2E_USER_ATTRIBUTE}
     return {key: value for key, value in raw.items() if isinstance(key, str) and key in permitted}
+
+
+def is_e2e_user(user: Mapping[str, Any] | object, settings: IdentitySettings) -> bool:
+    """Whether `user` is an e2e test account, which is always `False` in production.
+
+    True for a user carrying `E2E_USER_ATTRIBUTE` set to exactly `True`, or whose id is in
+    `settings.e2e_user_ids`. `user` is the hooks' mapping or a user model with the same
+    fields. The environment is checked first and on every call, so a marker or a listed id
+    that reaches a production deployment changes nothing. What an e2e user is exempt from is
+    the product's policy, not this package's.
+    """
+    if settings.environment.strip().lower() in _E2E_REFUSED_ENVIRONMENTS:
+        return False
+    from collections.abc import Mapping as RuntimeMapping
+
+    if isinstance(user, RuntimeMapping):
+        marker = user.get(E2E_USER_ATTRIBUTE)
+        user_id = user.get("id") or user.get("user_id") or ""
+    else:
+        marker = getattr(user, E2E_USER_ATTRIBUTE, None)
+        user_id = getattr(user, "id", None) or getattr(user, "user_id", None) or ""
+    if marker is True:
+        return True
+    return bool(user_id) and str(user_id) in settings.e2e_user_ids
 
 
 def _normalise_email(email: str) -> str:

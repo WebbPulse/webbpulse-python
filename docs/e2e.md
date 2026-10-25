@@ -742,3 +742,17 @@ holds read scopes alone wherever that is how the product authorises, and every w
 would be refused, which is the reason this exists. Overriding the whole fixture to pass one
 argument meant reimplementing the create, the worker-id suffix and the delete-failure warning
 alongside it.
+
+### Telling e2e users apart
+
+The ephemeral route also creates the user with `E2E_USER_ATTRIBUTE` (`e2e_user`) set to
+`True`, after `ephemeral_user_attributes` and `email_verified`, so the admin's mapping cannot
+unset it. The attribute is reserved: registration drops it from client input even when
+`registration_attributes` names it, and OAuth, SSO and SCIM provisioning never pass it. A
+product whose `create_user` copies attributes onto the row, as `DynamoIdentityHooks` does with
+the shared `User.e2e_user` field, holds the marker from the first write. Read it with
+`is_e2e_user(user, settings)`, which is also true for an id in `IdentitySettings.e2e_user_ids`
+(`IDENTITY_E2E_USER_IDS`, a JSON array, empty by default) for the durable staging user, and is
+always false in production, where a non-empty list is refused at startup. What an e2e user is
+exempt from, such as plan limits or billing, stays the product's policy. `on_user_created`
+still receives `EPHEMERAL_VIA` unchanged.

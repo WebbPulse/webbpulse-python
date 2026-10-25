@@ -5,6 +5,20 @@ Notable changes to the `webbpulse` package. The version here is the one in
 
 This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## 0.105.0
+
+### Added
+
+- A trusted e2e user marker in `webbpulse.identity` (PLAT-94). The ephemeral e2e route now
+  creates the user with the reserved attribute `E2E_USER_ATTRIBUTE` (`"e2e_user"`) set to
+  `True`, alongside `email_verified`, and the admin-supplied attributes cannot unset it.
+  Registration drops the key from client input even when `registration_attributes` lists it;
+  OAuth, SSO and SCIM never pass it. The new `is_e2e_user(user, settings)` is true for a
+  marked user or an id in the new `IdentitySettings.e2e_user_ids` (`IDENTITY_E2E_USER_IDS`,
+  a JSON array, empty by default), and always false in production, where a non-empty
+  `e2e_user_ids` is refused at startup. The shared `User` model gains `e2e_user: bool = False`.
+  `on_user_created` and its `via` are unchanged.
+
 ## 0.104.0
 
 ### Added

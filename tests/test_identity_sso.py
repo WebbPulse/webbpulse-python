@@ -56,7 +56,7 @@ from webbpulse.identity import (
     strip_sso_markers,
     valid_connection_id,
 )
-from webbpulse.identity.flows import IdentityFlows, MfaChallengeRequired
+from webbpulse.identity.flows import E2E_USER_ATTRIBUTE, IdentityFlows, MfaChallengeRequired
 from webbpulse.identity.mfa import access_token_amr
 from webbpulse.identity.oauth import OAUTH_LINK_BINDING_COOKIE, HttpxClient
 
@@ -834,6 +834,17 @@ def test_a_first_sign_in_on_a_verified_domain_provisions_and_links(
     again, outcome = service.resolve_login(connection, run_callback(service, provider))
     assert outcome == "linked"
     assert again["id"] == user["id"]
+
+
+def test_a_provisioned_sso_user_is_never_marked_as_e2e(
+    service: SsoService, provider: FakeOidcProvider, hooks: FakeHooks
+) -> None:
+    """An IdP claim named `e2e_user` does not reach `create_user`, so JIT cannot mark an account."""
+    provider.claims_override = {E2E_USER_ATTRIBUTE: True}
+    user, outcome = service.resolve_login(service.connection(CONNECTION_ID), run_callback(service, provider))
+    assert outcome == "provisioned"
+    assert E2E_USER_ATTRIBUTE not in user
+    assert E2E_USER_ATTRIBUTE not in hooks.users[str(user["id"])]
 
 
 def test_the_link_follows_the_subject_not_the_email(

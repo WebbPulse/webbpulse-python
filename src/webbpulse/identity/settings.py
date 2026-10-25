@@ -64,6 +64,8 @@ _PLAINTEXT_ISSUER_ENVIRONMENTS: Final[frozenset[str]] = frozenset({"local", "tes
 
 _LOCAL_SIGNER_REFUSED_ENVIRONMENTS: Final[frozenset[str]] = frozenset({"production", "prod"})
 
+_E2E_USER_IDS_REFUSED_ENVIRONMENTS: Final[frozenset[str]] = frozenset({"production", "prod"})
+
 DEFAULT_COOKIE_NAME: Final = "wp_refresh"
 
 _UNSUFFIXED_COOKIE_ENVIRONMENTS: Final[frozenset[str]] = frozenset({"production", "prod", "local", "test"})
@@ -189,6 +191,15 @@ class IdentitySettings(BaseSettings):
             "staging: the routes create and delete a verified account without a password "
             "policy prompt or an email round trip, which production must never offer. The "
             "router refuses to mount them in production even when this is true."
+        ),
+    )
+    e2e_user_ids: list[str] = Field(
+        default_factory=list,
+        description=(
+            "Ids of durable e2e users, such as the staging login user the e2e plugin falls back "
+            "to when no ephemeral user is minted. `is_e2e_user` is true for them as well as for "
+            "a user the ephemeral route marked. Empty by default, and refused in production, "
+            "where `is_e2e_user` is always false whatever this holds."
         ),
     )
 
@@ -676,6 +687,22 @@ class IdentitySettings(BaseSettings):
                 raise ValueError(f"desktop_handoff_schemes lists {scheme!r} twice.")
             cleaned.append(scheme)
         return cleaned
+
+    @field_validator("e2e_user_ids")
+    @classmethod
+    def _clean_e2e_user_ids(cls, value: list[str]) -> list[str]:
+        """Strip each durable e2e user id and drop blank entries."""
+        return [cleaned for entry in value if (cleaned := entry.strip())]
+
+    @model_validator(mode="after")
+    def _refuse_e2e_user_ids_in_production(self) -> IdentitySettings:
+        """Refuse durable e2e user ids in a production environment, so one cannot be configured there."""
+        if self.e2e_user_ids and self.environment.strip().lower() in _E2E_USER_IDS_REFUSED_ENVIRONMENTS:
+            raise ValueError(
+                f"e2e_user_ids is refused in environment {self.environment!r}. Production has no "
+                "e2e users, so is_e2e_user is always false there and the list must be empty."
+            )
+        return self
 
     @model_validator(mode="after")
     def _check_desktop_handoff(self) -> IdentitySettings:

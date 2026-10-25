@@ -49,6 +49,7 @@ from webbpulse.identity import (
     render_verification,
 )
 from webbpulse.identity.flows import (
+    E2E_USER_ATTRIBUTE,
     PASSWORD_CREDENTIAL_TYPE,
     IdentityFlows,
     LoginRejected,
@@ -1663,6 +1664,39 @@ def test_flows_register_filters_attributes_without_the_router(
     user = created_user(hooks)
     assert user["display_name"] == "Pat"
     assert "is_service_account" not in user
+
+
+def test_the_register_route_never_passes_the_e2e_marker_even_when_allowlisted(
+    kms: FakeKms, hooks: FakeHooks, stores: IdentityStores, attempts: InMemoryLoginAttemptStore
+) -> None:
+    """`e2e_user` is reserved: an adopter allowlisting it still cannot let a client set it."""
+    with registration_client(
+        kms, hooks, stores, attempts, registration_attributes=["display_name", E2E_USER_ATTRIBUTE]
+    ) as client:
+        response = client.post(
+            f"{prefix()}/register",
+            json={
+                "email": EMAIL,
+                "password": PASSWORD,
+                "attributes": {"display_name": "Pat", E2E_USER_ATTRIBUTE: True},
+            },
+        )
+
+    assert response.status_code == 201
+    user = created_user(hooks)
+    assert user["display_name"] == "Pat"
+    assert E2E_USER_ATTRIBUTE not in user
+
+
+def test_flows_register_never_passes_the_e2e_marker(
+    kms: FakeKms, hooks: FakeHooks, stores: IdentityStores, attempts: InMemoryLoginAttemptStore
+) -> None:
+    """A direct `register` caller is held to the same reservation as the route."""
+    flows = registration_flows(kms, hooks, stores, attempts, registration_attributes=[E2E_USER_ATTRIBUTE])
+
+    flows.register(email=EMAIL, password=PASSWORD, attributes={E2E_USER_ATTRIBUTE: True})
+
+    assert E2E_USER_ATTRIBUTE not in created_user(hooks)
 
 
 def test_registration_attributes_default_to_empty() -> None:
