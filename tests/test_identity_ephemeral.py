@@ -440,7 +440,9 @@ class TestIsE2eUser:
         monkeypatch.setenv("IDENTITY_E2E_USER_IDS", '[" durable-1 ", "", "durable-2"]')
         assert make_settings(environment="staging").e2e_user_ids == ["durable-1", "durable-2"]
 
-    def test_registration_keeps_its_via_and_gets_no_marker(self, hooks: FakeHooks, module_key: rsa.RSAPrivateKey) -> None:
+    def test_registration_keeps_its_via_and_gets_no_marker(
+        self, hooks: FakeHooks, module_key: rsa.RSAPrivateKey
+    ) -> None:
         """Existing behaviour is unchanged: password registration reports `password` and stays unmarked."""
         flows = make_flows(hooks, module_key, registration_attributes=[E2E_USER_ATTRIBUTE])
         flows.register(
