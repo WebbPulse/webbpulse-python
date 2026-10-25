@@ -15,7 +15,7 @@ import secrets
 import time
 import uuid
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING, Any, Final
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
@@ -634,7 +634,8 @@ class OAuthServerService:
 
         A client re-authorizing in the same tenant for the same resource replaces its
         earlier grant, keeping its id and first grant time, so a user sees one row per
-        grant rather than one per authorization.
+        grant rather than one per authorization. With `mcp_include_granted_scopes` on, the
+        replacement keeps the scopes the earlier grant held, as `granted_scopes` describes.
         """
         moment = int(time.time()) if now is None else now
         existing = next(
@@ -651,13 +652,36 @@ class OAuthServerService:
             client_id=request.client.client_id,
             tenant_id=tenant_id,
             resource=request.resource,
-            scopes=request.scopes,
+            scopes=self.granted_scopes(request, existing),
             granted_at=existing.granted_at if existing is not None and existing.granted_at else _iso(moment),
             updated_at=_iso(moment),
             last_used_at=_iso(moment),
         )
         self._stores.consents.put(record)
         return record
+
+    def granted_scopes(self, request: AuthorizationRequest, existing: ConsentRecord | None) -> tuple[str, ...]:
+        """The scopes a consent to `request` stores, given the grant it replaces.
+
+        The request's own scopes unless `mcp_include_granted_scopes` is on and `existing`
+        is a grant to replace. Then the union of both, in `mcp_scopes_supported` order and
+        limited to it, so a scope the server stopped offering is dropped here exactly as a
+        refresh drops it.
+        """
+        if not self._settings.mcp_include_granted_scopes or existing is None:
+            return request.scopes
+        held = set(existing.scopes) | set(request.scopes)
+        return tuple(scope for scope in self._settings.mcp_scopes_supported if scope in held)
+
+    def authorized_request(self, request: AuthorizationRequest, consent: ConsentRecord) -> AuthorizationRequest:
+        """The request a code is issued for once `consent` is recorded.
+
+        `request` itself unless `mcp_include_granted_scopes` is on, and then the same
+        request carrying the consent's scopes, so the code and its token hold the union.
+        """
+        if not self._settings.mcp_include_granted_scopes or consent.scopes == request.scopes:
+            return request
+        return replace(request, scopes=consent.scopes)
 
     def exchange_code(
         self,
@@ -1209,8 +1233,8 @@ def build_oauth_server_router(
                     OAuthServerError("invalid_request", "That workspace is not one this account may grant access to.")
                 )
 
-        service.record_consent(parsed, user_id=user_id, tenant_id=tenant_id)
-        code = service.issue_code(parsed, user_id=user_id, tenant_id=tenant_id)
+        recorded = service.record_consent(parsed, user_id=user_id, tenant_id=tenant_id)
+        code = service.issue_code(service.authorized_request(parsed, recorded), user_id=user_id, tenant_id=tenant_id)
         return RedirectResponse(
             _redirect_with(parsed.redirect_uri, {"code": code, "state": parsed.state}),
             status_code=303,

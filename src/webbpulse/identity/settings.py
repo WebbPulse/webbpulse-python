@@ -389,6 +389,17 @@ class IdentitySettings(BaseSettings):
             "Zero turns the check off."
         ),
     )
+    mcp_include_granted_scopes: bool = Field(
+        default=False,
+        description=(
+            "Keep the scopes a client already holds when it authorizes again for more. Off "
+            "replaces a standing grant's scopes with those of the latest authorization. On, "
+            "a re-authorization for the same user, client, tenant and resource stores the "
+            "union of the granted and the approved scopes, limited to "
+            "`mcp_scopes_supported`, and the code it issues carries that union. A refresh "
+            "never widens a grant either way."
+        ),
+    )
 
     oauth_redirect_uris: list[str] = Field(
         default_factory=list,
