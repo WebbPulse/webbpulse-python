@@ -137,6 +137,7 @@ from webbpulse.identity.dynamo_hooks import (
     DynamoUsersHooks,
 )
 from webbpulse.identity.email import (
+    RESERVED_HEADER_NAMES,
     TRANSACTIONAL_PURPOSES,
     CappedEmailSender,
     EmailCapExceeded,
@@ -737,6 +738,7 @@ __all__ = [
     "REGISTER_PATH",
     "REMOVE_EVENT_NAME",
     "REQUEST_CONTEXT_HEADER",
+    "RESERVED_HEADER_NAMES",
     "RESET_CONFIRM_PATH",
     "RESET_EMAIL_LIMIT",
     "RESET_IP_LIMIT",

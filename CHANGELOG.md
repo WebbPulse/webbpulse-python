@@ -5,6 +5,20 @@ Notable changes to the `webbpulse` package. The version here is the one in
 
 This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## 0.103.0
+
+### Added
+
+- `webbpulse.identity.EmailMessage` takes an optional `headers` mapping of name to value
+  (PLAT-92), empty by default so existing callers are unchanged. `SesV2EmailSender` sends
+  them as `Content.Simple.Headers` only when there are any, `render_branded` takes
+  `headers` and passes them through, and `RecordingEmailSender` keeps them on the recorded
+  message. Construction raises `ValueError` for an empty name, a colon, CR or LF in a name,
+  a CR or LF in a value, or a name in the new `RESERVED_HEADER_NAMES` (From, To, Cc, Bcc,
+  Subject, Reply-To, Return-Path, Sender, Message-ID, Date, MIME-Version and Content-Type,
+  compared case-insensitively). The intended use is headers such as `List-Unsubscribe` and
+  `List-Unsubscribe-Post` for one-click unsubscribe.
+
 ## 0.102.0
 
 ### Fixed
