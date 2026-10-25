@@ -57,6 +57,7 @@ that never turns the flag on provisions nothing extra.
 | `mcp_login_url` | Where a browser with no session is sent from `/authorize`. Unset answers 401 |
 | `mcp_login_return_param` | The query parameter carrying the authorize URL back. Default `returnTo` |
 | `mcp_consent_max_age` | Sends an older login back through `mcp_login_url` with `prompt=login`. Default off |
+| `mcp_include_granted_scopes` | A re-authorization keeps the scopes already granted and adds the new ones. Default off |
 
 **`mcp_tenant_claim` may not name a registered claim.** `mint_access_token` drops
 registered claims from product claims rather than letting them be overridden, so naming one
@@ -164,6 +165,14 @@ A tenant policy can also tighten after consent. `refresh_guard`, passed to
 `build_identity_router`, is handed the `ConsentRecord` each refresh continues before the
 refresh token is spent. An explicit `False` answers `invalid_grant` and leaves the token
 live, so the grant works again if the product's answer changes; an exception propagates.
+
+A client re-authorizing in the same tenant for the same resource replaces its grant, keeping
+the consent id, the first grant time and its refresh families. By default the new grant
+holds only the scopes this authorization asked for, so a step-up that asks for one more
+scope drops the rest. With `mcp_include_granted_scopes` on, the grant stores the union of
+the scopes it held and the ones just approved, limited to `mcp_scopes_supported`, and the
+code and token from that authorization carry the union. A grant in another tenant or to
+another resource is never merged in, and a refresh still never widens a grant.
 
 The form carries the authorization parameters through the user's browser, so they are
 covered by an HMAC that also binds the signed-in user id, which is never sent. A scope or

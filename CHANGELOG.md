@@ -5,6 +5,20 @@ Notable changes to the `webbpulse` package. The version here is the one in
 
 This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## 0.104.0
+
+### Added
+
+- `IdentitySettings.mcp_include_granted_scopes` (PLAT-56), off by default so existing
+  deployments are unchanged. On, a step-up `/authorize` for the same user, client, tenant
+  and resource keeps the scopes the client already held: `OAuthServerService.record_consent`
+  stores the union of the granted and the approved scopes, in `mcp_scopes_supported` order
+  and limited to it, and keeps the consent id, `granted_at` and the refresh families. The
+  code and token from that authorization carry the union. A grant in another tenant or to
+  another resource is never merged in, and a refresh still never widens a grant. The new
+  `OAuthServerService.granted_scopes` and `authorized_request` expose the rule to a product
+  that drives the service without the router.
+
 ## 0.103.0
 
 ### Added

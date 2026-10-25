@@ -713,10 +713,10 @@ class TestClientStore:
 
 
 def _service_with_refresh(
-    fake_kms: Any, refresh_guard: Any = None
+    fake_kms: Any, refresh_guard: Any = None, settings: IdentitySettings | None = None
 ) -> tuple[OAuthServerService, OAuthServerStores, InMemoryRefreshTokenStore]:
     """An `OAuthServerService` with flows, so a granted code also starts a refresh family."""
-    settings = build_settings()
+    settings = settings or build_settings()
     tokens = TokenService(settings, fake_kms)
     refresh_tokens = InMemoryRefreshTokenStore()
     flows = IdentityFlows(
@@ -1992,3 +1992,183 @@ class TestRefreshFamilyContext:
         assert summary.ip == "203.0.113.9"
         assert summary.last_ip == "203.0.113.9"
         assert summary.client == "Bun"
+
+
+def _consent_and_exchange(
+    service: OAuthServerService, scope: str, *, tenant_id: str = TENANT, now: int | None = None
+) -> tuple[ConsentRecord, dict[str, Any]]:
+    """Authorize `scope` for `USER` the way the consent route does, and exchange the code."""
+    verifier = new_pkce_verifier()
+    request = service.parse_authorization_request(authorize_params(verifier, scope=scope))
+    recorded = service.record_consent(request, user_id=USER, tenant_id=tenant_id, now=now)
+    code = service.issue_code(service.authorized_request(request, recorded), user_id=USER, tenant_id=tenant_id)
+    body = service.exchange_code(
+        {"code": code, "client_id": "first-party", "redirect_uri": REDIRECT, "code_verifier": verifier}
+    )
+    return recorded, body
+
+
+def _union_service(
+    fake_kms: Any, **overrides: Any
+) -> tuple[OAuthServerService, OAuthServerStores, InMemoryRefreshTokenStore]:
+    """A refresh-capable service with `mcp_include_granted_scopes` on."""
+    settings = build_settings(mcp_include_granted_scopes=True, **overrides)
+    return _service_with_refresh(fake_kms, settings=settings)
+
+
+class TestIncludeGrantedScopes:
+    """A step-up authorize keeps the scopes already granted only when the flag is on."""
+
+    def test_the_flag_is_off_by_default(self) -> None:
+        """A deployment that sets nothing keeps the replacing behaviour."""
+        assert build_settings().mcp_include_granted_scopes is False
+
+    def test_by_default_a_step_up_replaces_the_granted_scopes(self, fake_kms: Any) -> None:
+        """Off, the latest authorize's scopes are all the grant, the code and the token carry."""
+        service, stores, _ = _service_with_refresh(fake_kms)
+        _consent_and_exchange(service, "mcp:read")
+
+        recorded, body = _consent_and_exchange(service, "mcp:write")
+
+        assert recorded.scopes == ("mcp:write",)
+        assert _only_consent(stores).scopes == ("mcp:write",)
+        assert body["scope"] == "mcp:write"
+
+    def test_a_step_up_stores_and_issues_the_union(self, fake_kms: Any) -> None:
+        """On, the grant keeps its id, first grant time and refresh family, and gains the scope."""
+        service, stores, _ = _union_service(fake_kms)
+        first, first_body = _consent_and_exchange(service, "mcp:read", now=1_700_000_000)
+
+        second, body = _consent_and_exchange(service, "mcp:write", now=1_700_000_100)
+
+        assert second.consent_id == first.consent_id
+        assert second.granted_at == first.granted_at
+        assert second.scopes == ("mcp:read", "mcp:write")
+        assert _only_consent(stores).scopes == ("mcp:read", "mcp:write")
+        assert body["scope"] == "mcp:read mcp:write"
+        claims = TokenService(build_settings(), fake_kms).verify_access_token(body["access_token"], audience=RESOURCE)
+        assert claims["scope"] == "mcp:read mcp:write"
+        refreshed = service.refresh({"refresh_token": first_body["refresh_token"], "client_id": "first-party"})
+        assert refreshed["scope"] == "mcp:read mcp:write"
+
+    def test_a_first_authorize_is_unchanged_by_the_flag(self, fake_kms: Any) -> None:
+        """With no grant to keep, the request's scopes are the grant."""
+        service, _, _ = _union_service(fake_kms)
+
+        recorded, body = _consent_and_exchange(service, "mcp:write")
+
+        assert recorded.scopes == ("mcp:write",)
+        assert body["scope"] == "mcp:write"
+
+    def test_another_tenant_gets_no_union(self, fake_kms: Any) -> None:
+        """A grant in one tenant adds nothing to an authorize in another."""
+        service, stores, _ = _union_service(fake_kms)
+        _consent_and_exchange(service, "mcp:read", tenant_id=TENANT)
+
+        recorded, body = _consent_and_exchange(service, "mcp:write", tenant_id="workspace-2")
+
+        assert recorded.scopes == ("mcp:write",)
+        assert body["scope"] == "mcp:write"
+        by_tenant = {grant.tenant_id: grant.scopes for grant in stores.consents.list_for_user(USER)}
+        assert by_tenant == {TENANT: ("mcp:read",), "workspace-2": ("mcp:write",)}
+
+    def test_another_resource_gets_no_union(self, fake_kms: Any) -> None:
+        """A grant to a different resource is not the grant this authorize replaces."""
+        service, stores, _ = _union_service(fake_kms)
+        stores.consents.put(
+            ConsentRecord(
+                consent_id="other-resource",
+                user_id=USER,
+                client_id="first-party",
+                tenant_id=TENANT,
+                resource="https://other.example.com/mcp",
+                scopes=("mcp:read",),
+                granted_at="2026-01-01T00:00:00Z",
+            )
+        )
+
+        recorded, body = _consent_and_exchange(service, "mcp:write")
+
+        assert recorded.consent_id != "other-resource"
+        assert recorded.scopes == ("mcp:write",)
+        assert body["scope"] == "mcp:write"
+
+    def test_a_scope_no_longer_supported_is_dropped_from_the_union(self, fake_kms: Any) -> None:
+        """A held scope the server stopped offering is not carried into the new grant."""
+        service, stores, _ = _union_service(fake_kms)
+        request = service.parse_authorization_request(authorize_params(new_pkce_verifier(), scope="mcp:read"))
+        stored = service.record_consent(request, user_id=USER, tenant_id=TENANT)
+        stores.consents.put(replace(stored, scopes=("mcp:read", "mcp:retired")))
+
+        recorded, body = _consent_and_exchange(service, "mcp:write")
+
+        assert recorded.scopes == ("mcp:read", "mcp:write")
+        assert body["scope"] == "mcp:read mcp:write"
+
+    def test_a_refresh_never_widens_the_grant(self, fake_kms: Any) -> None:
+        """On, a refresh asking beyond the grant is refused and leaves the grant as it was."""
+        service, stores, _ = _union_service(fake_kms)
+        _, body = _consent_and_exchange(service, "mcp:read")
+
+        with pytest.raises(OAuthServerError) as exc:
+            service.refresh(
+                {"refresh_token": body["refresh_token"], "client_id": "first-party", "scope": "mcp:read mcp:write"}
+            )
+
+        assert exc.value.error == "invalid_scope"
+        assert _only_consent(stores).scopes == ("mcp:read",)
+        refreshed = service.refresh({"refresh_token": body["refresh_token"], "client_id": "first-party"})
+        assert refreshed["scope"] == "mcp:read"
+        assert _only_consent(stores).scopes == ("mcp:read",)
+
+    def test_the_consent_route_issues_the_union(self, fake_kms: Any) -> None:
+        """Through the router, a step-up code exchanges for a token holding both scopes."""
+        settings = build_settings(mcp_include_granted_scopes=True)
+        stores = build_stores()
+        app = FastAPI()
+        app.include_router(
+            build_identity_router(
+                settings,
+                Hooks(),
+                IdentityStores(credentials=InMemoryCredentialStore(), refresh_tokens=InMemoryRefreshTokenStore()),
+                tokens=TokenService(settings, fake_kms),
+                oauth_server_stores=stores,
+                tenant_resolver=tenants_for,
+                limiter_enabled=False,
+            )
+        )
+        client = TestClient(app)
+        prefix = identity_prefix(settings)
+
+        def authorize(scope: str) -> dict[str, Any]:
+            """Consent to `scope` in the browser and exchange the code it redirects with."""
+            verifier = new_pkce_verifier()
+            page = client.get(
+                f"{prefix}{AUTHORIZE_PATH}",
+                params=authorize_params(verifier, scope=scope),
+                headers=signed_in(client, fake_kms),
+            )
+            fields = _form_fields(page.text)
+            fields["decision"] = "allow"
+            fields["tenant_id"] = TENANT
+            redirect = client.post(
+                f"{prefix}{CONSENT_PATH}", data=fields, headers=signed_in(client, fake_kms), follow_redirects=False
+            )
+            code, _ = _code_from(redirect.headers["location"])
+            token = client.post(
+                f"{prefix}{TOKEN_PATH}",
+                data={
+                    "grant_type": "authorization_code",
+                    "code": code,
+                    "client_id": "first-party",
+                    "redirect_uri": REDIRECT,
+                    "code_verifier": verifier,
+                },
+            )
+            assert token.status_code == 200
+            body: dict[str, Any] = token.json()
+            return body
+
+        assert authorize("mcp:read")["scope"] == "mcp:read"
+        assert authorize("mcp:write")["scope"] == "mcp:read mcp:write"
+        assert _only_consent(stores).scopes == ("mcp:read", "mcp:write")
