@@ -92,7 +92,7 @@ def test_reserved_names_are_refused_case_insensitively(name: str) -> None:
 
 def test_the_reserved_set_covers_the_documented_names() -> None:
     """The exported set lists the twelve names the sender or SES owns, lowercased."""
-    assert RESERVED_HEADER_NAMES == {
+    expected = {
         "from",
         "to",
         "cc",
@@ -106,6 +106,7 @@ def test_the_reserved_set_covers_the_documented_names() -> None:
         "mime-version",
         "content-type",
     }
+    assert expected == RESERVED_HEADER_NAMES
 
 
 @pytest.mark.parametrize("name", ["X-Bad\r\nBcc", "X-Bad\nName", "X-Bad\rName", "X-Bad:Name"])
