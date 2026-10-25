@@ -31,6 +31,7 @@ if TYPE_CHECKING:  # pragma: no cover
     from webbpulse.identity.settings import IdentitySettings
 
 __all__ = [
+    "RESERVED_HEADER_NAMES",
     "TRANSACTIONAL_PURPOSES",
     "CappedEmailSender",
     "EmailCapExceeded",
@@ -60,6 +61,24 @@ TRANSACTIONAL_PURPOSES: Final[frozenset[str]] = frozenset(
 )
 """The `purpose` tags `CappedEmailSender` counts as transactional, besides any `mfa` prefix."""
 
+RESERVED_HEADER_NAMES: Final[frozenset[str]] = frozenset(
+    {
+        "from",
+        "to",
+        "cc",
+        "bcc",
+        "subject",
+        "reply-to",
+        "return-path",
+        "sender",
+        "message-id",
+        "date",
+        "mime-version",
+        "content-type",
+    }
+)
+"""Lowercased header names `EmailMessage.headers` refuses, since the sender or SES owns them."""
+
 
 class EmailSendFailed(Exception):
     """SES refused a message, or the client raised on the way to it.
@@ -74,7 +93,10 @@ class EmailMessage:
     """One rendered message, ready for any sender.
 
     Rendered before a sender is chosen. `to` is a single address: identity never sends to
-    more than one recipient.
+    more than one recipient. `headers` are extra message headers, such as
+    `List-Unsubscribe`, checked at construction: a name in `RESERVED_HEADER_NAMES`
+    (compared case-insensitively), an empty name, a name with a colon, or a CR or LF in a
+    name or value raises `ValueError`.
     """
 
     to: str
@@ -82,6 +104,24 @@ class EmailMessage:
     text: str
     html: str
     tags: dict[str, str] = field(default_factory=dict)
+    headers: dict[str, str] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        """Refuse headers that are reserved, malformed or could inject another header."""
+        for name, value in self.headers.items():
+            _check_header(name, value)
+
+
+def _check_header(name: str, value: str) -> None:
+    """Raise `ValueError` when one custom header is reserved, malformed or carries CR or LF."""
+    if not name.strip():
+        raise ValueError("An email header needs a non-empty name.")
+    if any(ch in name for ch in "\r\n:"):
+        raise ValueError(f"Email header name {name!r} must not contain a colon, CR or LF.")
+    if any(ch in value for ch in "\r\n"):
+        raise ValueError(f"Email header {name!r} has a CR or LF in its value.")
+    if name.strip().lower() in RESERVED_HEADER_NAMES:
+        raise ValueError(f"Email header {name!r} is reserved and is set by the sender.")
 
 
 class EmailSender(ABC):
@@ -160,6 +200,10 @@ class SesV2EmailSender(EmailSender):
         }
         if self._configuration_set:
             request["ConfigurationSetName"] = self._configuration_set
+        if message.headers:
+            request["Content"]["Simple"]["Headers"] = [
+                {"Name": name, "Value": value} for name, value in message.headers.items()
+            ]
         if message.tags:
             request["EmailTags"] = [{"Name": name, "Value": value} for name, value in sorted(message.tags.items())]
 
@@ -333,11 +377,13 @@ def render_branded(
     footer_note: Paragraph | None = None,
     footer_links: Sequence[EmailLink] = (),
     tags: dict[str, str] | None = None,
+    headers: dict[str, str] | None = None,
 ) -> EmailMessage:
     """Render blocks through `webbpulse.email_layout` into an `EmailMessage` ready for any sender.
 
     The product-side entry point for every non-identity email, so a product's invites and
-    notifications share the identity emails' layout.
+    notifications share the identity emails' layout. `headers` pass through to
+    `EmailMessage.headers`.
     """
     rendered = render_email(
         brand,
@@ -347,7 +393,14 @@ def render_branded(
         footer_note=footer_note,
         footer_links=footer_links,
     )
-    return EmailMessage(to=to, subject=subject, text=rendered.text, html=rendered.html, tags=dict(tags or {}))
+    return EmailMessage(
+        to=to,
+        subject=subject,
+        text=rendered.text,
+        html=rendered.html,
+        tags=dict(tags or {}),
+        headers=dict(headers or {}),
+    )
 
 
 def _product(settings: IdentitySettings) -> str:
