@@ -1,7 +1,9 @@
 """Admin-only routes that create and delete one throwaway login user per e2e run.
 
 A third route sweeps the ephemeral users older than a cutoff, for the run whose teardown
-delete failed: `webbpulse.e2e` calls it once at session start.
+delete failed: `webbpulse.e2e` calls it once at session start. A fourth hands a suite the
+verification token for a user it created unverified, so the verify journey can run without
+collecting mail.
 
 Why they exist: the suite's profile, social-link and sign-in journeys all mutate the user
 they run as, so a single durable account forces every run to serialise behind a concurrency
@@ -45,6 +47,7 @@ __all__ = [
     "EPHEMERAL_USERS_PATH",
     "EPHEMERAL_USERS_SWEEP_PATH",
     "EPHEMERAL_USER_ITEM_PATH",
+    "EPHEMERAL_USER_VERIFICATION_LINK_PATH",
     "caller_is_admin",
     "caller_roles",
     "register_ephemeral_routes",
@@ -53,6 +56,7 @@ __all__ = [
 EPHEMERAL_USERS_PATH: Final = "/e2e/users"
 EPHEMERAL_USER_ITEM_PATH: Final = "/e2e/users/{user_id}"
 EPHEMERAL_USERS_SWEEP_PATH: Final = "/e2e/users/sweep"
+EPHEMERAL_USER_VERIFICATION_LINK_PATH: Final = "/e2e/users/{user_id}/verification-link"
 
 ADMIN_ROLE: Final = "admin"
 
@@ -103,6 +107,14 @@ EPHEMERAL_ROUTE_RESPONSES: Final[Mapping[tuple[str, str], dict[int, str]]] = {
         200: "The ephemeral user was deleted, or was already gone.",
         401: "No access token, or one carrying no subject.",
         403: "The caller is not an admin, or ephemeral users are disabled here.",
+    },
+    ("POST", EPHEMERAL_USER_VERIFICATION_LINK_PATH): {
+        201: "A verification link was issued and its token returned, without mailing it.",
+        401: "No access token, or one carrying no subject.",
+        403: "The caller is not an admin, ephemeral users are disabled here, or the user is not an ephemeral one.",
+        404: "No user has that id.",
+        409: "The user's email address is already verified.",
+        503: "This deployment has no link store to issue verification links from.",
     },
     ("POST", EPHEMERAL_USERS_SWEEP_PATH): {
         200: "The leftover ephemeral users older than the cutoff were deleted.",
@@ -243,10 +255,11 @@ def register_ephemeral_routes(
         response_model=None,
     )
     async def create_ephemeral_user(request: _FastAPIRequest, payload: dict[str, Any] = Body(...)) -> Any:
-        """Create one verified account for this run and return its id and email.
+        """Create one account for this run and return its id and email.
 
         The password arrives in the body, is hashed by the flow and is never echoed back:
-        the caller generated it and already holds it.
+        the caller generated it and already holds it. The account is verified unless the
+        body carries `verified: false`.
         """
         refusal = refuse_non_admin(request)
         if refusal is not None:
@@ -257,6 +270,7 @@ def register_ephemeral_routes(
                     email=str(payload.get("email", "")),
                     password=str(payload.get("password", "")),
                     attributes=payload.get("attributes") or {},
+                    verified=payload.get("verified", True) is not False,
                 )
             )
         except PasswordRejected as exc:
@@ -293,6 +307,24 @@ def register_ephemeral_routes(
         return _JSONResponse({"user_id": user_id, "deleted": deleted}, status_code=200)
 
     @router.post(
+        f"{prefix}{EPHEMERAL_USER_VERIFICATION_LINK_PATH}",
+        tags=["identity"],
+        summary="Issue a verification link token for one unverified e2e user",
+        include_in_schema=False,
+        response_model=None,
+    )
+    async def issue_ephemeral_verification_link(request: _FastAPIRequest, user_id: str) -> Any:
+        """Return the token a mailed verification link would carry, mailing nothing."""
+        refusal = refuse_non_admin(request)
+        if refusal is not None:
+            return refusal
+        try:
+            issued = await run_sync(lambda: flows.issue_ephemeral_verification_link(user_id))
+        except LoginRejected as exc:
+            return rejected(request, exc)
+        return _JSONResponse(issued, status_code=201)
+
+    @router.post(
         f"{prefix}{EPHEMERAL_USERS_SWEEP_PATH}",
         tags=["identity"],
         summary="Delete leftover ephemeral e2e users older than a cutoff",
@@ -327,4 +359,4 @@ def register_ephemeral_routes(
             return rejected(request, exc)
         return _JSONResponse(swept, status_code=200)
 
-    _ = (create_ephemeral_user, delete_ephemeral_user, sweep_ephemeral_users)
+    _ = (create_ephemeral_user, delete_ephemeral_user, issue_ephemeral_verification_link, sweep_ephemeral_users)

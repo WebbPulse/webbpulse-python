@@ -31,8 +31,10 @@ from webbpulse.e2e.ephemeral import (
     ephemeral_email,
     generate_password,
     is_route_refusal,
+    issue_verification_token,
     item_path,
     sweep_ephemeral_users,
+    verification_link_path,
 )
 from webbpulse.e2e.xdist import (
     SHARED_STATE_GROUP,
@@ -500,6 +502,57 @@ class TestDescribeErrorBody:
     def test_a_json_body_that_is_not_an_object_is_excerpted(self) -> None:
         """A bare list or string is not the envelope, so it falls through to the excerpt."""
         assert describe_error_body(FakeResponse(500, ["nope"], text='["nope"]')) == 'body=["nope"]'
+
+
+class TestUnverifiedEphemeralUser:
+    """Asking for an unverified user and fetching the token its mailed link would carry."""
+
+    @staticmethod
+    def user() -> EphemeralUser:
+        """One created user to verify."""
+        return EphemeralUser(
+            credentials=Credentials(email="e2e@e2e.invalid", password="x", user_id="user-1", ephemeral=True),
+            user_id="user-1",
+        )
+
+    def test_the_default_body_carries_no_verified_key(self) -> None:
+        """An older backend sees the same body it always did."""
+        client = FakeClient([FakeResponse(201, {"user_id": "user-1"})])
+        create_ephemeral_user(client, run_id=RUN_ID, admin_token=ADMIN_TOKEN)
+        assert "verified" not in client.calls[0]["json"]
+
+    def test_an_unverified_user_is_asked_for_explicitly(self) -> None:
+        """`verified=False` reaches the route as `verified: false`."""
+        client = FakeClient([FakeResponse(201, {"user_id": "user-1"})])
+        create_ephemeral_user(client, run_id=RUN_ID, admin_token=ADMIN_TOKEN, verified=False)
+        assert client.calls[0]["json"]["verified"] is False
+
+    def test_the_link_path_hangs_off_the_item_path(self) -> None:
+        """The suite and the router agree on where the route lives."""
+        assert verification_link_path("user-1") == f"{CREATE_PATH}/user-1/verification-link"
+
+    def test_it_returns_the_token(self) -> None:
+        """A 201 yields the token, fetched with the admin token."""
+        client = FakeClient([FakeResponse(201, {"user_id": "user-1", "token": "link-token"})])
+        assert issue_verification_token(client, self.user(), admin_token=ADMIN_TOKEN) == "link-token"
+        assert client.calls[0]["method"] == "POST"
+        assert client.calls[0]["path"] == verification_link_path("user-1")
+        assert client.tokens == [ADMIN_TOKEN]
+
+    @pytest.mark.parametrize("status", [403, 404, 405, 409, 503])
+    def test_any_other_answer_raises(self, status: int) -> None:
+        """A suite asking for the token has no fallback, so a refusal is a failure."""
+        client = FakeClient([FakeResponse(status, {"error_code": "NOT_EPHEMERAL_USER"})])
+        with pytest.raises(RuntimeError) as caught:
+            issue_verification_token(client, self.user(), admin_token=ADMIN_TOKEN)
+        assert f"answered {status}" in str(caught.value)
+        assert ADMIN_TOKEN not in str(caught.value)
+
+    def test_a_201_without_a_token_raises(self) -> None:
+        """An empty token could only fail later, further from the cause."""
+        client = FakeClient([FakeResponse(201, {"user_id": "user-1"})])
+        with pytest.raises(RuntimeError):
+            issue_verification_token(client, self.user(), admin_token=ADMIN_TOKEN)
 
 
 class TestDeleteEphemeralUser:
