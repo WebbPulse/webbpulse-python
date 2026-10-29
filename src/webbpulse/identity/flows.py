@@ -384,7 +384,7 @@ class IdentityFlows:
             extra={"event": "register.success", "user_id": user_id, "ip": ip},
         )
 
-        if self._settings.email_verification_required:
+        if self._settings.email_verification_required and not self._settings.unverified_sessions:
             raise LoginRejected(
                 "Check your email to confirm your address before signing in.",
                 error_code="EMAIL_VERIFICATION_REQUIRED",
@@ -2179,13 +2179,14 @@ class IdentityFlows:
     ) -> str:
         """The single place an access token is minted, and so the single place `amr` is set.
 
-        `amr`, `auth_time` and `sso_connection` are applied after `claims_for`, so a product
-        hook cannot overwrite them. `mfa` is added alongside the specific factor when more
-        than one was used.
+        `amr`, `auth_time`, `sso_connection` and `email_verified` are applied after
+        `claims_for`, so a product hook cannot overwrite them. `mfa` is added alongside the
+        specific factor when more than one was used.
         """
+        from webbpulse.identity.claims import stamp_email_verified
         from webbpulse.identity.sso import SSO_CONNECTION_CLAIM, sso_connection_from_amr
 
-        claims = dict(self._hooks.claims_for(user))
+        claims = stamp_email_verified(self._hooks.claims_for(user), user)
         claims["amr"] = list(access_token_amr(amr))
         claims.pop(SSO_CONNECTION_CLAIM, None)
         connection_id = sso_connection_from_amr(amr)

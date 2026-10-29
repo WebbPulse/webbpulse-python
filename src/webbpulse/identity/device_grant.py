@@ -621,7 +621,10 @@ class DeviceGrantService:
         """The token response for a grant: an access token bound to its scopes and a refresh token."""
         held = self.held_scopes(user)
         scopes = grant.scopes if held is None else tuple(scope for scope in grant.scopes if scope in set(held))
-        claims = {key: value for key, value in self._hooks.claims_for(user).items() if key not in ("scope", "scopes")}
+        from webbpulse.identity.claims import stamp_email_verified
+
+        product = {key: value for key, value in self._hooks.claims_for(user).items() if key not in ("scope", "scopes")}
+        claims = stamp_email_verified(product, user)
         claims.update(
             {
                 "scope": " ".join(scopes),

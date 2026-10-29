@@ -30,6 +30,7 @@ from webbpulse.identity import (
     new_attempt,
     normalise_password,
 )
+from webbpulse.identity.claims import email_unverified, stamp_email_verified
 from webbpulse.identity.flows import (
     INVALID_CREDENTIALS_MESSAGE,
     PASSWORD_CREDENTIAL_TYPE,
@@ -456,6 +457,66 @@ def test_register_does_not_sign_in_when_verification_is_required(
         strict.register(email=EMAIL, password=PASSWORD)
     assert caught.value.error_code == "EMAIL_VERIFICATION_REQUIRED"
     assert hooks.by_email[EMAIL] in hooks.users
+
+
+def test_register_signs_in_unverified_when_unverified_sessions_is_on(
+    kms: FakeKms, hooks: FakeHooks, stores: IdentityStores
+) -> None:
+    """With `unverified_sessions`, registering under required verification issues a session."""
+    settings = make_settings(email_verification_required=True, unverified_sessions=True)
+    lenient = IdentityFlows(settings, hooks, stores, TokenService(settings, kms))
+    result = lenient.register(email=EMAIL, password=PASSWORD)
+    assert result is not None
+    claims = TokenService(settings, kms).verify_access_token(result.access_token)
+    assert claims["email_verified"] is False
+    assert email_unverified(claims)
+
+
+def test_access_token_email_verified_comes_from_the_row_not_the_hook(
+    flows: IdentityFlows, hooks: FakeHooks, stores: IdentityStores, kms: FakeKms, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A hook that sets `email_verified` is overridden by the user row's value."""
+    seed_account(hooks, stores, email_verified=False)
+    monkeypatch.setattr(hooks, "claims_for", lambda user: {"email_verified": True})
+    result = flows.login(email=EMAIL, password=PASSWORD)
+    claims = TokenService(make_settings(), kms).verify_access_token(result.access_token)
+    assert claims["email_verified"] is False
+
+
+def test_access_token_has_no_email_verified_for_a_row_without_one(
+    flows: IdentityFlows, hooks: FakeHooks, stores: IdentityStores, kms: FakeKms
+) -> None:
+    """A row that never recorded `email_verified` mints a token with no such claim."""
+    seed_account(hooks, stores)
+    hooks.users[USER_ID].pop("email_verified", None)
+    result = flows.login(email=EMAIL, password=PASSWORD)
+    claims = TokenService(make_settings(), kms).verify_access_token(result.access_token)
+    assert "email_verified" not in claims
+    assert not email_unverified(claims)
+
+
+@pytest.mark.parametrize(
+    ("claims", "expected"),
+    [
+        ({}, False),
+        ({"email_verified": True}, False),
+        ({"email_verified": "true"}, False),
+        ({"email_verified": False}, True),
+        ({"email_verified": "false"}, True),
+    ],
+)
+def test_email_unverified_is_true_only_for_an_explicit_false(claims: dict[str, Any], expected: bool) -> None:
+    """Only a claim that coerces to false reads as unverified."""
+    assert email_unverified(claims) is expected
+
+
+def test_stamp_email_verified_replaces_a_hook_value() -> None:
+    """The row's value wins, and a row without the key drops the claim."""
+    assert stamp_email_verified({"email_verified": True, "roles": []}, {"email_verified": False}) == {
+        "email_verified": False,
+        "roles": [],
+    }
+    assert stamp_email_verified({"email_verified": True}, {}) == {}
 
 
 def test_login_succeeds_and_mints_a_token_bound_to_the_family(

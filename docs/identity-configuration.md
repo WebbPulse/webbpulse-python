@@ -27,6 +27,7 @@ permanently.
 | `registration_enabled` | `True` | |
 | `registration_attributes` | `[]` | The keys of a register body's `attributes` that reach `create_user`; every other key, a non-object value, and the reserved `e2e_user` are dropped |
 | `email_verification_required` | `True` | |
+| `unverified_sessions` | `False` | Register signs the account in while its address is unconfirmed; the token carries `email_verified` false for the product to gate on with `email_unverified` |
 | `totp_enabled` | `True` | |
 | `passkeys_enabled` | `True` | |
 | `passkeys_passwordless` | `True` | |

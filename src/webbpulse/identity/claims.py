@@ -16,6 +16,9 @@ if TYPE_CHECKING:  # pragma: no cover
     from fastapi import Request
 
 __all__ = [
+    "EMAIL_NOT_VERIFIED",
+    "EMAIL_NOT_VERIFIED_DETAIL",
+    "EMAIL_VERIFIED_CLAIM",
     "GATE_CLAIMS_KEY",
     "AuthorizerClaims",
     "ClaimsUnavailable",
@@ -24,11 +27,13 @@ __all__ = [
     "UnparseableRequestContext",
     "authorizer_claims",
     "coerce_claims",
+    "email_unverified",
     "gate_claims",
     "identity_claims",
     "identity_subject",
     "is_browser_session",
     "read_authorizer_claims",
+    "stamp_email_verified",
     "subject_dependency",
 ]
 
@@ -58,7 +63,17 @@ def _bind_fastapi_request() -> None:
 
 INTEGER_CLAIMS: Final[frozenset[str]] = frozenset({"exp", "iat", "nbf", "auth_time"})
 
-BOOLEAN_CLAIMS: Final[frozenset[str]] = frozenset({"email_verified"})
+EMAIL_VERIFIED_CLAIM: Final = "email_verified"
+
+EMAIL_NOT_VERIFIED: Final = "EMAIL_NOT_VERIFIED"
+
+EMAIL_NOT_VERIFIED_DETAIL: Final[Mapping[str, str]] = {
+    "error_code": EMAIL_NOT_VERIFIED,
+    "message": "Confirm your email address to continue.",
+}
+"""The 403 detail a product returns when `email_unverified` refuses a route."""
+
+BOOLEAN_CLAIMS: Final[frozenset[str]] = frozenset({EMAIL_VERIFIED_CLAIM})
 
 ARRAY_CLAIMS: Final[frozenset[str]] = frozenset({"amr", "roles", "groups", "aud"})
 
@@ -214,6 +229,30 @@ def is_browser_session(claims: Mapping[str, Any], audience: str) -> bool:
     if isinstance(audiences, str):
         audiences = [audiences]
     return isinstance(audiences, list) and audience in [str(item) for item in audiences]
+
+
+def stamp_email_verified(claims: Mapping[str, Any], user: Mapping[str, Any]) -> dict[str, Any]:
+    """A copy of `claims` whose `email_verified` is the user row's, never the product hook's.
+
+    A row with no `email_verified` key gets no claim at all, so a token for such a user
+    reads as unknown rather than unverified.
+    """
+    stamped = dict(claims)
+    stamped.pop(EMAIL_VERIFIED_CLAIM, None)
+    if EMAIL_VERIFIED_CLAIM in user:
+        stamped[EMAIL_VERIFIED_CLAIM] = bool(user[EMAIL_VERIFIED_CLAIM])
+    return stamped
+
+
+def email_unverified(claims: Mapping[str, Any]) -> bool:
+    """Whether verified claims say the caller's address is explicitly unconfirmed.
+
+    True only for an `email_verified` claim that coerces to false, so a token minted
+    before the claim existed, or by a client grant that carries none, is never refused.
+    """
+    if EMAIL_VERIFIED_CLAIM not in claims:
+        return False
+    return _coerce_bool(claims[EMAIL_VERIFIED_CLAIM]) is False
 
 
 def coerce_claims(claims: Mapping[str, Any]) -> dict[str, Any]:
