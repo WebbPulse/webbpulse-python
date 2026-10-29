@@ -164,6 +164,16 @@ class IdentitySettings(BaseSettings):
         ),
     )
     email_verification_required: bool = True
+    unverified_sessions: bool = Field(
+        default=False,
+        description=(
+            "Sign a new account in at registration even while `email_verification_required` "
+            "holds its address unconfirmed. The access token then carries `email_verified` "
+            "false, and the product gates the routes that need a confirmed address on "
+            "`email_unverified`. Off by default, so registration refuses a session until the "
+            "link is opened."
+        ),
+    )
     totp_enabled: bool = True
     passkeys_enabled: bool = True
     passkeys_passwordless: bool = True

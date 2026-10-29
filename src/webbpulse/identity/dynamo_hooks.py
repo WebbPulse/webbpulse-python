@@ -9,6 +9,7 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING, Any, Final
 
+from webbpulse.identity.claims import EMAIL_NOT_VERIFIED
 from webbpulse.identity.hooks import AuthenticationRefused, BaseIdentityHooks
 from webbpulse.identity.users import DynamoUsersRepository, User
 
@@ -28,9 +29,6 @@ unverified one and use the difference to enumerate addresses."""
 
 ACCOUNT_DISABLED: Final = "ACCOUNT_DISABLED"
 """The refusal code for an account an operator switched off."""
-
-EMAIL_NOT_VERIFIED: Final = "EMAIL_NOT_VERIFIED"
-"""The refusal code for an account whose address is not yet confirmed."""
 
 
 class DynamoUsersHooks[UserT: User](BaseIdentityHooks):

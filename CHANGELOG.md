@@ -5,6 +5,23 @@ Notable changes to the `webbpulse` package. The version here is the one in
 
 This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## 0.106.0
+
+### Added
+
+- `IdentitySettings.unverified_sessions` (PLAT-101), off by default so existing deployments
+  are unchanged. On, `register` signs the new account in even while
+  `email_verification_required` holds its address unconfirmed, instead of raising
+  `EMAIL_VERIFICATION_REQUIRED`.
+- Every access token minted by `IdentityFlows` and the device grant now carries
+  `email_verified` from the user row, applied after `claims_for` so a product hook cannot
+  set it, and re-read on each refresh. A row with no `email_verified` key gets no claim.
+  The new `stamp_email_verified(claims, user)` does the stamping.
+- `email_unverified(claims)` is true only for an explicitly false `email_verified` claim,
+  and `EMAIL_NOT_VERIFIED_DETAIL` is the 403 detail a product returns when it refuses a
+  route for that reason. `EMAIL_NOT_VERIFIED` and `EMAIL_VERIFIED_CLAIM` now live in
+  `webbpulse.identity.claims`; `dynamo_hooks.EMAIL_NOT_VERIFIED` is the same value.
+
 ## 0.105.0
 
 ### Added
