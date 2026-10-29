@@ -53,8 +53,10 @@ __all__ = [
     "ephemeral_email",
     "generate_password",
     "is_route_refusal",
+    "issue_verification_token",
     "item_path",
     "sweep_ephemeral_users",
+    "verification_link_path",
 ]
 
 CREATE_PATH: Final = "/api/auth/e2e/users"
@@ -209,6 +211,11 @@ def item_path(user_id: str, *, create_path: str = CREATE_PATH) -> str:
     return f"{create_path.rstrip('/')}/{user_id}"
 
 
+def verification_link_path(user_id: str, *, create_path: str = CREATE_PATH) -> str:
+    """The verification-link path for one ephemeral user, derived from the create path."""
+    return f"{item_path(user_id, create_path=create_path)}/verification-link"
+
+
 def generate_password(length: int = PASSWORD_LENGTH) -> str:
     """A random password strong enough for any product's policy, from `secrets`.
 
@@ -288,6 +295,7 @@ def create_ephemeral_user(
     create_path: str = CREATE_PATH,
     password: str | None = None,
     attributes: dict[str, Any] | None = None,
+    verified: bool = True,
     sleep: Callable[[float], None] = time.sleep,
 ) -> EphemeralUser | None:
     """Create this run's login user, or None when the route is not offered here.
@@ -302,6 +310,7 @@ def create_ephemeral_user(
         create_path=create_path,
         password=password,
         attributes=attributes,
+        verified=verified,
         sleep=sleep,
     )
     return result if isinstance(result, EphemeralUser) else None
@@ -315,6 +324,7 @@ def attempt_ephemeral_user(
     create_path: str = CREATE_PATH,
     password: str | None = None,
     attributes: dict[str, Any] | None = None,
+    verified: bool = True,
     sleep: Callable[[float], None] = time.sleep,
 ) -> EphemeralUser | str:
     """Create this run's login user, or say why this deployment does not offer the route.
@@ -327,11 +337,17 @@ def attempt_ephemeral_user(
     route that exists and is erroring is a finding rather than a reason to quietly mutate the
     shared account.
 
+    `verified=False` asks for the user unverified, for a suite proving the verify journey
+    with `issue_verification_token`. The default body is unchanged, so an older backend
+    answers it exactly as before.
+
     Neither the generated password nor the admin token reaches the raised message.
     """
     secret = password if password is not None else generate_password()
     email = ephemeral_email(run_id)
-    body = {"email": email, "password": secret, "attributes": dict(attributes or {})}
+    body: dict[str, Any] = {"email": email, "password": secret, "attributes": dict(attributes or {})}
+    if not verified:
+        body["verified"] = False
     response = client.with_token(admin_token).post(create_path, json=body)
     for delay in GATEWAY_RETRY_DELAYS:
         if response.status_code != 403 or is_route_refusal(response):
@@ -375,6 +391,27 @@ def attempt_ephemeral_user(
         user_id=user_id,
         create_path=create_path,
     )
+
+
+def issue_verification_token(client: TokenClient, user: EphemeralUser, *, admin_token: str) -> str:
+    """The token a mailed verification link would carry for this unverified ephemeral user.
+
+    Raises `RuntimeError` naming the status and the error envelope when the route answers
+    anything but 201, a 404 or 405 included, because a suite asking for the token has no
+    fallback. Neither the token nor the admin token reaches the raised message.
+    """
+    path = verification_link_path(user.user_id, create_path=user.create_path)
+    response = client.with_token(admin_token).post(path)
+    if response.status_code != 201:
+        raise RuntimeError(f"POST {path} answered {response.status_code}. It said: {describe_error_body(response)}")
+    try:
+        payload = response.json()
+    except ValueError as error:
+        raise RuntimeError(f"POST {path} answered 201 with a body that is not JSON") from error
+    token = str(payload.get("token", "") or "") if isinstance(payload, dict) else ""
+    if not token:
+        raise RuntimeError(f"POST {path} answered 201 with no token.")
+    return token
 
 
 def delete_ephemeral_user(client: TokenClient, user: EphemeralUser, *, admin_token: str) -> bool:

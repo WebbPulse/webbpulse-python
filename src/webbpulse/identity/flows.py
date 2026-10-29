@@ -1326,14 +1326,19 @@ class IdentityFlows:
         email: str,
         password: str,
         attributes: Mapping[str, Any] | None = None,
+        verified: bool = True,
     ) -> dict[str, str]:
-        """Create one already-verified account for a single e2e run, bypassing registration.
+        """Create one account for a single e2e run, bypassing registration.
 
         Distinct from `register` on three points, each of which is why the ordinary route
         cannot serve a test run: the address is marked verified at creation so no mail has
         to be collected, `email_verification_required` never blocks the caller, and a taken
         address is an error rather than the silent 200 registration answers with, because a
         run that quietly reuses somebody else's account would mutate it.
+
+        `verified=False` creates the account unverified instead, for a suite proving the
+        pending-verification journey; `issue_ephemeral_verification_link` then hands it the
+        token a mailed link would have carried.
 
         The password is hashed and handed to the credential store, and is never logged,
         returned or put in an exception message. Returns the new user's id and email only.
@@ -1374,7 +1379,7 @@ class IdentityFlows:
         secret = hash_password(checked)
         user = self._hooks.create_user(
             email=normalised_email,
-            attributes=dict(attributes or {}) | {"email_verified": True, E2E_USER_ATTRIBUTE: True},
+            attributes=dict(attributes or {}) | {"email_verified": bool(verified), E2E_USER_ATTRIBUTE: True},
         )
         user_id = _user_id(user)
 
@@ -1395,6 +1400,61 @@ class IdentityFlows:
             extra={"event": "identity.ephemeral_user_created", "user_id": user_id},
         )
         return {"user_id": user_id, "email": normalised_email}
+
+    def issue_ephemeral_verification_link(self, user_id: str) -> dict[str, str]:
+        """Issue a verification link for one unverified ephemeral user and return its token.
+
+        Nothing is mailed: the reserved `e2e.invalid` address could never receive it, and a
+        suite proving verification needs the token itself. The token is the same one a mailed
+        link carries, so confirming it exercises the production confirm path. Only an
+        ephemeral user is served, so no real account's link can leave the server this way.
+
+        Refuses with 404 `USER_NOT_FOUND`, 403 `NOT_EPHEMERAL_USER`, 409
+        `EMAIL_ALREADY_VERIFIED`, or 503 `EMAIL_NOT_CONFIGURED` where no link store exists.
+        The token is never logged.
+        """
+        if not self._settings.ephemeral_users_enabled:
+            raise LoginRejected(
+                "Ephemeral e2e users are not enabled in this environment.",
+                error_code="EPHEMERAL_USERS_DISABLED",
+                status_code=403,
+            )
+        cleaned = user_id.strip()
+        if not cleaned:
+            raise LoginRejected(
+                "A user id is required.",
+                error_code="USER_ID_REQUIRED",
+                status_code=400,
+            )
+        from webbpulse.identity.ephemeral_sweep import is_ephemeral_email
+
+        current = self._hooks.load_user_by_id(cleaned)
+        if current is None:
+            raise LoginRejected(
+                "No user has that id.",
+                error_code="USER_NOT_FOUND",
+                status_code=404,
+            )
+        email = str(current.get("email") or current.get("email_lower") or "")
+        if not is_ephemeral_email(email):
+            raise LoginRejected(
+                "Only ephemeral e2e users can be issued a link through this route.",
+                error_code="NOT_EPHEMERAL_USER",
+                status_code=403,
+            )
+        if _is_verified(current):
+            raise LoginRejected(
+                "This user's email address is already verified.",
+                error_code="EMAIL_ALREADY_VERIFIED",
+                status_code=409,
+            )
+        links = self._require_links()
+        issued = links.issue(cleaned, "verify_email", attributes={"email": _normalise_email(email)})
+        _log.info(
+            "Issued a verification link for an ephemeral e2e user.",
+            extra={"event": "identity.ephemeral_verification_link_issued", "user_id": cleaned},
+        )
+        return {"user_id": cleaned, "token": issued.token}
 
     def delete_ephemeral_user(self, user_id: str) -> bool:
         """Delete one ephemeral e2e user through the product's own deletion hook.
