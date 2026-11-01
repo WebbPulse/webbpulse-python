@@ -1,6 +1,6 @@
 # Identity: OAuth sign-in and account linking
 
-Federated sign-in and account linking against Google and GitHub: the routes, the state and
+Federated sign-in and account linking against Google, GitHub and Apple: the routes, the state and
 link tables, and the rules about attaching and detaching a provider. The rest of the identity
 package is in [identity.md](identity.md); the normative contract is in
 [the identity standard](identity-standard.md). Back to the [README](../README.md).
@@ -117,6 +117,30 @@ proving who somebody is does not prove possession of their second factor, and wi
 require any federated sign-in or Google in particular. The provider name is not a second
 factor, so an OAuth-only session carries no `mfa`; it gains `mfa` only once TOTP, a passkey
 or a password step-up adds a real second factor.
+
+**Sign in with Apple differs from Google in four ways, and needs four values.** Set
+`apple_client_id` (the Services ID), `apple_team_id` and `apple_key_id`, and put the `.p8`
+under `apple` in `oauth_client_secrets`. Without all four the provider is not listed and a
+start refuses.
+
+- The client secret is a JWT. Each token exchange mints an ES256 one from the `.p8`, which
+  lasts five minutes, so nothing needs rotating on Apple's six-month limit.
+- The callback is a cross-site POST, because Apple requires `form_post` when it asks for name
+  or email. The browser withholds the `Lax` binding cookie from that POST, so
+  `POST <prefix>/oauth/callback` redirects to the GET callback, where the browser sends it.
+  The route mounts only when Apple has a client id. A gateway that gates `/api/auth` must let
+  this POST through unauthenticated, because a gate cookie is withheld from it too.
+- The name arrives once, on the first sign-in, in an unsigned `user` form field. It waits on
+  the state row as `profile_name`, so it never enters a URL. It is display data and nothing
+  trusts it. If that first sign-in fails after the post, Apple does not send it again.
+- Relay addresses are ordinary provider-verified addresses. They sign in and register like
+  any other, and won't auto-link unless an account already holds that relay address. Mail to
+  them needs the sending domains registered with Apple. Apple can omit the email for Managed
+  Apple Accounts, so a new user without one gets `OAUTH_EMAIL_MISSING`.
+
+`sub` is scoped to the Apple Developer team, so moving the app to another team means
+migrating every link within Apple's 60-day transfer window. Token revocation on account
+deletion and Apple's server notifications are not implemented yet (PLAT-108).
 
 **Client secrets are arguments, not settings, and are never logged.** They arrive as
 `oauth_client_secrets` on `build_identity_router` because they come from the product's own

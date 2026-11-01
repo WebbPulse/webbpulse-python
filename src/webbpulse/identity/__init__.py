@@ -249,6 +249,7 @@ from webbpulse.identity.mfa import (
 )
 from webbpulse.identity.oauth import (
     AMR_OAUTH,
+    APPLE_PROVIDER,
     GITHUB_PROVIDER,
     GOOGLE_PROVIDER,
     OAUTH_LINK_USER_INDEX,
@@ -632,6 +633,7 @@ __all__ = [
     "API_KEY_PREFIX",
     "API_KEY_TABLE",
     "API_KEY_USER_INDEX",
+    "APPLE_PROVIDER",
     "ARRAY_CLAIMS",
     "ATTEMPT_TTL",
     "AUTHORIZATION_CODES_TABLE",

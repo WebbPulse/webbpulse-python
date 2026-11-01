@@ -32,13 +32,13 @@ __all__ = [
     "TotpCipherKind",
 ]
 
-OAuthProvider = Literal["google", "github"]
+OAuthProvider = Literal["google", "github", "apple"]
 
 SignerKind = Literal["kms", "local"]
 
 TotpCipherKind = Literal["kms", "secret"]
 
-_DEFAULT_OAUTH_PROVIDERS: Final[list[OAuthProvider]] = ["google", "github"]
+_DEFAULT_OAUTH_PROVIDERS: Final[list[OAuthProvider]] = ["google", "github", "apple"]
 
 MAX_ACCESS_TOKEN_TTL: Final = timedelta(hours=1)
 
@@ -324,6 +324,9 @@ class IdentitySettings(BaseSettings):
 
     google_client_id: str = Field(default="")
     github_client_id: str = Field(default="")
+    apple_client_id: str = Field(default="", description="The Sign in with Apple Services ID.")
+    apple_team_id: str = Field(default="", description="The Apple Developer Team ID that owns the signing key.")
+    apple_key_id: str = Field(default="", description="The Key ID of the Sign in with Apple private key.")
 
     mcp_oauth_enabled: bool = Field(
         default=False,

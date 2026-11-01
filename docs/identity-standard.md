@@ -94,7 +94,7 @@ Paths are relative to the issuer prefix (normally `/api/auth`).
 | `POST /refresh` (the cookie authenticates it) | none |
 | `POST /logout`, `POST /logout-all` (MUST work with an expired access token) | none |
 | `POST /verify-email`, `/verify-email/confirm`, `POST /reset`, `/reset/confirm` | none |
-| `GET /oauth/{provider}/start`, `GET /oauth/callback` | none |
+| `GET /oauth/{provider}/start`, `GET /oauth/callback`, `POST /oauth/callback` | none |
 | `GET /oauth/providers`, `GET /passkeys/availability`, `GET /health` | none |
 | `GET /.well-known/openid-configuration`, `GET /.well-known/jwks.json` | none |
 | `POST /password` | bearer |
