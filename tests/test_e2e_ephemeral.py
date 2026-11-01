@@ -548,6 +548,16 @@ class TestUnverifiedEphemeralUser:
         assert f"answered {status}" in str(caught.value)
         assert ADMIN_TOKEN not in str(caught.value)
 
+    @pytest.mark.parametrize("status", [200, 202, 302])
+    def test_an_unexpected_success_keeps_its_body_out_of_the_message(self, status: int) -> None:
+        """A body that carries the token is not echoed by the failure that reports it."""
+        body = '{"user_id": "user-1", "token": "link-token"}'
+        client = FakeClient([FakeResponse(status, {"user_id": "user-1", "token": "link-token"}, text=body)])
+        with pytest.raises(RuntimeError) as caught:
+            issue_verification_token(client, self.user(), admin_token=ADMIN_TOKEN)
+        assert f"answered {status}" in str(caught.value)
+        assert "link-token" not in str(caught.value)
+
     def test_a_201_without_a_token_raises(self) -> None:
         """An empty token could only fail later, further from the cause."""
         client = FakeClient([FakeResponse(201, {"user_id": "user-1"})])

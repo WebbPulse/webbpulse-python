@@ -398,10 +398,13 @@ def issue_verification_token(client: TokenClient, user: EphemeralUser, *, admin_
 
     Raises `RuntimeError` naming the status and the error envelope when the route answers
     anything but 201, a 404 or 405 included, because a suite asking for the token has no
-    fallback. Neither the token nor the admin token reaches the raised message.
+    fallback. Neither the token nor the admin token reaches the raised message, so an
+    unexpected answer below 400 is reported without its body, which could carry the token.
     """
     path = verification_link_path(user.user_id, create_path=user.create_path)
     response = client.with_token(admin_token).post(path)
+    if response.status_code < 400 and response.status_code != 201:
+        raise RuntimeError(f"POST {path} answered {response.status_code} rather than 201. Its body is left out.")
     if response.status_code != 201:
         raise RuntimeError(f"POST {path} answered {response.status_code}. It said: {describe_error_body(response)}")
     try:
