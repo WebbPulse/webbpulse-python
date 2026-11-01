@@ -12,8 +12,11 @@ seeded before its first plan:
 
 A secret value is read from a hidden prompt, or from stdin when stdin is not a terminal, so it
 never reaches argv or shell history. No command prints a secret value. Every write merges one
-key into the current JSON object, keeps every other key, and re-checks the current version
-just before writing so two operators cannot silently overwrite each other.
+key into the current JSON object and keeps every other key. A secret write stages a new version
+and moves AWSCURRENT to it only if AWSCURRENT is still on the version it read, which Secrets
+Manager enforces, so a stale read or another writer causes a retry or a failure and never a lost
+key. A parameter write re-checks the version just before writing, which narrows that window but
+cannot close it, since SSM has no conditional put.
 
 Diagnostics go to stderr and data to stdout. The exit codes are the `EXIT_*` constants.
 """
@@ -21,10 +24,12 @@ Diagnostics go to stderr and data to stdout. The exit codes are the `EXIT_*` con
 from __future__ import annotations
 
 import argparse
+import contextlib
 import getpass
 import json
 import re
 import sys
+import time
 import uuid
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
@@ -46,6 +51,10 @@ EXIT_CONFLICT = 5
 EXIT_KEY_ABSENT = 6
 
 DEFAULT_RETRIES = 3
+RETRY_BASE_DELAY_SECONDS = 0.5
+
+CURRENT_STAGE = "AWSCURRENT"
+PENDING_STAGE = "WEBBPULSE_CONFIG_PENDING"
 
 CONFIG_PARAMETER_DESCRIPTION = (
     "Operator-owned JSON object of private non-secret config read by Terraform. "
@@ -54,6 +63,8 @@ CONFIG_PARAMETER_DESCRIPTION = (
 
 _UPPER_SNAKE = re.compile(r"^[A-Z][A-Z0-9_]*$")
 _MISSING_CODES = frozenset({"ResourceNotFoundException", "ParameterNotFound"})
+_NO_CURRENT_VALUE_CODES = frozenset({"ResourceNotFoundException", "InvalidRequestException"})
+_LOST_SWAP_CODES = frozenset({"InvalidParameterException", "ResourceNotFoundException"})
 
 JsonObject = dict[str, Any]
 Mutation = Callable[[JsonObject], JsonObject]
@@ -257,28 +268,30 @@ class SecretStore:
         if "DeletedDate" in described:
             raise ResourceMissingError(f"{self.where} is scheduled for deletion; restore it or apply terraform")
         for version_id, stages in described.get("VersionIdsToStages", {}).items():
-            if "AWSCURRENT" in stages:
+            if CURRENT_STAGE in stages:
                 return version_id
         return None
 
     def _read(self) -> tuple[str | None, JsonObject]:
-        """Return the current version id and its decoded object, pinned to that exact version."""
+        """Return the id and decoded object of AWSCURRENT from one call, so the two always belong together."""
         from botocore.exceptions import ClientError
 
-        version = self.current_version()
-        if version is None:
-            return None, {}
         try:
-            response = self._client.get_secret_value(SecretId=self.secret_id, VersionId=version)
+            response = self._client.get_secret_value(SecretId=self.secret_id, VersionStage=CURRENT_STAGE)
         except ClientError as exc:
+            if _error_code(exc) in _NO_CURRENT_VALUE_CODES and self.current_version() is None:
+                return None, {}
             raise _translate(exc, self.where) from None
         raw = response.get("SecretString")
         if raw is None:
             raise NotJsonObjectError(f"{self.where} holds a binary value, not a JSON object")
-        return version, decode_object(raw, self.where)
+        return response["VersionId"], decode_object(raw, self.where)
 
-    def _write(self, value: JsonObject) -> str:
-        """Write a new AWSCURRENT version and return its id."""
+    def _write(self, value: JsonObject, base: str | None) -> str | None:
+        """Stage a new version and make it current only if AWSCURRENT is still on `base`.
+
+        Returns the new version id, or `None` when AWSCURRENT is elsewhere, so the caller re-reads.
+        """
         from botocore.exceptions import ClientError
 
         try:
@@ -286,10 +299,43 @@ class SecretStore:
                 SecretId=self.secret_id,
                 SecretString=encode_object(value),
                 ClientRequestToken=str(uuid.uuid4()),
+                VersionStages=[PENDING_STAGE],
             )
         except ClientError as exc:
             raise _translate(exc, self.where) from None
-        return response["VersionId"]
+        version = response["VersionId"]
+        try:
+            if CURRENT_STAGE not in response.get("VersionStages", []):
+                self._promote(version, base)
+        except ClientError as exc:
+            self._release_pending(version)
+            if _error_code(exc) in _LOST_SWAP_CODES:
+                return None
+            raise ConfigToolError(
+                f"{_translate(exc, self.where)}; the new version was not confirmed as current"
+            ) from None
+        self._release_pending(version)
+        return version
+
+    def _promote(self, version: str, base: str | None) -> None:
+        """Move AWSCURRENT to `version`, which Secrets Manager refuses unless the label is on `base`."""
+        if base is None:
+            self._client.update_secret_version_stage(
+                SecretId=self.secret_id, VersionStage=CURRENT_STAGE, MoveToVersionId=version
+            )
+        else:
+            self._client.update_secret_version_stage(
+                SecretId=self.secret_id, VersionStage=CURRENT_STAGE, MoveToVersionId=version, RemoveFromVersionId=base
+            )
+
+    def _release_pending(self, version: str) -> None:
+        """Take the pending label off `version`, ignoring a failure since the outcome is already decided."""
+        from botocore.exceptions import ClientError
+
+        with contextlib.suppress(ClientError):
+            self._client.update_secret_version_stage(
+                SecretId=self.secret_id, VersionStage=PENDING_STAGE, RemoveFromVersionId=version
+            )
 
     def key_names(self) -> list[str]:
         """Return the secret's key names, sorted."""
@@ -310,8 +356,21 @@ class SecretStore:
         return self._update(_without_key(validate_key(key)))
 
     def _update(self, mutate: Mutation) -> WriteResult:
-        """Apply one mutation under the concurrent change guard."""
-        return _merge(self._read, self.current_version, self._write, mutate, retries=self._retries, where=self.where)
+        """Apply one mutation by compare and swap, re-reading with a backoff whenever the swap is refused."""
+        for attempt in range(self._retries + 1):
+            if attempt:
+                time.sleep(RETRY_BASE_DELAY_SECONDS * 2 ** (attempt - 1))
+            version, current = self._read()
+            updated = mutate(dict(current))
+            if updated == current:
+                return WriteResult(changed=False, version=version)
+            written = self._write(updated, version)
+            if written is not None:
+                return WriteResult(changed=True, version=written)
+        raise ConcurrentChangeError(
+            f"{self.where} changed between read and write on each of {self._retries + 1} attempts; "
+            "AWSCURRENT did not move, so nothing written took effect; try again"
+        )
 
 
 class ConfigStore:
@@ -485,7 +544,10 @@ def _session(profile: str | None, region: str | None) -> Any:
         raise ConfigToolError(f"{PROG} needs boto3; install webbpulse[dynamodb]") from None
     session = boto3.Session(profile_name=profile, region_name=region)
     if not session.region_name:
-        raise UsageError("no AWS region resolved; pass --region or set one on the profile or in AWS_REGION")
+        raise UsageError(
+            "no AWS region resolved; pass --region, set region on the profile, or set AWS_DEFAULT_REGION "
+            "(boto3 does not read AWS_REGION)"
+        )
     return session
 
 

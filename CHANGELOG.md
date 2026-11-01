@@ -5,6 +5,28 @@ Notable changes to the `webbpulse` package. The version here is the one in
 
 This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## 0.110.0
+
+### Changed
+
+- `webbpulse-config secret set` and `unset`, and `SecretStore.set`, `set_many` and `unset`, need
+  `secretsmanager:UpdateSecretVersionStage` on the secret as well as
+  `secretsmanager:PutSecretValue` (PLAT-104). Without it they fail with an error and `AWSCURRENT`
+  stays where it was. Grant it to every role that writes through `SecretStore` before adopting
+  this release.
+
+### Fixed
+
+- A secret write can no longer report success after losing a key written just before it
+  (PLAT-104). `SecretStore` used to re-check the version with `DescribeSecret` and then call an
+  unconditional `PutSecretValue`, so a stale read or a concurrent writer inside that window was
+  overwritten. It now reads the value and its version id in one `GetSecretValue`, puts the new
+  version under the `WEBBPULSE_CONFIG_PENDING` label, and moves `AWSCURRENT` with
+  `UpdateSecretVersionStage` naming the version it read. A refused move re-reads with a backoff,
+  then raises `ConcurrentChangeError`. A refused attempt leaves an unlabelled version behind.
+- The `webbpulse-config` region error names `AWS_DEFAULT_REGION` instead of `AWS_REGION`, which
+  boto3 does not read (PLAT-104).
+
 ## 0.109.0
 
 ### Changed

@@ -8,10 +8,12 @@ from __future__ import annotations
 import io
 import json
 from collections.abc import Iterator
+from pathlib import Path
 from typing import Any, cast
 
 import boto3
 import pytest
+from botocore.exceptions import ClientError
 from moto import mock_aws
 from pytest import MonkeyPatch
 
@@ -24,8 +26,10 @@ from webbpulse.ops.config import (
     EXIT_NOT_OBJECT,
     EXIT_OK,
     EXIT_USAGE,
+    PENDING_STAGE,
     ConcurrentChangeError,
     ConfigStore,
+    ConfigToolError,
     SecretStore,
     UsageError,
     main,
@@ -47,6 +51,7 @@ def _aws(monkeypatch: MonkeyPatch) -> Iterator[None]:
     monkeypatch.setenv("AWS_ACCESS_KEY_ID", "testing")
     monkeypatch.setenv("AWS_SECRET_ACCESS_KEY", "testing")
     monkeypatch.setenv("AWS_SESSION_TOKEN", "testing")
+    monkeypatch.setattr(ops, "RETRY_BASE_DELAY_SECONDS", 0)
     with mock_aws():
         yield
 
@@ -88,8 +93,14 @@ def make_parameter(value: str = '{"EXISTING":"keep"}') -> None:
 
 
 def stored_secret() -> dict[str, Any]:
-    """Read the secret back directly, bypassing the tool."""
-    return cast(dict[str, Any], json.loads(secrets_client().get_secret_value(SecretId=SECRET_ID)["SecretString"]))
+    """Read the AWSCURRENT value back directly, bypassing the tool."""
+    response = secrets_client().get_secret_value(SecretId=SECRET_ID, VersionStage="AWSCURRENT")
+    return cast(dict[str, Any], json.loads(response["SecretString"]))
+
+
+def version_stages() -> dict[str, list[str]]:
+    """Return the labels on every version of the secret."""
+    return cast(dict[str, list[str]], secrets_client().describe_secret(SecretId=SECRET_ID)["VersionIdsToStages"])
 
 
 def stored_parameter() -> dict[str, Any]:
@@ -250,7 +261,8 @@ def test_secret_id_override_targets_a_non_standard_name() -> None:
         stderr=err,
     )
     assert code == EXIT_OK
-    assert json.loads(secrets_client().get_secret_value(SecretId="webbpulse-staging/app")["SecretString"]) == {"K": "v"}
+    response = secrets_client().get_secret_value(SecretId="webbpulse-staging/app", VersionStage="AWSCURRENT")
+    assert json.loads(response["SecretString"]) == {"K": "v"}
 
 
 def test_a_command_with_no_target_is_a_usage_error() -> None:
@@ -261,27 +273,135 @@ def test_a_command_with_no_target_is_a_usage_error() -> None:
 
 
 class RacingSecrets:
-    """A Secrets Manager client that lets another writer land between the tool's read and write."""
+    """A Secrets Manager client that lets another writer land just before the tool moves AWSCURRENT."""
 
     def __init__(self, inner: Any, *, races: int) -> None:
         """Wrap a real client and arrange `races` concurrent writes."""
         self._inner = inner
         self._races = races
-        self._describes = 0
 
-    def describe_secret(self, **kwargs: Any) -> Any:
-        """Every second describe is the pre-write re-check; a race lands just before it."""
-        self._describes += 1
-        if self._describes % 2 == 0 and self._races > 0:
+    def update_secret_version_stage(self, **kwargs: Any) -> Any:
+        """Land a race before the swap, which then finds AWSCURRENT on another version."""
+        if kwargs["VersionStage"] == "AWSCURRENT" and self._races > 0:
             self._races -= 1
-            current = json.loads(self._inner.get_secret_value(SecretId=SECRET_ID)["SecretString"])
+            response = self._inner.get_secret_value(SecretId=SECRET_ID, VersionStage="AWSCURRENT")
+            current = json.loads(response["SecretString"])
             current[f"RACER_{self._races}"] = "theirs"
             self._inner.put_secret_value(SecretId=SECRET_ID, SecretString=json.dumps(current))
-        return self._inner.describe_secret(**kwargs)
+        return self._inner.update_secret_version_stage(**kwargs)
 
     def __getattr__(self, name: str) -> Any:
         """Pass every other call straight through."""
         return getattr(self._inner, name)
+
+
+class StaleReads:
+    """A Secrets Manager client whose reads answer from a snapshot taken before a later write.
+
+    Metadata stays stale for the client's whole life and the first `stale_reads` reads of AWSCURRENT
+    stay stale too, whatever the version they name now holds.
+    """
+
+    def __init__(self, inner: Any, *, stale_reads: int) -> None:
+        """Wrap a real client and snapshot what it reads right now."""
+        self._inner = inner
+        self._stale_reads = stale_reads
+        self._described = inner.describe_secret(SecretId=SECRET_ID)
+        self._read: Any = None
+        self._miss: ClientError | None = None
+        try:
+            self._read = inner.get_secret_value(SecretId=SECRET_ID, VersionStage="AWSCURRENT")
+        except ClientError as exc:
+            self._miss = exc
+
+    def describe_secret(self, **kwargs: Any) -> Any:
+        """Answer from the snapshot."""
+        return self._described
+
+    def get_secret_value(self, **kwargs: Any) -> Any:
+        """Answer a read of AWSCURRENT from the snapshot until the stale reads run out."""
+        if "VersionStage" in kwargs and self._stale_reads > 0:
+            self._stale_reads -= 1
+            if self._miss is not None:
+                raise self._miss
+            return self._read
+        return self._inner.get_secret_value(**kwargs)
+
+    def __getattr__(self, name: str) -> Any:
+        """Pass every other call straight through."""
+        return getattr(self._inner, name)
+
+
+class RefusedSwap:
+    """A Secrets Manager client whose identity may put a version but may not move AWSCURRENT."""
+
+    def __init__(self, inner: Any) -> None:
+        """Wrap a real client."""
+        self._inner = inner
+
+    def update_secret_version_stage(self, **kwargs: Any) -> Any:
+        """Refuse the swap and let the pending label cleanup through."""
+        if kwargs["VersionStage"] == "AWSCURRENT":
+            error: Any = {"Error": {"Code": "AccessDeniedException", "Message": "not authorized"}}
+            raise ClientError(error, "UpdateSecretVersionStage")
+        return self._inner.update_secret_version_stage(**kwargs)
+
+    def __getattr__(self, name: str) -> Any:
+        """Pass every other call straight through."""
+        return getattr(self._inner, name)
+
+
+def test_a_set_after_a_stale_read_keeps_the_key_written_just_before_it() -> None:
+    """A set that reads the version before the previous set is refused, re-reads and keeps both keys."""
+    make_secret()
+    stale = StaleReads(secrets_client(), stale_reads=1)
+    assert SecretStore(secrets_client(), SECRET_ID).set("FIRST", "one").changed
+    result = SecretStore(cast(Any, stale), SECRET_ID).set("SECOND", "two")
+    assert result.changed
+    assert stored_secret() == {"SECRET_KEY": "old", "OTHER": "keep", "FIRST": "one", "SECOND": "two"}
+    assert "AWSCURRENT" in version_stages()[cast(str, result.version)]
+
+
+def test_a_read_that_stays_stale_fails_loudly_and_keeps_the_newer_key() -> None:
+    """However long the staleness lasts, the set raises rather than overwrite the newer version."""
+    make_secret()
+    stale = StaleReads(secrets_client(), stale_reads=100)
+    assert SecretStore(secrets_client(), SECRET_ID).set("FIRST", "one").changed
+    with pytest.raises(ConcurrentChangeError):
+        SecretStore(cast(Any, stale), SECRET_ID).set("SECOND", "two")
+    assert stored_secret() == {"SECRET_KEY": "old", "OTHER": "keep", "FIRST": "one"}
+
+
+def test_a_first_write_after_a_stale_empty_read_keeps_the_key_written_just_before_it() -> None:
+    """A read that still sees no value cannot replace a first version it never saw."""
+    secrets_client().create_secret(Name=SECRET_ID)
+    stale = StaleReads(secrets_client(), stale_reads=1)
+    assert SecretStore(secrets_client(), SECRET_ID).set("FIRST", "one").changed
+    assert SecretStore(cast(Any, stale), SECRET_ID).set("SECOND", "two").changed
+    assert stored_secret() == {"FIRST": "one", "SECOND": "two"}
+
+
+def test_two_sets_in_a_row_keep_both_keys_and_leave_no_pending_label() -> None:
+    """Each set moves AWSCURRENT to its own version, AWSPREVIOUS follows, and the pending label goes."""
+    make_secret()
+    store = SecretStore(secrets_client(), SECRET_ID)
+    first = store.set("FIRST", "one")
+    second = store.set("SECOND", "two")
+    assert stored_secret() == {"SECRET_KEY": "old", "OTHER": "keep", "FIRST": "one", "SECOND": "two"}
+    stages = version_stages()
+    assert "AWSCURRENT" in stages[cast(str, second.version)]
+    assert "AWSPREVIOUS" in stages[cast(str, first.version)]
+    assert not any(PENDING_STAGE in labels for labels in stages.values())
+
+
+def test_a_refused_swap_fails_loudly_and_leaves_the_current_value_alone() -> None:
+    """An identity that cannot move AWSCURRENT gets an error naming it, and readers keep the old value."""
+    make_secret()
+    store = SecretStore(cast(Any, RefusedSwap(secrets_client())), SECRET_ID)
+    with pytest.raises(ConfigToolError, match=r"AccessDeniedException.*not confirmed as current"):
+        store.set("MINE", "ours")
+    assert stored_secret() == {"SECRET_KEY": "old", "OTHER": "keep"}
+    assert not any(PENDING_STAGE in labels for labels in version_stages().values())
 
 
 def test_a_concurrent_change_is_retried_and_both_writes_survive() -> None:
@@ -344,6 +464,31 @@ def test_the_cli_exits_with_the_conflict_code(monkeypatch: MonkeyPatch) -> None:
     assert code == EXIT_CONFLICT
     assert "nothing written" in err
     assert "MINE" not in stored_secret()
+
+
+def test_aws_default_region_resolves_a_region(monkeypatch: MonkeyPatch, tmp_path: Path) -> None:
+    """The variable the region error names is one boto3 reads."""
+    make_secret()
+    monkeypatch.setenv("AWS_CONFIG_FILE", str(tmp_path / "absent"))
+    monkeypatch.setenv("AWS_DEFAULT_REGION", REGION)
+    out = io.StringIO()
+    code = main(["--prefix", PREFIX, "secret", "keys"], stdout=out, stderr=io.StringIO())
+    assert code == EXIT_OK
+    assert out.getvalue() == "OTHER\nSECRET_KEY\n"
+
+
+def test_aws_region_alone_resolves_nothing_and_the_error_names_what_works(
+    monkeypatch: MonkeyPatch, tmp_path: Path
+) -> None:
+    """boto3 ignores AWS_REGION, so the error offers only what resolves a region and says so."""
+    monkeypatch.setenv("AWS_CONFIG_FILE", str(tmp_path / "absent"))
+    monkeypatch.setenv("AWS_REGION", REGION)
+    err = io.StringIO()
+    code = main(["--prefix", PREFIX, "secret", "keys"], stdout=io.StringIO(), stderr=err)
+    assert code == EXIT_USAGE
+    assert "--region" in err.getvalue()
+    assert "AWS_DEFAULT_REGION" in err.getvalue()
+    assert "does not read AWS_REGION" in err.getvalue()
 
 
 def test_config_set_parses_json_and_keeps_other_keys() -> None:

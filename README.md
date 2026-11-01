@@ -212,6 +212,13 @@ uv run webbpulse-config --prefix carmodpicker-staging config unset ALLOWED_EMAIL
 | `config get [KEY]` | Prints one value (a string raw, anything else as JSON), or the whole object |
 | `config unset KEY` | Removes one key |
 
+A secret write stages a new version under the `WEBBPULSE_CONFIG_PENDING` label and moves
+`AWSCURRENT` to it with `UpdateSecretVersionStage`, naming the version it read, so Secrets Manager
+refuses the move if anything else became current in between. The tool then re-reads and retries,
+and exits with the conflict code if the value keeps moving. A refused or conflicting attempt leaves
+an unlabelled version behind and never changes what readers see. The identity needs
+`secretsmanager:UpdateSecretVersionStage` as well as `secretsmanager:PutSecretValue`.
+
 Target options go before or after the subcommand. `--prefix` resolves both names;
 `--secret-id` and `--parameter-name` override either for an estate with non-standard names
 (Portfolio's secret is `webbpulse-<env>/app`). `--profile` and `--region` default to the AWS
@@ -428,9 +435,10 @@ back with a one-time `code`, and `convert_manifest_code(code)` answers the new A
 credentials masked. It needs no App configuration. Write the credentials into the `app`
 secret under the keys above in one version with
 `SecretStore(client, secret_id).set_many(app.app_secret_values())` from `webbpulse.ops.config`,
-or by hand with `webbpulse-config secret set`. The writer needs `secretsmanager:PutSecretValue`
-on that secret only, and the app-secrets module needs `json_preserve_unmanaged` so an apply
-keeps the keys.
+or by hand with `webbpulse-config secret set`. The writer needs `secretsmanager:GetSecretValue`,
+`secretsmanager:DescribeSecret`, `secretsmanager:PutSecretValue` and
+`secretsmanager:UpdateSecretVersionStage` on that secret only, and the app-secrets module needs
+`json_preserve_unmanaged` so an apply keeps the keys.
 
 ## Stripe
 
