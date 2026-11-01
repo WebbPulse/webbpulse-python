@@ -1031,28 +1031,41 @@ def _log_failed_export_response(response: Any) -> None:
     )
 
 
-def _log_export_response_bodies(exporter: Any) -> None:
-    """Wrap an exporter's `_export` so a non-2xx response's body is logged once.
+def _export_transport(exporter: Any) -> Any:
+    """The HTTP transport of an OTLP exporter, or `None` on an exporter that has none.
 
-    Wraps the private `_export`, which is the only place the response object exists before the
-    exporter throws it away. Guarded by a sentinel and by `getattr`, so a future rename loses
-    only the diagnostic rather than breaking exports.
+    From `opentelemetry-exporter-otlp-proto-http` 1.45 the exporter sends through
+    `_client._transport`, and that transport holds the `requests` session. Before it, the
+    session sat on the exporter itself. The `otel` extra still allows the older shape.
+    """
+    return getattr(getattr(exporter, "_client", None), "_transport", None)
+
+
+def _log_export_response_bodies(exporter: Any) -> None:
+    """Wrap the private send call so a non-2xx response's body is logged once.
+
+    That call is the transport's `request`, or `_export` on an older exporter: the only place
+    the response object exists before the exporter throws it away. Guarded by a sentinel and
+    by `getattr`, so a future rename loses only the diagnostic rather than breaking exports.
     """
     if getattr(exporter, _BODY_LOGGING_ATTR, False):
         return
-    inner = getattr(exporter, "_export", None)
+    transport = _export_transport(exporter)
+    owner, name = (exporter, "_export") if transport is None else (transport, "request")
+    inner = getattr(owner, name, None)
     if not callable(inner):  # pragma: no cover
         return
     setattr(exporter, _BODY_LOGGING_ATTR, True)
 
-    def _export(*args: Any, **kwargs: Any) -> Any:
-        """Export, then log the response body when the endpoint refused the batch."""
-        response = inner(*args, **kwargs)
+    def _send(*args: Any, **kwargs: Any) -> Any:
+        """Send, then log the response body when the endpoint refused the batch."""
+        outcome = inner(*args, **kwargs)
+        response = getattr(outcome, "response", outcome)
         if getattr(response, "ok", True) is False:
             _log_failed_export_response(response)
-        return response
+        return outcome
 
-    exporter._export = _export
+    setattr(owner, name, _send)
 
 
 def _build_span_exporter(endpoint: str, timeout_millis: int) -> SpanExporter:
@@ -1105,25 +1118,27 @@ def _build_span_exporter(endpoint: str, timeout_millis: int) -> SpanExporter:
 def _pin_credentials_per_request(exporter: Any, credentials: _ReresolvingCredentials) -> None:
     """Wrap the exporter's signing session so each request signs from one credential snapshot.
 
-    Swaps the private `_session` after construction, guarded so a future rename loses only
-    the pinning rather than breaking exports.
+    Swaps the private `_session` after construction, on the transport when the exporter has
+    one, guarded so a future rename loses only the pinning rather than breaking exports.
     """
-    session = getattr(exporter, "_session", None)
+    holder = _export_transport(exporter) or exporter
+    session = getattr(holder, "_session", None)
     if session is None:  # pragma: no cover
         return
-    exporter._session = _PinnedCredentialSession(session, credentials)
+    holder._session = _PinnedCredentialSession(session, credentials)
 
 
 def _guard_export_timeouts(exporter: Any) -> None:
     """Wrap an exporter's `requests` session so a clock jump cannot produce a `ValueError`.
 
-    Swaps the private `_session` after construction, guarded so a future rename loses only
-    the clamp rather than breaking exports.
+    Swaps the private `_session` after construction, on the transport when the exporter has
+    one, guarded so a future rename loses only the clamp rather than breaking exports.
     """
-    session = getattr(exporter, "_session", None)
+    holder = _export_transport(exporter) or exporter
+    session = getattr(holder, "_session", None)
     if session is None:  # pragma: no cover
         return
-    exporter._session = _PositiveTimeoutSession(session)
+    holder._session = _PositiveTimeoutSession(session)
 
 
 def configure_tracing(
