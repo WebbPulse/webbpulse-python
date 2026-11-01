@@ -1834,6 +1834,7 @@ def test_every_provider_in_the_table_has_a_display_name() -> None:
     assert {name: config.display_name for name, config in PROVIDERS.items()} == {
         GOOGLE_PROVIDER: "Google",
         GITHUB_PROVIDER: "GitHub",
+        APPLE_PROVIDER: "Apple",
     }
 
 
