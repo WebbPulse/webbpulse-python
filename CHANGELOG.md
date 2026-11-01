@@ -5,6 +5,15 @@ Notable changes to the `webbpulse` package. The version here is the one in
 
 This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## 0.108.0
+
+### Security
+
+- The `aws-otel` extra now requires `aws-opentelemetry-distro>=0.22.0` (PLAT-76). Every
+  earlier distro release pins `opentelemetry-api` at or below 1.44.0, which CVE-2026-114603
+  affects; 0.22.0 pins the fixed 1.45.1. Adopters relock to pick it up and can then drop
+  their `--ignore-vuln CVE-2026-114603`.
+
 ## 0.107.0
 
 ### Added
