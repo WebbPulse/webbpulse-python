@@ -162,7 +162,7 @@ class AppleNotifications:
                 payload,
                 key,
                 algorithms=["RS256"],
-                audience=self._settings.apple_notification_audiences or [self._settings.apple_client_id],
+                audience=[self._settings.apple_client_id, *self._settings.apple_notification_audiences],
                 issuer=APPLE_ISSUER,
                 leeway=self._settings.clock_skew_leeway,
                 options={"require": ["iss", "aud", "iat"]},

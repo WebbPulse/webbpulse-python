@@ -331,8 +331,8 @@ class IdentitySettings(BaseSettings):
     apple_notification_audiences: list[str] = Field(
         default_factory=list,
         description=(
-            "The `aud` values an Apple account notification may carry. Empty means `apple_client_id` only; "
-            "set it when notifications are registered on a different App ID."
+            "More `aud` values an Apple account notification may carry, beside `apple_client_id`. "
+            "Set it when notifications are registered on a different App ID."
         ),
     )
 

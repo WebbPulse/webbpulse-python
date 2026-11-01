@@ -3041,7 +3041,9 @@ def test_the_audience_allow_list_replaces_the_client_id(
     client = _providers_client(router)
     allowed = _apple_notification(provider, "email-enabled", aud="com.example.app")
     assert _post_notification(client, allowed).status_code == 200
-    assert _post_notification(client, _apple_notification(provider, "email-enabled")).status_code == 400
+    assert _post_notification(client, _apple_notification(provider, "email-enabled")).status_code == 200
+    stranger = _apple_notification(provider, "email-enabled", aud="com.example.other")
+    assert _post_notification(client, stranger).status_code == 400
 
 
 def test_email_disabled_and_enabled_flip_the_flag_on_the_link(
