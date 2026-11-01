@@ -64,7 +64,9 @@ sign of shutdown, not at the provider's `shutdown`: under the Lambda Web Adapter
 request's synchronous flush runs between uvicorn's `SIGTERM` handler and the ASGI lifespan
 shutdown event, so a window opened inside `shutdown` is opened after the failure it exists to
 explain. `_install_sigterm_hook` chains uvicorn's handler and the lifespan wrapper flips the
-same flag, and `shutdown_signalled` is what the failure paths read.
+same flag, and `shutdown_signalled` is what the failure paths read. An entrypoint configures
+tracing before `uvicorn.run`, and uvicorn then replaces the process's `SIGTERM` handler, so the
+lifespan wrapper installs the hook again once uvicorn's handler is in place.
 
 The provider is constructed with `shutdown_on_exit=False` because the SDK's `atexit` hook
 cannot see that the lifespan already shut the provider down and calls it again, which the
@@ -151,7 +153,7 @@ _SHUTDOWN_WRAPPED_ATTR: Final = "_webbpulse_shutdown_flush_wrapped"
 
 _SHUTTING_DOWN = threading.Event()
 
-_SIGTERM_HOOKED = False
+_SIGTERM_HOOK: Any = None
 
 _ATEXIT_REGISTERED = False
 
@@ -189,12 +191,15 @@ def _install_sigterm_hook() -> None:
     window leaves that flush's `403` at ERROR. Chaining rather than replacing keeps uvicorn's
     graceful shutdown intact.
 
+    Called from `configure_tracing`, for a process that never starts uvicorn, and again from
+    the lifespan wrapper, because `uvicorn.run` replaces whatever `configure_tracing` installed.
+    A no-op while the hook is already the current handler. uvicorn restores the earlier hook
+    as it exits and raises the signal again, which ends the process.
+
     Only installable from the main thread, and a no-op anywhere else, which is what `signal`
     itself requires.
     """
-    global _SIGTERM_HOOKED
-    if _SIGTERM_HOOKED:
-        return
+    global _SIGTERM_HOOK
 
     import signal
 
@@ -205,21 +210,25 @@ def _install_sigterm_hook() -> None:
         previous = signal.getsignal(signal.SIGTERM)
     except (OSError, ValueError):  # pragma: no cover
         return
+    if previous is _SIGTERM_HOOK:
+        return
 
     def handler(signum: int, frame: Any) -> None:
         """Note the signal, then delegate to the handler that was installed before us."""
-        note_shutdown_signal("sigterm")
-        if callable(previous):
-            previous(signum, frame)
-        elif previous is signal.SIG_DFL:
-            signal.signal(signal.SIGTERM, signal.SIG_DFL)
-            signal.raise_signal(signal.SIGTERM)
+        try:
+            note_shutdown_signal("sigterm")
+        finally:
+            if callable(previous):
+                previous(signum, frame)
+            elif previous is signal.SIG_DFL:
+                signal.signal(signal.SIGTERM, signal.SIG_DFL)
+                signal.raise_signal(signal.SIGTERM)
 
     try:
         signal.signal(signal.SIGTERM, handler)
     except (OSError, ValueError):  # pragma: no cover
         return
-    _SIGTERM_HOOKED = True
+    _SIGTERM_HOOK = handler
 
 
 def is_tracing_enabled() -> bool:
@@ -1442,7 +1451,9 @@ def instrument_fastapi(
             actually binds; passing a larger number here does not extend it.
         flush_on_shutdown: wrap the lifespan so container shutdown flushes and shuts the
             provider down. On by default and on every platform, since a container being
-            replaced loses buffered spans the same way a Lambda sandbox does.
+            replaced loses buffered spans the same way a Lambda sandbox does. The same wrapper
+            keeps the `SIGTERM` hook installed under uvicorn, so turning it off also leaves
+            failures before the lifespan shutdown at ERROR.
         shutdown_flush_timeout_millis: ceiling on the shutdown flush. `None` reads
             `resolve_shutdown_flush_timeout`, which defaults to 300 ms so the flush finishes
             inside the grace period Lambda gives the runtime before `SIGKILL`.
@@ -1524,8 +1535,10 @@ def _wrap_lifespan_with_shutdown_flush(app: FastAPI, timeout_millis: int) -> Non
 
         The demotion window opens as soon as the shutdown event is seen, before the app's own
         shutdown work runs, because an export failing anywhere past that point is the process
-        going away rather than a fault.
+        going away rather than a fault. The hook goes back on here because uvicorn replaced
+        it between `configure_tracing` and this lifespan starting.
         """
+        _install_sigterm_hook()
         async with inner(scope) as state:
             try:
                 yield state

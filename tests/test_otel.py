@@ -3,6 +3,10 @@
 from __future__ import annotations
 
 import logging
+import os
+import signal
+import subprocess
+import sys
 import threading
 import time
 from datetime import datetime, timedelta
@@ -2450,8 +2454,6 @@ def test_the_demotion_is_scoped_to_the_teardown_flush(
 
 def test_the_sigterm_hook_chains_the_handler_that_was_already_installed() -> None:
     """uvicorn's graceful shutdown must survive the hook that watches for the same signal."""
-    import signal
-
     calls: list[str] = []
 
     def previous(signum: int, frame: Any) -> None:
@@ -2459,7 +2461,6 @@ def test_the_sigterm_hook_chains_the_handler_that_was_already_installed() -> Non
         calls.append("previous")
 
     installed = signal.signal(signal.SIGTERM, previous)
-    otel._SIGTERM_HOOKED = False
     try:
         otel._install_sigterm_hook()
         handler = signal.getsignal(signal.SIGTERM)
@@ -2472,15 +2473,11 @@ def test_the_sigterm_hook_chains_the_handler_that_was_already_installed() -> Non
         assert otel.shutdown_signalled(), "the demotion window did not open on SIGTERM"
     finally:
         signal.signal(signal.SIGTERM, installed)
-        otel._SIGTERM_HOOKED = False
 
 
 def test_the_sigterm_hook_is_installed_only_once() -> None:
     """Re-entering configure_tracing must not stack a second hook onto the first."""
-    import signal
-
     installed = signal.signal(signal.SIGTERM, signal.SIG_IGN)
-    otel._SIGTERM_HOOKED = False
     try:
         otel._install_sigterm_hook()
         first = signal.getsignal(signal.SIGTERM)
@@ -2488,7 +2485,134 @@ def test_the_sigterm_hook_is_installed_only_once() -> None:
         assert signal.getsignal(signal.SIGTERM) is first
     finally:
         signal.signal(signal.SIGTERM, installed)
-        otel._SIGTERM_HOOKED = False
+
+
+def test_the_sigterm_hook_goes_back_on_over_a_handler_that_replaced_it() -> None:
+    """A later install chains the handler that replaced the hook, as uvicorn's replaces it."""
+    calls: list[str] = []
+
+    def replacement(signum: int, frame: Any) -> None:
+        """Stand in for the handler `capture_signals` installs."""
+        calls.append("replacement")
+
+    installed = signal.signal(signal.SIGTERM, signal.SIG_IGN)
+    try:
+        otel._install_sigterm_hook()
+        signal.signal(signal.SIGTERM, replacement)
+        otel._install_sigterm_hook()
+        handler = signal.getsignal(signal.SIGTERM)
+        assert handler is not replacement, "the hook did not go back on"
+        assert callable(handler)
+
+        handler(signal.SIGTERM, None)
+
+        assert calls == ["replacement"]
+        assert otel.shutdown_signalled()
+    finally:
+        signal.signal(signal.SIGTERM, installed)
+
+
+def test_the_sigterm_hook_still_delegates_when_noting_the_signal_fails(monkeypatch: MonkeyPatch) -> None:
+    """uvicorn must receive the signal whatever happens in the hook."""
+    calls: list[str] = []
+
+    def previous(signum: int, frame: Any) -> None:
+        """Stand in for uvicorn's own SIGTERM handler."""
+        calls.append("previous")
+
+    def explode(source: str) -> None:
+        """Fail where the hook notes the signal."""
+        raise RuntimeError(source)
+
+    installed = signal.signal(signal.SIGTERM, previous)
+    try:
+        otel._install_sigterm_hook()
+        handler = signal.getsignal(signal.SIGTERM)
+        assert callable(handler)
+        monkeypatch.setattr(otel, "note_shutdown_signal", explode)
+
+        with pytest.raises(RuntimeError):
+            handler(signal.SIGTERM, None)
+
+        assert calls == ["previous"]
+    finally:
+        signal.signal(signal.SIGTERM, installed)
+
+
+_UVICORN_ORDER_SCRIPT = """
+import asyncio
+import logging
+import signal
+from contextlib import asynccontextmanager
+from types import SimpleNamespace
+
+from fastapi import FastAPI
+
+from webbpulse import otel
+from webbpulse.lambda_entry import run_uvicorn
+
+
+class Emit(logging.Handler):
+    def emit(self, record):
+        source = getattr(record, "shutdown_source", "")
+        print(f"{record.levelname}|{record.getMessage()}|{source}", flush=True)
+
+
+for name in ("webbpulse.otel", otel._OTLP_EXPORTER_LOGGER):
+    logger = logging.getLogger(name)
+    logger.addHandler(Emit())
+    logger.setLevel(logging.INFO)
+
+
+def fail_an_export():
+    otel._log_failed_export_response(SimpleNamespace(status_code=403, text="expired", headers={}))
+    logging.getLogger(otel._OTLP_EXPORTER_LOGGER).error("Failed to export spans batch")
+
+
+async def drive():
+    await asyncio.sleep(0.2)
+    fail_an_export()
+    signal.raise_signal(signal.SIGTERM)
+    fail_an_export()
+
+
+@asynccontextmanager
+async def lifespan(_app):
+    task = asyncio.create_task(drive())
+    yield
+    await task
+    print("APP_LIFESPAN_FINISHED", flush=True)
+
+
+otel.configure_tracing("order-test", endpoint="http://127.0.0.1:9/v1/traces")
+app = FastAPI(lifespan=lifespan)
+otel.instrument_fastapi(app, flush_per_request=False)
+run_uvicorn(app, host="127.0.0.1", port=0)
+"""
+
+
+def test_export_failures_after_sigterm_are_demoted_under_a_real_uvicorn() -> None:
+    """The entrypoint's real order: configure tracing, instrument, then `uvicorn.run`.
+
+    In a subprocess because uvicorn owns the process's signal handlers and the signal ends it.
+    The failures run on the event loop either side of the signal, with no tick in between, so
+    the second pair lands before uvicorn has started its lifespan shutdown.
+    """
+    env = {k: v for k, v in os.environ.items() if k not in {OTEL_DISABLED_ENV, "OTEL_SDK_DISABLED"}}
+    result = subprocess.run(
+        [sys.executable, "-c", _UVICORN_ORDER_SCRIPT],
+        capture_output=True,
+        text=True,
+        timeout=60,
+        env=env,
+        check=False,
+    )
+    lines = result.stdout.splitlines()
+    assert result.returncode == -signal.SIGTERM, result.stderr
+    failures = [line.split("|")[0] for line in lines if "rejected an export" in line or "Failed to export" in line]
+    assert failures == ["ERROR", "ERROR", "WARNING", "WARNING"], lines
+    assert "INFO|Shutdown signalled; demoting later span export failures.|sigterm" in lines, lines
+    assert lines[-1] == "APP_LIFESPAN_FINISHED", lines
 
 
 def test_an_export_failure_after_a_shutdown_signal_is_demoted(

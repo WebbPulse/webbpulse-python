@@ -5,6 +5,16 @@ Notable changes to the `webbpulse` package. The version here is the one in
 
 This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## 0.113.0
+
+### Fixed
+
+- Span export failures after `SIGTERM` now log at WARNING under uvicorn (PLAT-110). Every
+  entrypoint configures tracing before `uvicorn.run`, and uvicorn replaced the hook, so the
+  demotion window opened only at the ASGI lifespan shutdown, after the failures it exists to
+  demote. The lifespan wrapper now installs the hook again on top of uvicorn's handler, which
+  still runs, so graceful shutdown is unchanged. Failures on a healthy process stay at ERROR.
+
 ## 0.112.0
 
 ### Fixed
