@@ -20,8 +20,9 @@ already exported a span before the trace's outcome is known. `TailSamplingSpanPr
 buffers a trace in memory only until the trace is complete, and
 `_FlushTracingASGIMiddleware` then exports it synchronously, inside the invocation, before
 the final response body is sent, since sending it ends the invocation. The cost is the same
-as `SimpleSpanProcessor`'s, one blocking export per request rather than per span, and no
-span is ever owned by a thread the freeze can stop.
+as `SimpleSpanProcessor`'s, one blocking export per request rather than per span. The hold
+does not always keep an export ahead of the freeze, which the section on expired signatures
+covers.
 
 Two paths remain where a buffered trace would otherwise outlive the process. A trace whose
 spans are still open when the response returns stays buffered by design, and a background
@@ -42,6 +43,18 @@ signing key came from different resolutions, which X-Ray rejects with 403. So
 `TailSamplingSpanProcessor` serialises export, the exporter's `force_flush` and its
 `shutdown` behind one lock, and `_ReresolvingCredentials` pins one frozen snapshot per
 signature. See those classes for the detail.
+
+## Why an expired signature gets one more attempt
+
+The distro signs each attempt immediately before sending it, so a signature only goes stale
+when the thread stops between signing and the bytes leaving. The final body hold described
+above does not rule that out. Behind a `BaseHTTPMiddleware`, which `RequestIdMiddleware` is,
+the response body arrives with `more_body=True` and only the empty closing message is held, so
+the client already has the whole body while the export runs. The sandbox can freeze mid-export
+and thaw minutes later for shutdown, when X-Ray refuses the request with `Signature expired`.
+The exporter does not retry a 403, so `_PinnedCredentialSession` signs and sends that one
+rejection once more, inside the shutdown flush budget. Every other rejection is left to the
+exporter.
 
 ## When an export failure stops being a fault
 
@@ -917,6 +930,33 @@ class _RefreshingCredentialSession:
         return getattr(self._session, name)
 
 
+_EXPIRED_SIGNATURE_STATUS: Final = 403
+
+_EXPIRED_SIGNATURE_MESSAGE: Final = "Signature expired"
+
+
+def _is_expired_signature_rejection(response: Any) -> bool:
+    """Whether the endpoint refused a request only because its signature had gone stale."""
+    if getattr(response, "status_code", None) != _EXPIRED_SIGNATURE_STATUS:
+        return False
+    try:
+        return _EXPIRED_SIGNATURE_MESSAGE in (getattr(response, "text", "") or "")
+    except Exception:  # pragma: no cover
+        return False
+
+
+def _resend_timeout(timeout: Any) -> float:
+    """The caller's timeout, held inside the shutdown flush budget.
+
+    A resend usually runs as the sandbox shuts down, with the lifespan flush waiting behind
+    it, so it must not take longer than that flush is allowed to.
+    """
+    ceiling = resolve_shutdown_flush_timeout() / 1000
+    if isinstance(timeout, bool) or not isinstance(timeout, int | float):
+        return ceiling
+    return min(timeout, ceiling)
+
+
 class _PinnedCredentialSession:
     """A `requests` session that pins one credential snapshot per request.
 
@@ -924,6 +964,9 @@ class _PinnedCredentialSession:
     Entering `_ReresolvingCredentials.pinned` around that call is what makes all of those
     reads agree, so the access key id in `Credential=` always matches the secret the
     signature was derived from.
+
+    A request refused with `Signature expired` is signed and sent once more, from a new
+    snapshot, because the exporter would otherwise drop the batch.
     """
 
     def __init__(self, session: Any, credentials: _ReresolvingCredentials) -> None:
@@ -933,13 +976,26 @@ class _PinnedCredentialSession:
 
     def post(self, *args: Any, **kwargs: Any) -> Any:
         """POST with one credential snapshot held for the whole signature."""
-        with self._credentials.pinned():
-            return self._session.post(*args, **kwargs)
+        return self._send_signed(self._session.post, *args, **kwargs)
 
     def request(self, *args: Any, **kwargs: Any) -> Any:
         """Make a request with one credential snapshot held for the whole signature."""
+        return self._send_signed(self._session.request, *args, **kwargs)
+
+    def _send_signed(self, send: Any, *args: Any, **kwargs: Any) -> Any:
+        """Send once, and once more with a new signature if the first one expired in transit."""
         with self._credentials.pinned():
-            return self._session.request(*args, **kwargs)
+            response = send(*args, **kwargs)
+        if not _is_expired_signature_rejection(response):
+            return response
+
+        _log.info(
+            "Re-signing a span export whose signature expired before it was sent.",
+            extra={"otlp_response_body": response.text[:_RESPONSE_BODY_LIMIT]},
+        )
+        kwargs["timeout"] = _resend_timeout(kwargs.get("timeout"))
+        with self._credentials.pinned():
+            return send(*args, **kwargs)
 
     def __getattr__(self, name: str) -> Any:
         """Delegate everything else to the wrapped session."""

@@ -5,6 +5,16 @@ Notable changes to the `webbpulse` package. The version here is the one in
 
 This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## 0.112.0
+
+### Fixed
+
+- A span export frozen between signing and sending is signed and sent again when it thaws
+  (PLAT-109). X-Ray refused it with `403 Signature expired`, which the exporter does not retry,
+  so the batch was lost and a healthy sandbox logged two ERROR lines on its way out. Only that
+  rejection is resent, once, with a new signature and a timeout held inside the shutdown flush
+  budget, and it logs one INFO line. A second rejection and every other 403 still log as before.
+
 ## 0.111.0
 
 ### Added
