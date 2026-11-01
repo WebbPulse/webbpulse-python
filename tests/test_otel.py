@@ -2473,7 +2473,7 @@ def test_the_sigterm_hook_chains_the_handler_that_was_already_installed() -> Non
         assert otel.shutdown_signalled(), "the demotion window did not open on SIGTERM"
     finally:
         signal.signal(signal.SIGTERM, installed)
-    
+
 
 def test_the_sigterm_hook_is_installed_only_once() -> None:
     """Re-entering configure_tracing must not stack a second hook onto the first."""
@@ -2485,7 +2485,7 @@ def test_the_sigterm_hook_is_installed_only_once() -> None:
         assert signal.getsignal(signal.SIGTERM) is first
     finally:
         signal.signal(signal.SIGTERM, installed)
-    
+
 
 def test_the_sigterm_hook_goes_back_on_over_a_handler_that_replaced_it() -> None:
     """A later install chains the handler that replaced the hook, as uvicorn's replaces it."""
