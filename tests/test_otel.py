@@ -5,6 +5,7 @@ from __future__ import annotations
 import logging
 import threading
 import time
+from datetime import datetime, timedelta
 from typing import Any, ClassVar, cast
 
 import pytest
@@ -2805,3 +2806,164 @@ def test_the_processor_shutdown_reaches_the_exporter_only_once() -> None:
     processor.shutdown(300)
     assert shutdowns == ["shutdown"], "the repeat shutdown reached the exporter"
     assert flushes == ["flush"], "the repeat shutdown flushed again"
+
+
+_XRAY_ENDPOINT = "https://xray.us-west-2.amazonaws.com/v1/traces"
+
+_EXPIRED_BODY = "Signature expired: 20261101T073418Z is now earlier than 20261101T073432Z"
+
+
+class _EndpointResponse:
+    """The parts of a `requests` response the exporter and its wrappers read."""
+
+    def __init__(self, status_code: int, text: str = "") -> None:
+        """Build a response with the given status and body."""
+        self.status_code = status_code
+        self.ok = status_code < 400
+        self.reason = "OK" if self.ok else "Forbidden"
+        self.text = text
+        self.content = text.encode()
+        self.headers: dict[str, str] = {}
+
+
+def _endpoint_with_freezes(monkeypatch: MonkeyPatch, freezes: int) -> list[str]:
+    """Stand in for X-Ray, freezing the sandbox after signing on the first `freezes` sends.
+
+    Signing stays real and reads the fake clock. A freeze moves that clock six minutes between
+    the signature and the endpoint's check, and the endpoint applies the five minute limit to
+    the `X-Amz-Date` it receives. Returns the timestamp of every request that arrived.
+    """
+    import requests
+
+    clock = [datetime(2026, 11, 1, 7, 34, 18)]
+    arrived: list[str] = []
+
+    def fake_request(self: Any, method: Any = None, url: Any = None, *args: Any, **kwargs: Any) -> Any:
+        """Refuse a request whose signature is more than five minutes old on arrival."""
+        stamp = dict(kwargs.get("headers") or {})["X-Amz-Date"]
+        arrived.append(stamp)
+        if len(arrived) <= freezes:
+            clock[0] += timedelta(minutes=6)
+        age = clock[0] - datetime.strptime(stamp, "%Y%m%dT%H%M%SZ")
+        if age > timedelta(minutes=5):
+            return _EndpointResponse(403, _EXPIRED_BODY)
+        return _EndpointResponse(200)
+
+    monkeypatch.setattr("botocore.auth.get_current_datetime", lambda *_a, **_k: clock[0])
+    monkeypatch.setattr(requests.Session, "request", fake_request)
+    return arrived
+
+
+def test_a_signature_expired_by_a_freeze_is_signed_again_and_delivered(
+    monkeypatch: MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """The batch survives, with a new signature, and the healthy sandbox logs no ERROR."""
+    from opentelemetry.sdk.trace.export import SpanExportResult
+
+    _lambda_style_env(monkeypatch, "AKIAFIRST")
+    arrived = _endpoint_with_freezes(monkeypatch, freezes=1)
+    exporter = otel._build_span_exporter(_XRAY_ENDPOINT, 1000)
+
+    with caplog.at_level(logging.INFO):
+        result = exporter.export([])
+
+    assert result is SpanExportResult.SUCCESS
+    assert arrived == ["20261101T073418Z", "20261101T074018Z"]
+    assert not [r for r in caplog.records if r.levelno >= logging.ERROR]
+    assert [r for r in caplog.records if r.getMessage().startswith("Re-signing a span export")]
+
+
+def test_a_resend_that_also_expires_is_not_sent_a_third_time(
+    monkeypatch: MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """One resend is the limit, and a second rejection fails loudly as it always did."""
+    from opentelemetry.sdk.trace.export import SpanExportResult
+
+    _lambda_style_env(monkeypatch, "AKIAFIRST")
+    arrived = _endpoint_with_freezes(monkeypatch, freezes=2)
+    exporter = otel._build_span_exporter(_XRAY_ENDPOINT, 1000)
+
+    with caplog.at_level(logging.INFO):
+        result = exporter.export([])
+
+    assert result is SpanExportResult.FAILURE
+    assert len(arrived) == 2
+    rejected = [r for r in caplog.records if r.getMessage() == "The OTLP span endpoint rejected an export."]
+    assert [r.levelno for r in rejected] == [logging.ERROR]
+
+
+def test_any_other_403_is_not_sent_again(monkeypatch: MonkeyPatch, caplog: pytest.LogCaptureFixture) -> None:
+    """A permissions or clock problem keeps today's single attempt and ERROR line."""
+    import requests
+    from opentelemetry.sdk.trace.export import SpanExportResult
+
+    _lambda_style_env(monkeypatch, "AKIAFIRST")
+    sends: list[Any] = []
+
+    def fake_request(self: Any, method: Any = None, url: Any = None, *args: Any, **kwargs: Any) -> Any:
+        """Refuse every request for a reason that re-signing cannot fix."""
+        sends.append(method)
+        return _EndpointResponse(403, "AccessDeniedException: not authorized")
+
+    monkeypatch.setattr(requests.Session, "request", fake_request)
+    exporter = otel._build_span_exporter(_XRAY_ENDPOINT, 1000)
+
+    with caplog.at_level(logging.INFO):
+        result = exporter.export([])
+
+    assert result is SpanExportResult.FAILURE
+    assert len(sends) == 1
+    assert not [r for r in caplog.records if r.getMessage().startswith("Re-signing a span export")]
+    assert [r for r in caplog.records if r.levelno >= logging.ERROR]
+
+
+class _ScriptedSigningSession:
+    """A signing session that answers from a script and records each call's snapshot and timeout."""
+
+    def __init__(self, credentials: Any, responses: list[_EndpointResponse]) -> None:
+        """Hold the credentials to read and the responses to give, in order."""
+        self._credentials = credentials
+        self._responses = responses
+        self.timeouts: list[Any] = []
+        self.snapshots: list[Any] = []
+
+    def request(self, *args: Any, timeout: Any = None, **kwargs: Any) -> _EndpointResponse:
+        """Record the call and give the next scripted response."""
+        self.timeouts.append(timeout)
+        self.snapshots.append(self._credentials.get_frozen_credentials())
+        return self._responses.pop(0)
+
+    def post(self, *args: Any, timeout: Any = None, **kwargs: Any) -> _EndpointResponse:
+        """Answer exactly as `request` does."""
+        return self.request(*args, timeout=timeout, **kwargs)
+
+
+def _scripted_session() -> tuple[otel._PinnedCredentialSession, _ScriptedSigningSession]:
+    """A pinned session over a script of one expired rejection and then a success."""
+    credentials = otel._ReresolvingCredentials(_AlternatingCredentialSession())
+    inner = _ScriptedSigningSession(credentials, [_EndpointResponse(403, _EXPIRED_BODY), _EndpointResponse(200)])
+    return otel._PinnedCredentialSession(inner, credentials), inner
+
+
+def test_the_older_post_path_resends_with_its_own_snapshot() -> None:
+    """Exporter 1.44 sends through `post`, and each attempt pins its own credentials."""
+    session, inner = _scripted_session()
+
+    assert session.post(url="https://example.invalid", timeout=1).status_code == 200
+    assert len(inner.snapshots) == 2
+    assert all(_secret_for(s.access_key) == s.secret_key for s in inner.snapshots)
+
+
+@pytest.mark.parametrize(
+    ("timeout", "resent_with"),
+    [(5, 0.3), (0.1, 0.1), (None, 0.3), ((1, 5), 0.3)],
+)
+def test_the_resend_stays_inside_the_shutdown_flush_budget(
+    monkeypatch: MonkeyPatch, timeout: Any, resent_with: float
+) -> None:
+    """The lifespan flush waits behind a resend, so a resend cannot outlast that flush's budget."""
+    monkeypatch.delenv(otel.SHUTDOWN_FLUSH_TIMEOUT_ENV, raising=False)
+    session, inner = _scripted_session()
+
+    assert session.request("POST", "https://example.invalid", timeout=timeout).status_code == 200
+    assert inner.timeouts == [timeout, resent_with]
