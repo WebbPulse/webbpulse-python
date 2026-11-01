@@ -14,6 +14,14 @@ This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   affects; 0.22.0 pins the fixed 1.45.1. Adopters relock to pick it up and can then drop
   their `--ignore-vuln CVE-2026-114603`.
 
+### Fixed
+
+- `webbpulse.otel` follows the OTLP exporter's move to a transport in
+  `opentelemetry-exporter-otlp-proto-http` 1.45. The per-request credential pinning, the
+  positive timeout clamp and the rejected-response body log all wrap private attributes the
+  exporter no longer sends through, so without this they would stop working with no error.
+  They now wrap `_client._transport`, and still wrap the exporter itself on older releases.
+
 ## 0.107.0
 
 ### Added

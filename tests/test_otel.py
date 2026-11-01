@@ -1193,13 +1193,13 @@ def test_a_young_in_flight_trace_is_not_evicted_by_age() -> None:
 def test_the_exporter_is_given_the_export_deadline() -> None:
     """The flush timeout reaches the exporter's own timeout, with a one second floor."""
     exporter = otel._build_span_exporter("http://localhost:4318/v1/traces", 2000)
-    assert exporter._timeout == 2  # type: ignore[attr-defined]
+    assert exporter._client._timeout == 2  # type: ignore[attr-defined]
 
     signed = otel._build_span_exporter("https://xray.us-west-2.amazonaws.com/v1/traces", 3000)
-    assert signed._timeout == 3  # type: ignore[attr-defined]
+    assert signed._client._timeout == 3  # type: ignore[attr-defined]
 
     floored = otel._build_span_exporter("http://localhost:4318/v1/traces", 100)
-    assert floored._timeout == 1  # type: ignore[attr-defined]
+    assert floored._client._timeout == 1  # type: ignore[attr-defined]
 
 
 async def _noop_asgi_app(scope: Any, receive: Any, send: Any) -> None:
@@ -1504,7 +1504,7 @@ def _signing_probe(monkeypatch: MonkeyPatch, exporter: Any) -> tuple[Any, list[s
     import requests
 
     signed: list[str] = []
-    auth_session = exporter._session._session
+    auth_session = exporter._client._transport._session._session
 
     def fake_request(self: Any, method: Any = None, url: Any = None, *args: Any, **kwargs: Any) -> Any:
         """Record the access key id from the Authorization header and return a stub response."""
@@ -1636,7 +1636,7 @@ def test_both_halves_of_a_connect_read_timeout_are_clamped() -> None:
 
 def test_a_frozen_then_thawed_export_does_not_raise(monkeypatch: MonkeyPatch) -> None:
     """A clock jump past the exporter's deadline still yields a positive timeout and no raise."""
-    import opentelemetry.exporter.otlp.proto.http.trace_exporter as upstream
+    import opentelemetry.exporter.otlp.common.http as upstream
 
     exporter = otel._build_span_exporter("http://localhost:4318/v1/traces", 1000)
 
@@ -1647,7 +1647,7 @@ def test_a_frozen_then_thawed_export_does_not_raise(monkeypatch: MonkeyPatch) ->
 
         headers: ClassVar[dict[str, str]] = {}
 
-        def post(self, *args: Any, timeout: Any = None, **kwargs: Any) -> Any:
+        def request(self, *args: Any, timeout: Any = None, **kwargs: Any) -> Any:
             """Record the timeout and return a stub successful response."""
             seen.append(timeout)
 
@@ -1660,16 +1660,82 @@ def test_a_frozen_then_thawed_export_does_not_raise(monkeypatch: MonkeyPatch) ->
 
             return _Response()
 
-    guarded = cast("Any", exporter)._session
+    guarded = cast("Any", exporter)._client._transport._session
     assert isinstance(guarded, otel._PositiveTimeoutSession)
     guarded._session = _Transport()
 
-    monkeypatch.setattr(upstream, "time", lambda: time.time() + 3600)
+    class _JumpingClock:
+        """A clock that lands an hour further on every read, as a thawed sandbox sees it."""
+
+        now = time.time()
+
+        def time(self) -> float:
+            """Advance an hour and report it."""
+            self.now += 3600
+            return self.now
+
+    monkeypatch.setattr(upstream, "time", _JumpingClock())
 
     exporter.export([])
 
     assert seen, "the exporter never reached the session"
     assert all(value > 0 for value in seen), seen
+
+
+def test_the_signing_transport_pins_and_clamps_around_the_auth_session() -> None:
+    """The wrappers sit on the session the exporter really sends through, not on a stale one."""
+    from amazon.opentelemetry.distro.exporter.otlp.aws.common.aws_auth_session import AwsAuthSession
+
+    exporter = otel._build_span_exporter("https://xray.us-west-2.amazonaws.com/v1/traces", 1000)
+
+    guarded = cast("Any", exporter)._client._transport._session
+    assert isinstance(guarded, otel._PositiveTimeoutSession)
+    assert isinstance(guarded._session, otel._PinnedCredentialSession)
+    assert isinstance(guarded._session._session, AwsAuthSession)
+
+
+def test_a_session_on_the_exporter_itself_is_still_wrapped() -> None:
+    """An older exporter with no transport keeps its session on the exporter, and that is wrapped."""
+
+    class _OlderExporter:
+        """An exporter from before the upstream transport split."""
+
+        _session = object()
+
+    exporter = _OlderExporter()
+    otel._guard_export_timeouts(exporter)
+
+    assert isinstance(exporter._session, otel._PositiveTimeoutSession)
+
+
+def test_a_rejected_response_from_the_real_transport_logs_its_body(caplog: pytest.LogCaptureFixture) -> None:
+    """A real exporter's transport result carries the response, and its body reaches the log."""
+    exporter = otel._build_span_exporter("http://localhost:4318/v1/traces", 1000)
+
+    class _Rejected:
+        """A rejected HTTP response."""
+
+        ok = False
+        status_code = 403
+        reason = "Forbidden"
+        text = "explicit deny"
+        headers: ClassVar[dict[str, str]] = {}
+
+    class _Session:
+        """A requests session stand-in that always answers with the rejection."""
+
+        def request(self, *args: Any, **kwargs: Any) -> Any:
+            """Answer the way the endpoint does when it refuses the batch."""
+            return _Rejected()
+
+    cast("Any", exporter)._client._transport._session = _Session()
+
+    with caplog.at_level(logging.WARNING, logger="webbpulse.otel"):
+        exporter.export([])
+
+    records = [r for r in caplog.records if "rejected an export" in r.message]
+    assert len(records) == 1
+    assert records[0].otlp_response_body == "explicit deny"  # type: ignore[attr-defined]
 
 
 def test_a_thawed_sandbox_does_not_log_an_error(caplog: pytest.LogCaptureFixture) -> None:
