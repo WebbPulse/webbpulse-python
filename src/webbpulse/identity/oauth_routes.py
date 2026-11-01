@@ -20,6 +20,7 @@ if TYPE_CHECKING:  # pragma: no cover
     from webbpulse.identity.settings import IdentitySettings
 
 __all__ = [
+    "OAUTH_APPLE_NOTIFICATIONS_PATH",
     "OAUTH_CALLBACK_PATH",
     "OAUTH_LINKS_PATH",
     "OAUTH_LINK_PATH",
@@ -37,6 +38,7 @@ OAUTH_CALLBACK_PATH: Final = "/oauth/callback"
 OAUTH_LINK_PATH: Final = "/oauth/{provider}/link"
 OAUTH_LINKS_PATH: Final = "/oauth/links"
 OAUTH_PROVIDERS_PATH: Final = "/oauth/providers"
+OAUTH_APPLE_NOTIFICATIONS_PATH: Final = "/oauth/apple/notifications"
 
 OAUTH_PROVIDERS_CACHE_CONTROL: Final = "public, max-age=300"
 
@@ -44,6 +46,8 @@ OAUTH_START_IP_LIMIT: Final = (20, 900)
 
 OAUTH_FORM_POST_MAX_BYTES: Final = 64 * 1024
 OAUTH_FORM_POST_MAX_FIELDS: Final = 8
+
+OAUTH_NOTIFICATION_IP_LIMIT: Final = (600, 60)
 
 _FastAPIRequest: Any = None
 
@@ -126,14 +130,15 @@ def register_oauth_routes(
 
     Reusing those closures keeps the cookie attributes and refusal shape identical to the
     password path. Mounted only when at least one provider has a client id, and the form
-    post callback only when an enabled provider answers that way, so a deployment without
-    one gains no route its gateway would have to carry.
+    post callback and Apple's notifications route only with Apple enabled, so a deployment
+    without it gains no route its gateway would have to carry.
     """
     from fastapi import Body
     from fastapi.responses import JSONResponse, RedirectResponse
 
     from webbpulse.identity.flows import LoginRejected, MfaChallengeRequired
     from webbpulse.identity.oauth import (
+        APPLE_PROVIDER,
         OAUTH_LINK_BINDING_COOKIE,
         OAUTH_STATE_TTL_SECONDS,
         OAuthRejected,
@@ -393,6 +398,29 @@ def register_oauth_routes(
 
         _ = oauth_form_post_callback
 
+    if APPLE_PROVIDER in oauth.enabled_providers():
+
+        @router.post(
+            f"{prefix}{OAUTH_APPLE_NOTIFICATIONS_PATH}",
+            dependencies=limits(("oauth-apple-notifications", OAUTH_NOTIFICATION_IP_LIMIT, "ip")),
+        )
+        async def oauth_apple_notifications(request: _FastAPIRequest) -> Any:
+            """Take one of Apple's account notifications, whose signature is its authentication.
+
+            Answers 200 once verified, whether or not the event meant anything here, 400 when
+            it cannot be verified, and 503 when it should be delivered again.
+            """
+            from webbpulse.identity.router import run_sync
+
+            payload = _notification_payload(await request.body())
+            try:
+                await run_sync(lambda: oauth.handle_apple_notification(payload, end_sessions=flows.logout_all))
+            except OAuthRejected as exc:
+                return oauth_refused(request, exc)
+            return JSONResponse({"received": True})
+
+        _ = oauth_apple_notifications
+
     @router.post(f"{prefix}{OAUTH_LINK_PATH}")
     async def oauth_link(
         request: _FastAPIRequest, provider: str, payload: dict[str, Any] = Body(default={})
@@ -516,6 +544,24 @@ def _callback_form(body: bytes) -> dict[str, str]:
         return {}
 
 
+def _notification_payload(body: bytes) -> str:
+    """The signed `payload` from a notification body, empty when there is none to read.
+
+    Apple's sample is a JSON object. Its delivery encoding is not otherwise documented, so a
+    form-encoded `payload` is read too.
+    """
+    import json
+
+    if len(body) > OAUTH_FORM_POST_MAX_BYTES:
+        return ""
+    try:
+        parsed = json.loads(body)
+    except ValueError:
+        return _callback_form(body).get("payload", "")
+    payload = parsed.get("payload") if isinstance(parsed, dict) else None
+    return payload if isinstance(payload, str) else ""
+
+
 def _with_flag(target: str, key: str, value: str = "1") -> str:
     """Append a query parameter to a frontend URL that may already have some."""
     from urllib.parse import quote
@@ -555,6 +601,11 @@ OAUTH_ROUTE_RESPONSES: Final[dict[tuple[str, str], dict[int, str]]] = {
     ("POST", OAUTH_CALLBACK_PATH): {
         303: "The browser is redirected to the GET callback on this origin",
         429: "Too many form posts from this address",
+    },
+    ("POST", OAUTH_APPLE_NOTIFICATIONS_PATH): {
+        400: "The notification's signature, issuer, audience or events could not be verified",
+        429: "Too many notifications from this address",
+        503: "Apple's signing keys or the handling of the event failed, so it may be delivered again",
     },
     ("POST", OAUTH_LINK_PATH): {
         400: "The provider is unknown",

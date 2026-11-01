@@ -12,6 +12,7 @@ from urllib.parse import urlencode
 import pytest
 
 from webbpulse.identity import (
+    OAUTH_APPLE_NOTIFICATIONS_PATH,
     OAUTH_LINK_USER_INDEX,
     OAUTH_LINKS_TABLE,
     OAUTH_STATE_TTL_SECONDS,
@@ -38,6 +39,9 @@ from webbpulse.identity import (
     OAuthService,
     OAuthStateRecord,
     PasskeyRecord,
+    ProviderAccountEvent,
+    ProviderTokens,
+    RefreshTokenRecord,
     TokenService,
     build_identity_router,
     identity_prefix,
@@ -164,6 +168,10 @@ class FakeProvider:
         self.github_emails_status = 200
         self.nonce_to_echo = ""
         self.apple_claims: dict[str, Any] = {}
+        self.apple_refresh_token = ""
+        self.apple_revoke_status = 200
+        self.apple_revocations: list[dict[str, str]] = []
+        self.jwks_status = 200
 
     def jwks(self) -> dict[str, Any]:
         """The JWKS document serving this fake's public signing key."""
@@ -237,10 +245,19 @@ class FakeProvider:
         url = str(request.url)
 
         if url in (PROVIDERS[GOOGLE_PROVIDER].jwks_url, PROVIDERS[APPLE_PROVIDER].jwks_url):
-            return httpx.Response(200, json=self.jwks())
+            return httpx.Response(self.jwks_status, json=self.jwks())
 
         if url == PROVIDERS[APPLE_PROVIDER].token_url:
-            return httpx.Response(200, json={"access_token": "apple-access", "id_token": self.apple_id_token()})
+            body = {"access_token": "apple-access", "id_token": self.apple_id_token()}
+            if self.apple_refresh_token:
+                body["refresh_token"] = self.apple_refresh_token
+            return httpx.Response(200, json=body)
+
+        if url == PROVIDERS[APPLE_PROVIDER].revoke_url:
+            from urllib.parse import parse_qsl
+
+            self.apple_revocations.append(dict(parse_qsl(request.content.decode())))
+            return httpx.Response(self.apple_revoke_status, json={"error": "invalid_client"})
 
         if url == PROVIDERS[GOOGLE_PROVIDER].token_url:
             if self.token_error:
@@ -1101,7 +1118,7 @@ def test_list_links_returns_only_this_users_links(
 
 
 def test_no_provider_tokens_are_stored(oauth: OAuthService, provider: FakeProvider, hooks: FakeHooks) -> None:
-    """This design consumes a provider as an identity source and never calls its API."""
+    """Google and GitHub stay identity sources, so only Apple's revocable token is ever kept."""
     import dataclasses
 
     user = hooks.add(EMAIL, email_verified=True)
@@ -1112,7 +1129,8 @@ def test_no_provider_tokens_are_stored(oauth: OAuthService, provider: FakeProvid
     assert "google-access" not in values
     assert "gho_test" not in values
     fields = {field.name for field in dataclasses.fields(record)}
-    assert not {"access_token", "refresh_token", "provider_token"} & fields
+    assert not {"access_token", "refresh_token"} & fields
+    assert record.provider_token is None
 
 
 def test_unlink_refuses_to_remove_the_only_sign_in_method(
@@ -2747,3 +2765,741 @@ def test_the_profile_name_round_trips_through_dynamodb(oauth_tables: dict[str, A
     spent = states.consume("apple-state")
     assert spent is not None
     assert spent.profile_name == "Ada Lovelace"
+
+
+APPLE_TOKEN_MASTER_KEY = base64.b64encode(bytes(range(32))).decode()
+APPLE_USER_ID = "user-apple"
+APPLE_LINK_KEY = provider_account_key(APPLE_PROVIDER, APPLE_SUB)
+APPLE_REFRESH_TOKEN = "apple-refresh-token"
+NOTIFICATIONS_PATH = f"{identity_prefix(make_settings())}{OAUTH_APPLE_NOTIFICATIONS_PATH}"
+
+
+def _sealing_settings(**overrides: Any) -> dict[str, Any]:
+    """Apple's settings plus a master key, so a provider token can be sealed."""
+    return _apple_settings(totp_cipher="secret", totp_master_key=APPLE_TOKEN_MASTER_KEY, **overrides)
+
+
+@pytest.fixture
+def sealing_client(
+    hooks: FakeHooks,
+    link_stores: IdentityStores,
+    kms: FakeKms,
+    provider: FakeProvider,
+    apple_key: ec.EllipticCurvePrivateKey,
+    monkeypatch: pytest.MonkeyPatch,
+) -> Any:
+    """An HTTPS `TestClient` for a product with Apple configured and a key to seal tokens with."""
+    import webbpulse.identity.oauth as oauth_module
+
+    fake_http = provider.client()
+    monkeypatch.setattr(oauth_module, "HttpxClient", lambda: fake_http)
+    app = FastAPI()
+    app.include_router(
+        _providers_router(
+            hooks, link_stores, kms, secrets={APPLE_PROVIDER: _apple_pem(apple_key)}, **_sealing_settings()
+        )
+    )
+    return TestClient(app, base_url="https://testserver", follow_redirects=False)
+
+
+def _provider_tokens(
+    stores: IdentityStores, provider: FakeProvider, apple_key: ec.EllipticCurvePrivateKey, **http: Any
+) -> ProviderTokens:
+    """A `ProviderTokens` over the stores, sealing with the master key and calling the fake."""
+    return ProviderTokens(
+        make_settings(**_sealing_settings()),
+        links=stores.require_oauth_links(),
+        client_secrets={APPLE_PROVIDER: _apple_pem(apple_key)},
+        http_client=http.get("client") or provider.client(),
+    )
+
+
+def _apple_identity(token: str = APPLE_REFRESH_TOKEN) -> OAuthIdentity:
+    """An Apple identity carrying a refresh token."""
+    return OAuthIdentity(
+        provider=APPLE_PROVIDER,
+        subject=APPLE_SUB,
+        email=APPLE_RELAY_EMAIL,
+        email_verified=True,
+        provider_refresh_token=token,
+    )
+
+
+def _seed_apple_link(stores: IdentityStores, **overrides: Any) -> Any:
+    """Write the Apple link the notifications act on, and return it."""
+    from webbpulse.identity.oauth import OAuthLinkRecord
+
+    fields: dict[str, Any] = {
+        "provider_subject": APPLE_LINK_KEY,
+        "provider": APPLE_PROVIDER,
+        "subject": APPLE_SUB,
+        "user_id": APPLE_USER_ID,
+        "linked_at": "2026-01-01T00:00:00Z",
+        "provider_email": APPLE_RELAY_EMAIL,
+        "provider_email_verified": True,
+        "last_login_at": "2026-01-01T00:00:00Z",
+    }
+    fields.update(overrides)
+    record = OAuthLinkRecord(**fields)
+    stores.require_oauth_links().put(record)
+    return record
+
+
+def _apple_notification(
+    provider: FakeProvider,
+    event_type: str,
+    *,
+    events: dict[str, Any] | None = None,
+    raw_events: Any = None,
+    **claims: Any,
+) -> str:
+    """A genuinely signed notification, with per-test changes to its claims and events."""
+    import jwt
+
+    now = int(time.time())
+    body: dict[str, Any] = {
+        "iss": APPLE_ISSUER,
+        "aud": APPLE_CLIENT_ID,
+        "iat": now,
+        "jti": "notification-1",
+        "events": {"type": event_type, "sub": APPLE_SUB, "event_time": now, **(events or {})},
+    }
+    body.update(claims)
+    if raw_events is not None:
+        body["events"] = raw_events
+    return jwt.encode(body, provider.key, algorithm="RS256", headers={"kid": "test-key"})
+
+
+def _post_notification(client: Any, payload: str) -> Any:
+    """POST a notification the way Apple's sample shows it, as a JSON object."""
+    return client.post(NOTIFICATIONS_PATH, json={"payload": payload})
+
+
+def _seed_refresh_token(stores: IdentityStores) -> str:
+    """Give the Apple user a live session, returning its token hash."""
+    stores.require_refresh_tokens().put(
+        RefreshTokenRecord(
+            token_hash="apple-session",
+            family_id="apple-family",
+            user_id=APPLE_USER_ID,
+            generation=0,
+            created_at="2026-01-01T00:00:00Z",
+            expires_at=int(time.time()) + 3600,
+        )
+    )
+    return "apple-session"
+
+
+def _session_revoked(stores: IdentityStores, token_hash: str) -> bool:
+    """Whether a seeded session has been revoked."""
+    record = stores.require_refresh_tokens().get(token_hash)
+    assert record is not None
+    return record.revoked
+
+
+def _notification_routes(router: Any) -> list[str]:
+    """The paths mounted for Apple's notifications."""
+    return [route.path for route in router.routes if route.path.endswith(OAUTH_APPLE_NOTIFICATIONS_PATH)]
+
+
+def test_a_deployment_without_apple_mounts_no_notification_route(
+    hooks: FakeHooks, stores: IdentityStores, kms: FakeKms
+) -> None:
+    """Every other product keeps exactly the routes its gateway already carries."""
+    secrets = {GOOGLE_PROVIDER: GOOGLE_SECRET, GITHUB_PROVIDER: GITHUB_SECRET}
+    assert _notification_routes(_providers_router(hooks, stores, kms, secrets=secrets)) == []
+
+
+def test_an_apple_client_id_without_the_key_still_mounts_the_notification_route(
+    hooks: FakeHooks, stores: IdentityStores, kms: FakeKms
+) -> None:
+    """Verifying needs only Apple's public keys, so a missing `.p8` does not lose an event."""
+    secrets = {GOOGLE_PROVIDER: GOOGLE_SECRET}
+    router = _providers_router(hooks, stores, kms, secrets=secrets, apple_client_id=APPLE_CLIENT_ID)
+    assert _notification_routes(router) == [NOTIFICATIONS_PATH]
+
+
+def test_a_configured_apple_mounts_the_notification_route(
+    hooks: FakeHooks, stores: IdentityStores, kms: FakeKms, apple_key: ec.EllipticCurvePrivateKey
+) -> None:
+    """A complete configuration adds the route under the identity prefix."""
+    secrets = {APPLE_PROVIDER: _apple_pem(apple_key)}
+    router = _providers_router(hooks, stores, kms, secrets=secrets, **_apple_settings())
+    assert _notification_routes(router) == [NOTIFICATIONS_PATH]
+
+
+def test_a_notification_signed_with_another_key_is_refused(
+    sealing_client: Any, provider: FakeProvider, link_stores: IdentityStores
+) -> None:
+    """A valid shape under the published `kid` is worth nothing without Apple's signature."""
+    import jwt
+
+    record = _seed_apple_link(link_stores)
+    now = int(time.time())
+    forged = jwt.encode(
+        {
+            "iss": APPLE_ISSUER,
+            "aud": APPLE_CLIENT_ID,
+            "iat": now,
+            "events": {"type": "account-deleted", "sub": APPLE_SUB, "event_time": now},
+        },
+        rsa.generate_private_key(public_exponent=65537, key_size=2048),
+        algorithm="RS256",
+        headers={"kid": "test-key"},
+    )
+    response = _post_notification(sealing_client, forged)
+    assert response.status_code == 400
+    assert "OAUTH_NOTIFICATION_INVALID" in response.text
+    assert link_stores.require_oauth_links().get(APPLE_LINK_KEY) == record
+
+
+def test_a_symmetric_notification_is_refused_without_a_key_fetch(sealing_client: Any, provider: FakeProvider) -> None:
+    """RS256 is pinned, so an attacker's choice of algorithm never reaches verification."""
+    import jwt
+
+    forged = jwt.encode(
+        {"iss": APPLE_ISSUER, "aud": APPLE_CLIENT_ID, "iat": int(time.time()), "events": {}},
+        "a-shared-secret-long-enough-to-pass-the-minimum-key-length-check",
+        algorithm="HS256",
+        headers={"kid": "test-key"},
+    )
+    assert _post_notification(sealing_client, forged).status_code == 400
+    assert provider.requests == []
+
+
+@pytest.mark.parametrize(
+    "claims",
+    [
+        {"iss": "https://appleid.example.com"},
+        {"aud": "com.example.other"},
+        {"exp": 1000},
+    ],
+)
+def test_a_notification_with_bad_claims_is_refused(
+    claims: dict[str, Any], sealing_client: Any, provider: FakeProvider, link_stores: IdentityStores
+) -> None:
+    """The issuer and audience are checked, and an `exp`, when one is sent, is honoured."""
+    record = _seed_apple_link(link_stores)
+    response = _post_notification(sealing_client, _apple_notification(provider, "account-deleted", **claims))
+    assert response.status_code == 400
+    assert link_stores.require_oauth_links().get(APPLE_LINK_KEY) == record
+
+
+def test_an_unpublished_kid_is_refused(sealing_client: Any, provider: FakeProvider) -> None:
+    """A signature under a key Apple does not publish cannot be checked, so it fails."""
+    import jwt
+
+    forged = jwt.encode(
+        {"iss": APPLE_ISSUER, "aud": APPLE_CLIENT_ID, "iat": int(time.time()), "events": {}},
+        provider.key,
+        algorithm="RS256",
+        headers={"kid": "another-key"},
+    )
+    assert _post_notification(sealing_client, forged).status_code == 400
+
+
+@pytest.mark.parametrize("body", [b"", b"not a jws", b'{"payload": 5}', b'["payload"]', b"x" * 100_000])
+def test_a_body_without_a_payload_is_refused(body: bytes, sealing_client: Any, provider: FakeProvider) -> None:
+    """Junk ends at the header check, and costs no fetch of Apple's keys."""
+    response = sealing_client.post(NOTIFICATIONS_PATH, content=body)
+    assert response.status_code == 400
+    assert provider.requests == []
+
+
+def test_an_outage_at_apple_invites_a_redelivery(
+    sealing_client: Any, provider: FakeProvider, link_stores: IdentityStores
+) -> None:
+    """A JWKS failure says nothing about the notification, so it answers 503 rather than 400."""
+    record = _seed_apple_link(link_stores)
+    provider.jwks_status = 500
+    response = _post_notification(sealing_client, _apple_notification(provider, "account-deleted"))
+    assert response.status_code == 503
+    assert "OAUTH_NOTIFICATION_FAILED" in response.text
+    assert link_stores.require_oauth_links().get(APPLE_LINK_KEY) == record
+
+
+def test_the_audience_allow_list_replaces_the_client_id(
+    hooks: FakeHooks,
+    link_stores: IdentityStores,
+    kms: FakeKms,
+    provider: FakeProvider,
+    apple_key: ec.EllipticCurvePrivateKey,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Notifications registered on another App ID verify once that App ID is listed."""
+    import webbpulse.identity.oauth as oauth_module
+
+    fake_http = provider.client()
+    monkeypatch.setattr(oauth_module, "HttpxClient", lambda: fake_http)
+    router = _providers_router(
+        hooks,
+        link_stores,
+        kms,
+        secrets={APPLE_PROVIDER: _apple_pem(apple_key)},
+        **_sealing_settings(apple_notification_audiences=["com.example.app"]),
+    )
+    client = _providers_client(router)
+    allowed = _apple_notification(provider, "email-enabled", aud="com.example.app")
+    assert _post_notification(client, allowed).status_code == 200
+    assert _post_notification(client, _apple_notification(provider, "email-enabled")).status_code == 200
+    stranger = _apple_notification(provider, "email-enabled", aud="com.example.other")
+    assert _post_notification(client, stranger).status_code == 400
+
+
+def test_email_disabled_and_enabled_flip_the_flag_on_the_link(
+    sealing_client: Any, provider: FakeProvider, link_stores: IdentityStores
+) -> None:
+    """Both keep the link and the session, and take the address Apple sent."""
+    _seed_apple_link(link_stores)
+    session = _seed_refresh_token(link_stores)
+    links = link_stores.require_oauth_links()
+
+    disabled = _apple_notification(
+        provider, "email-disabled", events={"email": "New@PrivateRelay.AppleID.com", "is_private_email": "true"}
+    )
+    assert _post_notification(sealing_client, disabled).json() == {"received": True}
+    record = links.get(APPLE_LINK_KEY)
+    assert record is not None
+    assert record.provider_email_disabled is True
+    assert record.provider_email == "new@privaterelay.appleid.com"
+
+    assert _post_notification(sealing_client, _apple_notification(provider, "email-enabled")).status_code == 200
+    record = links.get(APPLE_LINK_KEY)
+    assert record is not None
+    assert record.provider_email_disabled is False
+    assert record.provider_email == "new@privaterelay.appleid.com"
+    assert _session_revoked(link_stores, session) is False
+
+
+def test_consent_revoked_ends_sessions_and_drops_the_token_but_keeps_the_link(
+    sealing_client: Any, provider: FakeProvider, link_stores: IdentityStores
+) -> None:
+    """A returning user lands on the same account, and Apple has already killed the token."""
+    from webbpulse.identity import PROVIDER_TOKEN_PURPOSE
+    from webbpulse.identity.crypto import SecretMasterKeyCipher
+
+    sealed = SecretMasterKeyCipher(base64.b64decode(APPLE_TOKEN_MASTER_KEY)).seal(
+        APPLE_REFRESH_TOKEN.encode(), user_id=APPLE_USER_ID, purpose=PROVIDER_TOKEN_PURPOSE
+    )
+    _seed_apple_link(link_stores, provider_token=sealed)
+    session = _seed_refresh_token(link_stores)
+
+    assert _post_notification(sealing_client, _apple_notification(provider, "consent-revoked")).status_code == 200
+
+    record = link_stores.require_oauth_links().get(APPLE_LINK_KEY)
+    assert record is not None
+    assert record.provider_token is None
+    assert _session_revoked(link_stores, session) is True
+    assert provider.apple_revocations == []
+
+
+def test_account_deleted_ends_sessions_and_removes_the_link_but_not_the_user(
+    sealing_client: Any, provider: FakeProvider, link_stores: IdentityStores, hooks: FakeHooks
+) -> None:
+    """Deleting the local account is the product's call, through the hook."""
+    hooks.add(APPLE_RELAY_EMAIL, user_id=APPLE_USER_ID)
+    _seed_apple_link(link_stores)
+    session = _seed_refresh_token(link_stores)
+
+    assert _post_notification(sealing_client, _apple_notification(provider, "account-deleted")).status_code == 200
+
+    assert link_stores.require_oauth_links().get(APPLE_LINK_KEY) is None
+    assert _session_revoked(link_stores, session) is True
+    assert APPLE_USER_ID in hooks.users
+
+
+def test_a_redelivered_deletion_is_harmless(
+    sealing_client: Any, provider: FakeProvider, link_stores: IdentityStores
+) -> None:
+    """The second delivery finds no link and still answers 200."""
+    _seed_apple_link(link_stores)
+    payload = _apple_notification(provider, "account-deleted")
+    assert _post_notification(sealing_client, payload).status_code == 200
+    assert _post_notification(sealing_client, payload).status_code == 200
+
+
+def test_a_failed_session_revocation_keeps_the_link_for_the_redelivery(
+    hooks: FakeHooks, link_stores: IdentityStores, provider: FakeProvider, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Sessions end first, so a failure there leaves something for the next delivery to find."""
+    from webbpulse.identity import AppleNotifications
+
+    record = _seed_apple_link(link_stores)
+
+    def fail(user_id: str) -> None:
+        """Stand in for a session store that is down."""
+        raise RuntimeError("secret detail")
+
+    notifications = AppleNotifications(
+        make_settings(**_apple_settings()),
+        hooks,
+        links=link_stores.require_oauth_links(),
+        http_client=provider.client(),
+        other_sign_in=lambda user_id, *, removing: False,
+    )
+    with pytest.raises(OAuthRejected) as excinfo:
+        notifications.handle(_apple_notification(provider, "account-deleted"), end_sessions=fail)
+    assert excinfo.value.status_code == 503
+    assert link_stores.require_oauth_links().get(APPLE_LINK_KEY) == record
+    assert "secret detail" not in caplog.text
+
+
+@pytest.mark.parametrize("event_type", ["consent-revoked", "account-deleted"])
+def test_an_ending_event_older_than_the_last_sign_in_is_ignored(
+    event_type: str, sealing_client: Any, provider: FakeProvider, link_stores: IdentityStores
+) -> None:
+    """It describes an authorization the user has since granted again."""
+    record = _seed_apple_link(link_stores, last_login_at="2026-06-01T00:00:00+00:00")
+    session = _seed_refresh_token(link_stores)
+    payload = _apple_notification(provider, event_type, events={"event_time": 1_000_000})
+    assert _post_notification(sealing_client, payload).status_code == 200
+    assert link_stores.require_oauth_links().get(APPLE_LINK_KEY) == record
+    assert _session_revoked(link_stores, session) is False
+
+
+def test_an_event_time_in_milliseconds_reads_as_seconds(
+    sealing_client: Any, provider: FakeProvider, link_stores: IdentityStores
+) -> None:
+    """Apple's sample uses seconds, and a millisecond stamp must not look like the far future."""
+    _seed_apple_link(link_stores, last_login_at="2099-01-01T00:00:00+00:00")
+    stale = _apple_notification(provider, "account-deleted", events={"event_time": int(time.time() * 1000)})
+    assert _post_notification(sealing_client, stale).status_code == 200
+    assert link_stores.require_oauth_links().get(APPLE_LINK_KEY) is not None
+
+
+def test_events_arrive_as_an_object_or_a_json_string(
+    sealing_client: Any, provider: FakeProvider, link_stores: IdentityStores
+) -> None:
+    """Apple documents an object, and integrators report an encoded string, so both work."""
+    _seed_apple_link(link_stores)
+    now = int(time.time())
+    encoded = json.dumps({"type": "account-deleted", "sub": APPLE_SUB, "event_time": now})
+    payload = _apple_notification(provider, "ignored", raw_events=encoded)
+    assert _post_notification(sealing_client, payload).status_code == 200
+    assert link_stores.require_oauth_links().get(APPLE_LINK_KEY) is None
+
+
+@pytest.mark.parametrize("events", ["not json", 5, {"sub": APPLE_SUB}, {"type": "email-enabled"}])
+def test_unreadable_events_are_refused(events: Any, sealing_client: Any, provider: FakeProvider) -> None:
+    """A verified token without a type and a subject still gives nothing to act on."""
+    payload = _apple_notification(provider, "ignored", raw_events=events)
+    assert _post_notification(sealing_client, payload).status_code == 400
+
+
+def test_a_form_encoded_payload_is_read_too(
+    sealing_client: Any, provider: FakeProvider, link_stores: IdentityStores
+) -> None:
+    """Apple's delivery encoding is not fully documented, so the form spelling also works."""
+    _seed_apple_link(link_stores)
+    response = sealing_client.post(
+        NOTIFICATIONS_PATH,
+        content=urlencode({"payload": _apple_notification(provider, "account-deleted")}),
+        headers={"content-type": "application/x-www-form-urlencoded"},
+    )
+    assert response.status_code == 200
+    assert link_stores.require_oauth_links().get(APPLE_LINK_KEY) is None
+
+
+def test_an_unknown_event_or_subject_is_acknowledged_and_changes_nothing(
+    sealing_client: Any, provider: FakeProvider, link_stores: IdentityStores
+) -> None:
+    """Apple gets its 200, so it has no reason to keep delivering either."""
+    record = _seed_apple_link(link_stores)
+    unknown_type = _apple_notification(provider, "brand-new-event")
+    unknown_subject = _apple_notification(provider, "account-deleted", events={"sub": "000000.someone.else"})
+    assert _post_notification(sealing_client, unknown_type).status_code == 200
+    assert _post_notification(sealing_client, unknown_subject).status_code == 200
+    assert link_stores.require_oauth_links().get(APPLE_LINK_KEY) == record
+
+
+def test_the_hook_sees_the_event_and_can_take_over(
+    sealing_client: Any,
+    provider: FakeProvider,
+    link_stores: IdentityStores,
+    hooks: FakeHooks,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Returning `True` skips the default, which is how a product deletes the account instead."""
+    seen: list[ProviderAccountEvent] = []
+
+    def take_over(event: ProviderAccountEvent) -> bool:
+        """Record the event and claim it."""
+        seen.append(event)
+        return True
+
+    monkeypatch.setattr(hooks, "on_provider_account_event", take_over)
+    record = _seed_apple_link(link_stores)
+    session = _seed_refresh_token(link_stores)
+    payload = _apple_notification(
+        provider, "account-deleted", events={"email": APPLE_RELAY_EMAIL, "is_private_email": "true"}
+    )
+
+    assert _post_notification(sealing_client, payload).status_code == 200
+
+    assert link_stores.require_oauth_links().get(APPLE_LINK_KEY) == record
+    assert _session_revoked(link_stores, session) is False
+    event = seen[0]
+    assert (event.provider, event.event_type, event.user_id) == (APPLE_PROVIDER, "account-deleted", APPLE_USER_ID)
+    assert (event.subject, event.email) == (APPLE_SUB, APPLE_RELAY_EMAIL)
+    assert event.is_private_email is True
+    assert event.jwt_id == "notification-1"
+    assert event.event_time > 0
+    assert event.has_other_sign_in is False
+    assert APPLE_SUB not in repr(event)
+    assert APPLE_RELAY_EMAIL not in repr(event)
+
+
+def test_the_hook_is_told_about_another_way_in(
+    sealing_client: Any,
+    provider: FakeProvider,
+    link_stores: IdentityStores,
+    hooks: FakeHooks,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The last-way-in check is what lets a product decide whether to delete the account."""
+    seen: list[ProviderAccountEvent] = []
+
+    def record_event(event: ProviderAccountEvent) -> None:
+        """Record the event and let the default run."""
+        seen.append(event)
+
+    monkeypatch.setattr(hooks, "on_provider_account_event", record_event)
+    _seed_apple_link(link_stores)
+    link_stores.require_credentials().put(
+        CredentialRecord(user_id=APPLE_USER_ID, credential_type=PASSWORD_CREDENTIAL_TYPE, secret="hashed")
+    )
+
+    assert _post_notification(sealing_client, _apple_notification(provider, "account-deleted")).status_code == 200
+
+    assert seen[0].has_other_sign_in is True
+    assert link_stores.require_oauth_links().get(APPLE_LINK_KEY) is None
+
+
+def test_a_raising_hook_answers_503_and_applies_nothing(
+    sealing_client: Any,
+    provider: FakeProvider,
+    link_stores: IdentityStores,
+    hooks: FakeHooks,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A redelivery gets another chance at the product's policy."""
+
+    def explode(event: ProviderAccountEvent) -> None:
+        """Stand in for a product whose handler failed."""
+        raise RuntimeError("product failure")
+
+    monkeypatch.setattr(hooks, "on_provider_account_event", explode)
+    record = _seed_apple_link(link_stores)
+    response = _post_notification(sealing_client, _apple_notification(provider, "account-deleted"))
+    assert response.status_code == 503
+    assert "product failure" not in response.text
+    assert link_stores.require_oauth_links().get(APPLE_LINK_KEY) == record
+
+
+def test_a_notification_never_logs_the_jws_subject_or_email(
+    sealing_client: Any, provider: FakeProvider, link_stores: IdentityStores, caplog: pytest.LogCaptureFixture
+) -> None:
+    """The log line carries the event type, the outcome and the user id, and nothing Apple sent."""
+    import logging
+
+    caplog.set_level(logging.DEBUG, logger="webbpulse.identity")
+    _seed_apple_link(link_stores)
+    payload = _apple_notification(provider, "email-disabled", events={"email": APPLE_RELAY_EMAIL})
+    assert _post_notification(sealing_client, payload).status_code == 200
+    rendered = " ".join(record.getMessage() + str(record.__dict__) for record in caplog.records)
+    assert "oauth.apple_notification" in rendered
+    assert payload not in rendered
+    assert APPLE_SUB not in rendered
+    assert APPLE_RELAY_EMAIL not in rendered
+
+
+def test_an_apple_sign_in_seals_the_refresh_token_onto_the_link(
+    sealing_client: Any, provider: FakeProvider, link_stores: IdentityStores
+) -> None:
+    """Only ciphertext reaches the row, and the record's repr hides even that."""
+    provider.apple_refresh_token = APPLE_REFRESH_TOKEN
+    state = _start_apple(sealing_client, provider)
+    posted = _post_apple(sealing_client, {"state": state, "code": "abc"})
+    response = sealing_client.get(posted.headers["location"], headers={"sec-fetch-site": "cross-site"})
+    assert "oauth_error" not in response.headers["location"]
+
+    link = link_stores.require_oauth_links().get(APPLE_LINK_KEY)
+    assert link is not None
+    assert link.provider_token is not None
+    assert APPLE_REFRESH_TOKEN not in str(link.provider_token.as_item())
+    assert "provider_token" not in repr(link)
+
+
+def test_a_later_sign_in_keeps_or_replaces_the_stored_token(
+    sealing_client: Any, provider: FakeProvider, link_stores: IdentityStores
+) -> None:
+    """Apple does not always send a new token, and losing the old one would strand it."""
+
+    def sign_in() -> Any:
+        """Run one sign-in and return the link it leaves."""
+        state = _start_apple(sealing_client, provider)
+        posted = _post_apple(sealing_client, {"state": state, "code": "abc"})
+        sealing_client.get(posted.headers["location"], headers={"sec-fetch-site": "cross-site"})
+        return link_stores.require_oauth_links().get(APPLE_LINK_KEY)
+
+    provider.apple_refresh_token = APPLE_REFRESH_TOKEN
+    first = sign_in().provider_token
+    provider.apple_refresh_token = ""
+    assert sign_in().provider_token == first
+    provider.apple_refresh_token = "a-newer-token"
+    assert sign_in().provider_token != first
+
+
+def test_a_sign_in_with_no_cipher_still_works_and_stores_nothing(
+    apple_client: Any, provider: FakeProvider, link_stores: IdentityStores
+) -> None:
+    """The token is a nicety for deletion, never a condition of signing in."""
+    provider.apple_refresh_token = APPLE_REFRESH_TOKEN
+    state = _start_apple(apple_client, provider)
+    posted = _post_apple(apple_client, {"state": state, "code": "abc"})
+    response = apple_client.get(posted.headers["location"], headers={"sec-fetch-site": "cross-site"})
+    assert "oauth_error" not in response.headers["location"]
+    link = link_stores.require_oauth_links().get(APPLE_LINK_KEY)
+    assert link is not None
+    assert link.provider_token is None
+
+
+def test_a_token_is_sealed_only_for_a_provider_that_can_revoke(
+    stores: IdentityStores, provider: FakeProvider, apple_key: ec.EllipticCurvePrivateKey
+) -> None:
+    """Google and GitHub stay identity sources with nothing stored."""
+    tokens = _provider_tokens(stores, provider, apple_key)
+    google = OAuthIdentity(
+        provider=GOOGLE_PROVIDER,
+        subject=GOOGLE_SUB,
+        email=EMAIL,
+        email_verified=True,
+        provider_refresh_token=APPLE_REFRESH_TOKEN,
+    )
+    assert tokens.seal(google, APPLE_USER_ID) is None
+    assert tokens.seal(_apple_identity(token=""), APPLE_USER_ID) is None
+
+
+def test_the_identity_repr_hides_the_refresh_token() -> None:
+    """A logged identity must not leak the token it carries."""
+    assert APPLE_REFRESH_TOKEN not in repr(_apple_identity())
+
+
+def test_revoking_presents_the_token_and_a_minted_client_secret(
+    stores: IdentityStores, provider: FakeProvider, apple_key: ec.EllipticCurvePrivateKey
+) -> None:
+    """The request is Apple's documented form, and the token is opened only to send it."""
+    import jwt
+
+    tokens = _provider_tokens(stores, provider, apple_key)
+    sealed = tokens.seal(_apple_identity(), APPLE_USER_ID)
+    record = _seed_apple_link(stores, provider_token=sealed)
+
+    assert tokens.revoke(record) is True
+
+    sent = provider.apple_revocations[0]
+    assert sent["client_id"] == APPLE_CLIENT_ID
+    assert sent["token"] == APPLE_REFRESH_TOKEN
+    assert sent["token_type_hint"] == "refresh_token"
+    claims = jwt.decode(sent["client_secret"], options={"verify_signature": False})
+    assert (claims["iss"], claims["sub"], claims["aud"]) == (APPLE_TEAM_ID, APPLE_CLIENT_ID, APPLE_ISSUER)
+
+
+def test_a_refused_revoke_logs_and_does_not_raise(
+    stores: IdentityStores,
+    provider: FakeProvider,
+    apple_key: ec.EllipticCurvePrivateKey,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """The deletion carries on, and the log line is what is left of the attempt."""
+    tokens = _provider_tokens(stores, provider, apple_key)
+    record = _seed_apple_link(stores, provider_token=tokens.seal(_apple_identity(), APPLE_USER_ID))
+    provider.apple_revoke_status = 400
+    assert tokens.revoke(record) is False
+    assert "A provider token could not be revoked." in caplog.text
+    assert APPLE_REFRESH_TOKEN not in caplog.text
+
+
+def test_a_network_failure_on_revoke_does_not_raise(
+    stores: IdentityStores, provider: FakeProvider, apple_key: ec.EllipticCurvePrivateKey
+) -> None:
+    """A provider that cannot be reached is the same as one that refused."""
+    from webbpulse.identity.oauth import HttpxClient
+
+    def unreachable(request: httpx.Request) -> httpx.Response:
+        """Fail the way a blocked egress path does."""
+        raise httpx.ConnectError("no route")
+
+    broken = HttpxClient(client=httpx.Client(transport=httpx.MockTransport(unreachable)))
+    tokens = _provider_tokens(stores, provider, apple_key, client=broken)
+    record = _seed_apple_link(stores, provider_token=tokens.seal(_apple_identity(), APPLE_USER_ID))
+    assert tokens.revoke(record) is False
+
+
+def test_a_token_sealed_for_one_user_does_not_open_for_another(
+    stores: IdentityStores, provider: FakeProvider, apple_key: ec.EllipticCurvePrivateKey
+) -> None:
+    """The cipher binds the token to its user, so a moved row sends nothing to Apple."""
+    tokens = _provider_tokens(stores, provider, apple_key)
+    sealed = tokens.seal(_apple_identity(), "someone-else")
+    record = _seed_apple_link(stores, provider_token=sealed)
+    assert tokens.revoke(record) is False
+    assert provider.apple_revocations == []
+
+
+def test_revoke_stored_refuses_a_link_that_is_no_longer_this_users(
+    stores: IdentityStores, provider: FakeProvider, apple_key: ec.EllipticCurvePrivateKey
+) -> None:
+    """A stale index hit must not revoke the token of whoever holds the link now."""
+    tokens = _provider_tokens(stores, provider, apple_key)
+    _seed_apple_link(stores, provider_token=tokens.seal(_apple_identity(), APPLE_USER_ID))
+    assert tokens.revoke_stored(APPLE_LINK_KEY, user_id="someone-else") is False
+    assert tokens.revoke_stored("apple#missing", user_id=APPLE_USER_ID) is False
+    assert provider.apple_revocations == []
+
+
+def test_unlinking_apple_revokes_its_token_first(
+    hooks: FakeHooks, stores: IdentityStores, provider: FakeProvider, apple_key: ec.EllipticCurvePrivateKey
+) -> None:
+    """Removing the link would otherwise leave the app authorized with no way to end it."""
+    secrets = {APPLE_PROVIDER: _apple_pem(apple_key)}
+    settings = make_settings(**_sealing_settings())
+    tokens = _provider_tokens(stores, provider, apple_key)
+    _seed_apple_link(stores, provider_token=tokens.seal(_apple_identity(), APPLE_USER_ID))
+    stores.require_credentials().put(
+        CredentialRecord(user_id=APPLE_USER_ID, credential_type=PASSWORD_CREDENTIAL_TYPE, secret="hashed")
+    )
+    service = OAuthService(
+        settings,
+        hooks,
+        states=stores.require_oauth_states(),
+        links=stores.require_oauth_links(),
+        credentials=stores.require_credentials(),
+        client_secrets=secrets,
+        http_client=provider.client(),
+    )
+
+    service.unlink(user_id=APPLE_USER_ID, provider=APPLE_PROVIDER)
+
+    assert stores.require_oauth_links().get(APPLE_LINK_KEY) is None
+    assert provider.apple_revocations[0]["token"] == APPLE_REFRESH_TOKEN
+
+
+def test_the_dynamo_link_store_round_trips_the_token_and_the_flag(
+    oauth_tables: dict[str, Any], stores: IdentityStores, provider: FakeProvider, apple_key: ec.EllipticCurvePrivateKey
+) -> None:
+    """A sealed token and a disabled address survive the table, and absent ones stay absent."""
+    from webbpulse.dynamodb import Repository
+
+    links = DynamoOAuthLinkStore(Repository("oauth-links", prefix="test"))
+    sealed = _provider_tokens(stores, provider, apple_key).seal(_apple_identity(), APPLE_USER_ID)
+    record = _seed_apple_link(stores, provider_token=sealed, provider_email_disabled=True)
+    links.put(record)
+    assert links.get(APPLE_LINK_KEY) == record
+
+    plain = _seed_apple_link(stores, provider_subject="apple#plain")
+    links.put(plain)
+    stored = links.get("apple#plain")
+    assert stored is not None
+    assert stored.provider_token is None
+    assert stored.provider_email_disabled is False

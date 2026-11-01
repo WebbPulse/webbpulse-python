@@ -661,6 +661,7 @@ def _mount_flows(
         attempts=attempts,
         email_sender=email_sender,
         kms_client=kms_client,
+        oauth_client_secrets=oauth_client_secrets,
     )
 
     from webbpulse.identity.events import register_user_purge_events
@@ -1061,6 +1062,7 @@ def _mount_flows(
             credentials=stores.credentials,
             passkeys=stores.passkeys,
             client_secrets=oauth_client_secrets,
+            kms_client=kms_client,
         )
         if oauth_service.enabled_providers():
             register_oauth_routes(

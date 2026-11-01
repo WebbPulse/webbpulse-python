@@ -46,6 +46,7 @@ if TYPE_CHECKING:  # pragma: no cover
     from webbpulse.identity.desktop_handoff import DesktopHandoffService, MintedHandoff
     from webbpulse.identity.email import EmailMessage, EmailSender
     from webbpulse.identity.hooks import IdentityHooks
+    from webbpulse.identity.oauth import ProviderTokens
     from webbpulse.identity.passkeys import PasskeyService, RegistrationChallenge
     from webbpulse.identity.service import TokenService
     from webbpulse.identity.sessions import SessionSummary
@@ -169,7 +170,8 @@ class PurgeResult:
 
     `unsupported` names the tables whose store could not enumerate the user's rows, which
     is a table with no user index rather than a failure. Every row in such a table carries
-    a TTL, so nothing is left behind permanently.
+    a TTL, so nothing is left behind permanently. `provider_tokens_revoked` counts calls to
+    a provider rather than rows, so it stays out of `total` and `counts`.
     """
 
     user_id: str
@@ -185,6 +187,7 @@ class PurgeResult:
     device_grants: int = 0
     device_codes: int = 0
     unsupported: tuple[str, ...] = ()
+    provider_tokens_revoked: int = 0
 
     @property
     def total(self) -> int:
@@ -237,11 +240,13 @@ class IdentityFlows:
         attempts: LoginAttemptStore | None = None,
         email_sender: EmailSender | None = None,
         kms_client: Any = None,
+        oauth_client_secrets: Mapping[str, str] | None = None,
     ) -> None:
         """Wire the flows to their settings, hooks, stores and token service.
 
         The MFA, passkey and link services are built only when their stores and settings are
         present, so an unconfigured capability is absent rather than broken.
+        `oauth_client_secrets` lets `purge_user` revoke stored provider tokens.
         """
         self._settings = settings
         self._hooks = hooks
@@ -250,6 +255,16 @@ class IdentityFlows:
         self._attempts = attempts
         self._email = email_sender
         self._sessions = SessionService(settings, stores.require_refresh_tokens())
+        self._provider_tokens: ProviderTokens | None = None
+        if stores.oauth_links is not None:
+            from webbpulse.identity.oauth import ProviderTokens
+
+            self._provider_tokens = ProviderTokens(
+                settings,
+                links=stores.oauth_links,
+                client_secrets=oauth_client_secrets,
+                kms_client=kms_client,
+            )
         self._links: LinkService | None = None
         if email_sender is not None and stores.identity_tokens is not None:
             from webbpulse.identity.verification import LinkService
@@ -1601,6 +1616,10 @@ class IdentityFlows:
         non-user subject, such as a run or registry token, is never reached. The user's device
         logins go too when `IdentityStores.device_grants` is set, and the device requests they
         decided and their failed lookup counters when `IdentityStores.device_codes` is.
+
+        A provider token stored on a link is revoked first, one best-effort attempt per link.
+        A failure there logs and the purge carries on: raising would hold the stream shard for
+        as long as the provider is down, and the deletion matters more than the revoke.
         """
         cleaned = user_id.strip()
         if not cleaned:
@@ -1623,8 +1642,12 @@ class IdentityFlows:
         stores = self._stores
         device_grants = stores.device_grants
         device_codes = stores.device_codes
+        provider_tokens_revoked = (
+            self._provider_tokens.revoke_for_user(cleaned) if self._provider_tokens is not None else 0
+        )
         result = PurgeResult(
             user_id=cleaned,
+            provider_tokens_revoked=provider_tokens_revoked,
             refresh_tokens=counted(
                 "refresh_tokens",
                 lambda: stores.require_refresh_tokens().delete_all_for_user(cleaned),
@@ -1688,6 +1711,7 @@ class IdentityFlows:
                 "user_id": cleaned,
                 "total_rows": result.total,
                 "unsupported_tables": list(result.unsupported),
+                "provider_tokens_revoked": result.provider_tokens_revoked,
                 **result.counts(),
             },
         )
