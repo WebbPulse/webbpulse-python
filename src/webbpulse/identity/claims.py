@@ -9,7 +9,7 @@ from __future__ import annotations
 import inspect
 import json
 import logging
-from collections.abc import Awaitable, Callable, Mapping
+from collections.abc import Awaitable, Callable, Iterable, Mapping
 from typing import TYPE_CHECKING, Any, Final
 
 if TYPE_CHECKING:  # pragma: no cover
@@ -33,6 +33,7 @@ __all__ = [
     "identity_subject",
     "is_browser_session",
     "read_authorizer_claims",
+    "require_verified_email",
     "stamp_email_verified",
     "subject_dependency",
 ]
@@ -253,6 +254,27 @@ def email_unverified(claims: Mapping[str, Any]) -> bool:
     if EMAIL_VERIFIED_CLAIM not in claims:
         return False
     return _coerce_bool(claims[EMAIL_VERIFIED_CLAIM]) is False
+
+
+def require_verified_email(request: Request, claims: Mapping[str, Any], *, allowed_routes: Iterable[str]) -> None:
+    """Raise the 403 `EMAIL_NOT_VERIFIED` for an unconfirmed caller off the product's allowed routes.
+
+    `allowed_routes` is the product's policy, so it has no default. Each entry allows that
+    path and everything under it on a segment boundary, and a blank or `/` entry allows
+    nothing rather than every route. The path is the one the router matched, not one
+    re-parsed from the URL. Claims that do not say `email_verified` false always pass.
+    """
+    if not email_unverified(claims):
+        return
+    path = request.scope["path"]
+    for route in allowed_routes:
+        trimmed = route.rstrip("/")
+        if trimmed and (path == trimmed or path.startswith(f"{trimmed}/")):
+            return
+
+    from fastapi import HTTPException
+
+    raise HTTPException(status_code=403, detail=dict(EMAIL_NOT_VERIFIED_DETAIL))
 
 
 def coerce_claims(claims: Mapping[str, Any]) -> dict[str, Any]:

@@ -30,7 +30,12 @@ from webbpulse.identity import (
     new_attempt,
     normalise_password,
 )
-from webbpulse.identity.claims import email_unverified, stamp_email_verified
+from webbpulse.identity.claims import (
+    EMAIL_NOT_VERIFIED_DETAIL,
+    email_unverified,
+    require_verified_email,
+    stamp_email_verified,
+)
 from webbpulse.identity.flows import (
     INVALID_CREDENTIALS_MESSAGE,
     PASSWORD_CREDENTIAL_TYPE,
@@ -508,6 +513,74 @@ def test_access_token_has_no_email_verified_for_a_row_without_one(
 def test_email_unverified_is_true_only_for_an_explicit_false(claims: dict[str, Any], expected: bool) -> None:
     """Only a claim that coerces to false reads as unverified."""
     assert email_unverified(claims) is expected
+
+
+def _request_for(path: str) -> Any:
+    """A real Starlette request for one path."""
+    from starlette.requests import Request
+
+    return Request({"type": "http", "method": "GET", "path": path, "headers": [], "query_string": b""})
+
+
+ALLOWED_ROUTES = ("/api/auth", "/api/users/me")
+
+
+@pytest.mark.parametrize(
+    ("path", "allowed"),
+    [
+        ("/api/auth", True),
+        ("/api/auth/refresh", True),
+        ("/api/users/me", True),
+        ("/api/users/me/email", True),
+        ("/api/authors", False),
+        ("/api/users/me2", False),
+        ("/api/users/other", False),
+        ("/api/workspaces", False),
+        ("/", False),
+    ],
+)
+def test_require_verified_email_matches_allowed_routes_on_a_segment_boundary(path: str, allowed: bool) -> None:
+    """An unverified caller passes only on an allowed route or under one."""
+    request = _request_for(path)
+    if allowed:
+        require_verified_email(request, {"email_verified": False}, allowed_routes=ALLOWED_ROUTES)
+        return
+    with pytest.raises(fastapi.HTTPException) as caught:
+        require_verified_email(request, {"email_verified": False}, allowed_routes=ALLOWED_ROUTES)
+    assert caught.value.status_code == 403
+    assert caught.value.detail == dict(EMAIL_NOT_VERIFIED_DETAIL)
+
+
+@pytest.mark.parametrize("claims", [{}, {"email_verified": True}, {"email_verified": "true"}])
+def test_require_verified_email_passes_claims_that_do_not_say_unverified(claims: dict[str, Any]) -> None:
+    """A verified caller, an API key's claims and an older token reach every route."""
+    require_verified_email(_request_for("/api/workspaces"), claims, allowed_routes=())
+
+
+def test_require_verified_email_reads_the_gateway_string_spelling() -> None:
+    """The JWT authorizer's string `false` refuses like a real boolean."""
+    with pytest.raises(fastapi.HTTPException):
+        require_verified_email(_request_for("/api/workspaces"), {"email_verified": "false"}, allowed_routes=())
+
+
+@pytest.mark.parametrize("route", ["", "/"])
+def test_require_verified_email_never_lets_a_root_entry_open_every_route(route: str) -> None:
+    """A blank or root entry allows nothing, so a bad list fails closed."""
+    with pytest.raises(fastapi.HTTPException):
+        require_verified_email(_request_for("/api/workspaces"), {"email_verified": False}, allowed_routes=[route])
+
+
+def test_require_verified_email_accepts_a_trailing_slash_on_an_entry() -> None:
+    """An entry written with a trailing slash matches the same tree."""
+    require_verified_email(_request_for("/api/auth/refresh"), {"email_verified": False}, allowed_routes=["/api/auth/"])
+
+
+def test_require_verified_email_judges_the_routed_path_not_the_url() -> None:
+    """A decoded `?` in the path cannot truncate it onto an allowed route."""
+    with pytest.raises(fastapi.HTTPException):
+        require_verified_email(
+            _request_for("/api/users/me?/settings"), {"email_verified": False}, allowed_routes=["/api/users/me"]
+        )
 
 
 def test_stamp_email_verified_replaces_a_hook_value() -> None:

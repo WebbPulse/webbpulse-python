@@ -198,7 +198,8 @@ behind one `REFUSAL_MESSAGE` so the difference cannot enumerate addresses), `loa
 `load_user_by_email`, `create_user`, `mark_email_verified`, `delete_user`, `on_user_created`,
 `has_other_sign_in_method` and `user_repository`. `claims_for` inherits `BaseIdentityHooks`'s
 empty mapping, which is correct for a product with no roles, and is the one hook a product
-with roles overrides.
+with roles overrides. A product on `unverified_sessions` also overrides `may_authenticate`
+without the unverified refusal, because the flows call it at login and at refresh.
 
 **`create_identity_tables(client, prefix="", *, skip_existing=True, include_users=True)`**
 walks `TABLES`, creates each table and applies its declared TTL through
