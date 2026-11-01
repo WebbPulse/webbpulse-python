@@ -398,7 +398,7 @@ def test_a_refused_swap_fails_loudly_and_leaves_the_current_value_alone() -> Non
     """An identity that cannot move AWSCURRENT gets an error naming it, and readers keep the old value."""
     make_secret()
     store = SecretStore(cast(Any, RefusedSwap(secrets_client())), SECRET_ID)
-    with pytest.raises(ConfigToolError, match="AccessDeniedException.*not confirmed as current"):
+    with pytest.raises(ConfigToolError, match=r"AccessDeniedException.*not confirmed as current"):
         store.set("MINE", "ours")
     assert stored_secret() == {"SECRET_KEY": "old", "OTHER": "keep"}
     assert not any(PENDING_STAGE in labels for labels in version_stages().values())
