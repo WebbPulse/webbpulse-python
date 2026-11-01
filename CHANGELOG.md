@@ -5,6 +5,15 @@ Notable changes to the `webbpulse` package. The version here is the one in
 
 This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## 0.115.0
+
+### Added
+
+- `require_verified_email(request, claims, *, allowed_routes)` in `webbpulse.identity` (PLAT-106):
+  the 403 `EMAIL_NOT_VERIFIED` gate behind `unverified_sessions`. The product passes the routes an
+  unconfirmed session may reach, each matched on a segment boundary. Claims that do not say
+  `email_verified` false always pass, so API keys and older tokens are unaffected.
+
 ## 0.113.0
 
 ### Fixed

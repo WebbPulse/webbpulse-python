@@ -169,9 +169,10 @@ class IdentitySettings(BaseSettings):
         description=(
             "Sign a new account in at registration even while `email_verification_required` "
             "holds its address unconfirmed. The access token then carries `email_verified` "
-            "false, and the product gates the routes that need a confirmed address on "
-            "`email_unverified`. Off by default, so registration refuses a session until the "
-            "link is opened."
+            "false, and the product gates the routes that need a confirmed address with "
+            "`require_verified_email`. Its `may_authenticate` must permit an unverified "
+            "account, or the session fails at the next login or refresh. Off by default, so "
+            "registration refuses a session until the link is opened."
         ),
     )
     totp_enabled: bool = True

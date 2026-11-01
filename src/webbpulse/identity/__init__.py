@@ -57,6 +57,7 @@ from webbpulse.identity.claims import (
     identity_subject,
     is_browser_session,
     read_authorizer_claims,
+    require_verified_email,
     stamp_email_verified,
     subject_dependency,
 )
@@ -1041,6 +1042,7 @@ __all__ = [
     "render_verification",
     "require_recent_auth",
     "require_scopes",
+    "require_verified_email",
     "revoke_api_key",
     "revoke_api_key_by_id",
     "signing_client",
