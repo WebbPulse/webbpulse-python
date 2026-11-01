@@ -747,6 +747,19 @@ class TestUnverifiedEphemeralUsers:
         for log_record in caplog.records:
             assert token not in repr(log_record.__dict__)
 
+    def test_issuing_logs_its_own_event_and_never_claims_a_mail_went_out(
+        self, hooks: FakeHooks, module_key: rsa.RSAPrivateKey, sender: Any, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """Nothing is mailed, so `email.verification_sent` would be a false record."""
+        flows = make_mailing_flows(hooks, module_key, sender)
+        created = flows.create_ephemeral_user(email=EMAIL, password=PASSWORD, verified=False)
+        with caplog.at_level("DEBUG"):
+            flows.issue_ephemeral_verification_link(created["user_id"])
+        events = {getattr(log_record, "event", "") for log_record in caplog.records}
+        assert "identity.ephemeral_verification_link_issued" in events
+        assert "email.verification_sent" not in events
+        assert sender.sent == []
+
     def test_a_verified_user_is_refused(self, hooks: FakeHooks, module_key: rsa.RSAPrivateKey, sender: Any) -> None:
         """There is nothing to verify, so no link is minted."""
         flows = make_mailing_flows(hooks, module_key, sender)
@@ -835,6 +848,42 @@ class TestUnverifiedEphemeralUsers:
         assert issued.json()["user_id"] == user_id
         assert issued.json()["token"]
         assert sender.sent == []
+
+    def test_the_routes_refusal_of_a_real_user_reads_as_the_application(
+        self, hooks: FakeHooks, module_key: rsa.RSAPrivateKey, sender: Any
+    ) -> None:
+        """The body the route really sends is one `issue_verification_token` will not retry."""
+        from fastapi import FastAPI
+        from fastapi.testclient import TestClient
+
+        from webbpulse.e2e.ephemeral import is_application_refusal
+        from webbpulse.identity import build_identity_router
+
+        settings = make_settings(
+            ephemeral_users_enabled=True,
+            environment="staging",
+            frontend_base_url="https://app.staging.example.com",
+            email_from="no-reply@example.com",
+            product_name="Example",
+            support_email="support@example.com",
+        )
+        router = build_identity_router(
+            settings,
+            hooks,
+            make_stores(),
+            tokens=TokenService(settings, FakeKms({KEY_A: module_key})),
+            email_sender=sender,
+        )
+        app = FastAPI()
+        app.include_router(router)
+        real = hooks.create_user(email="owner@example.com", attributes={"email_verified": False})
+        refused = TestClient(app).post(
+            f"/api/auth/e2e/users/{real['id']}/verification-link",
+            headers=TestEphemeralRoutesOverHttp.headers_for(TestEphemeralRoutesOverHttp.ADMIN),
+        )
+        assert refused.status_code == 403, refused.text
+        assert refused.json()["error_code"] == "NOT_EPHEMERAL_USER"
+        assert is_application_refusal(refused) is True
 
 
 NOW = datetime(2026, 9, 29, 12, 0, tzinfo=UTC)

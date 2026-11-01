@@ -30,6 +30,7 @@ from webbpulse.e2e.ephemeral import (
     email_validation_hint,
     ephemeral_email,
     generate_password,
+    is_application_refusal,
     is_route_refusal,
     issue_verification_token,
     item_path,
@@ -563,6 +564,115 @@ class TestUnverifiedEphemeralUser:
         client = FakeClient([FakeResponse(201, {"user_id": "user-1"})])
         with pytest.raises(RuntimeError):
             issue_verification_token(client, self.user(), admin_token=ADMIN_TOKEN)
+
+    def test_a_gateway_403_is_retried_until_it_issues(self) -> None:
+        """The cold start passes, and the token arrives after one short wait."""
+        client = FakeClient(
+            [FakeResponse(403, GATEWAY_FORBIDDEN), FakeResponse(201, {"user_id": "user-1", "token": "link-token"})]
+        )
+        sleeps: list[float] = []
+        token = issue_verification_token(client, self.user(), admin_token=ADMIN_TOKEN, sleep=sleeps.append)
+        assert token == "link-token"
+        assert sleeps == [GATEWAY_RETRY_DELAYS[0]]
+        assert client.tokens == [ADMIN_TOKEN, ADMIN_TOKEN]
+
+    def test_a_gateway_403_that_persists_raises_after_every_delay(self) -> None:
+        """The refusal is reported as the gateway's, with the admin token left out."""
+        attempts = len(GATEWAY_RETRY_DELAYS) + 1
+        client = FakeClient([FakeResponse(403, GATEWAY_FORBIDDEN) for _ in range(attempts)])
+        sleeps: list[float] = []
+        with pytest.raises(RuntimeError) as caught:
+            issue_verification_token(client, self.user(), admin_token=ADMIN_TOKEN, sleep=sleeps.append)
+        message = str(caught.value)
+        assert len(client.calls) == attempts
+        assert sleeps == list(GATEWAY_RETRY_DELAYS)
+        assert "answered 403" in message
+        assert "authorizer" in message
+        assert "Forbidden" in message
+        assert ADMIN_TOKEN not in message
+
+    @pytest.mark.parametrize(
+        "payload",
+        [
+            {"error_code": "NOT_EPHEMERAL_USER"},
+            {"error_code": "ADMIN_REQUIRED"},
+            {"error_code": "EPHEMERAL_USERS_DISABLED"},
+            {"error_code": "SOME_PRODUCT_REFUSAL"},
+            {"detail": {"error_code": "NOT_EPHEMERAL_USER"}},
+        ],
+    )
+    def test_an_application_403_raises_without_retrying(self, payload: Any) -> None:
+        """A refusal that carries a code will not change on a retry, so it fails at once."""
+        client = FakeClient([FakeResponse(403, payload)])
+        sleeps: list[float] = []
+        with pytest.raises(RuntimeError) as caught:
+            issue_verification_token(client, self.user(), admin_token=ADMIN_TOKEN, sleep=sleeps.append)
+        assert "answered 403" in str(caught.value)
+        assert "authorizer" not in str(caught.value)
+        assert len(client.calls) == 1
+        assert sleeps == []
+
+    @pytest.mark.parametrize("status", [400, 401, 404, 405, 409, 429, 500, 503])
+    def test_any_other_failure_raises_without_retrying(self, status: int) -> None:
+        """Only a 403 can be the gateway's cold start."""
+        client = FakeClient([FakeResponse(status, GATEWAY_FORBIDDEN)])
+        sleeps: list[float] = []
+        with pytest.raises(RuntimeError) as caught:
+            issue_verification_token(client, self.user(), admin_token=ADMIN_TOKEN, sleep=sleeps.append)
+        assert f"answered {status}" in str(caught.value)
+        assert len(client.calls) == 1
+        assert sleeps == []
+
+    def test_a_gateway_403_followed_by_an_application_403_raises_that_refusal(self) -> None:
+        """Once the application answers, its answer decides and the retries stop."""
+        client = FakeClient([FakeResponse(403, GATEWAY_FORBIDDEN), route_refusal("NOT_EPHEMERAL_USER")])
+        sleeps: list[float] = []
+        with pytest.raises(RuntimeError) as caught:
+            issue_verification_token(client, self.user(), admin_token=ADMIN_TOKEN, sleep=sleeps.append)
+        assert "NOT_EPHEMERAL_USER" in str(caught.value)
+        assert sleeps == [GATEWAY_RETRY_DELAYS[0]]
+
+    def test_a_retry_that_lands_on_an_unexpected_success_keeps_the_token_out(self) -> None:
+        """The body rule still holds for an answer reached through a retry."""
+        body = '{"user_id": "user-1", "token": "link-token"}'
+        client = FakeClient(
+            [
+                FakeResponse(403, GATEWAY_FORBIDDEN),
+                FakeResponse(200, {"user_id": "user-1", "token": "link-token"}, text=body),
+            ]
+        )
+        with pytest.raises(RuntimeError) as caught:
+            issue_verification_token(client, self.user(), admin_token=ADMIN_TOKEN, sleep=lambda _: None)
+        assert "link-token" not in str(caught.value)
+        assert ADMIN_TOKEN not in str(caught.value)
+
+    def test_the_create_retry_still_keys_on_its_own_narrower_codes(self) -> None:
+        """Sharing the loop did not widen `attempt_ephemeral_user`: another code is still retried."""
+        client = FakeClient(
+            [FakeResponse(403, {"error_code": "NOT_EPHEMERAL_USER"}), FakeResponse(201, {"user_id": "user-1"})]
+        )
+        sleeps: list[float] = []
+        user = create_ephemeral_user(client, run_id=RUN_ID, admin_token=ADMIN_TOKEN, sleep=sleeps.append)
+        assert user is not None
+        assert sleeps == [GATEWAY_RETRY_DELAYS[0]]
+
+    @pytest.mark.parametrize(
+        ("payload", "expected"),
+        [
+            ({"error_code": "NOT_EPHEMERAL_USER"}, True),
+            ({"detail": {"error_code": "NOT_EPHEMERAL_USER"}}, True),
+            (GATEWAY_FORBIDDEN, False),
+            ({"error_code": ""}, False),
+            ({"error_code": None}, False),
+            ({"detail": "Forbidden"}, False),
+            (None, False),
+            (ValueError("not json"), False),
+            (["Forbidden"], False),
+        ],
+    )
+    def test_is_application_refusal_reads_only_the_code(self, payload: Any, expected: bool) -> None:
+        """The gateway's body, an empty one and a blank code are not the application speaking."""
+        assert is_application_refusal(FakeResponse(403, payload)) is expected
 
 
 class TestDeleteEphemeralUser:

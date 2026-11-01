@@ -743,6 +743,32 @@ would be refused, which is the reason this exists. Overriding the whole fixture 
 argument meant reimplementing the create, the worker-id suffix and the delete-failure warning
 alongside it.
 
+### Proving the verify journey
+
+`create_ephemeral_user` and `attempt_ephemeral_user` take `verified=False`, which sends
+`verified: false` to the create route and leaves the account with `email_verified` false. The
+default body has no such key. `issue_verification_token(client, user, admin_token=...)`, from
+`webbpulse.e2e.ephemeral`, then fetches the token a mailed link would carry, so a suite can
+drive signup, verify and first sign-in without collecting mail. Spending it goes through the
+production confirm path.
+
+The helper calls `POST /api/auth/e2e/users/{user_id}/verification-link`, which is admin only,
+mounted under the same two gates as the other routes, and mails nothing. It logs
+`identity.ephemeral_verification_link_issued` rather than `email.verification_sent`, and never
+the token. Besides the 401 and 403 every route here answers, it refuses:
+
+| Status | `error_code` | Meaning |
+| --- | --- | --- |
+| 403 | `NOT_EPHEMERAL_USER` | The user's address is not an ephemeral one, so a real account's link cannot leave the server |
+| 404 | `USER_NOT_FOUND` | No user has that id |
+| 409 | `EMAIL_ALREADY_VERIFIED` | The user is already verified, so there is nothing to verify |
+| 503 | `EMAIL_NOT_CONFIGURED` | This deployment has no link store |
+
+The helper has no fallback, so all of these raise `RuntimeError` at once, naming the status
+and the error envelope. Only a 403 with no `error_code`, which is the gateway in front of the
+route, is retried after each delay in `GATEWAY_RETRY_DELAYS` before it raises. The token and
+the admin token stay out of every message.
+
 ### Telling e2e users apart
 
 The ephemeral route also creates the user with `E2E_USER_ATTRIBUTE` (`e2e_user`) set to

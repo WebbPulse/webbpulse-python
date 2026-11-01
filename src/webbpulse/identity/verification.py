@@ -114,6 +114,7 @@ class LinkService:
         *,
         now: datetime | None = None,
         attributes: Mapping[str, Any] | None = None,
+        mailed: bool = True,
     ) -> IssuedLink:
         """Mint a link for a user and write its hash.
 
@@ -121,6 +122,9 @@ class LinkService:
         carries no user index, and each outstanding link is still single use and short lived.
         `attributes` is stored on the record for the confirming flow, such as the address an
         email change moves to.
+
+        `mailed=False` is for a link handed to the caller rather than sent. It logs no issued
+        event, since those events say a mail went out, and the caller logs its own.
         """
         moment = now or datetime.now(UTC)
         ttl = self.ttl_for(purpose)
@@ -137,14 +141,15 @@ class LinkService:
                 attributes=dict(attributes or {}),
             )
         )
-        _log.info(
-            "Identity link issued.",
-            extra={
-                "event": _ISSUED_EVENTS.get(purpose, "password.reset_requested"),
-                "user_id": user_id,
-                "purpose": purpose,
-            },
-        )
+        if mailed:
+            _log.info(
+                "Identity link issued.",
+                extra={
+                    "event": _ISSUED_EVENTS.get(purpose, "password.reset_requested"),
+                    "user_id": user_id,
+                    "purpose": purpose,
+                },
+            )
         return IssuedLink(
             token=token,
             url=self.link_for(purpose, token),
