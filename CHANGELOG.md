@@ -5,6 +5,21 @@ Notable changes to the `webbpulse` package. The version here is the one in
 
 This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## 0.111.0
+
+### Added
+
+- Sign in with Apple as an OAuth provider, `APPLE_PROVIDER` (PLAT-107). New settings
+  `apple_client_id` (the Services ID), `apple_team_id` and `apple_key_id`, with the `.p8`
+  under `apple` in `oauth_client_secrets`. The provider stays unlisted and cannot start until
+  all four are set. `"apple"` joins the default `oauth_providers`.
+- `POST <prefix>/oauth/callback`, mounted only when Apple has a client id, so no other
+  deployment gains a route. It redirects to the GET callback so the `Lax` binding cookie is
+  sent, and keeps Apple's first-sign-in name on the state row as `profile_name`.
+
+### Fixed
+
+- A linked sign-in whose provider sends no email keeps the stored `provider_email_verified`.
 ## 0.110.0
 
 ### Changed

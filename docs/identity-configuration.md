@@ -32,7 +32,7 @@ permanently.
 | `passkeys_enabled` | `True` | |
 | `passkeys_passwordless` | `True` | |
 | `passkeys_second_factor` | `False` | A registered passkey answers the login MFA challenge as the `passkey` factor; needs the TOTP stores for the ticket |
-| `oauth_providers` | `["google","github"]` | `OAuthProvider` literals |
+| `oauth_providers` | `["google","github","apple"]` | `OAuthProvider` literals |
 | `password_breach_check` | `False` | Opt in to the breach corpus check (5.2) |
 | `mfa_required_for_roles` | `[]` | |
 | `e2e_user_ids` | `[]` | Durable e2e user ids `is_e2e_user` treats as e2e users; `IDENTITY_E2E_USER_IDS` is a JSON array; refused in production |
@@ -58,6 +58,7 @@ permanently.
 | `product_name`, `support_email`, `logo_url` | `""`, `""`, `None` | Branding. `logo_url` is an absolute PNG or JPEG URL for the email header |
 | `email_accent_color`, `email_legal_line` | `""`, `""` | Email button and link accent (`#rrggbb`, empty is the default accent) and the footer legal line |
 | `google_client_id`, `github_client_id` | `""` | Client **ids** only; secrets never live here |
+| `apple_client_id`, `apple_team_id`, `apple_key_id` | `""` | The Services ID, Team ID and Key ID for Sign in with Apple; the `.p8` is the `apple` client secret |
 | `oauth_redirect_uris` | `[]` | Exact-match allow-list; empty means `<issuer>/oauth/callback` |
 | `desktop_handoff_schemes` | `[]` | Custom URL schemes a desktop app receives a handoff code on, such as `["myapp"]`. Empty leaves the handoff routes unmounted. Web schemes (`http`, `https`, `javascript` and the like) are refused |
 | `desktop_handoff_code_ttl` | 60 seconds | Capped at `MAX_HANDOFF_CODE_TTL` (2 minutes), must be positive |

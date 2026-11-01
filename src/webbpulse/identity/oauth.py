@@ -8,10 +8,12 @@ from __future__ import annotations
 
 import base64
 import hashlib
+import json
 import logging
 import secrets
+import time
 from abc import ABC, abstractmethod
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import TYPE_CHECKING, Any, Final, Literal, Protocol
 from urllib.parse import urlencode, urlsplit
 
@@ -27,6 +29,7 @@ if TYPE_CHECKING:  # pragma: no cover
     from webbpulse.identity.storage import CredentialStore, PasskeyStore
 
 __all__ = [
+    "APPLE_PROVIDER",
     "GITHUB_PROVIDER",
     "GOOGLE_PROVIDER",
     "OAUTH_LINKS_TABLE",
@@ -71,6 +74,14 @@ OAUTH_LINK_BINDING_COOKIE: Final = "wp_oauth_link"
 
 GOOGLE_PROVIDER: Final = "google"
 GITHUB_PROVIDER: Final = "github"
+APPLE_PROVIDER: Final = "apple"
+
+APPLE_ISSUER: Final = "https://appleid.apple.com"
+
+APPLE_CLIENT_SECRET_TTL_SECONDS: Final = 300
+"""How long a minted Apple client secret lives. Minted per use, so it need not last."""
+
+PROFILE_NAME_MAX_LENGTH: Final = 200
 
 type OAuthMode = Literal["login", "link"]
 
@@ -200,6 +211,11 @@ class OAuthProviderConfig:
     returns_id_token: bool = False
     extra_authorize_params: Mapping[str, str] = field(default_factory=dict)
 
+    @property
+    def uses_form_post(self) -> bool:
+        """Whether the provider answers with a cross-site POST rather than a redirect."""
+        return self.extra_authorize_params.get("response_mode") == "form_post"
+
 
 PROVIDERS: Final[Mapping[str, OAuthProviderConfig]] = {
     GOOGLE_PROVIDER: OAuthProviderConfig(
@@ -225,6 +241,18 @@ PROVIDERS: Final[Mapping[str, OAuthProviderConfig]] = {
         supports_pkce=False,
         returns_id_token=False,
     ),
+    APPLE_PROVIDER: OAuthProviderConfig(
+        name=APPLE_PROVIDER,
+        display_name="Apple",
+        authorize_url=f"{APPLE_ISSUER}/auth/authorize",
+        token_url=f"{APPLE_ISSUER}/auth/token",
+        jwks_url=f"{APPLE_ISSUER}/auth/keys",
+        id_token_issuers=(APPLE_ISSUER,),
+        scope="name email",
+        supports_pkce=False,
+        returns_id_token=True,
+        extra_authorize_params={"response_mode": "form_post"},
+    ),
 }
 
 
@@ -242,6 +270,7 @@ class OAuthStateRecord:
 
     Holds the PKCE verifier and the nonce, which never reach the browser. `return_to` is
     validated against the allow-list when it is stored, so a stored row is safe to use.
+    `profile_name` is a name the provider sent with its callback rather than in a token.
     """
 
     state: str
@@ -255,6 +284,7 @@ class OAuthStateRecord:
     user_id: str = ""
     redirect_uri: str = ""
     binding: str = ""
+    profile_name: str = ""
 
 
 @dataclass(frozen=True, slots=True)
@@ -447,6 +477,7 @@ class DynamoOAuthStateStore(OAuthStateStore):
                 "user_id": record.user_id,
                 "redirect_uri": record.redirect_uri,
                 "binding": record.binding,
+                "profile_name": record.profile_name,
             }
         )
 
@@ -569,6 +600,7 @@ def _state_from_item(item: Mapping[str, Any]) -> OAuthStateRecord:
         user_id=str(item.get("user_id", "")),
         redirect_uri=str(item.get("redirect_uri", "")),
         binding=str(item.get("binding", "")),
+        profile_name=str(item.get("profile_name", "")),
     )
 
 
@@ -681,9 +713,20 @@ class OAuthService:
             if name in self._settings.oauth_providers and self._client_id(name) and self._has_secret(name)
         ]
 
+    def accepts_form_post(self) -> bool:
+        """Whether any enabled provider answers its callback with a form post."""
+        return any(PROVIDERS[name].uses_form_post for name in self.enabled_providers())
+
     def _has_secret(self, provider: str) -> bool:
-        """Whether a client secret is configured, without raising or logging."""
-        return bool(self._secrets.get(provider, ""))
+        """Whether a client secret is configured, without raising or logging.
+
+        Apple's is minted, so it also needs the team and key ids that identify the key.
+        """
+        if not self._secrets.get(provider, ""):
+            return False
+        if provider == APPLE_PROVIDER:
+            return bool(self._settings.apple_team_id and self._settings.apple_key_id)
+        return True
 
     def _provider(self, provider: str) -> OAuthProviderConfig:
         """The config for an enabled provider, refusing an unknown or disabled one."""
@@ -702,6 +745,8 @@ class OAuthService:
             return self._settings.google_client_id
         if provider == GITHUB_PROVIDER:
             return self._settings.github_client_id
+        if provider == APPLE_PROVIDER:
+            return self._settings.apple_client_id
         return ""
 
     def _client_secret(self, provider: str) -> str:
@@ -710,18 +755,43 @@ class OAuthService:
         The refusal deliberately says nothing about how the service is configured; the
         detail goes to the log line instead.
         """
-        secret = self._secrets.get(provider, "")
-        if not secret:
+        if not self._has_secret(provider):
             _log.error(
                 "No OAuth client secret configured.",
                 extra={"event": "oauth.misconfigured", "provider": provider},
             )
-            raise OAuthRejected(
-                "That sign-in provider is not available.",
-                error_code="OAUTH_PROVIDER_UNAVAILABLE",
-                status_code=503,
+            raise _provider_unavailable()
+        secret = self._secrets[provider]
+        return self._apple_client_secret(secret) if provider == APPLE_PROVIDER else secret
+
+    def _apple_client_secret(self, private_key: str) -> str:
+        """Mint the short-lived ES256 JWT Apple takes in place of a static client secret.
+
+        A key that will not sign refuses like a missing secret. Only the exception's type
+        reaches the log, since its text could quote the key.
+        """
+        import jwt
+
+        now = int(time.time())
+        try:
+            return jwt.encode(
+                {
+                    "iss": self._settings.apple_team_id,
+                    "iat": now,
+                    "exp": now + APPLE_CLIENT_SECRET_TTL_SECONDS,
+                    "aud": APPLE_ISSUER,
+                    "sub": self._settings.apple_client_id,
+                },
+                private_key.replace("\\n", "\n"),
+                algorithm="ES256",
+                headers={"kid": self._settings.apple_key_id},
             )
-        return secret
+        except Exception as exc:
+            _log.error(
+                "Could not sign the Apple client secret.",
+                extra={"event": "oauth.misconfigured", "provider": APPLE_PROVIDER, "reason": type(exc).__name__},
+            )
+            raise _provider_unavailable() from exc
 
     def start(
         self,
@@ -850,6 +920,23 @@ class OAuthService:
             )
         return record
 
+    def keep_form_post_name(self, state: str, user: str) -> None:
+        """Keep the name a form post carried on its state row, for the callback to read.
+
+        Apple sends the name once, unsigned, on the first sign-in only, so it can neither
+        wait for the token nor travel in the redirect URL. An unusable name or state changes
+        nothing, and the callback then refuses a bad state on its one refusal path.
+        """
+        name = _name_from_form_post_user(user)
+        if not name:
+            return
+        record = self._states.consume(state)
+        if record is None:
+            return
+        config = PROVIDERS.get(record.provider)
+        keep = config is not None and config.uses_form_post
+        self._states.put(replace(record, profile_name=name) if keep else record)
+
     def identity_from_callback(self, provider: str, *, code: str, state_record: OAuthStateRecord) -> OAuthIdentity:
         """Exchange the code and turn the provider's answer into an `OAuthIdentity`.
 
@@ -861,7 +948,8 @@ class OAuthService:
 
         if config.returns_id_token:
             id_token = _require_str(token_body, "id_token", provider)
-            return self._identity_from_id_token(config, id_token, nonce=state_record.nonce)
+            identity = self._identity_from_id_token(config, id_token, nonce=state_record.nonce)
+            return replace(identity, name=state_record.profile_name) if state_record.profile_name else identity
 
         access_token = _require_str(token_body, "access_token", provider)
         return self._identity_from_userinfo(config, access_token)
@@ -1303,7 +1391,9 @@ class OAuthService:
                     user_id=record.user_id,
                     linked_at=record.linked_at,
                     provider_email=identity.email or record.provider_email,
-                    provider_email_verified=identity.email_verified,
+                    provider_email_verified=(
+                        identity.email_verified if identity.email else record.provider_email_verified
+                    ),
                     last_login_at=now_iso(),
                     provider_login=identity.login or record.provider_login,
                 )
@@ -1313,6 +1403,31 @@ class OAuthService:
                 "Could not record an OAuth login on its link.",
                 extra={"event": "oauth.touch_failed", "provider": record.provider},
             )
+
+
+def _provider_unavailable() -> OAuthRejected:
+    """The refusal for a provider this deployment cannot use, naming no configuration."""
+    return OAuthRejected(
+        "That sign-in provider is not available.",
+        error_code="OAUTH_PROVIDER_UNAVAILABLE",
+        status_code=503,
+    )
+
+
+def _name_from_form_post_user(user: str) -> str:
+    """The display name in Apple's `user` JSON, normalised and capped, or an empty string.
+
+    The field is unsigned and browser-carried, so anything unexpected yields no name.
+    """
+    try:
+        body = json.loads(user) if user else None
+    except ValueError:
+        return ""
+    name = body.get("name") if isinstance(body, dict) else None
+    if not isinstance(name, dict):
+        return ""
+    parts = [name.get("firstName"), name.get("lastName")]
+    return " ".join(" ".join(part for part in parts if isinstance(part, str)).split())[:PROFILE_NAME_MAX_LENGTH]
 
 
 def _as_bool(value: object) -> bool:

@@ -249,6 +249,7 @@ from webbpulse.identity.mfa import (
 )
 from webbpulse.identity.oauth import (
     AMR_OAUTH,
+    APPLE_PROVIDER,
     GITHUB_PROVIDER,
     GOOGLE_PROVIDER,
     OAUTH_LINK_USER_INDEX,
@@ -677,6 +678,7 @@ __all__ = [
     "EVENTS_PATH_ENV",
     "FORBIDDEN_ERROR_CODE",
     "GATE_CLAIMS_KEY",
+    "APPLE_PROVIDER",
     "GITHUB_PROVIDER",
     "GOOGLE_PROVIDER",
     "GRANT_TYPES_SUPPORTED",

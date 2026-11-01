@@ -1,4 +1,4 @@
-"""The six OAuth HTTP routes, mounted onto the identity router.
+"""The OAuth HTTP routes, mounted onto the identity router.
 
 Kept apart from `router.py` so each milestone mounts its own routes, and apart from
 `oauth.py` so the service stays importable without FastAPI.
@@ -41,6 +41,9 @@ OAUTH_PROVIDERS_PATH: Final = "/oauth/providers"
 OAUTH_PROVIDERS_CACHE_CONTROL: Final = "public, max-age=300"
 
 OAUTH_START_IP_LIMIT: Final = (20, 900)
+
+OAUTH_FORM_POST_MAX_BYTES: Final = 64 * 1024
+OAUTH_FORM_POST_MAX_FIELDS: Final = 8
 
 _FastAPIRequest: Any = None
 
@@ -119,10 +122,12 @@ def register_oauth_routes(
     success_body: Callable[[Any], dict[str, Any]],
     set_refresh_cookie: Callable[[JSONResponse, str], JSONResponse],
 ) -> None:
-    """Add the five OAuth routes, given the closures `_mount_flows` already built.
+    """Add the OAuth routes, given the closures `_mount_flows` already built.
 
     Reusing those closures keeps the cookie attributes and refusal shape identical to the
-    password path. Mounted only when at least one provider has a client id.
+    password path. Mounted only when at least one provider has a client id, and the form
+    post callback only when an enabled provider answers that way, so a deployment without
+    one gains no route its gateway would have to carry.
     """
     from fastapi import Body
     from fastapi.responses import JSONResponse, RedirectResponse
@@ -361,6 +366,33 @@ def register_oauth_routes(
         redirect.set_cookie(settings.cookie_name, result.refresh_token, **settings.cookie_kwargs())
         return clear_binding_cookie(redirect)
 
+    if oauth.accepts_form_post():
+
+        @router.post(
+            f"{prefix}{OAUTH_CALLBACK_PATH}",
+            dependencies=limits(("oauth-form-post", OAUTH_START_IP_LIMIT, "ip")),
+        )
+        async def oauth_form_post_callback(request: _FastAPIRequest) -> Any:
+            """Turn a provider's cross-site form post into the same-origin GET callback.
+
+            The browser withholds the `Lax` binding cookie from a cross-site POST but sends
+            it on the GET this redirects to, so all the checks stay on the one GET path. Only
+            `state`, `code` and `error` go into the URL.
+            """
+            from urllib.parse import urlencode
+
+            from webbpulse.identity.router import run_sync
+
+            form = _callback_form(await request.body())
+            state = form.get("state", "")
+            user = form.get("user", "")
+            if state and user:
+                await run_sync(lambda: oauth.keep_form_post_name(state, user))
+            query = urlencode({key: form[key] for key in ("state", "code", "error") if form.get(key)})
+            return RedirectResponse(f"{request.url.path}?{query}", status_code=303)
+
+        _ = oauth_form_post_callback
+
     @router.post(f"{prefix}{OAUTH_LINK_PATH}")
     async def oauth_link(
         request: _FastAPIRequest, provider: str, payload: dict[str, Any] = Body(default={})
@@ -468,6 +500,22 @@ def register_oauth_routes(
     _ = (oauth_start, oauth_callback, oauth_link, oauth_links, oauth_unlink)
 
 
+def _callback_form(body: bytes) -> dict[str, str]:
+    """A form post's fields, empty when the body is oversized or malformed.
+
+    Decoded here rather than through `request.form()`, which needs `python-multipart`. An
+    empty form then fails on the callback's ordinary missing-state path.
+    """
+    from urllib.parse import parse_qsl
+
+    if len(body) > OAUTH_FORM_POST_MAX_BYTES:
+        return {}
+    try:
+        return dict(parse_qsl(body.decode("utf-8", errors="replace"), max_num_fields=OAUTH_FORM_POST_MAX_FIELDS))
+    except ValueError:
+        return {}
+
+
 def _with_flag(target: str, key: str, value: str = "1") -> str:
     """Append a query parameter to a frontend URL that may already have some."""
     from urllib.parse import quote
@@ -503,6 +551,10 @@ OAUTH_ROUTE_RESPONSES: Final[dict[tuple[str, str], dict[int, str]]] = {
     ("GET", OAUTH_CALLBACK_PATH): {
         303: "The browser leg is redirected back to the frontend, on success and on failure alike",
         400: "The state was spent, unknown or malformed",
+    },
+    ("POST", OAUTH_CALLBACK_PATH): {
+        303: "The browser is redirected to the GET callback on this origin",
+        429: "Too many form posts from this address",
     },
     ("POST", OAUTH_LINK_PATH): {
         400: "The provider is unknown",

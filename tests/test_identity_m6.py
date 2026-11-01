@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 import base64
+import json
 import time
 from collections.abc import Mapping
 from typing import TYPE_CHECKING, Any
+from urllib.parse import urlencode
 
 import pytest
 
@@ -44,14 +46,21 @@ from webbpulse.identity import (
     provider_account_key,
 )
 from webbpulse.identity.flows import PASSWORD_CREDENTIAL_TYPE, IdentityFlows, MfaChallengeRequired
-from webbpulse.identity.oauth import AMR_OAUTH, GITHUB_PROVIDER, GOOGLE_PROVIDER
+from webbpulse.identity.oauth import (
+    AMR_OAUTH,
+    APPLE_CLIENT_SECRET_TTL_SECONDS,
+    APPLE_ISSUER,
+    APPLE_PROVIDER,
+    GITHUB_PROVIDER,
+    GOOGLE_PROVIDER,
+)
 
 if TYPE_CHECKING:
     from collections.abc import Iterator
 
 import httpx
 from cryptography.hazmat.primitives import hashes, serialization
-from cryptography.hazmat.primitives.asymmetric import padding, rsa, utils
+from cryptography.hazmat.primitives.asymmetric import ec, padding, rsa, utils
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
@@ -63,6 +72,11 @@ FRONTEND = "https://staging.example.com"
 
 GOOGLE_CLIENT_ID = "1234567890-abcdefg.apps.googleusercontent.com"
 GITHUB_CLIENT_ID = "Iv1.0123456789abcdef"
+APPLE_CLIENT_ID = "com.example.web"
+APPLE_TEAM_ID = "TEAM123456"
+APPLE_KEY_ID = "KEY1234567"
+APPLE_SUB = "001234.abcdef0123456789.0123"
+APPLE_RELAY_EMAIL = "abc123@privaterelay.appleid.com"
 GOOGLE_SECRET = "google-client-secret-value"
 GITHUB_SECRET = "github-client-secret-value"
 
@@ -149,6 +163,7 @@ class FakeProvider:
         ]
         self.github_emails_status = 200
         self.nonce_to_echo = ""
+        self.apple_claims: dict[str, Any] = {}
 
     def jwks(self) -> dict[str, Any]:
         """The JWKS document serving this fake's public signing key."""
@@ -192,13 +207,40 @@ class FakeProvider:
         claims.update(overrides)
         return jwt.encode(claims, self.key, algorithm="RS256", headers={"kid": "test-key"})
 
+    def apple_id_token(self) -> str:
+        """A genuinely signed Apple ID token, with Apple's string booleans and no name."""
+        import jwt
+
+        now = int(time.time())
+        claims: dict[str, Any] = {
+            "iss": APPLE_ISSUER,
+            "aud": APPLE_CLIENT_ID,
+            "sub": APPLE_SUB,
+            "email": APPLE_RELAY_EMAIL,
+            "email_verified": "true",
+            "is_private_email": "true",
+            "iat": now,
+            "exp": now + 3600,
+            "nonce": self.nonce_to_echo,
+        }
+        claims.update(self.apple_claims)
+        return jwt.encode(
+            {key: value for key, value in claims.items() if value is not None},
+            self.key,
+            algorithm="RS256",
+            headers={"kid": "test-key"},
+        )
+
     def handler(self, request: httpx.Request) -> httpx.Response:
         """Answer a provider request by URL, recording it first."""
         self.requests.append(request)
         url = str(request.url)
 
-        if url == PROVIDERS[GOOGLE_PROVIDER].jwks_url:
+        if url in (PROVIDERS[GOOGLE_PROVIDER].jwks_url, PROVIDERS[APPLE_PROVIDER].jwks_url):
             return httpx.Response(200, json=self.jwks())
+
+        if url == PROVIDERS[APPLE_PROVIDER].token_url:
+            return httpx.Response(200, json={"access_token": "apple-access", "id_token": self.apple_id_token()})
 
         if url == PROVIDERS[GOOGLE_PROVIDER].token_url:
             if self.token_error:
@@ -2305,3 +2347,406 @@ def test_the_dynamo_stores_round_trip_the_binding_and_the_login(oauth_tables: di
     spent = states.consume("bound-state")
     assert spent is not None
     assert spent.binding == "digest-value"
+
+
+@pytest.fixture(scope="module")
+def apple_key() -> ec.EllipticCurvePrivateKey:
+    """A P-256 key shaped like the `.p8` Apple issues."""
+    return ec.generate_private_key(ec.SECP256R1())
+
+
+def _apple_pem(key: ec.EllipticCurvePrivateKey) -> str:
+    """The key as PKCS#8 PEM text, as a `.p8` file holds it."""
+    return key.private_bytes(
+        serialization.Encoding.PEM,
+        serialization.PrivateFormat.PKCS8,
+        serialization.NoEncryption(),
+    ).decode()
+
+
+def _apple_settings(**overrides: Any) -> dict[str, Any]:
+    """The three Apple settings, with per-test overrides applied."""
+    return {
+        "apple_client_id": APPLE_CLIENT_ID,
+        "apple_team_id": APPLE_TEAM_ID,
+        "apple_key_id": APPLE_KEY_ID,
+        **overrides,
+    }
+
+
+def _form_post_routes(router: Any) -> list[str]:
+    """The paths mounted for a POST to the OAuth callback."""
+    return [
+        route.path for route in router.routes if route.path.endswith("/oauth/callback") and "POST" in route.methods
+    ]
+
+
+@pytest.fixture
+def apple_client(
+    hooks: FakeHooks,
+    link_stores: IdentityStores,
+    kms: FakeKms,
+    provider: FakeProvider,
+    apple_key: ec.EllipticCurvePrivateKey,
+    monkeypatch: pytest.MonkeyPatch,
+) -> Any:
+    """An HTTPS `TestClient` for a product with Apple fully configured."""
+    import webbpulse.identity.oauth as oauth_module
+
+    fake_http = provider.client()
+    monkeypatch.setattr(oauth_module, "HttpxClient", lambda: fake_http)
+    app = FastAPI()
+    app.include_router(
+        _providers_router(hooks, link_stores, kms, secrets={APPLE_PROVIDER: _apple_pem(apple_key)}, **_apple_settings())
+    )
+    return TestClient(app, base_url="https://testserver", follow_redirects=False)
+
+
+def _start_apple(client: Any, provider: FakeProvider) -> str:
+    """Start an Apple sign-in, have the fake echo its nonce, and return the state."""
+    from urllib.parse import parse_qs, urlsplit
+
+    start = client.get(f"{identity_prefix(make_settings())}/oauth/apple/start")
+    assert start.status_code == 302
+    query = parse_qs(urlsplit(start.headers["location"]).query)
+    provider.nonce_to_echo = query["nonce"][0]
+    return query["state"][0]
+
+
+def _post_apple(client: Any, fields: dict[str, str]) -> Any:
+    """POST a form to the callback the way Apple's redirect makes the browser do it."""
+    return client.post(
+        f"{identity_prefix(make_settings())}/oauth/callback",
+        content=urlencode(fields),
+        headers={"content-type": "application/x-www-form-urlencoded"},
+    )
+
+
+APPLE_USER_FIELD = json.dumps({"name": {"firstName": "Ada", "lastName": "Lovelace"}, "email": APPLE_RELAY_EMAIL})
+
+
+@pytest.mark.parametrize(
+    ("settings", "with_key"),
+    [
+        ({}, False),
+        ({}, True),
+        ({"apple_client_id": APPLE_CLIENT_ID}, True),
+        (_apple_settings(apple_team_id=""), True),
+        (_apple_settings(apple_key_id=""), True),
+        (_apple_settings(), False),
+    ],
+)
+def test_apple_is_not_offered_until_all_four_values_are_set(
+    settings: dict[str, Any],
+    with_key: bool,
+    hooks: FakeHooks,
+    stores: IdentityStores,
+    kms: FakeKms,
+    apple_key: ec.EllipticCurvePrivateKey,
+) -> None:
+    """Any missing identifier, or the missing key, leaves the button off."""
+    secrets = {GOOGLE_PROVIDER: GOOGLE_SECRET, GITHUB_PROVIDER: GITHUB_SECRET}
+    if with_key:
+        secrets[APPLE_PROVIDER] = _apple_pem(apple_key)
+    client = _providers_client(_providers_router(hooks, stores, kms, secrets=secrets, **settings))
+    names = [entry["id"] for entry in _get_providers(client).json()["providers"]]
+    assert names == ["google", "github"]
+
+
+def test_apple_is_offered_after_the_other_providers_once_configured(
+    hooks: FakeHooks, stores: IdentityStores, kms: FakeKms, apple_key: ec.EllipticCurvePrivateKey
+) -> None:
+    """A complete configuration adds the button, labelled, in the stable order."""
+    secrets = {GOOGLE_PROVIDER: GOOGLE_SECRET, GITHUB_PROVIDER: GITHUB_SECRET, APPLE_PROVIDER: _apple_pem(apple_key)}
+    client = _providers_client(_providers_router(hooks, stores, kms, secrets=secrets, **_apple_settings()))
+    entries = _get_providers(client).json()["providers"]
+    assert [entry["id"] for entry in entries] == ["google", "github", "apple"]
+    assert entries[-1]["display_name"] == "Apple"
+
+
+def test_a_deployment_without_apple_mounts_no_form_post_route(
+    hooks: FakeHooks, stores: IdentityStores, kms: FakeKms
+) -> None:
+    """Every other product keeps exactly the routes its gateway already carries."""
+    secrets = {GOOGLE_PROVIDER: GOOGLE_SECRET, GITHUB_PROVIDER: GITHUB_SECRET}
+    assert _form_post_routes(_providers_router(hooks, stores, kms, secrets=secrets)) == []
+
+
+def test_an_apple_client_id_mounts_the_form_post_route(
+    hooks: FakeHooks, stores: IdentityStores, kms: FakeKms
+) -> None:
+    """The route follows the client id, like every other OAuth route."""
+    router = _providers_router(hooks, stores, kms, apple_client_id=APPLE_CLIENT_ID)
+    assert _form_post_routes(router) == [f"{identity_prefix(make_settings())}/oauth/callback"]
+
+
+def test_an_apple_start_without_the_key_refuses_as_unavailable(
+    hooks: FakeHooks, stores: IdentityStores, kms: FakeKms
+) -> None:
+    """A half-configured Apple cannot begin a sign-in."""
+    client = _providers_client(_providers_router(hooks, stores, kms, **_apple_settings()))
+    response = client.get(f"{identity_prefix(make_settings())}/oauth/apple/start")
+    assert "OAUTH_PROVIDER_UNAVAILABLE" in response.headers.get("location", response.text)
+
+
+def test_the_apple_authorize_url_asks_for_a_form_post_and_a_nonce_without_pkce(
+    apple_client: Any,
+) -> None:
+    """Apple requires `form_post` for name and email, and does not do PKCE."""
+    from urllib.parse import parse_qs, urlsplit
+
+    start = apple_client.get(f"{identity_prefix(make_settings())}/oauth/apple/start")
+    url = urlsplit(start.headers["location"])
+    query = parse_qs(url.query)
+    assert f"{url.scheme}://{url.netloc}{url.path}" == f"{APPLE_ISSUER}/auth/authorize"
+    assert query["client_id"] == [APPLE_CLIENT_ID]
+    assert query["response_mode"] == ["form_post"]
+    assert query["response_type"] == ["code"]
+    assert query["scope"] == ["name email"]
+    assert query["nonce"][0]
+    assert "code_challenge" not in query
+
+
+def test_the_form_post_redirects_to_the_get_callback_without_the_name_in_the_url(
+    apple_client: Any, provider: FakeProvider
+) -> None:
+    """Only the state and code travel on, and the redirect stays on this origin."""
+    state = _start_apple(apple_client, provider)
+    response = _post_apple(apple_client, {"state": state, "code": "abc", "user": APPLE_USER_FIELD})
+    assert response.status_code == 303
+    location = response.headers["location"]
+    expected_query = urlencode({"state": state, "code": "abc"})
+    assert location == f"{identity_prefix(make_settings())}/oauth/callback?{expected_query}"
+    assert "Ada" not in location
+    assert "user=" not in location
+
+
+def test_the_first_apple_sign_in_registers_with_the_posted_name_and_relay_address(
+    apple_client: Any, provider: FakeProvider, hooks: FakeHooks
+) -> None:
+    """The whole path: start, form post, GET with the binding cookie, new account."""
+    state = _start_apple(apple_client, provider)
+    posted = _post_apple(apple_client, {"state": state, "code": "abc", "user": APPLE_USER_FIELD})
+
+    response = apple_client.get(posted.headers["location"])
+
+    assert response.status_code == 303
+    assert "oauth_error" not in response.headers["location"]
+    user = hooks.users[hooks.by_email[APPLE_RELAY_EMAIL]]
+    assert user["name"] == "Ada Lovelace"
+    assert user["email_verified"] is True
+    assert hooks.created_via == [APPLE_PROVIDER]
+
+
+def test_a_later_apple_sign_in_without_a_name_or_email_finds_the_link(
+    apple_client: Any, provider: FakeProvider, hooks: FakeHooks, stores: IdentityStores
+) -> None:
+    """Apple can drop the email on a return visit, and the link's verified flag survives."""
+    first = _start_apple(apple_client, provider)
+    apple_client.get(_post_apple(apple_client, {"state": first, "code": "abc"}).headers["location"])
+
+    provider.apple_claims = {"email": None, "email_verified": None}
+    again = _start_apple(apple_client, provider)
+    response = apple_client.get(_post_apple(apple_client, {"state": again, "code": "def"}).headers["location"])
+
+    assert "oauth_error" not in response.headers["location"]
+    assert len(hooks.users) == 1
+    link = stores.require_oauth_links().get(provider_account_key(APPLE_PROVIDER, APPLE_SUB))
+    assert link is not None
+    assert link.provider_email == APPLE_RELAY_EMAIL
+    assert link.provider_email_verified is True
+
+
+def test_a_new_apple_user_without_an_email_is_refused(apple_client: Any, provider: FakeProvider) -> None:
+    """A Managed Apple Account can omit the email, and a new account needs one."""
+    provider.apple_claims = {"email": None, "email_verified": None}
+    state = _start_apple(apple_client, provider)
+    response = apple_client.get(_post_apple(apple_client, {"state": state, "code": "abc"}).headers["location"])
+    assert "oauth_error=OAUTH_EMAIL_MISSING" in response.headers["location"]
+
+
+def test_the_exchange_presents_a_signed_apple_client_secret(
+    apple_client: Any, provider: FakeProvider, apple_key: ec.EllipticCurvePrivateKey
+) -> None:
+    """The JWT verifies against the key and carries the claims Apple documents."""
+    import jwt
+
+    state = _start_apple(apple_client, provider)
+    apple_client.get(_post_apple(apple_client, {"state": state, "code": "abc"}).headers["location"])
+
+    exchange = next(r for r in provider.requests if str(r.url) == PROVIDERS[APPLE_PROVIDER].token_url)
+    secret = _parse_form(exchange)["client_secret"]
+    header = jwt.get_unverified_header(secret)
+    claims = jwt.decode(secret, apple_key.public_key(), algorithms=["ES256"], audience=APPLE_ISSUER)
+    assert header["alg"] == "ES256"
+    assert header["kid"] == APPLE_KEY_ID
+    assert claims["iss"] == APPLE_TEAM_ID
+    assert claims["sub"] == APPLE_CLIENT_ID
+    assert claims["exp"] - claims["iat"] == APPLE_CLIENT_SECRET_TTL_SECONDS
+
+
+def test_a_key_stored_with_escaped_newlines_still_signs(
+    hooks: FakeHooks,
+    stores: IdentityStores,
+    provider: FakeProvider,
+    apple_key: ec.EllipticCurvePrivateKey,
+) -> None:
+    """A `.p8` flattened into one line of a JSON secret is the same key."""
+    service = OAuthService(
+        make_settings(**_apple_settings()),
+        hooks,
+        states=stores.require_oauth_states(),
+        links=stores.require_oauth_links(),
+        credentials=stores.credentials,
+        client_secrets={APPLE_PROVIDER: _apple_pem(apple_key).replace("\n", "\\n")},
+        http_client=provider.client(),
+    )
+    assert service.start(APPLE_PROVIDER, mode="login").state
+
+
+def test_a_key_that_cannot_sign_refuses_without_logging_it(
+    hooks: FakeHooks, stores: IdentityStores, provider: FakeProvider, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A bad `.p8` looks like a missing one, and its text stays out of the log."""
+    service = OAuthService(
+        make_settings(**_apple_settings()),
+        hooks,
+        states=stores.require_oauth_states(),
+        links=stores.require_oauth_links(),
+        credentials=stores.credentials,
+        client_secrets={APPLE_PROVIDER: "not-a-real-key-material"},
+        http_client=provider.client(),
+    )
+    with pytest.raises(OAuthRejected) as refused:
+        service.start(APPLE_PROVIDER, mode="login")
+    assert refused.value.error_code == "OAUTH_PROVIDER_UNAVAILABLE"
+    assert "not-a-real-key-material" not in caplog.text
+
+
+def test_an_apple_cancellation_reaches_the_cancelled_outcome(apple_client: Any, provider: FakeProvider) -> None:
+    """Apple posts `user_cancelled_authorize`, and the GET callback handles it as usual."""
+    state = _start_apple(apple_client, provider)
+    posted = _post_apple(apple_client, {"state": state, "error": "user_cancelled_authorize"})
+    response = apple_client.get(posted.headers["location"])
+    assert "oauth_error=OAUTH_CANCELLED" in response.headers["location"]
+
+
+def test_a_form_post_replay_cannot_sign_in_twice(apple_client: Any, provider: FakeProvider) -> None:
+    """The state is single-use even though the name path rewrites the row."""
+    state = _start_apple(apple_client, provider)
+    fields = {"state": state, "code": "abc", "user": APPLE_USER_FIELD}
+    apple_client.get(_post_apple(apple_client, fields).headers["location"])
+
+    replay = apple_client.get(_post_apple(apple_client, fields).headers["location"])
+
+    assert "oauth_error=" in replay.headers["location"]
+
+
+def test_a_form_post_from_another_browser_is_refused(
+    apple_client: Any, provider: FakeProvider, hooks: FakeHooks
+) -> None:
+    """Without the binding cookie the GET callback refuses, as it does for Google."""
+    state = _start_apple(apple_client, provider)
+    posted = _post_apple(apple_client, {"state": state, "code": "abc", "user": APPLE_USER_FIELD})
+    apple_client.cookies.clear()
+
+    response = apple_client.get(posted.headers["location"])
+
+    assert "oauth_error=OAUTH_STATE_INVALID" in response.headers["location"]
+    assert hooks.users == {}
+
+
+@pytest.mark.parametrize(
+    "user",
+    ["{not json", "[]", '"text"', '{"name": "flat"}', '{"name": {"firstName": 7}}', '{"email": "a@example.com"}'],
+)
+def test_a_malformed_user_field_is_ignored(
+    user: str, apple_client: Any, provider: FakeProvider, hooks: FakeHooks
+) -> None:
+    """The field is unsigned, so bad input costs the name and not the sign-in."""
+    state = _start_apple(apple_client, provider)
+    posted = _post_apple(apple_client, {"state": state, "code": "abc", "user": user})
+    response = apple_client.get(posted.headers["location"])
+    assert "oauth_error" not in response.headers["location"]
+    assert not hooks.users[hooks.by_email[APPLE_RELAY_EMAIL]].get("name")
+
+
+def test_a_posted_name_is_normalised_and_capped(apple_client: Any, provider: FakeProvider, hooks: FakeHooks) -> None:
+    """Whitespace collapses and a long name is cut at the limit."""
+    state = _start_apple(apple_client, provider)
+    user = json.dumps({"name": {"firstName": "  Ada  ", "lastName": "L" * 500}})
+    apple_client.get(_post_apple(apple_client, {"state": state, "code": "abc", "user": user}).headers["location"])
+    name = hooks.users[hooks.by_email[APPLE_RELAY_EMAIL]]["name"]
+    assert name.startswith("Ada LL")
+    assert len(name) == 200
+
+
+def test_a_name_posted_against_a_google_state_is_dropped(apple_client: Any, stores: IdentityStores) -> None:
+    """A form post only keeps a name for a provider that answers by form post."""
+    states = stores.require_oauth_states()
+    states.put(
+        OAuthStateRecord(
+            state="google-state",
+            provider=GOOGLE_PROVIDER,
+            mode="login",
+            created_at="2026-01-01T00:00:00Z",
+            expires_at=int(time.time()) + 600,
+        )
+    )
+    _post_apple(apple_client, {"state": "google-state", "code": "abc", "user": APPLE_USER_FIELD})
+    record = states.consume("google-state")
+    assert record is not None
+    assert record.profile_name == ""
+
+
+@pytest.mark.parametrize(
+    "fields",
+    [
+        {"state": "unknown-state", "code": "abc", "user": APPLE_USER_FIELD},
+        {"code": "abc"},
+        {"state": "s", "padding": "x" * (70 * 1024)},
+        {f"field{index}": "x" for index in range(20)},
+    ],
+)
+def test_a_bad_form_post_ends_on_the_state_refusal(fields: dict[str, str], apple_client: Any) -> None:
+    """Unknown, missing, oversized or overlong forms all reach the one refusal path."""
+    posted = _post_apple(apple_client, fields)
+    assert posted.status_code == 303
+    response = apple_client.get(posted.headers["location"])
+    assert response.status_code == 303
+    assert "oauth_error=" in response.headers["location"]
+
+
+def test_the_form_post_route_is_rate_limited(hooks: FakeHooks, stores: IdentityStores, kms: FakeKms) -> None:
+    """It is unauthenticated and writes to a table, so it carries a limit like the start route."""
+    router = build_identity_router(
+        make_settings(apple_client_id=APPLE_CLIENT_ID),
+        hooks,
+        stores,
+        kms_client=kms,
+        limiter_enabled=True,
+    )
+    route = next(
+        route for route in router.routes if route.path.endswith("/oauth/callback") and "POST" in route.methods
+    )
+    assert route.dependencies
+
+
+def test_the_profile_name_round_trips_through_dynamodb(oauth_tables: dict[str, Any]) -> None:
+    """The name waits on the state row between the form post and the callback."""
+    from webbpulse.dynamodb import Repository
+
+    states = DynamoOAuthStateStore(Repository("oauth-states", prefix="test"))
+    states.put(
+        OAuthStateRecord(
+            state="apple-state",
+            provider=APPLE_PROVIDER,
+            mode="login",
+            created_at="2026-01-01T00:00:00Z",
+            expires_at=int(time.time()) + 600,
+            profile_name="Ada Lovelace",
+        )
+    )
+    spent = states.consume("apple-state")
+    assert spent is not None
+    assert spent.profile_name == "Ada Lovelace"
