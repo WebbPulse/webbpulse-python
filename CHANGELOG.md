@@ -5,6 +5,24 @@ Notable changes to the `webbpulse` package. The version here is the one in
 
 This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## 0.116.0
+
+### Added
+
+- Sign in with Apple tokens are revoked at account deletion (PLAT-108). A link now keeps
+  Apple's refresh token sealed with the `totp_cipher` cipher, and `purge_user`, unlink and
+  orphan-link cleanup call `POST /auth/revoke` once. A failed revoke logs
+  `oauth.provider_token_revoke_failed` and the deletion carries on. A link with no token, or a
+  deployment with no cipher, deletes as before. `IdentityFlows` takes `oauth_client_secrets`,
+  `OAuthService` takes `kms_client`, and `PurgeResult` gains `provider_tokens_revoked`.
+- `POST <prefix>/oauth/apple/notifications`, mounted only with Apple enabled, verifies Apple's
+  signed account notifications against its JWKS (PLAT-108). `email-disabled` and
+  `email-enabled` update the link, `consent-revoked` ends sessions and drops the token,
+  `account-deleted` ends sessions and removes the link. None deletes the local account.
+  `apple_notification_audiences` widens the accepted `aud`.
+- The optional `ProviderAccountEventHooks.on_provider_account_event` hook gives a product its
+  own policy for those events, and returning `True` skips the default (PLAT-108).
+
 ## 0.115.0
 
 ### Added

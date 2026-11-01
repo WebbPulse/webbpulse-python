@@ -139,8 +139,45 @@ start refuses.
   Apple Accounts, so a new user without one gets `OAUTH_EMAIL_MISSING`.
 
 `sub` is scoped to the Apple Developer team, so moving the app to another team means
-migrating every link within Apple's 60-day transfer window. Token revocation on account
-deletion and Apple's server notifications are not implemented yet (PLAT-108).
+migrating every link within Apple's 60-day transfer window. Token revocation and Apple's
+server notifications are described under "Apple revocation and account notifications".
+
+**Apple revocation and account notifications.** Apple's refresh token is the one provider
+token a link keeps, and only so deletion can revoke it. It is sealed with the cipher
+`totp_cipher` selects, under the purpose `oauth-provider-token`, on the link's own row. With no
+key available the sign-in still works and nothing is stored, logged as
+`oauth.provider_token_not_stored`. A later sign-in without a new token keeps the stored one, and
+a link made before this existed has none until its next sign-in.
+
+`purge_user`, unlink and orphan-link cleanup revoke the token once, then delete. A failure logs
+`oauth.provider_token_revoke_failed` with the reason and never stops the deletion, so that log
+line is the only record of a token left live. A standalone stream consumer has to pass
+`oauth_client_secrets` to `IdentityFlows` and needs outbound internet for this to happen.
+
+`POST <prefix>/oauth/apple/notifications` is unauthenticated, because the payload's signature is
+the authentication. It mounts only with Apple enabled, so a gateway has to carry it with
+authorization `NONE`, and the URL is registered in the Apple Developer portal. The JWS is checked
+against Apple's JWKS with RS256 pinned, `iss` must be Apple's, and `aud` must be
+`apple_client_id` or one of `apple_notification_audiences`. It answers 200 once verified, even
+for an unknown subject or event type, 400 when it cannot be verified, and 503 when Apple's keys
+are unavailable or applying the event failed.
+
+| Event | Package default |
+| --- | --- |
+| `email-disabled`, `email-enabled` | Sets `provider_email_disabled` on the link |
+| `consent-revoked` | Ends the user's sessions and drops the stored token, keeping the link |
+| `account-deleted` | Ends the user's sessions and removes the link |
+
+None of them deletes the local account or sends mail, because that is product policy. A product
+implements `on_provider_account_event` from `ProviderAccountEventHooks`, which runs first and
+receives a `ProviderAccountEvent`, including `has_other_sign_in` for the two ending events.
+Returning `True` skips the default. Raising answers 503. The hook is synchronous and must be
+idempotent.
+
+Apple documents no retry or dedupe behaviour, so every step is safe to repeat. `jti` is not
+persisted and the sample payload carries no `exp`, so a captured notification can be replayed.
+A consent or deletion event older than the link's last sign-in is ignored, which limits the harm,
+and email events have no such guard.
 
 **Client secrets are arguments, not settings, and are never logged.** They arrive as
 `oauth_client_secrets` on `build_identity_router` because they come from the product's own

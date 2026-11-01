@@ -7,6 +7,7 @@ signing in works. Offered both as a Protocol and as a concrete base class.
 from __future__ import annotations
 
 from collections.abc import Mapping
+from dataclasses import dataclass, field
 from typing import Any, Protocol, runtime_checkable
 
 __all__ = [
@@ -15,6 +16,8 @@ __all__ = [
     "EmailChangeHooks",
     "HookNotImplemented",
     "IdentityHooks",
+    "ProviderAccountEvent",
+    "ProviderAccountEventHooks",
 ]
 
 
@@ -144,6 +147,44 @@ class EmailChangeHooks(Protocol):
         ...
 
 
+@dataclass(frozen=True, slots=True)
+class ProviderAccountEvent:
+    """A provider's verified word that something changed on an account linked here.
+
+    `event_type` is the provider's own name for it, such as Apple's `email-disabled`,
+    `email-enabled`, `consent-revoked` or `account-deleted`. `event_time` is epoch seconds, 0
+    when the provider sent none. `has_other_sign_in` says whether the user could still sign in
+    without this link, and is computed only for `consent-revoked` and `account-deleted`.
+    """
+
+    provider: str
+    event_type: str
+    user_id: str
+    subject: str = field(default="", repr=False)
+    email: str = field(default="", repr=False)
+    is_private_email: bool = False
+    event_time: int = 0
+    jwt_id: str = ""
+    has_other_sign_in: bool = False
+
+
+@runtime_checkable
+class ProviderAccountEventHooks(Protocol):
+    """The optional hook where a product decides what a provider account change means to it.
+
+    Kept out of `IdentityHooks` so a product written before these events existed still
+    satisfies that protocol. Without it the package defaults apply on their own.
+    """
+
+    def on_provider_account_event(self, event: ProviderAccountEvent) -> bool | None:
+        """React to a verified event for a linked account. Synchronous, and must be idempotent.
+
+        Runs before the package default. Return `True` to skip that default, having handled
+        the event in full. Raising answers 503, so the provider may deliver it again.
+        """
+        ...
+
+
 class BaseIdentityHooks:
     """A concrete `IdentityHooks` whose unimplemented hooks raise a clear error.
 
@@ -210,3 +251,7 @@ class BaseIdentityHooks:
         working on upgrade.
         """
         return False
+
+    def on_provider_account_event(self, event: ProviderAccountEvent) -> bool | None:
+        """Nothing, so the package default applies. A product overrides this for its own policy."""
+        return None

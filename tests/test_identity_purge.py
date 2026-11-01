@@ -18,6 +18,7 @@ from webbpulse.identity import (
     AuthenticationRefused,
     BaseIdentityHooks,
     CredentialRecord,
+    HttpResponse,
     IdentitySettings,
     IdentityStores,
     IdentityTokenRecord,
@@ -961,3 +962,174 @@ def test_the_auth_routes_are_untouched(events_client: tuple[TestClient, Identity
     assert discovery.json()["issuer"] == ISSUER
     assert client.get("/api/auth/health").status_code == 200
     assert client.post("/api/auth/login", json={"email": "nobody@example.com", "password": "x"}).status_code == 401
+
+
+APPLE_MASTER_KEY = bytes(range(32))
+APPLE_LINK_KEY = "apple#apple-subject"
+
+
+def _apple_private_key() -> str:
+    """A throwaway `.p8`, as PKCS#8 PEM text."""
+    from cryptography.hazmat.primitives.asymmetric import ec
+
+    return (
+        ec.generate_private_key(ec.SECP256R1())
+        .private_bytes(
+            serialization.Encoding.PEM,
+            serialization.PrivateFormat.PKCS8,
+            serialization.NoEncryption(),
+        )
+        .decode()
+    )
+
+
+def _apple_flows(
+    kms: FakeKms, stores: IdentityStores, monkeypatch: pytest.MonkeyPatch, http: Any, *, secrets: bool = True
+) -> IdentityFlows:
+    """`IdentityFlows` with Apple configured, a master key, and this HTTP client for revokes."""
+    import base64
+
+    import webbpulse.identity.oauth as oauth_module
+
+    monkeypatch.setattr(oauth_module, "HttpxClient", lambda: http)
+    settings = make_settings(
+        apple_client_id="com.example.web",
+        apple_team_id="TEAM123456",
+        apple_key_id="KEY1234567",
+        totp_cipher="secret",
+        totp_master_key=base64.b64encode(APPLE_MASTER_KEY).decode(),
+    )
+    return IdentityFlows(
+        settings,
+        FakeHooks(),
+        stores,
+        TokenService(settings, kms),
+        oauth_client_secrets={"apple": _apple_private_key()} if secrets else None,
+    )
+
+
+def _seed_apple_link(stores: IdentityStores, *, with_token: bool = True) -> None:
+    """Link an Apple account to the user, holding a sealed refresh token when asked to."""
+    from webbpulse.identity import PROVIDER_TOKEN_PURPOSE
+    from webbpulse.identity.crypto import SecretMasterKeyCipher
+
+    sealed = SecretMasterKeyCipher(APPLE_MASTER_KEY).seal(
+        b"apple-refresh-token", user_id=USER_ID, purpose=PROVIDER_TOKEN_PURPOSE
+    )
+    stores.require_oauth_links().put(
+        OAuthLinkRecord(
+            provider_subject=APPLE_LINK_KEY,
+            provider="apple",
+            subject="apple-subject",
+            user_id=USER_ID,
+            linked_at="2026-09-13T00:00:00Z",
+            provider_token=sealed if with_token else None,
+        )
+    )
+
+
+class RecordingHttp:
+    """An `HttpClient` that records each post and answers with a fixed status, or fails."""
+
+    def __init__(self, *, status: int = 200, error: Exception | None = None) -> None:
+        """Hold the answer to give."""
+        self.status = status
+        self.error = error
+        self.posts: list[tuple[str, dict[str, str]]] = []
+
+    def post_form(self, url: str, *, data: Mapping[str, str], headers: Mapping[str, str]) -> HttpResponse:
+        """Record the form, then answer or fail."""
+        self.posts.append((url, dict(data)))
+        if self.error is not None:
+            raise self.error
+        return HttpResponse(status_code=self.status, json_body={"error": "invalid_grant"})
+
+    def get_json(self, url: str, *, headers: Mapping[str, str]) -> HttpResponse:
+        """Answer every read with nothing, since a purge never makes one."""
+        return HttpResponse(status_code=404, json_body=None)
+
+
+def test_the_purge_revokes_a_stored_apple_token_before_deleting_the_link(
+    kms: FakeKms, stores: IdentityStores, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Apple hears about the deletion, and the count stays out of the row totals."""
+    http = RecordingHttp()
+    flows = _apple_flows(kms, stores, monkeypatch, http)
+    _seed_apple_link(stores)
+
+    result = flows.purge_user(USER_ID)
+
+    assert [url for url, _ in http.posts] == ["https://appleid.apple.com/auth/revoke"]
+    assert http.posts[0][1]["token"] == "apple-refresh-token"
+    assert http.posts[0][1]["token_type_hint"] == "refresh_token"
+    assert result.provider_tokens_revoked == 1
+    assert result.oauth_links == 1
+    assert result.total == 1
+    assert "provider_tokens_revoked" not in result.counts()
+    assert stores.require_oauth_links().get(APPLE_LINK_KEY) is None
+
+
+@pytest.mark.parametrize(
+    "http",
+    [
+        RecordingHttp(status=400),
+        RecordingHttp(status=500),
+        RecordingHttp(error=ConnectionError("no route")),
+    ],
+)
+def test_a_failed_revoke_does_not_strand_the_deletion(
+    http: RecordingHttp, kms: FakeKms, stores: IdentityStores, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A provider refusal or an outage is logged, and every row still goes."""
+    flows = _apple_flows(kms, stores, monkeypatch, http)
+    _seed_apple_link(stores)
+
+    result = flows.purge_user(USER_ID)
+
+    assert result.provider_tokens_revoked == 0
+    assert result.oauth_links == 1
+    assert stores.require_oauth_links().get(APPLE_LINK_KEY) is None
+
+
+def test_a_link_without_a_token_purges_with_no_call_to_apple(
+    kms: FakeKms, stores: IdentityStores, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A link made before tokens were stored deletes exactly as it always did."""
+    http = RecordingHttp()
+    flows = _apple_flows(kms, stores, monkeypatch, http)
+    _seed_apple_link(stores, with_token=False)
+
+    result = flows.purge_user(USER_ID)
+
+    assert http.posts == []
+    assert result.provider_tokens_revoked == 0
+    assert result.oauth_links == 1
+
+
+def test_flows_without_client_secrets_still_purge(
+    kms: FakeKms, stores: IdentityStores, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A standalone stream consumer that has no `.p8` logs the miss and deletes the row."""
+    http = RecordingHttp()
+    flows = _apple_flows(kms, stores, monkeypatch, http, secrets=False)
+    _seed_apple_link(stores)
+
+    result = flows.purge_user(USER_ID)
+
+    assert http.posts == []
+    assert result.oauth_links == 1
+    assert stores.require_oauth_links().get(APPLE_LINK_KEY) is None
+
+
+def test_other_providers_make_no_call_at_purge(
+    kms: FakeKms, stores: IdentityStores, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Google and GitHub store no token, so the purge has nothing to tell them."""
+    http = RecordingHttp()
+    flows = _apple_flows(kms, stores, monkeypatch, http)
+    seed_every_table(stores)
+
+    result = flows.purge_user(USER_ID)
+
+    assert http.posts == []
+    assert result.provider_tokens_revoked == 0

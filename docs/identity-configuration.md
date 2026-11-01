@@ -59,6 +59,7 @@ permanently.
 | `email_accent_color`, `email_legal_line` | `""`, `""` | Email button and link accent (`#rrggbb`, empty is the default accent) and the footer legal line |
 | `google_client_id`, `github_client_id` | `""` | Client **ids** only; secrets never live here |
 | `apple_client_id`, `apple_team_id`, `apple_key_id` | `""` | The Services ID, Team ID and Key ID for Sign in with Apple; the `.p8` is the `apple` client secret |
+| `apple_notification_audiences` | `[]` | The `aud` values an Apple account notification may carry; empty means `apple_client_id` only |
 | `oauth_redirect_uris` | `[]` | Exact-match allow-list; empty means `<issuer>/oauth/callback` |
 | `desktop_handoff_schemes` | `[]` | Custom URL schemes a desktop app receives a handoff code on, such as `["myapp"]`. Empty leaves the handoff routes unmounted. Web schemes (`http`, `https`, `javascript` and the like) are refused |
 | `desktop_handoff_code_ttl` | 60 seconds | Capped at `MAX_HANDOFF_CODE_TTL` (2 minutes), must be positive |

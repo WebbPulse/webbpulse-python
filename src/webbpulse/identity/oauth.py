@@ -24,6 +24,7 @@ if TYPE_CHECKING:  # pragma: no cover
     from collections.abc import Callable, Mapping
 
     from webbpulse.dynamodb import Repository
+    from webbpulse.identity.crypto import SealedSecret, TotpCipher
     from webbpulse.identity.hooks import IdentityHooks
     from webbpulse.identity.settings import IdentitySettings
     from webbpulse.identity.storage import CredentialStore, PasskeyStore
@@ -38,6 +39,7 @@ __all__ = [
     "OAUTH_STATES_TABLE",
     "OAUTH_STATE_TTL_SECONDS",
     "PROVIDERS",
+    "PROVIDER_TOKEN_PURPOSE",
     "DynamoOAuthLinkStore",
     "DynamoOAuthStateStore",
     "HttpClient",
@@ -55,6 +57,7 @@ __all__ = [
     "OAuthService",
     "OAuthStateRecord",
     "OAuthStateStore",
+    "ProviderTokens",
     "link_binding_matches",
     "new_link_binding",
     "provider_account_key",
@@ -80,6 +83,9 @@ APPLE_ISSUER: Final = "https://appleid.apple.com"
 
 APPLE_CLIENT_SECRET_TTL_SECONDS: Final = 300
 """How long a minted Apple client secret lives. Minted per use, so it need not last."""
+
+PROVIDER_TOKEN_PURPOSE: Final = "oauth-provider-token"
+"""The cipher purpose for a provider token, so it never opens as any other sealed secret."""
 
 PROFILE_NAME_MAX_LENGTH: Final = 200
 
@@ -209,6 +215,7 @@ class OAuthProviderConfig:
     scope: str = ""
     supports_pkce: bool = False
     returns_id_token: bool = False
+    revoke_url: str = ""
     extra_authorize_params: Mapping[str, str] = field(default_factory=dict)
 
     @property
@@ -247,6 +254,7 @@ PROVIDERS: Final[Mapping[str, OAuthProviderConfig]] = {
         authorize_url=f"{APPLE_ISSUER}/auth/authorize",
         token_url=f"{APPLE_ISSUER}/auth/token",
         jwks_url=f"{APPLE_ISSUER}/auth/keys",
+        revoke_url=f"{APPLE_ISSUER}/auth/revoke",
         id_token_issuers=(APPLE_ISSUER,),
         scope="name email",
         supports_pkce=False,
@@ -291,7 +299,10 @@ class OAuthStateRecord:
 class OAuthLinkRecord:
     """One provider identity attached to one local user.
 
-    No provider tokens are stored: a provider is consumed as an identity source only.
+    A provider is an identity source, so no token is stored for signing in. The exception
+    is `provider_token`, the sealed refresh token of a provider with a `revoke_url`, kept
+    only so account deletion can revoke it. `provider_email_disabled` records the provider
+    saying it will not forward mail to this address.
     """
 
     provider_subject: str
@@ -303,6 +314,8 @@ class OAuthLinkRecord:
     provider_email_verified: bool = False
     last_login_at: str = ""
     provider_login: str = ""
+    provider_email_disabled: bool = False
+    provider_token: SealedSecret | None = field(default=None, repr=False)
 
 
 @dataclass(frozen=True, slots=True)
@@ -310,7 +323,8 @@ class OAuthIdentity:
     """What a provider said about the person who just authenticated.
 
     Normalised across providers. `email_verified` is `False` unless the provider positively
-    asserted otherwise, and the auto-link decision turns on it.
+    asserted otherwise, and the auto-link decision turns on it. `provider_refresh_token` is
+    set only for a provider with a `revoke_url`, and is sealed before it is stored.
     """
 
     provider: str
@@ -319,6 +333,7 @@ class OAuthIdentity:
     email_verified: bool
     name: str = ""
     login: str = ""
+    provider_refresh_token: str = field(default="", repr=False)
 
     @property
     def account_key(self) -> str:
@@ -571,8 +586,12 @@ class DynamoOAuthLinkStore(OAuthLinkStore):
 
 
 def _link_to_item(record: OAuthLinkRecord) -> dict[str, Any]:
-    """Render a link record as the item shape the table stores."""
-    return {
+    """Render a link record as the item shape the table stores.
+
+    The token and the disabled flag are written only when set, so a row without them keeps
+    the shape it always had.
+    """
+    item: dict[str, Any] = {
         "provider_subject": record.provider_subject,
         "provider": record.provider,
         "subject": record.subject,
@@ -583,6 +602,11 @@ def _link_to_item(record: OAuthLinkRecord) -> dict[str, Any]:
         "last_login_at": record.last_login_at,
         "provider_login": record.provider_login,
     }
+    if record.provider_email_disabled:
+        item["provider_email_disabled"] = True
+    if record.provider_token is not None:
+        item.update(record.provider_token.as_item())
+    return item
 
 
 def _state_from_item(item: Mapping[str, Any]) -> OAuthStateRecord:
@@ -616,7 +640,18 @@ def _link_from_item(item: Mapping[str, Any]) -> OAuthLinkRecord:
         provider_email_verified=bool(item.get("provider_email_verified", False)),
         last_login_at=str(item.get("last_login_at", "")),
         provider_login=str(item.get("provider_login", "")),
+        provider_email_disabled=bool(item.get("provider_email_disabled", False)),
+        provider_token=_sealed_token_from_item(item),
     )
+
+
+def _sealed_token_from_item(item: Mapping[str, Any]) -> SealedSecret | None:
+    """The sealed provider token on a link row, without importing the cipher for a row with none."""
+    if not item.get("secret_ciphertext"):
+        return None
+    from webbpulse.identity.crypto import SealedSecret
+
+    return SealedSecret.from_item(item)
 
 
 def new_link_binding() -> tuple[str, str]:
@@ -662,6 +697,262 @@ def pkce_challenge(verifier: str) -> str:
     return _b64url(hashlib.sha256(verifier.encode("ascii")).digest())
 
 
+def _configured_client_id(settings: IdentitySettings, provider: str) -> str:
+    """The configured client id for a provider, or an empty string."""
+    if provider == GOOGLE_PROVIDER:
+        return settings.google_client_id
+    if provider == GITHUB_PROVIDER:
+        return settings.github_client_id
+    if provider == APPLE_PROVIDER:
+        return settings.apple_client_id
+    return ""
+
+
+def _has_client_secret(settings: IdentitySettings, client_secrets: Mapping[str, str], provider: str) -> bool:
+    """Whether a client secret is configured, without raising or logging.
+
+    Apple's is minted, so it also needs the team and key ids that identify the key.
+    """
+    if not client_secrets.get(provider, ""):
+        return False
+    if provider == APPLE_PROVIDER:
+        return bool(settings.apple_team_id and settings.apple_key_id)
+    return True
+
+
+def _usable_client_secret(settings: IdentitySettings, client_secrets: Mapping[str, str], provider: str) -> str:
+    """The client secret to send a provider, refusing with a 503 when none is configured.
+
+    The refusal deliberately says nothing about how the service is configured; the detail
+    goes to the log line instead.
+    """
+    if not _has_client_secret(settings, client_secrets, provider):
+        _log.error(
+            "No OAuth client secret configured.",
+            extra={"event": "oauth.misconfigured", "provider": provider},
+        )
+        raise _provider_unavailable()
+    secret = client_secrets[provider]
+    return _apple_client_secret(settings, secret) if provider == APPLE_PROVIDER else secret
+
+
+def _apple_client_secret(settings: IdentitySettings, private_key: str) -> str:
+    """Mint the short-lived ES256 JWT Apple takes in place of a static client secret.
+
+    A key that will not sign refuses like a missing secret. Only the exception's type reaches
+    the log, since its text could quote the key.
+    """
+    import jwt
+
+    now = int(time.time())
+    try:
+        return jwt.encode(
+            {
+                "iss": settings.apple_team_id,
+                "iat": now,
+                "exp": now + APPLE_CLIENT_SECRET_TTL_SECONDS,
+                "aud": APPLE_ISSUER,
+                "sub": settings.apple_client_id,
+            },
+            private_key.replace("\\n", "\n"),
+            algorithm="ES256",
+            headers={"kid": settings.apple_key_id},
+        )
+    except Exception as exc:
+        _log.error(
+            "Could not sign the Apple client secret.",
+            extra={"event": "oauth.misconfigured", "provider": APPLE_PROVIDER, "reason": type(exc).__name__},
+        )
+        raise _provider_unavailable() from exc
+
+
+def published_provider_keys(http: HttpClient, config: OAuthProviderConfig) -> list[Any] | None:
+    """A provider's published JWKS entries, or `None` when it answered with something else.
+
+    Fetched per verification so a key rotation needs no invalidation. A transport failure
+    propagates, since the caller decides what that means.
+    """
+    response = http.get_json(config.jwks_url, headers={"accept": "application/json"})
+    if not response.ok or not isinstance(response.json_body, dict):
+        return None
+    keys = response.json_body.get("keys")
+    return keys if isinstance(keys, list) else None
+
+
+def provider_key_for(keys: list[Any], kid: str) -> Any:
+    """The public key published under this `kid`, or `None` when it is not published."""
+    import jwt
+
+    for entry in keys:
+        if isinstance(entry, dict) and str(entry.get("kid", "")) == kid:
+            return jwt.PyJWK.from_dict(dict(entry)).key
+    return None
+
+
+class ProviderTokens:
+    """Seal a provider's refresh token onto its link, and revoke it when the link goes.
+
+    Best effort throughout. Neither a sign-in nor a deletion may fail because of this class,
+    so every failure becomes a log line carrying the exception type and never its text. The
+    cipher is the one `totp_cipher` selects, resolved at use, so a product without one simply
+    stores no tokens.
+    """
+
+    def __init__(
+        self,
+        settings: IdentitySettings,
+        *,
+        links: OAuthLinkStore,
+        client_secrets: Mapping[str, str] | None = None,
+        http_client: HttpClient | None = None,
+        kms_client: Any = None,
+    ) -> None:
+        """Hold the settings, link store, client secrets, HTTP client and KMS client to use."""
+        self._settings = settings
+        self._links = links
+        self._secrets = dict(client_secrets or {})
+        self._http = http_client if http_client is not None else HttpxClient()
+        self._kms = kms_client
+
+    def _cipher(self) -> TotpCipher | None:
+        """The configured cipher, or `None` when this deployment has no key to seal with."""
+        from webbpulse.identity.crypto import EnvelopeCipher, SecretMasterKeyCipher, resolve_totp_master_key
+
+        if self._settings.totp_cipher == "secret":
+            raw = self._settings.totp_master_key_bytes
+            if not raw:
+                resolved = resolve_totp_master_key()
+                raw = base64.b64decode(resolved.encode("ascii"), validate=True) if resolved else b""
+            return SecretMasterKeyCipher(raw) if raw else None
+        if self._settings.data_key_arn and self._kms is not None:
+            return EnvelopeCipher(self._settings.data_key_arn, self._kms)
+        return None
+
+    def seal(self, identity: OAuthIdentity, user_id: str) -> SealedSecret | None:
+        """Seal the identity's refresh token for this user, or `None` when nothing can be stored."""
+        token = identity.provider_refresh_token
+        config = PROVIDERS.get(identity.provider)
+        if not token or config is None or not config.revoke_url:
+            return None
+        reason = "no_cipher"
+        try:
+            cipher = self._cipher()
+            if cipher is not None:
+                return cipher.seal(token.encode("utf-8"), user_id=user_id, purpose=PROVIDER_TOKEN_PURPOSE)
+        except Exception as exc:
+            reason = type(exc).__name__
+        _log.warning(
+            "A provider token could not be stored, so it cannot be revoked at deletion.",
+            extra={
+                "event": "oauth.provider_token_not_stored",
+                "provider": identity.provider,
+                "user_id": user_id,
+                "reason": reason,
+            },
+        )
+        return None
+
+    def revoke(self, record: OAuthLinkRecord) -> bool:
+        """Revoke the token stored on this link, returning whether the provider confirmed it.
+
+        One attempt. Never raises. A link with no stored token has nothing to revoke.
+        """
+        config = PROVIDERS.get(record.provider)
+        if config is None or not config.revoke_url:
+            return False
+        if record.provider_token is None:
+            _log.info(
+                "A link holds no provider token to revoke.",
+                extra={"event": "oauth.provider_token_absent", "provider": record.provider, "user_id": record.user_id},
+            )
+            return False
+        try:
+            cipher = self._cipher()
+            if cipher is None:
+                self._revoke_failed(record, reason="no_cipher")
+                return False
+            token = cipher.open(record.provider_token, user_id=record.user_id, purpose=PROVIDER_TOKEN_PURPOSE)
+            response = self._http.post_form(
+                config.revoke_url,
+                data={
+                    "client_id": _configured_client_id(self._settings, record.provider),
+                    "client_secret": _usable_client_secret(self._settings, self._secrets, record.provider),
+                    "token": token.decode("utf-8"),
+                    "token_type_hint": "refresh_token",
+                },
+                headers={"Accept": "application/json"},
+            )
+        except Exception as exc:
+            self._revoke_failed(record, reason=type(exc).__name__)
+            return False
+        if not response.ok:
+            body = response.json_body if isinstance(response.json_body, dict) else {}
+            self._revoke_failed(
+                record,
+                reason="refused",
+                status=response.status_code,
+                error=str(body.get("error", ""))[:64],
+            )
+            return False
+        _log.info(
+            "A provider token was revoked.",
+            extra={"event": "oauth.provider_token_revoked", "provider": record.provider, "user_id": record.user_id},
+        )
+        return True
+
+    def revoke_stored(self, provider_subject: str, *, user_id: str) -> bool:
+        """Revoke the token on a link, re-read from the base table.
+
+        The `user_id-index` may not project the token and may be stale, so only the base row
+        counts, and only while it still belongs to this user. Never raises.
+        """
+        try:
+            record = self._links.get(provider_subject)
+        except Exception as exc:
+            _log.warning(
+                "A link could not be read to revoke its provider token.",
+                extra={
+                    "event": "oauth.provider_token_revoke_failed",
+                    "user_id": user_id,
+                    "reason": type(exc).__name__,
+                },
+            )
+            return False
+        if record is None or record.user_id != user_id:
+            return False
+        return self.revoke(record)
+
+    def revoke_for_user(self, user_id: str) -> int:
+        """Revoke every stored token this user holds, returning how many were revoked. Never raises."""
+        try:
+            listed = self._links.list_for_user(user_id)
+        except Exception as exc:
+            _log.warning(
+                "A user's links could not be listed to revoke their provider tokens.",
+                extra={
+                    "event": "oauth.provider_token_revoke_failed",
+                    "user_id": user_id,
+                    "reason": type(exc).__name__,
+                },
+            )
+            return 0
+        return sum(1 for record in listed if self.revoke_stored(record.provider_subject, user_id=user_id))
+
+    def _revoke_failed(self, record: OAuthLinkRecord, *, reason: str, status: int = 0, error: str = "") -> None:
+        """Log a revoke that did not land, which is the only record of it once the row goes."""
+        _log.warning(
+            "A provider token could not be revoked.",
+            extra={
+                "event": "oauth.provider_token_revoke_failed",
+                "provider": record.provider,
+                "user_id": record.user_id,
+                "reason": reason,
+                "status": status,
+                "error": error,
+            },
+        )
+
+
 class OAuthService:
     """Provider start, callback, link, list and unlink, with no FastAPI in sight.
 
@@ -680,10 +971,12 @@ class OAuthService:
         client_secrets: Mapping[str, str] | None = None,
         http_client: HttpClient | None = None,
         passkeys: PasskeyStore | None = None,
+        kms_client: Any = None,
     ) -> None:
         """Hold the settings, hooks, stores, client secrets and HTTP client to use.
 
         `passkeys` lets the unlink guard count a passwordless passkey as a way back in.
+        `kms_client` seals a provider token when `totp_cipher` is `kms`.
         """
         self._settings = settings
         self._hooks = hooks
@@ -693,6 +986,13 @@ class OAuthService:
         self._passkeys = passkeys
         self._secrets = dict(client_secrets or {})
         self._http = http_client if http_client is not None else HttpxClient()
+        self._tokens = ProviderTokens(
+            settings,
+            links=links,
+            client_secrets=self._secrets,
+            http_client=self._http,
+            kms_client=kms_client,
+        )
 
     def enabled_providers(self) -> list[str]:
         """The providers this product has both switched on and given a client id.
@@ -718,15 +1018,8 @@ class OAuthService:
         return any(PROVIDERS[name].uses_form_post for name in self.enabled_providers())
 
     def _has_secret(self, provider: str) -> bool:
-        """Whether a client secret is configured, without raising or logging.
-
-        Apple's is minted, so it also needs the team and key ids that identify the key.
-        """
-        if not self._secrets.get(provider, ""):
-            return False
-        if provider == APPLE_PROVIDER:
-            return bool(self._settings.apple_team_id and self._settings.apple_key_id)
-        return True
+        """Whether a client secret is configured, without raising or logging."""
+        return _has_client_secret(self._settings, self._secrets, provider)
 
     def _provider(self, provider: str) -> OAuthProviderConfig:
         """The config for an enabled provider, refusing an unknown or disabled one."""
@@ -741,57 +1034,11 @@ class OAuthService:
 
     def _client_id(self, provider: str) -> str:
         """The configured client id for a provider, or an empty string."""
-        if provider == GOOGLE_PROVIDER:
-            return self._settings.google_client_id
-        if provider == GITHUB_PROVIDER:
-            return self._settings.github_client_id
-        if provider == APPLE_PROVIDER:
-            return self._settings.apple_client_id
-        return ""
+        return _configured_client_id(self._settings, provider)
 
     def _client_secret(self, provider: str) -> str:
-        """The client secret for a provider, refusing with a 503 when none is configured.
-
-        The refusal deliberately says nothing about how the service is configured; the
-        detail goes to the log line instead.
-        """
-        if not self._has_secret(provider):
-            _log.error(
-                "No OAuth client secret configured.",
-                extra={"event": "oauth.misconfigured", "provider": provider},
-            )
-            raise _provider_unavailable()
-        secret = self._secrets[provider]
-        return self._apple_client_secret(secret) if provider == APPLE_PROVIDER else secret
-
-    def _apple_client_secret(self, private_key: str) -> str:
-        """Mint the short-lived ES256 JWT Apple takes in place of a static client secret.
-
-        A key that will not sign refuses like a missing secret. Only the exception's type
-        reaches the log, since its text could quote the key.
-        """
-        import jwt
-
-        now = int(time.time())
-        try:
-            return jwt.encode(
-                {
-                    "iss": self._settings.apple_team_id,
-                    "iat": now,
-                    "exp": now + APPLE_CLIENT_SECRET_TTL_SECONDS,
-                    "aud": APPLE_ISSUER,
-                    "sub": self._settings.apple_client_id,
-                },
-                private_key.replace("\\n", "\n"),
-                algorithm="ES256",
-                headers={"kid": self._settings.apple_key_id},
-            )
-        except Exception as exc:
-            _log.error(
-                "Could not sign the Apple client secret.",
-                extra={"event": "oauth.misconfigured", "provider": APPLE_PROVIDER, "reason": type(exc).__name__},
-            )
-            raise _provider_unavailable() from exc
+        """The client secret for a provider, refusing with a 503 when none is configured."""
+        return _usable_client_secret(self._settings, self._secrets, provider)
 
     def start(
         self,
@@ -949,7 +1196,12 @@ class OAuthService:
         if config.returns_id_token:
             id_token = _require_str(token_body, "id_token", provider)
             identity = self._identity_from_id_token(config, id_token, nonce=state_record.nonce)
-            return replace(identity, name=state_record.profile_name) if state_record.profile_name else identity
+            refresh_token = token_body.get("refresh_token") if config.revoke_url else ""
+            return replace(
+                identity,
+                name=state_record.profile_name or identity.name,
+                provider_refresh_token=refresh_token if isinstance(refresh_token, str) else "",
+            )
 
         access_token = _require_str(token_body, "access_token", provider)
         return self._identity_from_userinfo(config, access_token)
@@ -993,36 +1245,20 @@ class OAuthService:
     def _signing_key_for(self, config: OAuthProviderConfig, id_token: str) -> Any:
         """Find the provider's public key for this token, fetching the JWKS ourselves.
 
-        Fetched through `self._http` so the call carries a timeout, and per verification so a
-        key rotation needs no invalidation. An unpublished `kid` is refused.
+        Fetched through `self._http` so the call carries a timeout. An unpublished `kid` is
+        refused.
         """
         import jwt
 
         header = jwt.get_unverified_header(id_token)
-        kid = str(header.get("kid", ""))
-
-        response = self._http.get_json(config.jwks_url, headers={"accept": "application/json"})
-        if not response.ok or not isinstance(response.json_body, dict):
+        keys = published_provider_keys(self._http, config)
+        key = provider_key_for(keys, str(header.get("kid", ""))) if keys is not None else None
+        if key is None:
             raise OAuthRejected(
                 "That sign-in could not be completed. Try again.",
                 error_code="OAUTH_ID_TOKEN_INVALID",
             )
-
-        keys = response.json_body.get("keys")
-        if not isinstance(keys, list):
-            raise OAuthRejected(
-                "That sign-in could not be completed. Try again.",
-                error_code="OAUTH_ID_TOKEN_INVALID",
-            )
-
-        for entry in keys:
-            if isinstance(entry, dict) and str(entry.get("kid", "")) == kid:
-                return jwt.PyJWK.from_dict(dict(entry)).key
-
-        raise OAuthRejected(
-            "That sign-in could not be completed. Try again.",
-            error_code="OAUTH_ID_TOKEN_INVALID",
-        )
+        return key
 
     def _identity_from_id_token(self, config: OAuthProviderConfig, id_token: str, *, nonce: str) -> OAuthIdentity:
         """Verify an OIDC ID token, then read the identity out of its claims.
@@ -1153,6 +1389,7 @@ class OAuthService:
         if existing is not None:
             user = self._hooks.load_user_by_id(existing.user_id)
             if user is None:
+                self._tokens.revoke(existing)
                 self._links.delete(identity.account_key)
                 raise OAuthRejected(
                     "That account is no longer available.",
@@ -1326,11 +1563,29 @@ class OAuthService:
             )
 
         for record in links:
+            self._tokens.revoke_stored(record.provider_subject, user_id=user_id)
             self._links.delete(record.provider_subject)
         _log.info(
             "OAuth identity unlinked.",
             extra={"event": "oauth.unlinked", "provider": provider, "user_id": user_id},
         )
+
+    def handle_apple_notification(self, payload: str, *, end_sessions: Callable[[str], object]) -> str:
+        """Verify and act on one of Apple's account notifications, returning the outcome.
+
+        `end_sessions` signs a user out everywhere, and comes from the flows. See
+        `oauth_notifications.AppleNotifications`.
+        """
+        from webbpulse.identity.oauth_notifications import AppleNotifications
+
+        notifications = AppleNotifications(
+            self._settings,
+            self._hooks,
+            links=self._links,
+            http_client=self._http,
+            other_sign_in=self._other_sign_in_methods,
+        )
+        return notifications.handle(payload, end_sessions=end_sessions)
 
     def _other_sign_in_methods(self, user_id: str, *, removing: set[str]) -> bool:
         """Whether anything would still sign this user in after `removing` goes away.
@@ -1375,27 +1630,27 @@ class OAuthService:
             provider_email_verified=identity.email_verified,
             last_login_at=moment,
             provider_login=identity.login,
+            provider_token=self._tokens.seal(identity, user_id),
         )
 
     def _touch(self, record: OAuthLinkRecord, identity: OAuthIdentity) -> None:
         """Record this login on the link, and refresh what the provider now says.
 
-        Best effort: a write failure here must not fail a sign-in that already succeeded.
+        Best effort: a write failure here must not fail a sign-in that already succeeded. A
+        fresh provider token replaces the stored one without revoking it, since a revoke can
+        end the app's whole authorization.
         """
         try:
             self._links.put(
-                OAuthLinkRecord(
-                    provider_subject=record.provider_subject,
-                    provider=record.provider,
-                    subject=record.subject,
-                    user_id=record.user_id,
-                    linked_at=record.linked_at,
+                replace(
+                    record,
                     provider_email=identity.email or record.provider_email,
                     provider_email_verified=(
                         identity.email_verified if identity.email else record.provider_email_verified
                     ),
                     last_login_at=now_iso(),
                     provider_login=identity.login or record.provider_login,
+                    provider_token=self._tokens.seal(identity, record.user_id) or record.provider_token,
                 )
             )
         except Exception:

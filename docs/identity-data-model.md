@@ -54,6 +54,8 @@ Attributes beyond the keys:
   `last_used_step`. See 4.4.
 - **`recovery-codes`**: `used_at`, `created_at`.
 - **`oauth-links`**: `provider_account_key`, `provider_email`, `provider_email_verified`,
+  `provider_email_disabled` (only when true), the sealed provider token as `secret_ciphertext`,
+  `secret_nonce`, `wrapped_data_key` and `secret_scheme` (only for Apple, when a cipher is set),
   `linked_at`.
 - **`refresh-tokens`**: `family_id`, `user_id`, `generation`, `consumed_at`, `successor_hash`,
   `revoked`, `device` (a coarse user-agent class, **never a fingerprint**), `ip_first_seen`,

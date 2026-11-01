@@ -328,6 +328,13 @@ class IdentitySettings(BaseSettings):
     apple_client_id: str = Field(default="", description="The Sign in with Apple Services ID.")
     apple_team_id: str = Field(default="", description="The Apple Developer Team ID that owns the signing key.")
     apple_key_id: str = Field(default="", description="The Key ID of the Sign in with Apple private key.")
+    apple_notification_audiences: list[str] = Field(
+        default_factory=list,
+        description=(
+            "The `aud` values an Apple account notification may carry. Empty means `apple_client_id` only; "
+            "set it when notifications are registered on a different App ID."
+        ),
+    )
 
     mcp_oauth_enabled: bool = Field(
         default=False,

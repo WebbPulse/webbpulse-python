@@ -12,7 +12,7 @@ import logging
 import re
 import secrets
 from abc import ABC, abstractmethod
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import TYPE_CHECKING, Any, Final, Literal, Protocol
 from urllib.parse import urlsplit
 
@@ -680,17 +680,7 @@ class SsoService:
         """Record this sign-in on the link. Best effort, so a write failure never fails it."""
         try:
             self._links.put(
-                OAuthLinkRecord(
-                    provider_subject=record.provider_subject,
-                    provider=record.provider,
-                    subject=record.subject,
-                    user_id=record.user_id,
-                    linked_at=record.linked_at,
-                    provider_email=identity.email or record.provider_email,
-                    provider_email_verified=record.provider_email_verified,
-                    last_login_at=now_iso(),
-                    provider_login=record.provider_login,
-                )
+                replace(record, provider_email=identity.email or record.provider_email, last_login_at=now_iso())
             )
         except Exception:
             _log.warning(
