@@ -1118,7 +1118,7 @@ def test_list_links_returns_only_this_users_links(
 
 
 def test_no_provider_tokens_are_stored(oauth: OAuthService, provider: FakeProvider, hooks: FakeHooks) -> None:
-    """This design consumes a provider as an identity source and never calls its API."""
+    """Google and GitHub stay identity sources, so only Apple's revocable token is ever kept."""
     import dataclasses
 
     user = hooks.add(EMAIL, email_verified=True)
@@ -1129,7 +1129,8 @@ def test_no_provider_tokens_are_stored(oauth: OAuthService, provider: FakeProvid
     assert "google-access" not in values
     assert "gho_test" not in values
     fields = {field.name for field in dataclasses.fields(record)}
-    assert not {"access_token", "refresh_token", "provider_token"} & fields
+    assert not {"access_token", "refresh_token"} & fields
+    assert record.provider_token is None
 
 
 def test_unlink_refuses_to_remove_the_only_sign_in_method(
@@ -2909,12 +2910,13 @@ def test_a_deployment_without_apple_mounts_no_notification_route(
     assert _notification_routes(_providers_router(hooks, stores, kms, secrets=secrets)) == []
 
 
-def test_a_half_configured_apple_mounts_no_notification_route(
+def test_an_apple_client_id_without_the_key_still_mounts_the_notification_route(
     hooks: FakeHooks, stores: IdentityStores, kms: FakeKms
 ) -> None:
-    """The route needs the private key as well as the client id."""
+    """Verifying needs only Apple's public keys, so a missing `.p8` does not lose an event."""
     secrets = {GOOGLE_PROVIDER: GOOGLE_SECRET}
-    assert _notification_routes(_providers_router(hooks, stores, kms, secrets=secrets, **_apple_settings())) == []
+    router = _providers_router(hooks, stores, kms, secrets=secrets, apple_client_id=APPLE_CLIENT_ID)
+    assert _notification_routes(router) == [NOTIFICATIONS_PATH]
 
 
 def test_a_configured_apple_mounts_the_notification_route(
@@ -3068,13 +3070,15 @@ def test_email_disabled_and_enabled_flip_the_flag_on_the_link(
 
 
 def test_consent_revoked_ends_sessions_and_drops_the_token_but_keeps_the_link(
-    sealing_client: Any,
-    provider: FakeProvider,
-    link_stores: IdentityStores,
-    apple_key: ec.EllipticCurvePrivateKey,
+    sealing_client: Any, provider: FakeProvider, link_stores: IdentityStores
 ) -> None:
     """A returning user lands on the same account, and Apple has already killed the token."""
-    sealed = _provider_tokens(link_stores, provider, apple_key).seal(_apple_identity(), APPLE_USER_ID)
+    from webbpulse.identity import PROVIDER_TOKEN_PURPOSE
+    from webbpulse.identity.crypto import SecretMasterKeyCipher
+
+    sealed = SecretMasterKeyCipher(base64.b64decode(APPLE_TOKEN_MASTER_KEY)).seal(
+        APPLE_REFRESH_TOKEN.encode(), user_id=APPLE_USER_ID, purpose=PROVIDER_TOKEN_PURPOSE
+    )
     _seed_apple_link(link_stores, provider_token=sealed)
     session = _seed_refresh_token(link_stores)
 
