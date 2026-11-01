@@ -585,6 +585,57 @@ def test_issuing_a_link_stores_only_the_hash(links: LinkService, stores: Identit
     assert issued.token not in record.token_hash
 
 
+def _logged_events(caplog: pytest.LogCaptureFixture) -> set[str]:
+    """The structured `event` of every captured log record."""
+    return {str(getattr(log_record, "event", "")) for log_record in caplog.records}
+
+
+def test_a_link_issued_for_mailing_logs_its_sent_event(links: LinkService, caplog: pytest.LogCaptureFixture) -> None:
+    """The default keeps `email.verification_sent` for the links that are mailed."""
+    with caplog.at_level("INFO"):
+        links.issue(USER_ID, "verify_email")
+    assert "email.verification_sent" in _logged_events(caplog)
+
+
+@pytest.mark.parametrize("purpose", ["verify_email", "change_email", "reset_password"])
+def test_a_link_not_mailed_logs_no_issued_event(
+    links: LinkService, caplog: pytest.LogCaptureFixture, purpose: Any
+) -> None:
+    """`mailed=False` still mints the link, and no event claims a mail went out."""
+    with caplog.at_level("INFO"):
+        issued = links.issue(USER_ID, purpose, mailed=False)
+    assert issued.token
+    assert _logged_events(caplog).isdisjoint(
+        {"email.verification_sent", "email.change_requested", "password.reset_requested"}
+    )
+
+
+def test_registering_logs_the_sent_event(
+    flows: IdentityFlows, sender: RecordingEmailSender, caplog: pytest.LogCaptureFixture
+) -> None:
+    """The mailed registration path keeps its event."""
+    with caplog.at_level("INFO"):
+        flows.register(email=EMAIL, password=PASSWORD)
+    assert sender.last_for(EMAIL) is not None
+    assert "email.verification_sent" in _logged_events(caplog)
+
+
+def test_requesting_verification_logs_the_sent_event(
+    flows: IdentityFlows,
+    hooks: FakeHooks,
+    stores: IdentityStores,
+    sender: RecordingEmailSender,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """The mailed resend path keeps its event."""
+    seed_account(hooks, stores)
+    sender.clear()
+    with caplog.at_level("INFO"):
+        flows.request_verification(EMAIL)
+    assert sender.last_for(EMAIL) is not None
+    assert "email.verification_sent" in _logged_events(caplog)
+
+
 def test_the_two_purposes_get_the_two_ttls_section_4_3_specifies(links: LinkService) -> None:
     """Verification links live 24 hours and reset links 1 hour."""
     assert links.ttl_for("verify_email") == timedelta(hours=24)

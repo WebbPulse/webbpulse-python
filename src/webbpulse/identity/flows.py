@@ -1449,7 +1449,7 @@ class IdentityFlows:
                 status_code=409,
             )
         links = self._require_links()
-        issued = links.issue(cleaned, "verify_email", attributes={"email": _normalise_email(email)})
+        issued = links.issue(cleaned, "verify_email", attributes={"email": _normalise_email(email)}, mailed=False)
         _log.info(
             "Issued a verification link for an ephemeral e2e user.",
             extra={"event": "identity.ephemeral_verification_link_issued", "user_id": cleaned},

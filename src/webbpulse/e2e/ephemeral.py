@@ -52,6 +52,7 @@ __all__ = [
     "email_validation_hint",
     "ephemeral_email",
     "generate_password",
+    "is_application_refusal",
     "is_route_refusal",
     "issue_verification_token",
     "item_path",
@@ -266,6 +267,21 @@ class EphemeralUser:
     create_path: str = CREATE_PATH
 
 
+def _error_codes(response: Any) -> set[Any]:
+    """The `error_code` values this answer carries, top-level or under a `detail` object."""
+    try:
+        payload = response.json()
+    except Exception:
+        return set()
+    if not isinstance(payload, dict):
+        return set()
+    detail = payload.get("detail")
+    codes = {payload.get("error_code")}
+    if isinstance(detail, dict):
+        codes.add(detail.get("error_code"))
+    return codes
+
+
 def is_route_refusal(response: Any) -> bool:
     """Whether this 403 is the create route's own refusal rather than the gateway's.
 
@@ -274,17 +290,36 @@ def is_route_refusal(response: Any) -> bool:
     that renders the refusal through a bare `HTTPException`. Anything else, such as the
     authorizer's `{"message": "Forbidden"}`, is not the route speaking.
     """
-    try:
-        payload = response.json()
-    except Exception:
-        return False
-    if not isinstance(payload, dict):
-        return False
-    detail = payload.get("detail")
-    codes = {payload.get("error_code")}
-    if isinstance(detail, dict):
-        codes.add(detail.get("error_code"))
-    return any(code in ROUTE_REFUSAL_CODES for code in codes)
+    return any(code in ROUTE_REFUSAL_CODES for code in _error_codes(response))
+
+
+def is_application_refusal(response: Any) -> bool:
+    """Whether this 403 came from the application, because it carries any `error_code`.
+
+    Wider than `is_route_refusal`, whose codes mean "not offered here" and so leave out a
+    refusal such as `NOT_EPHEMERAL_USER`. The gateway's body never carries a code.
+    """
+    return any(_error_codes(response))
+
+
+def _retry_gateway_403(
+    send: Callable[[], Any],
+    *,
+    is_own_answer: Callable[[Any], bool],
+    sleep: Callable[[float], None],
+) -> Any:
+    """Send once, then resend after each `GATEWAY_RETRY_DELAYS` wait while the gateway refuses.
+
+    A 403 that `is_own_answer` accepts stops the retries, as does any other status. The last
+    response comes back whatever it was, for the caller to judge.
+    """
+    response = send()
+    for delay in GATEWAY_RETRY_DELAYS:
+        if response.status_code != 403 or is_own_answer(response):
+            break
+        sleep(delay)
+        response = send()
+    return response
 
 
 def create_ephemeral_user(
@@ -348,12 +383,11 @@ def attempt_ephemeral_user(
     body: dict[str, Any] = {"email": email, "password": secret, "attributes": dict(attributes or {})}
     if not verified:
         body["verified"] = False
-    response = client.with_token(admin_token).post(create_path, json=body)
-    for delay in GATEWAY_RETRY_DELAYS:
-        if response.status_code != 403 or is_route_refusal(response):
-            break
-        sleep(delay)
-        response = client.with_token(admin_token).post(create_path, json=body)
+    response = _retry_gateway_403(
+        lambda: client.with_token(admin_token).post(create_path, json=body),
+        is_own_answer=is_route_refusal,
+        sleep=sleep,
+    )
     if response.status_code in UNMOUNTED_STATUSES:
         return f"POST {create_path} answered {response.status_code}, so this deployment does not mount the route."
     if response.status_code == 403 and is_route_refusal(response):
@@ -393,8 +427,19 @@ def attempt_ephemeral_user(
     )
 
 
-def issue_verification_token(client: TokenClient, user: EphemeralUser, *, admin_token: str) -> str:
+def issue_verification_token(
+    client: TokenClient,
+    user: EphemeralUser,
+    *,
+    admin_token: str,
+    sleep: Callable[[float], None] = time.sleep,
+) -> str:
     """The token a mailed verification link would carry for this unverified ephemeral user.
+
+    A 403 with no `error_code` is the gateway in front of the route, such as an authorizer
+    timing out on a cold start, and is retried after each delay in `GATEWAY_RETRY_DELAYS`
+    before it raises. A 403 carrying a code, such as `NOT_EPHEMERAL_USER`, is the application
+    and raises at once.
 
     Raises `RuntimeError` naming the status and the error envelope when the route answers
     anything but 201, a 404 or 405 included, because a suite asking for the token has no
@@ -402,7 +447,17 @@ def issue_verification_token(client: TokenClient, user: EphemeralUser, *, admin_
     unexpected answer below 400 is reported without its body, which could carry the token.
     """
     path = verification_link_path(user.user_id, create_path=user.create_path)
-    response = client.with_token(admin_token).post(path)
+    response = _retry_gateway_403(
+        lambda: client.with_token(admin_token).post(path),
+        is_own_answer=is_application_refusal,
+        sleep=sleep,
+    )
+    if response.status_code == 403 and not is_application_refusal(response):
+        raise RuntimeError(
+            f"POST {path} answered 403 on {len(GATEWAY_RETRY_DELAYS) + 1} attempts with a body that "
+            "carries no error code, so the gateway in front of it, most likely the HTTP API "
+            f"authorizer, kept refusing the minted admin token. It said: {describe_error_body(response)}"
+        )
     if response.status_code < 400 and response.status_code != 201:
         raise RuntimeError(f"POST {path} answered {response.status_code} rather than 201. Its body is left out.")
     if response.status_code != 201:

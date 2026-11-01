@@ -5,6 +5,27 @@ Notable changes to the `webbpulse` package. The version here is the one in
 
 This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## 0.109.0
+
+### Changed
+
+- `webbpulse.e2e.ephemeral.issue_verification_token` retries a gateway 403 after each delay in
+  `GATEWAY_RETRY_DELAYS` and takes a `sleep` argument (PLAT-103). A 403 carrying an
+  `error_code`, read by the new `is_application_refusal`, raises at once, as does every other
+  failure. `attempt_ephemeral_user` shares the loop and behaves as before.
+- `LinkService.issue` takes `mailed`, true by default.
+
+### Fixed
+
+- `IdentityFlows.issue_ephemeral_verification_link` no longer logs `email.verification_sent`,
+  since it mails nothing. It logs only `identity.ephemeral_verification_link_issued`, and
+  mailed links keep their event.
+
+### Documentation
+
+- `docs/e2e.md` covers `verified: false`, the verification link route, its refusals and the
+  helpers.
+
 ## 0.108.0
 
 ### Security
