@@ -17,9 +17,15 @@ This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   deployment gains a route. It redirects to the GET callback so the `Lax` binding cookie is
   sent, and keeps Apple's first-sign-in name on the state row as `profile_name`.
 
+### Changed
+
+- OAuth authorize URLs encode spaces as `%20` rather than `+`, as Apple documents for `scope`
+  (PLAT-107). Google and GitHub accept both.
+
 ### Fixed
 
 - A linked sign-in whose provider sends no email keeps the stored `provider_email_verified`.
+
 ## 0.110.0
 
 ### Changed

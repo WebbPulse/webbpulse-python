@@ -2376,9 +2376,7 @@ def _apple_settings(**overrides: Any) -> dict[str, Any]:
 
 def _form_post_routes(router: Any) -> list[str]:
     """The paths mounted for a POST to the OAuth callback."""
-    return [
-        route.path for route in router.routes if route.path.endswith("/oauth/callback") and "POST" in route.methods
-    ]
+    return [route.path for route in router.routes if route.path.endswith("/oauth/callback") and "POST" in route.methods]
 
 
 @pytest.fixture
@@ -2410,15 +2408,15 @@ def _start_apple(client: Any, provider: FakeProvider) -> str:
     assert start.status_code == 302
     query = parse_qs(urlsplit(start.headers["location"]).query)
     provider.nonce_to_echo = query["nonce"][0]
-    return query["state"][0]
+    return str(query["state"][0])
 
 
 def _post_apple(client: Any, fields: dict[str, str]) -> Any:
-    """POST a form to the callback the way Apple's redirect makes the browser do it."""
+    """POST a form to the callback the way Apple's page makes the browser do it."""
     return client.post(
         f"{identity_prefix(make_settings())}/oauth/callback",
         content=urlencode(fields),
-        headers={"content-type": "application/x-www-form-urlencoded"},
+        headers={"content-type": "application/x-www-form-urlencoded", "sec-fetch-site": "cross-site"},
     )
 
 
@@ -2472,9 +2470,7 @@ def test_a_deployment_without_apple_mounts_no_form_post_route(
     assert _form_post_routes(_providers_router(hooks, stores, kms, secrets=secrets)) == []
 
 
-def test_an_apple_client_id_mounts_the_form_post_route(
-    hooks: FakeHooks, stores: IdentityStores, kms: FakeKms
-) -> None:
+def test_an_apple_client_id_mounts_the_form_post_route(hooks: FakeHooks, stores: IdentityStores, kms: FakeKms) -> None:
     """The route follows the client id, like every other OAuth route."""
     router = _providers_router(hooks, stores, kms, apple_client_id=APPLE_CLIENT_ID)
     assert _form_post_routes(router) == [f"{identity_prefix(make_settings())}/oauth/callback"]
@@ -2496,6 +2492,7 @@ def test_the_apple_authorize_url_asks_for_a_form_post_and_a_nonce_without_pkce(
     from urllib.parse import parse_qs, urlsplit
 
     start = apple_client.get(f"{identity_prefix(make_settings())}/oauth/apple/start")
+    assert "scope=name%20email" in start.headers["location"]
     url = urlsplit(start.headers["location"])
     query = parse_qs(url.query)
     assert f"{url.scheme}://{url.netloc}{url.path}" == f"{APPLE_ISSUER}/auth/authorize"
@@ -2528,7 +2525,7 @@ def test_the_first_apple_sign_in_registers_with_the_posted_name_and_relay_addres
     state = _start_apple(apple_client, provider)
     posted = _post_apple(apple_client, {"state": state, "code": "abc", "user": APPLE_USER_FIELD})
 
-    response = apple_client.get(posted.headers["location"])
+    response = apple_client.get(posted.headers["location"], headers={"sec-fetch-site": "cross-site"})
 
     assert response.status_code == 303
     assert "oauth_error" not in response.headers["location"]
@@ -2726,9 +2723,8 @@ def test_the_form_post_route_is_rate_limited(hooks: FakeHooks, stores: IdentityS
         kms_client=kms,
         limiter_enabled=True,
     )
-    route = next(
-        route for route in router.routes if route.path.endswith("/oauth/callback") and "POST" in route.methods
-    )
+    routes: list[Any] = list(router.routes)
+    route = next(route for route in routes if route.path.endswith("/oauth/callback") and "POST" in route.methods)
     assert route.dependencies
 
 

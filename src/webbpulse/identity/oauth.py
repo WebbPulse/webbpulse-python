@@ -15,7 +15,7 @@ import time
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field, replace
 from typing import TYPE_CHECKING, Any, Final, Literal, Protocol
-from urllib.parse import urlencode, urlsplit
+from urllib.parse import quote, urlencode, urlsplit
 
 from webbpulse.dynamodb import now_iso, ttl_in
 from webbpulse.identity.storage import constant_time_equals, is_expired
@@ -856,7 +856,7 @@ class OAuthService:
             extra={"event": "oauth.start", "provider": provider, "mode": mode},
         )
         return OAuthAuthorization(
-            authorization_url=f"{config.authorize_url}?{urlencode(params)}",
+            authorization_url=f"{config.authorize_url}?{urlencode(params, quote_via=quote)}",
             state=state,
         )
 
