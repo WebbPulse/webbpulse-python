@@ -5,6 +5,23 @@ Notable changes to the `webbpulse` package. The version here is the one in
 
 This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## 0.107.0
+
+### Added
+
+- Unverified ephemeral e2e users (PLAT-102). `POST /e2e/users` takes an optional
+  `verified: false`, and `IdentityFlows.create_ephemeral_user(verified=False)` creates the
+  account with `email_verified` false. The default is still verified.
+- `POST /e2e/users/{user_id}/verification-link`, admin only and mounted under the same
+  gates as the other ephemeral routes, issues a `verify_email` link for an unverified
+  ephemeral user and returns its token without mailing it. It refuses a real account (403
+  `NOT_EPHEMERAL_USER`), an unknown id (404), a verified user (409
+  `EMAIL_ALREADY_VERIFIED`) and a deployment with no link store (503). The flow is
+  `IdentityFlows.issue_ephemeral_verification_link`.
+- `webbpulse.e2e.ephemeral`: `create_ephemeral_user` and `attempt_ephemeral_user` take
+  `verified=False`, and `issue_verification_token(client, user, admin_token=...)` fetches the
+  token, so a suite can drive signup, verify and first sign-in without collecting mail.
+
 ## 0.106.0
 
 ### Added

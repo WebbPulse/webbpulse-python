@@ -35,6 +35,7 @@ from webbpulse.identity import (
 )
 from webbpulse.identity.ephemeral_routes import (
     EPHEMERAL_USER_ITEM_PATH,
+    EPHEMERAL_USER_VERIFICATION_LINK_PATH,
     EPHEMERAL_USERS_PATH,
     EPHEMERAL_USERS_SWEEP_PATH,
 )
@@ -138,6 +139,10 @@ class FakeHooks(BaseIdentityHooks):
         """Delete the users row, reporting whether one was there."""
         self.deleted.append(user_id)
         return self.users.pop(user_id, None) is not None
+
+    def mark_email_verified(self, user_id: str) -> None:
+        """Mark the stored user verified, as a product's confirm hook would."""
+        self.users[user_id]["email_verified"] = True
 
 
 def make_settings(**overrides: Any) -> IdentitySettings:
@@ -353,12 +358,14 @@ class TestEphemeralRouteMounting:
         """A product that has not opted in has no ephemeral routes to reach."""
         paths = self.mounted_paths(module_key)
         assert not any(path.endswith(EPHEMERAL_USERS_PATH) for path in paths)
+        assert not any(path.endswith(EPHEMERAL_USER_VERIFICATION_LINK_PATH) for path in paths)
 
     def test_the_routes_are_present_when_enabled_outside_production(self, module_key: rsa.RSAPrivateKey) -> None:
-        """Staging opts in and gets both routes."""
+        """Staging opts in and gets the routes."""
         paths = self.mounted_paths(module_key, ephemeral_users_enabled=True, environment="staging")
         assert any(path.endswith(EPHEMERAL_USERS_PATH) for path in paths)
         assert any(path.endswith(EPHEMERAL_USER_ITEM_PATH) for path in paths)
+        assert any(path.endswith(EPHEMERAL_USER_VERIFICATION_LINK_PATH) for path in paths)
 
     @pytest.mark.parametrize("environment", ["production", "prod", "Production", "PROD"])
     def test_production_refuses_to_mount_them_even_when_the_flag_is_on(
@@ -371,6 +378,7 @@ class TestEphemeralRouteMounting:
         """
         paths = self.mounted_paths(module_key, ephemeral_users_enabled=True, environment=environment)
         assert not any(path.endswith(EPHEMERAL_USERS_PATH) for path in paths)
+        assert not any(path.endswith(EPHEMERAL_USER_VERIFICATION_LINK_PATH) for path in paths)
 
 
 class TestIsE2eUser:
@@ -672,6 +680,161 @@ class TestEphemeralRoutesOverHttp:
         deleted = client.delete(f"/api/auth/e2e/users/{user_id}", headers=admin)
         assert deleted.status_code == 200, deleted.text
         assert deleted.json() == {"user_id": user_id, "deleted": True}
+
+
+def make_mailing_flows(hooks: FakeHooks, module_key: rsa.RSAPrivateKey, sender: Any, **overrides: Any) -> IdentityFlows:
+    """`IdentityFlows` with a link store and a recording sender, so verification links can be issued."""
+    defaults: dict[str, Any] = {
+        "ephemeral_users_enabled": True,
+        "frontend_base_url": "https://app.staging.example.com",
+        "email_from": "no-reply@example.com",
+        "product_name": "Example",
+        "support_email": "support@example.com",
+    }
+    settings = make_settings(**(defaults | overrides))
+    return IdentityFlows(
+        settings,
+        hooks,
+        make_stores(),
+        TokenService(settings, FakeKms({KEY_A: module_key})),
+        email_sender=sender,
+    )
+
+
+class TestUnverifiedEphemeralUsers:
+    """Creating an unverified ephemeral user and handing a suite its verification token."""
+
+    @pytest.fixture
+    def sender(self) -> Any:
+        """A sender that records instead of sending, so a test can prove nothing was mailed."""
+        from webbpulse.identity import RecordingEmailSender
+
+        return RecordingEmailSender()
+
+    def test_verified_false_creates_the_user_unverified(self, hooks: FakeHooks, module_key: rsa.RSAPrivateKey) -> None:
+        """The flag reaches the row, and the e2e marker is still set."""
+        flows = make_flows(hooks, module_key, ephemeral_users_enabled=True)
+        created = flows.create_ephemeral_user(email=EMAIL, password=PASSWORD, verified=False)
+        user = hooks.users[created["user_id"]]
+        assert user["email_verified"] is False
+        assert user[E2E_USER_ATTRIBUTE] is True
+
+    def test_the_token_confirms_through_the_production_path(
+        self, hooks: FakeHooks, module_key: rsa.RSAPrivateKey, sender: Any
+    ) -> None:
+        """The issued token is a real link token, and nothing is mailed to the reserved address."""
+        flows = make_mailing_flows(hooks, module_key, sender)
+        created = flows.create_ephemeral_user(email=EMAIL, password=PASSWORD, verified=False)
+        issued = flows.issue_ephemeral_verification_link(created["user_id"])
+        assert issued["user_id"] == created["user_id"]
+        assert issued["token"]
+        assert sender.sent == []
+        assert flows.confirm_verification(issued["token"]) == created["user_id"]
+        assert hooks.users[created["user_id"]]["email_verified"] is True
+
+    def test_the_token_never_reaches_the_log(
+        self, hooks: FakeHooks, module_key: rsa.RSAPrivateKey, sender: Any, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """Issuing and confirming the link log the event and the user id, never the token."""
+        flows = make_mailing_flows(hooks, module_key, sender)
+        with caplog.at_level("DEBUG"):
+            created = flows.create_ephemeral_user(email=EMAIL, password=PASSWORD, verified=False)
+            token = flows.issue_ephemeral_verification_link(created["user_id"])["token"]
+            flows.confirm_verification(token)
+        events = {getattr(log_record, "event", "") for log_record in caplog.records}
+        assert "identity.ephemeral_verification_link_issued" in events
+        assert token not in caplog.text
+        for log_record in caplog.records:
+            assert token not in repr(log_record.__dict__)
+
+    def test_a_verified_user_is_refused(self, hooks: FakeHooks, module_key: rsa.RSAPrivateKey, sender: Any) -> None:
+        """There is nothing to verify, so no link is minted."""
+        flows = make_mailing_flows(hooks, module_key, sender)
+        created = flows.create_ephemeral_user(email=EMAIL, password=PASSWORD)
+        with pytest.raises(LoginRejected) as caught:
+            flows.issue_ephemeral_verification_link(created["user_id"])
+        assert caught.value.error_code == "EMAIL_ALREADY_VERIFIED"
+        assert caught.value.status_code == 409
+
+    def test_a_real_user_is_refused(self, hooks: FakeHooks, module_key: rsa.RSAPrivateKey, sender: Any) -> None:
+        """An admin token cannot pull a real account's verification link out of the server."""
+        real = hooks.create_user(email="owner@example.com", attributes={"email_verified": False})
+        flows = make_mailing_flows(hooks, module_key, sender)
+        with pytest.raises(LoginRejected) as caught:
+            flows.issue_ephemeral_verification_link(str(real["id"]))
+        assert caught.value.error_code == "NOT_EPHEMERAL_USER"
+        assert caught.value.status_code == 403
+
+    def test_an_unknown_user_is_a_404(self, hooks: FakeHooks, module_key: rsa.RSAPrivateKey, sender: Any) -> None:
+        """A missing id is told apart from a refused one."""
+        flows = make_mailing_flows(hooks, module_key, sender)
+        with pytest.raises(LoginRejected) as caught:
+            flows.issue_ephemeral_verification_link("user-missing")
+        assert caught.value.error_code == "USER_NOT_FOUND"
+        assert caught.value.status_code == 404
+
+    def test_it_refuses_when_the_flag_is_off(
+        self, hooks: FakeHooks, module_key: rsa.RSAPrivateKey, sender: Any
+    ) -> None:
+        """The link route is gated by the same flag as the create route."""
+        flows = make_mailing_flows(hooks, module_key, sender, ephemeral_users_enabled=False)
+        with pytest.raises(LoginRejected) as caught:
+            flows.issue_ephemeral_verification_link("user-0001")
+        assert caught.value.error_code == "EPHEMERAL_USERS_DISABLED"
+
+    def test_no_link_store_answers_503(self, hooks: FakeHooks, module_key: rsa.RSAPrivateKey) -> None:
+        """A deployment that cannot issue links says so rather than failing obscurely."""
+        flows = make_flows(hooks, module_key, ephemeral_users_enabled=True)
+        created = flows.create_ephemeral_user(email=EMAIL, password=PASSWORD, verified=False)
+        with pytest.raises(LoginRejected) as caught:
+            flows.issue_ephemeral_verification_link(created["user_id"])
+        assert caught.value.error_code == "EMAIL_NOT_CONFIGURED"
+
+    def test_the_route_creates_unverified_and_returns_the_token(
+        self, hooks: FakeHooks, module_key: rsa.RSAPrivateKey, sender: Any
+    ) -> None:
+        """Over HTTP: `verified: false` on create, then the admin-only link route answers 201."""
+        from fastapi import FastAPI
+        from fastapi.testclient import TestClient
+
+        from webbpulse.identity import build_identity_router
+
+        settings = make_settings(
+            ephemeral_users_enabled=True,
+            environment="staging",
+            frontend_base_url="https://app.staging.example.com",
+            email_from="no-reply@example.com",
+            product_name="Example",
+            support_email="support@example.com",
+        )
+        router = build_identity_router(
+            settings,
+            hooks,
+            make_stores(),
+            tokens=TokenService(settings, FakeKms({KEY_A: module_key})),
+            email_sender=sender,
+        )
+        app = FastAPI()
+        app.include_router(router)
+        client = TestClient(app)
+        admin = TestEphemeralRoutesOverHttp.headers_for(TestEphemeralRoutesOverHttp.ADMIN)
+        created = client.post(
+            "/api/auth/e2e/users",
+            json={**dict(TestEphemeralRoutesOverHttp.PAYLOAD), "verified": False},
+            headers=admin,
+        )
+        assert created.status_code == 201, created.text
+        user_id = created.json()["user_id"]
+        assert hooks.users[user_id]["email_verified"] is False
+
+        anonymous = client.post(f"/api/auth/e2e/users/{user_id}/verification-link")
+        assert anonymous.status_code == 401
+
+        issued = client.post(f"/api/auth/e2e/users/{user_id}/verification-link", headers=admin)
+        assert issued.status_code == 201, issued.text
+        assert issued.json()["user_id"] == user_id
+        assert issued.json()["token"]
+        assert sender.sent == []
 
 
 NOW = datetime(2026, 9, 29, 12, 0, tzinfo=UTC)
